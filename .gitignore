@@ -185,7 +185,7 @@ src/every_query/train_codes/
 
 # AI 
 .cursor/
-.cluade
+.claude/
 CLAUDE.md
 
 # GCP analysis
