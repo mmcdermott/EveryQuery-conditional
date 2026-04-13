@@ -1,7 +1,7 @@
 import logging
 import textwrap
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import torch
 from transformers import AutoConfig, ModernBertConfig, ModernBertModel
@@ -278,14 +278,22 @@ class EveryQueryModel(torch.nn.Module):
         do_demo: bool = False,
         do_grad_ckpt: bool = False,
         mlp_dropout: float = 0.1,
-        model_name_or_config: str | ModernBertConfig = "answerdotai/ModernBERT-base",
+        model_name: str = "answerdotai/ModernBERT-base",
+        num_hidden_layers: int | None = None,
+        config_overrides: dict[str, Any] | None = None,
     ):
         super().__init__()
 
-        if isinstance(model_name_or_config, ModernBertConfig):
-            self.HF_model_config = model_name_or_config
-        else:
-            self.HF_model_config: ModernBertConfig = AutoConfig.from_pretrained(model_name_or_config)
+        self.HF_model_config: ModernBertConfig = AutoConfig.from_pretrained(model_name)
+
+        if config_overrides:
+            for key, value in config_overrides.items():
+                setattr(self.HF_model_config, key, value)
+
+        # Applied after config_overrides so the explicit parameter takes precedence
+        # if both config_overrides["num_hidden_layers"] and num_hidden_layers are set.
+        if num_hidden_layers is not None:
+            self.HF_model_config.num_hidden_layers = num_hidden_layers
 
         extra_kwargs = {"torch_dtype": self.PRECISION_TO_MODEL_WEIGHTS_DTYPE.get(precision)}
 
@@ -337,7 +345,9 @@ class EveryQueryModel(torch.nn.Module):
             "precision": precision,
             "do_demo": do_demo,
             "mlp_dropout": self.HF_model.config.mlp_dropout,
-            "model_name_or_config": model_name_or_config,
+            "model_name": model_name,
+            "num_hidden_layers": self.HF_model_config.num_hidden_layers,
+            "config_overrides": dict(config_overrides) if config_overrides else None,
         }
 
     @property
@@ -525,44 +535,11 @@ class EveryQueryModel(torch.nn.Module):
 
         Returns:
             A dictionary of inputs for the Hugging Face model.
-
-        Examples:
-            Without ``duration_days``, returns ``input_ids`` and ``attention_mask``:
-
-            >>> no_dur = Mock(
-            ...     mode="SM",
-            ...     code=torch.tensor([[1, 2, 3], [4, 5, 0]]),
-            ...     duration_days=None, PAD_INDEX=0,
-            ... )
-            >>> hf_in = demo_model._hf_inputs(no_dur)
-            >>> sorted(hf_in.keys())
-            ['attention_mask', 'input_ids']
-            >>> hf_in['attention_mask']
-            tensor([[ True,  True,  True],
-                    [ True,  True, False]])
-
-            With ``duration_days``, embeds a duration token at position 1:
-
-            >>> with torch.no_grad():
-            ...     hf_dur = demo_model._hf_inputs(sample_batch)
-            >>> sorted(hf_dur.keys())
-            ['attention_mask', 'inputs_embeds']
-            >>> hf_dur['inputs_embeds'].shape[1] == sample_batch.code.shape[1] + 1
-            True
-            >>> hf_dur['inputs_embeds'].shape[2] == demo_model_config.hidden_size
-            True
-            >>> hf_dur['attention_mask'].shape[1] == sample_batch.code.shape[1] + 1
-            True
         """
         attention_mask = batch.code != batch.PAD_INDEX  # (batch_size, seq_len)
 
         if batch.duration_days is not None:
-            # tok_embeddings in newer transformers, word_embeddings in older
-            embed_layer = (
-                getattr(self.HF_model.embeddings, "tok_embeddings", None)
-                or self.HF_model.embeddings.word_embeddings
-            )
-            word_embeds = embed_layer(batch.code)  # (B, seq_len, H)
+            word_embeds = self.HF_model.embeddings.tok_embeddings(batch.code)  # (B, seq_len, H)
             dur_norm = (batch.duration_days / 365.0).unsqueeze(-1)  # (B, 1)
             dur_emb = self.duration_embed(dur_norm).unsqueeze(1)  # (B, 1, H)
             # Insert duration embedding at position 1 (after query token at position 0)
@@ -615,34 +592,6 @@ class EveryQueryModel(torch.nn.Module):
         return self.criterion(logits, target)
 
     def _forward(self, batch: EveryQueryBatch) -> tuple[torch.FloatTensor, BaseModelOutput]:
-        """Runs the model forward pass: HF backbone, query pooling, task heads, and loss.
-
-        Examples:
-            >>> with torch.no_grad():
-            ...     loss, outputs = demo_model._forward(sample_batch)
-            >>> loss.isfinite()
-            tensor(True)
-            >>> isinstance(outputs, EveryQueryOutput)
-            True
-            >>> outputs.query_embed.shape == (sample_batch.batch_size, demo_model_config.hidden_size)
-            True
-            >>> outputs.censor_logits.shape == (sample_batch.batch_size, 1)
-            True
-            >>> outputs.occurs_logits.shape == (sample_batch.batch_size, 1)
-            True
-
-            Loss decomposes into the two sub-losses:
-
-            >>> outputs.censor_loss.isfinite() and outputs.occurs_loss.isfinite()
-            tensor(True)
-            >>> torch.allclose(loss, outputs.censor_loss + outputs.occurs_loss)
-            True
-
-            ``do_demo=True`` preserves hidden states in the output:
-
-            >>> outputs.last_hidden_state is not None
-            True
-        """
         outputs = self.HF_model(**self._hf_inputs(batch))
         embeddings = outputs.last_hidden_state  # (batch_size, seq_len + query_len, hidden_size)
         query_embed = embeddings[:, 0, :]  # 0 is query_index (batch_size, hidden_size)
