@@ -606,12 +606,27 @@ class EveryQueryModel(torch.nn.Module):
 
             >>> round(demo_model._get_loss(torch.tensor([[0.0]]), torch.tensor([1])).item(), 4)
             0.6931
+
+            An all-False mask yields a finite zero loss (not NaN from empty-mean BCE)
+            and still participates in autograd so downstream summation / backward works:
+
+            >>> empty_mask = torch.tensor([False, False])
+            >>> zero_loss = demo_model._get_loss(logits.requires_grad_(True), target, mask=empty_mask)
+            >>> zero_loss.item()
+            0.0
+            >>> zero_loss.requires_grad
+            True
         """
         target = target.float().unsqueeze(1)
         if mask is not None:
             logits = logits[mask]
             target = target[mask]
         assert logits.shape == target.shape, f"logits: {logits.shape}, target: {target.shape}"
+        if logits.numel() == 0:
+            # Empty masked batch: BCEWithLogitsLoss(reduction='mean') on an empty tensor
+            # returns NaN (0/0).  Return a differentiable zero that stays on the right
+            # device/dtype and keeps the autograd graph connected to the logits.
+            return logits.sum() * 0.0
         return self.criterion(logits, target)
 
     def _forward(self, batch: EveryQueryBatch) -> tuple[torch.FloatTensor, BaseModelOutput]:
