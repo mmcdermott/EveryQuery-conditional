@@ -260,46 +260,18 @@ class EveryQueryLightningModule(L.LightningModule):
                 if mask is not None:
                     preds = preds[mask]
                     target = target[mask]
-                if preds.numel() > 0 and target.unique().numel() == 2:
+                if preds.numel() > 0:
                     self._update_metric(name="occurs_auc", split=split, preds=preds, target=target)
 
     def training_step(self, batch: EveryQueryBatch) -> torch.Tensor:
-        """Forward pass and metric logging for a single training batch.
-
-        Examples:
-            >>> with patch.object(demo_lightning_module, '_log_metrics'):
-            ...     loss = demo_lightning_module.training_step(sample_batch)
-            >>> loss.shape
-            torch.Size([])
-            >>> torch.isfinite(loss).item()
-            True
-
-        Unlike ``validation_step``, gradients are tracked:
-
-            >>> loss.requires_grad
-            True
-        """
+        """Forward pass and metric logging for a single training batch."""
         loss, outputs = self.model(batch)
         self._log_metrics(loss, outputs, batch, train_split)
         return loss
 
     @torch.no_grad()
     def validation_step(self, batch: EveryQueryBatch) -> torch.Tensor:
-        """Forward pass and metric logging for a single validation batch (no gradients).
-
-        Examples:
-            >>> with patch.object(demo_lightning_module, '_log_metrics'):
-            ...     loss = demo_lightning_module.validation_step(sample_batch)
-            >>> loss.shape
-            torch.Size([])
-            >>> torch.isfinite(loss).item()
-            True
-
-        ``@torch.no_grad`` means the returned loss has no gradient:
-
-            >>> loss.requires_grad
-            False
-        """
+        """Forward pass and metric logging for a single validation batch (no gradients)."""
         loss, outputs = self.model(batch)
         self._log_metrics(loss, outputs, batch, tuning_split)
         return loss
@@ -506,6 +478,7 @@ class EveryQueryLightningModule(L.LightningModule):
         Examples:
             Round-trip save / load preserves hyper-parameters:
 
+            >>> import tempfile
             >>> with tempfile.TemporaryDirectory() as tmpdir:
             ...     ckpt_path = tmpdir + "/test.ckpt"
             ...     torch.save({

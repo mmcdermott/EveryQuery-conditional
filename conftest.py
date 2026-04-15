@@ -2,9 +2,9 @@
 
 Fixture dependency graph (all session-scoped)::
 
-    demo_model_config ──► demo_model ──► demo_lightning_module
-            │                                    │
-            ▼                                    ▼
+    demo_model ──────────► demo_lightning_module
+                                    │
+                                    ▼
     simple_static_MEDS ──► tensorized_cohort_dir  trained_model_ckpt (Phase 3)
             │                       │
             ▼                       ▼
@@ -49,6 +49,20 @@ _PRED_TIMES: dict[int, datetime] = {
 
 _QUERY_CODES = ["HR", "TEMP"]
 
+DEMO_CONFIG_OVERRIDES: dict[str, int] = {
+    "hidden_size": 64,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 2,
+    "intermediate_size": 128,
+    "max_position_embeddings": 128,
+    "vocab_size": 100,
+    "pad_token_id": 0,
+    "cls_token_id": 1,
+    "bos_token_id": 1,
+    "sep_token_id": 2,
+    "eos_token_id": 2,
+}
+
 
 # ── Model fixtures ──────────────────────────────────────────────────────
 
@@ -56,26 +70,14 @@ _QUERY_CODES = ["HR", "TEMP"]
 @pytest.fixture(scope="session")
 def demo_model_config() -> ModernBertConfig:
     """Tiny ModernBERT config suitable for CPU-only testing."""
-    return ModernBertConfig(
-        hidden_size=64,
-        num_hidden_layers=2,
-        num_attention_heads=2,
-        intermediate_size=128,
-        max_position_embeddings=128,
-        vocab_size=100,
-        pad_token_id=0,
-        cls_token_id=1,
-        bos_token_id=1,
-        sep_token_id=2,
-        eos_token_id=2,
-    )
+    return ModernBertConfig(**DEMO_CONFIG_OVERRIDES)
 
 
 @pytest.fixture(scope="session")
-def demo_model(demo_model_config: ModernBertConfig) -> EveryQueryModel:
+def demo_model() -> EveryQueryModel:
     """Randomly-initialised EveryQueryModel with tiny dimensions."""
     model = EveryQueryModel(
-        model_name_or_config=demo_model_config,
+        config_overrides=DEMO_CONFIG_OVERRIDES,
         do_demo=True,
         precision="32-true",
     )
@@ -150,6 +152,11 @@ def task_parquet_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
             ).cast({"prediction_time": pl.Datetime("us")})
 
             df.write_parquet(split_dir / "0.parquet")
+
+    import json
+
+    with open(task_dir / "sampled_durations.json", "w") as f:
+        json.dump([30, 31], f)
 
     return task_dir
 
