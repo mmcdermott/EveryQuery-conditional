@@ -7,6 +7,7 @@ import shutil
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
+from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
@@ -339,7 +340,10 @@ def _init_env() -> None:
     os.environ["OMP_NUM_THREADS"] = str(threads_per_file)
 
 
-@hydra.main(version_base="1.3", config_path="", config_name="config.yaml")
+CONFIGS = str(files("every_query"))
+
+
+@hydra.main(version_base="1.3", config_path=CONFIGS, config_name="config.yaml")
 def main(cfg: DictConfig) -> float | None:
     _init_env()
 

@@ -33,6 +33,7 @@ import logging
 import os
 import tempfile
 from dataclasses import dataclass
+from importlib.resources import files
 from pathlib import Path
 
 import hydra
@@ -666,7 +667,10 @@ def _resolve_path(cfg_value: str | None, env_var: str, name: str) -> Path:
     )
 
 
-@hydra.main(version_base=None, config_path=".", config_name="sample_tasks_config")
+CONFIGS = str(files("every_query"))
+
+
+@hydra.main(version_base=None, config_path=CONFIGS, config_name="sample_tasks_config")
 def main(cfg: DictConfig) -> None:
     """Hydra entry point.
 

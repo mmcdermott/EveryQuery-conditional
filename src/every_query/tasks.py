@@ -2,6 +2,7 @@ import gc
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
+from importlib.resources import files
 
 import hydra
 import numpy as np
@@ -207,7 +208,10 @@ def sample_durations(n: int, low: int, high: int, seed: int) -> list[int]:
     return sorted(unique)[:n]
 
 
-@hydra.main(version_base=None, config_path=".", config_name="tasks_config")
+CONFIGS = str(files("every_query"))
+
+
+@hydra.main(version_base=None, config_path=CONFIGS, config_name="tasks_config")
 def main(cfg: DictConfig) -> None:
     ensure_env()
     shard_index = int(cfg.shard_index) if cfg.shard_index is not None else None

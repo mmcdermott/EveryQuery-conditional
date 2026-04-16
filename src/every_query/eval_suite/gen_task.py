@@ -1,3 +1,4 @@
+from importlib.resources import files
 from pathlib import Path
 
 import hydra
@@ -102,7 +103,10 @@ def process_eval_tasks(
                 df.write_parquet(out_fp)
 
 
-@hydra.main(config_path="./conf", config_name="gen_tasks_config", version_base=None)
+EVAL_CONFIGS = str(files("every_query") / "eval_suite" / "conf")
+
+
+@hydra.main(config_path=EVAL_CONFIGS, config_name="gen_tasks_config", version_base=None)
 def main(cfg: DictConfig) -> None:
     codes = _resolve_codes(cfg.eval_codes)
     extra = list(cfg.get("extra_codes", []))

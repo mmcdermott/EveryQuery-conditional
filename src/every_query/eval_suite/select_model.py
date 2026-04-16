@@ -1,5 +1,6 @@
 import logging
 from datetime import UTC, datetime
+from importlib.resources import files
 from itertools import combinations
 from pathlib import Path
 
@@ -68,7 +69,10 @@ def _compute_win_rates(df: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
     return ranking, win_matrix
 
 
-@hydra.main(version_base="1.3", config_path="./conf", config_name="select_model_config.yaml")
+EVAL_CONFIGS = str(files("every_query") / "eval_suite" / "conf")
+
+
+@hydra.main(version_base="1.3", config_path=EVAL_CONFIGS, config_name="select_model_config.yaml")
 def main(cfg: DictConfig) -> None:
     model_run_dirs = [Path(p) for p in cfg.model_run_dirs]
     split = cfg.split

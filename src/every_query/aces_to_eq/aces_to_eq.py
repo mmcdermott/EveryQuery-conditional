@@ -1,5 +1,6 @@
 import logging
 import os
+from importlib.resources import files
 from pathlib import Path
 
 import hydra
@@ -55,7 +56,10 @@ def create_eq_task_df(
         logger.info(f"Wrote to {out_fp}")
 
 
-@hydra.main(version_base="1.3", config_path=".", config_name="config.yaml")
+ACES_CONFIGS = str(files("every_query") / "aces_to_eq")
+
+
+@hydra.main(version_base="1.3", config_path=ACES_CONFIGS, config_name="config.yaml")
 def main(cfg: DictConfig) -> None:
     all_eq_shards = sorted(
         Path(cfg.eq_tasks_all_dir).glob("*.parquet"),
