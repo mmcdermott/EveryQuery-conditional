@@ -58,17 +58,21 @@ repos:
     hooks:
       - id: mdformat
         args: ["--number"]
+        # Pin every plugin — otherwise fresh pre-commit envs (e.g. CI) resolve the
+        # latest release at install time and silently produce different formatting
+        # than stale local caches.  mdformat-shfmt in particular changes how it
+        # indents bash inside fenced code blocks between versions.
         additional_dependencies:
-          - mdformat-ruff
-          - mdformat-gfm
-          - mdformat-gfm-alerts
-          - mdformat-tables
-          - mdformat_frontmatter
-          - mdformat-black
-          - mdformat-config
-          - mdformat-shfmt
-          - mdformat-mkdocs
-          - mdformat-toc
+          - mdformat-ruff==0.1.3
+          - mdformat-gfm==1.0.0
+          - mdformat-gfm-alerts==2.0.0
+          - mdformat-tables==1.0.0
+          - mdformat_frontmatter==2.0.10
+          - mdformat-black==0.1.1
+          - mdformat-config==0.2.1
+          - mdformat-shfmt==0.2.0
+          - mdformat-mkdocs==5.1.4
+          - mdformat-toc==0.5.0
 
   # word spelling linter
   - repo: https://github.com/codespell-project/codespell
