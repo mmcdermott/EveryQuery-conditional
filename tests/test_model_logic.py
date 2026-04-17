@@ -124,6 +124,56 @@ class TestCensoredSamplesExcludedFromOccursLoss:
         )
 
 
+class TestAllCensoredBatchProducesFiniteLoss:
+    """An all-censored batch must still yield a finite total loss.
+
+    ``_forward`` masks ``occurs_loss`` with ``mask=~batch.censor``.  When every
+    sample in the batch is censored the mask is all-False, and
+    ``BCEWithLogitsLoss`` on an empty tensor with ``reduction='mean'`` returns
+    NaN (0/0).  That NaN propagates into ``loss = censor_loss + occurs_loss``
+    and silently poisons optimizer state.  See issue #30.
+    """
+
+    @torch.no_grad()
+    def test_all_censored_batch_total_loss_is_finite(self, demo_model, sample_batch):
+        perturbed = copy.deepcopy(sample_batch)
+        perturbed.censor = torch.ones_like(perturbed.censor, dtype=torch.bool)
+
+        assert perturbed.censor.all(), "Precondition: batch must be fully censored"
+
+        loss, out = demo_model._forward(perturbed)
+
+        assert out.censor_loss.isfinite(), (
+            "censor_loss must be finite for an all-censored batch (it uses mask=None)"
+        )
+        assert out.occurs_loss.isfinite(), (
+            "occurs_loss must be finite for an all-censored batch, but got "
+            f"{out.occurs_loss} — empty-mask BCE is returning NaN"
+        )
+        assert loss.isfinite(), f"total loss must be finite for an all-censored batch, but got {loss}"
+
+    def test_all_censored_batch_backward_does_not_nan_params(self, demo_model, sample_batch):
+        """``loss.backward()`` on an all-censored batch must not introduce NaNs into parameters.
+
+        This is the real-world failure mode: the NaN loss propagates through the
+        optimizer step and every subsequent forward produces NaN logits. We run
+        a full forward + backward and assert no parameter gradient is NaN.
+        """
+        perturbed = copy.deepcopy(sample_batch)
+        perturbed.censor = torch.ones_like(perturbed.censor, dtype=torch.bool)
+
+        demo_model.zero_grad(set_to_none=True)
+        loss, _ = demo_model._forward(perturbed)
+        loss.backward()
+
+        nan_grad_params = [
+            n for n, p in demo_model.named_parameters() if p.grad is not None and torch.isnan(p.grad).any()
+        ]
+        assert not nan_grad_params, (
+            f"loss.backward() on an all-censored batch produced NaN gradients for: {nan_grad_params}"
+        )
+
+
 class TestDurationPathSwitching:
     """Setting ``duration_days=None`` must switch ``_hf_inputs`` from the ``inputs_embeds`` path to the
     ``input_ids`` path.
