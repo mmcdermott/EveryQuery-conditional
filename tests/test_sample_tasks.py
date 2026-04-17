@@ -23,7 +23,6 @@ from meds import train_split
 from meds_torchdata.config import MEDSTorchDataConfig
 
 from every_query import sample_tasks as st
-from every_query import tasks_reference
 from every_query.dataset import EveryQueryPytorchDataset
 from every_query.sample_tasks import (
     TaskSpec,
@@ -35,6 +34,7 @@ from every_query.sample_tasks import (
     sample_tasks,
 )
 from every_query.utils.seeds import derive_seed
+from tests import tasks_reference
 
 # ---------------------------------------------------------------------------
 # Shared synthetic fixtures
@@ -231,10 +231,12 @@ def _sampler_long(
     want the equivalence test to depend on sampler randomness.  The equivalence claim is that for
     *any* index_df row, the labels from ``evaluate_index_df`` agree with the reference.
     """
-    from every_query import tasks as new_tasks
-
-    base_df = new_tasks.compute_base_prediction_times(events_df, min_context).select(
-        "subject_id", "prediction_time"
+    base_df = (
+        events_df.with_columns(pl.col("time").cum_count().over("subject_id").alias("_ccs"))
+        .filter(pl.col("_ccs") >= min_context)
+        .select(["subject_id", "time"])
+        .unique()
+        .rename({"time": "prediction_time"})
     )
     codes_df = pl.DataFrame({"query": query_codes}, schema={"query": pl.Utf8})
     index_df = base_df.join(codes_df, how="cross").with_columns(
@@ -907,7 +909,7 @@ _E2E_QUERIES = ["HR", "TEMP"]
 
 
 class TestEndToEndWithDataset:
-    """Sanity-check that sampler output is a drop-in replacement for ``collate_tasks`` output.
+    """Sanity-check that sampler output is a drop-in replacement for the dataset's task-labels contract.
 
     We don't run ``run_worker`` here because the sampler's shard-reading path expects string-coded
     events from an early preprocessing stage that the test fixture does not expose (the tensorized

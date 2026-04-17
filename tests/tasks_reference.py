@@ -1,13 +1,9 @@
-"""Reference implementations of the pre-refactor tasks.py functions.
+"""Reference implementations used as a test-only oracle for the sampler.
 
-These are verbatim copies of compute_censor_dataframe and build_task_label_matrix
-from the main branch before the new-speedup refactor, with one fix: the original
-code used `not pl.col("censored")` which raises in current polars. This is corrected
-to `pl.col("censored").not_()` — the logic is identical, only the API call changes.
-
-These exist solely for regression testing: tests compare the output of the new
-precompute_min_deltas_wide + build_task_for_duration pipeline against these originals.
-Do not import these in production code.
+``compute_censor_dataframe`` and ``build_task_label_matrix`` are the original exhaustive-grid
+task-label builders from the pre-sampler implementation.  ``test_sample_tasks.py`` cross-checks
+``sample_tasks.evaluate_index_df`` against them to guarantee bit-identity on the shared
+(subject x prediction_time x code) universe.  Do not import from production code.
 """
 
 import polars as pl
