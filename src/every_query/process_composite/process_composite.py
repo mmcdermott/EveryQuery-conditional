@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from importlib.resources import files
 from pathlib import Path
 
 import hydra
@@ -77,7 +78,12 @@ def agg_probs(
     return joined_df, aucs
 
 
-@hydra.main(version_base="1.3", config_path=".", config_name="process_composite_config.yaml")
+PROCESS_COMPOSITE_CONFIGS = str(files("every_query") / "process_composite")
+
+
+@hydra.main(
+    version_base="1.3", config_path=PROCESS_COMPOSITE_CONFIGS, config_name="process_composite_config.yaml"
+)
 def main(cfg: DictConfig) -> None:
     _, aucs = agg_probs(
         all_preds_df_fp=cfg.predictions_df_path,

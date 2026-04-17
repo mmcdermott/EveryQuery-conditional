@@ -1,5 +1,6 @@
 import hashlib
 import json
+from importlib.resources import files
 from pathlib import Path
 
 import hydra
@@ -19,7 +20,10 @@ def build_time_hash(cfg: DictConfig, read_dir: Path) -> str:
     return hash_hex
 
 
-@hydra.main(config_path="./conf", config_name="gen_index_times_config", version_base=None)
+EVAL_CONFIGS = str(files("every_query") / "eval_suite" / "conf")
+
+
+@hydra.main(config_path=EVAL_CONFIGS, config_name="gen_index_times_config", version_base=None)
 def main(cfg: DictConfig) -> None:
     task_dir = Path(cfg.io.task_dir)
     read_dir = task_dir / "all"

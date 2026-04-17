@@ -1,4 +1,5 @@
 import logging
+from importlib.resources import files
 from pathlib import Path
 
 import hydra
@@ -13,8 +14,11 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
+EVAL_CONFIGS = str(files("every_query") / "eval_suite" / "conf")
+
+
 @hydra.main(
-    version_base="1.3", config_path="./eval_suite/conf", config_name="get_per_code_from_composite_config.yaml"
+    version_base="1.3", config_path=EVAL_CONFIGS, config_name="get_per_code_from_composite_config.yaml"
 )
 def main(cfg: DictConfig) -> None:
     print("starting")

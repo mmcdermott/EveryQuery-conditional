@@ -55,7 +55,21 @@ every_query = ["**/*.yaml"]
 
 [project.optional-dependencies] # Add any optional dependencies here, installable via `pip install .[extra]`
 
-[project.scripts] # Add any console scripts here
+[project.scripts]
+EQ_train = "every_query.train:main"
+EQ_evaluate = "every_query.eval:main"
+EQ_generate_tasks = "every_query.sample_tasks:main"
+EQ_generate_tasks_exhaustive = "every_query.tasks:main"
+EQ_gen_eval_index = "every_query.eval_suite.gen_index_times:main"
+EQ_gen_eval_tasks = "every_query.eval_suite.gen_task:main"
+EQ_select_model = "every_query.eval_suite.select_model:main"
+
+[tool.coverage.run]
+# Measure coverage for EQ_* CLIs launched via subprocess in tests/test_cli_smoke.py.
+# coverage's `patch = ["subprocess"]` replaces the removed pytest-cov 7.0 subprocess hook
+# and implies parallel=true.  See
+# https://pytest-cov.readthedocs.io/en/latest/subprocess-support.html
+patch = ["subprocess"]
 
 [tool.pytest.ini_options] # Default pytest options
 addopts = [

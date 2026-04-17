@@ -1,6 +1,7 @@
 import logging
 import time
 from datetime import UTC, datetime
+from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
@@ -219,7 +220,10 @@ def _run_predict(
     return pred_df, embed_df
 
 
-@hydra.main(version_base="1.3", config_path="./eval_suite/conf", config_name="eval_config.yaml")
+EVAL_CONFIGS = str(files("every_query") / "eval_suite" / "conf")
+
+
+@hydra.main(version_base="1.3", config_path=EVAL_CONFIGS, config_name="eval_config.yaml")
 def main(cfg: DictConfig) -> None:
     model_run_dirs = list(cfg.model_run_dirs) if cfg.get("model_run_dirs") else [cfg.model_run_dir]
     durations = list(cfg.durations)
