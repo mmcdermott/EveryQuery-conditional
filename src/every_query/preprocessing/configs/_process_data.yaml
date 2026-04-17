@@ -10,3 +10,6 @@ do_demo: False
 hydra:
   run:
     dir: "${log_dir}"
+  output_subdir: null
+  job:
+    chdir: false
