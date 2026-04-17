@@ -29,12 +29,12 @@ from every_query.sample_tasks import (
     TaskSpec,
     build_index_df,
     compute_max_time_per_subject,
-    derive_seed,
     evaluate_index_df,
     run_worker,
     sample_contexts,
     sample_tasks,
 )
+from every_query.utils.seeds import derive_seed
 
 # ---------------------------------------------------------------------------
 # Shared synthetic fixtures
