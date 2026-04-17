@@ -65,11 +65,11 @@ EQ_gen_eval_tasks = "every_query.eval_suite.gen_task:main"
 EQ_select_model = "every_query.eval_suite.select_model:main"
 
 [tool.coverage.run]
-# ``parallel`` + ``COVERAGE_PROCESS_START`` (set in tests/test_cli_smoke.py)
-# let pytest-cov attribute subprocess-launched coverage data back to the parent
-# run — see https://pytest-cov.readthedocs.io/en/latest/subprocess-support.html
-parallel = true
-source_pkgs = ["every_query"]
+# Measure coverage for EQ_* CLIs launched via subprocess in tests/test_cli_smoke.py.
+# coverage's `patch = ["subprocess"]` replaces the removed pytest-cov 7.0 subprocess hook
+# and implies parallel=true.  See
+# https://pytest-cov.readthedocs.io/en/latest/subprocess-support.html
+patch = ["subprocess"]
 
 [tool.pytest.ini_options] # Default pytest options
 addopts = [
