@@ -6,7 +6,7 @@ proves the ``[project.scripts]`` entry resolved, the package config
 directory resolved via ``importlib.resources.files()``, and module-level
 imports don't blow up in a fresh interpreter.
 
-Three endpoints (``EQ_pretrain``, ``EQ_evaluate``, ``EQ_gen_eval_tasks``) compose a
+Three endpoints (``EQ_train``, ``EQ_evaluate``, ``EQ_gen_eval_tasks``) compose a
 ``{train,eval}_codes`` default group whose canonical file is generated out-of-band
 (see ``src/every_query/sample_codes/``) and is not checked in.  For those we point
 Hydra at a throwaway ``--config-dir`` that supplies an empty-codes smoke variant,
@@ -31,9 +31,9 @@ _VENV_BIN = str(Path(sys.executable).parent)
 # (console_script, extra_args) — extras inject a smoke code-group for configs
 # whose defaults pull an out-of-tree YAML.
 _ENTRYPOINTS: list[tuple[str, list[str]]] = [
-    ("EQ_pretrain", ["train_codes=smoke"]),
+    ("EQ_train", ["train_codes=smoke"]),
     ("EQ_evaluate", ["eval_codes=smoke"]),
-    ("EQ_prepare_tasks", []),
+    ("EQ_generate_tasks", []),
     ("EQ_gen_eval_index", []),
     ("EQ_gen_eval_tasks", ["eval_codes=smoke"]),
     ("EQ_select_model", []),

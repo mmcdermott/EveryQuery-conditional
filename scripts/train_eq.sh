@@ -45,6 +45,6 @@ uv run python -c "import sys; print('Executable:', sys.executable)"
 
 export HYDRA_FULL_ERROR=1
 
-srun uv run python -m every_query.pretrain.train "$@"
+srun uv run python -m every_query.train.train "$@"
 
 echo "Finished at $(date)"

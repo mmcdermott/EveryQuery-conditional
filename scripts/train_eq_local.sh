@@ -28,6 +28,6 @@ uv run python -c "import sys; print('Executable:', sys.executable)"
 
 export HYDRA_FULL_ERROR=1
 
-uv run numactl --cpunodebind=0 --membind=0 python -m every_query.pretrain.train "$@"
+uv run numactl --cpunodebind=0 --membind=0 python -m every_query.train.train "$@"
 
 echo "Finished at $(date)"

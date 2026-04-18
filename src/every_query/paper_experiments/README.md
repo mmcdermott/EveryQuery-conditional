@@ -16,7 +16,7 @@ Concrete examples of paper-experiments code:
 
 ## What does **not** belong here
 
-Anything on the normal-usage path: `preprocessing/`, `prepare_tasks/`, `pretrain/`, `predict/`, `evaluate/`. Those submodules are what any external user touches when running EveryQuery on their own cohort, and they should stay obviously separate from paper-only tooling.
+Anything on the normal-usage path: `preprocessing/`, `generate_tasks/`, `train/`, `predict/`, `evaluate/`. Those submodules are what any external user touches when running EveryQuery on their own cohort, and they should stay obviously separate from paper-only tooling.
 
 Cluster-specific operator tooling (SLURM submit wrappers, GCS upload scripts) also doesn't live here — that category already left the repo in [#77](https://github.com/payalchandak/EveryQuery/pull/77).
 

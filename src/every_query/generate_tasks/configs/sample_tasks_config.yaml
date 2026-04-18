@@ -1,7 +1,7 @@
 # Hydra config for the sampling-first task label generator.
 #
 # Sweep on the cluster with:
-#   python -m every_query.prepare_tasks.sample_tasks -m input_shard=0,1,2,... task_shard=range(0,K)
+#   python -m every_query.generate_tasks.sample_tasks -m input_shard=0,1,2,... task_shard=range(0,K)
 #
 # Path roots are left as `null` in this file and resolved inside `main()` via `load_dotenv()` +
 # env-var fallback, matching the repo convention where `.env` holds machine-specific paths

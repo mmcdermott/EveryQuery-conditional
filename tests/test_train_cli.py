@@ -1,4 +1,4 @@
-"""CLI-level integration tests for ``every_query.pretrain``.
+"""CLI-level integration tests for ``every_query.train``.
 
 Tests exercise the full ``pretrain.train.main`` Hydra entry-point (via subprocess) using
 the ``_demo_train.yaml`` config against sampler-shaped task labels.
@@ -23,7 +23,7 @@ def _run_train_subprocess(
     do_overwrite: bool = True,
     extra_overrides: list[str] | None = None,
 ) -> subprocess.CompletedProcess:
-    """Run ``python -m every_query.pretrain.train`` as a subprocess with the demo config."""
+    """Run ``python -m every_query.train.train`` as a subprocess with the demo config."""
     env = os.environ.copy()
     env["PATH"] = _VENV_BIN + os.pathsep + env.get("PATH", "")
     # Provide dummy env vars so ensure_env() passes in the subprocess.
@@ -53,7 +53,7 @@ def _run_train_subprocess(
     cmd = [
         sys.executable,
         "-m",
-        "every_query.pretrain.train",
+        "every_query.train.train",
         "--config-name=_demo_train",
         *overrides,
     ]
