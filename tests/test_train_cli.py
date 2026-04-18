@@ -122,3 +122,42 @@ class TestTrainResume:
 
     def test_best_model_present_after_resume(self, resumed_output):
         assert (resumed_output / "best_model.ckpt").is_file()
+
+
+class TestTrainOverwriteReRun:
+    """Re-running ``EQ_train`` with ``do_overwrite=True`` into a populated output_dir must leave a readable
+    ``config.yaml`` + ``resolved_config.yaml`` behind.
+
+    Regression guard for #31: the
+    pre-fix code wiped the dir via ``shutil.rmtree`` but only re-saved the config on the fresh-dir
+    branch, so overwrite re-runs silently produced runs that downstream tools (notably
+    ``eval.py``, which loads ``resolved_config.yaml``) couldn't inspect.
+    """
+
+    @pytest.fixture(scope="class")
+    def overwrite_output(self, task_labels_dir, tensorized_cohort_dir, tmp_path_factory) -> Path:
+        output_dir = tmp_path_factory.mktemp("cli_overwrite")
+
+        first = _run_train_subprocess(task_labels_dir, tensorized_cohort_dir, output_dir)
+        assert first.returncode == 0, (
+            f"Initial training failed (rc={first.returncode}).\nstderr:\n{first.stderr}"
+        )
+        assert (output_dir / "config.yaml").is_file()
+
+        overwritten = _run_train_subprocess(
+            task_labels_dir,
+            tensorized_cohort_dir,
+            output_dir,
+            do_overwrite=True,
+            do_resume=False,
+        )
+        assert overwritten.returncode == 0, (
+            f"Overwrite re-run failed (rc={overwritten.returncode}).\nstderr:\n{overwritten.stderr}"
+        )
+        return output_dir
+
+    def test_config_yaml_present_after_overwrite(self, overwrite_output):
+        assert (overwrite_output / "config.yaml").is_file()
+
+    def test_resolved_config_yaml_present_after_overwrite(self, overwrite_output):
+        assert (overwrite_output / "resolved_config.yaml").is_file()
