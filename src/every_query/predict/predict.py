@@ -62,7 +62,7 @@ def _run_one_group(
     # Shape the slice into what the dataset expects.
     tmp_rows = group_df.select("subject_id", "prediction_time").with_columns(
         pl.lit(code).alias("query"),
-        pl.lit(int(round(duration_days))).cast(pl.Int64).alias("duration_days"),
+        pl.lit(duration_days).cast(pl.Float32).alias("duration_days"),
         pl.lit(False).alias("boolean_value"),  # placeholder — ignored at predict time
         pl.lit(False).alias("occurs"),  # placeholder
     )
@@ -96,7 +96,7 @@ def _run_one_group(
                 "prediction_time": torch.cat(p_times).numpy(),
                 "predicted_boolean_probability": torch.cat(probs).numpy(),
             }
-        )
+        ).with_columns(pl.col("prediction_time").cast(pl.Datetime("us")))
 
 
 @hydra.main(version_base="1.3", config_path=CONFIGS, config_name="predict")
