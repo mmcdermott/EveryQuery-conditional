@@ -1,45 +1,48 @@
 # `model/`
 
-Shared model-definition code: *what the model is*, independent of *when it runs*.
-Imported by the `train/` stage (for training) and eventually by `predict/` (for inference).
-Nothing in this submodule is stage-specific — no Hydra entry points, no CLI, no config files.
+The EveryQuery model itself: the raw `nn.Module` architecture and the Lightning wrapper that
+drives training / validation / prediction loops. Pure architecture concerns — no data-layer
+shape, no Hydra entry points, no configs.
 
 ## What lives here
 
 - **`model.py`** — `EveryQueryModel` (the ModernBERT-style encoder `nn.Module`) and
-    `EveryQueryOutput` (the forward-pass output dataclass). This is the core architecture.
+    `EveryQueryOutput` (the forward-pass output dataclass). The core architecture.
 - **`lightning_module.py`** — `EveryQueryLightningModule`. Wraps `EveryQueryModel` for
     PyTorch Lightning with `training_step` / `validation_step` / `predict_step`. Shared between
-    training and inference — at predict time the same LightningModule's `predict_step` produces
-    predictions.
-- **`dataset.py`** — `EveryQueryPytorchDataset`, `EveryQueryBatch`, `QueryData`. The PyTorch
-    `Dataset` contract that maps tensorized MEDS shards + a task-labels parquet into batches the
-    model consumes. Also shared across training and inference.
+    training and inference — the same LightningModule's `predict_step` is what `predict/` will
+    use at inference time.
 
-The public API is re-exported via `__init__.py`, so call sites stay terse:
+Call through the package so stage submodules don't need to know the file layout:
 
 ```python
-from every_query.model import (
-    EveryQueryModel,
-    EveryQueryLightningModule,
-    EveryQueryPytorchDataset,
-)
+from every_query.model import EveryQueryModel, EveryQueryLightningModule
 ```
 
-Fully-qualified module paths (`every_query.model.dataset.EveryQueryPytorchDataset`, etc.) are
-used in Hydra `_target_` strings for explicitness, since a config reader wants to know exactly
-which file the class lives in.
+Hydra `_target_` strings in configs use the fully-qualified module path
+(`every_query.model.lightning_module.EveryQueryLightningModule`, etc.) for explicitness —
+a config reader should see exactly which file the class lives in.
+
+## Relationship to `data/`
+
+The data-layer contract (dataset, batch, query types) lives in
+[`every_query.data`](../data/). `model/` has no dependency on any stage submodule and no
+dependency on the upstream `generate_tasks/` output layout — it only knows the shape of the
+batch it receives, which is defined by `data/`.
+
+This split mirrors MEICAR's `model/` (pure architecture) + MTD's dataset (shared dataset
+plumbing). EQ has its own data layer because `EveryQueryBatch` carries query-specific fields
+upstream MTD's batch doesn't.
 
 ## Pipeline position
 
 ```
-preprocessing/ → generate_tasks/ → train/   ┐
-                                            ├──►  model/  (used by both)
-                                 predict/   ┘
+data/   ─┐
+         ├──►  model/  ─────►  predictions / loss
+train/  ─┘          ▲
+(or predict/)       │
+                    Hydra-instantiated via train/configs/*.yaml
 ```
-
-`model/` has no dependency on any stage submodule — it's the shared core. Stage submodules
-import from here, never the other way around.
 
 ## Related
 
