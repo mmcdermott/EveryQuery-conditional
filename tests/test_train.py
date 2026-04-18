@@ -94,6 +94,9 @@ def test_resume_advances_global_step(
             shutil.copytree(src, dst)
         else:
             shutil.copy2(src, dst)
+    # NOTE: copying config.yaml is load-bearing — train.py uses its presence (cfg_path.exists())
+    # to decide whether the output dir is "populated" and to enter the do_resume branch.  Without
+    # it, do_resume=True would be silently ignored and a fresh training run would start instead.
 
     _, start_ckpt = _highest_step_checkpoint(resume_dir)
     starting_step = start_ckpt["global_step"]
