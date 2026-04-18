@@ -8,6 +8,7 @@ reproducibility, and that the ``n_tasks`` knob is actually honored.
 from __future__ import annotations
 
 import hashlib
+import io
 from typing import TYPE_CHECKING
 
 import polars as pl
@@ -34,6 +35,13 @@ def _read_train_labels(tasks_dir: Path) -> pl.DataFrame:
     return pl.concat([pl.read_parquet(fp) for fp in fps], how="vertical")
 
 
+def _parquet_hash(df: pl.DataFrame) -> str:
+    """Return a short hex digest of *df* serialised as Parquet (for assertion messages)."""
+    buf = io.BytesIO()
+    df.write_parquet(buf)
+    return hashlib.sha256(buf.getvalue()).hexdigest()[:16]
+
+
 def test_sampler_output_schema(eq_sampled_tasks_dir: Path) -> None:
     """The labeled shards have exactly the columns MTD expects, with the right dtypes."""
     df = _read_train_labels(eq_sampled_tasks_dir)
@@ -45,15 +53,10 @@ def test_sampler_output_schema(eq_sampled_tasks_dir: Path) -> None:
         "query": pl.Utf8,
         "duration_days": pl.Int64,
     }
-    # Compare by (name, outer-dtype) so Datetime subtypes (μs vs ns) don't break the test.
-    actual = {c: (type(dt) if dt.base_type() == pl.Datetime else dt) for c, dt in df.schema.items()}
-    expected = {
-        c: (type(dt) if isinstance(dt, type) and dt is pl.Datetime else dt)
-        for c, dt in expected_schema.items()
-    }
-    for col, expected_dtype in expected.items():
-        assert col in actual, f"column {col!r} missing from sampler output: {df.columns}"
-        if expected_dtype is type(pl.Datetime):
+    for col, expected_dtype in expected_schema.items():
+        assert col in df.columns, f"column {col!r} missing from sampler output: {df.columns}"
+        if expected_dtype is pl.Datetime:
+            # Compare by base type so Datetime subtypes (μs vs ns) don't break the test across polars versions.
             assert df[col].dtype.base_type() == pl.Datetime, f"{col} is not Datetime: {df[col].dtype}"
         else:
             assert df[col].dtype == expected_dtype, (
@@ -115,8 +118,7 @@ def test_reproducible_with_same_seed(
     b = rerun_labels.filter(pl.col("subject_id").is_not_null()).sort(sort_cols)
     assert a.equals(b), (
         "two EQ_generate_tasks runs with identical seed produced different labeled output.\n"
-        f"fixture hash: {hashlib.sha256(a.write_parquet_buffered().getbuffer()).hexdigest()[:16]}  "
-        f"rerun hash: {hashlib.sha256(b.write_parquet_buffered().getbuffer()).hexdigest()[:16]}"
+        f"fixture hash: {_parquet_hash(a)}  rerun hash: {_parquet_hash(b)}"
     )
 
 
