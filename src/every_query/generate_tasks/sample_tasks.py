@@ -455,12 +455,35 @@ def _artifact_paths(
     input_shard: str,
     task_shard: int,
 ) -> tuple[Path, Path, Path, Path]:
-    """Resolve the ``(tasks_fp, index_fp, labels_fp, run_meta_fp)`` quadruple for one worker."""
+    """Resolve the ``(tasks_fp, index_fp, labels_fp, run_meta_fp)`` quadruple for one worker.
+
+    Only the *labels* parquet lives under ``out_dir`` — the caching artifacts (sampled tasks
+    JSON, unlabeled-index parquet, run-meta JSON) live in a sibling ``{out_dir}.cache/``
+    directory.  This separation is load-bearing: downstream tooling (MTD's
+    ``MEDSTorchDataConfig.task_labels_fps``, ``EveryQueryPytorchDataset.labels_df``) globs
+    ``task_labels_dir`` recursively with ``rglob("*.parquet")``, so any non-label parquet
+    under ``out_dir`` (in particular the index parquet, which has a narrower 4-column
+    schema) would be silently picked up and blow up ``pl.concat`` with a ``ShapeError``.
+
+    Examples:
+        >>> from pathlib import Path
+        >>> out = Path("/tmp/task_labels")
+        >>> tasks, index, labels, meta = _artifact_paths(out, split="train", input_shard="0", task_shard=0)
+        >>> labels
+        PosixPath('/tmp/task_labels/train/0__0000.parquet')
+        >>> index  # NOT under out_dir — sibling cache dir
+        PosixPath('/tmp/task_labels.cache/index/train/0__0000.parquet')
+        >>> tasks
+        PosixPath('/tmp/task_labels.cache/tasks/train/0__0000.json')
+        >>> meta
+        PosixPath('/tmp/task_labels.cache/runs/train/0__0000.json')
+    """
     worker_id = f"{input_shard}__{task_shard:04d}"
-    tasks_fp = out_dir / "_artifacts" / "tasks" / split / f"{worker_id}.json"
-    index_fp = out_dir / "_artifacts" / "index" / split / f"{worker_id}.parquet"
+    cache_dir = out_dir.parent / f"{out_dir.name}.cache"
+    tasks_fp = cache_dir / "tasks" / split / f"{worker_id}.json"
+    index_fp = cache_dir / "index" / split / f"{worker_id}.parquet"
     labels_fp = out_dir / split / f"{worker_id}.parquet"
-    run_meta_fp = out_dir / "_artifacts" / "runs" / split / f"{worker_id}.json"
+    run_meta_fp = cache_dir / "runs" / split / f"{worker_id}.json"
     return tasks_fp, index_fp, labels_fp, run_meta_fp
 
 
@@ -512,8 +535,8 @@ def _validate_run_meta(run_meta_fp: Path, current: dict[str, int]) -> None:
         "Refusing to reuse cached sampler artifacts: the worker config on disk at "
         f"{run_meta_fp} differs from the requested config:\n"
         + "\n".join(diff_lines)
-        + "\nPass overwrite=true to regenerate this worker's artifacts, "
-        "or delete the _artifacts/ subdirectory if you want a clean run."
+        + "\nPass overwrite=true to regenerate this worker's artifacts, or delete "
+        f"{run_meta_fp.parent.parent.parent!s} (the sampler cache dir) for a clean run."
     )
 
 
@@ -538,11 +561,11 @@ def run_worker(
     labeled parquet are each written on first run and loaded (without resampling) on subsequent
     runs. Set ``overwrite=True`` to force regeneration.
 
-    A per-worker meta sidecar at ``_artifacts/runs/{split}/{worker_id}.json`` captures the
-    sampling parameters the cached artifacts were generated with.  On every non-``overwrite`` rerun
-    those parameters are compared against the requested parameters and any mismatch raises
-    ``ValueError`` rather than silently reusing stale artifacts.  Missing meta (e.g. legacy
-    artifacts or hand-preseeded tasks.json) is tolerated.
+    A per-worker meta sidecar at ``{out_dir}.cache/runs/{split}/{worker_id}.json`` captures
+    the sampling parameters the cached artifacts were generated with.  On every
+    non-``overwrite`` rerun those parameters are compared against the requested parameters
+    and any mismatch raises ``ValueError`` rather than silently reusing stale artifacts.
+    Missing meta (e.g. legacy artifacts or hand-preseeded tasks.json) is tolerated.
 
     Returns:
         The path of the labeled parquet, or ``None`` if the labels already existed, the meta
