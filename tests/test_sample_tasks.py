@@ -5,8 +5,10 @@ Structure:
 - ``TestPrimitives`` — unit tests for the pure building blocks.
 - ``TestEvaluateIndexDfEdgeCases`` — hand-crafted edge cases for ``evaluate_index_df`` (strict-``>``
   semantics, missing-subject handling).
-- ``TestRunWorkerPipeline`` — artifact-level tests for the three-stage idempotent pipeline:
-  stage skip on rerun, overwrite, seed-axis independence, pre-seeded tasks.
+- ``TestRunWorkerPipeline`` — pipeline-level tests: the worker writes one output (labels), is
+  idempotent on rerun, regenerates on ``overwrite=True``, preserves the seed-derived axis
+  invariants across input and task shards, and — since the cache was removed — returns stale
+  labels silently if a config is changed without ``overwrite=True`` (caller-enforced contract).
 - ``TestEndToEndWithDataset`` — smoke test that builds sampler-shaped labels referencing real
   subject IDs from ``tensorized_cohort_dir``, feeds them through ``EveryQueryPytorchDataset``, and
   pushes one collated batch through ``demo_model``.  Verifies schema compatibility with the
