@@ -195,7 +195,7 @@ src/every_query/eval_suite/outputs/
 CLAUDE.md
 
 # GCP analysis
-data/
+/data/
 analysis/tables/
 analysis/figures/
 .DS_Store
