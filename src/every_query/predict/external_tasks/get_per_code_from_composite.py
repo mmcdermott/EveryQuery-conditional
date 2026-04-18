@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
-EVAL_CONFIGS = str(files("every_query") / "eval_suite" / "conf")
+EVAL_CONFIGS = str(files("every_query") / "predict" / "external_tasks" / "configs")
 
 
 @hydra.main(

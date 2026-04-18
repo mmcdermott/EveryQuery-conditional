@@ -69,7 +69,7 @@ def _compute_win_rates(df: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
     return ranking, win_matrix
 
 
-EVAL_CONFIGS = str(files("every_query") / "eval_suite" / "conf")
+EVAL_CONFIGS = str(files("every_query") / "evaluate" / "conf")
 
 
 @hydra.main(version_base="1.3", config_path=EVAL_CONFIGS, config_name="select_model_config.yaml")

@@ -20,7 +20,7 @@ def build_time_hash(cfg: DictConfig, read_dir: Path) -> str:
     return hash_hex
 
 
-EVAL_CONFIGS = str(files("every_query") / "eval_suite" / "conf")
+EVAL_CONFIGS = str(files("every_query") / "evaluate" / "conf")
 
 
 @hydra.main(config_path=EVAL_CONFIGS, config_name="gen_index_times_config", version_base=None)

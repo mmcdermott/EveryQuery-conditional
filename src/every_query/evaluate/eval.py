@@ -269,7 +269,7 @@ def _run_predict(
     return pred_df, embed_df
 
 
-EVAL_CONFIGS = str(files("every_query") / "eval_suite" / "conf")
+EVAL_CONFIGS = str(files("every_query") / "evaluate" / "conf")
 
 
 @hydra.main(version_base="1.3", config_path=EVAL_CONFIGS, config_name="eval_config.yaml")

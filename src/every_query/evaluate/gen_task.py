@@ -103,7 +103,7 @@ def process_eval_tasks(
                 df.write_parquet(out_fp)
 
 
-EVAL_CONFIGS = str(files("every_query") / "eval_suite" / "conf")
+EVAL_CONFIGS = str(files("every_query") / "evaluate" / "conf")
 
 
 @hydra.main(config_path=EVAL_CONFIGS, config_name="gen_tasks_config", version_base=None)

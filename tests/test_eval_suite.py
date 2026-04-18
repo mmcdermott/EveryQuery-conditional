@@ -7,8 +7,8 @@ import polars as pl
 import pytest
 from omegaconf import ListConfig, OmegaConf
 
-from every_query.eval import _model_name
-from every_query.eval_suite.gen_task import _resolve_codes, process_eval_tasks
+from every_query.evaluate.eval import _model_name
+from every_query.evaluate.gen_task import _resolve_codes, process_eval_tasks
 from every_query.utils.codes import code_slug
 
 # ---------------------------------------------------------------------------
