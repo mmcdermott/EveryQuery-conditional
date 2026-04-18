@@ -1,6 +1,6 @@
 """CLI-level integration tests for ``every_query.pretrain``.
 
-Tests exercise the full ``pretrain.__main__.main`` Hydra entry-point (via subprocess) using
+Tests exercise the full ``pretrain.train.main`` Hydra entry-point (via subprocess) using
 the ``_demo_train.yaml`` config against sampler-shaped task labels.
 """
 
