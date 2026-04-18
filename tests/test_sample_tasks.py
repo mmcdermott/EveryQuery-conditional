@@ -1,4 +1,4 @@
-"""Tests for ``every_query.sample_tasks`` (sampling-first PT task label generator).
+"""Tests for ``every_query.prepare_tasks`` (sampling-first PT task label generator).
 
 Structure:
 
@@ -22,9 +22,9 @@ import torch
 from meds import train_split
 from meds_torchdata.config import MEDSTorchDataConfig
 
-from every_query import sample_tasks as st
 from every_query.dataset import EveryQueryPytorchDataset
-from every_query.sample_tasks import (
+from every_query.prepare_tasks import sample_tasks as st
+from every_query.prepare_tasks.sample_tasks import (
     TaskSpec,
     build_index_df,
     compute_max_time_per_subject,
@@ -250,7 +250,7 @@ class TestEvaluateIndexDfEdgeCases:
         ).with_columns(pl.col("prediction_time").cast(pl.Datetime("us")))
 
         max_time_df = compute_max_time_per_subject(events)
-        with caplog.at_level("WARNING", logger="every_query.sample_tasks"):
+        with caplog.at_level("WARNING", logger="every_query.prepare_tasks.sample_tasks"):
             result = evaluate_index_df(index_df, events, max_time_df)
 
         # Neither row produces a null label.

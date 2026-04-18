@@ -1,7 +1,7 @@
 # Minimal Hydra config for CPU-only integration tests.
 #
 # Usage (tests override the ??? paths via Hydra CLI or compose API):
-#   python -m every_query.train --config-name=_demo_train \
+#   python -m every_query.pretrain.train --config-name=_demo_train \
 #       output_dir=/tmp/eq_test \
 #       datamodule.config.task_labels_dir=/tmp/tasks \
 #       datamodule.config.tensorized_cohort_dir=/tmp/cohort
@@ -65,7 +65,7 @@ trainer:
   _target_: lightning.pytorch.trainer.Trainer
   logger: false
   callbacks:
-    _target_: every_query.train.values_as_list
+    _target_: every_query.pretrain.train.values_as_list
     model_checkpoint:
       _target_: lightning.pytorch.callbacks.ModelCheckpoint
       dirpath: ${output_dir}/checkpoints

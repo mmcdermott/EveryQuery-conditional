@@ -3,7 +3,7 @@
 import re
 import time
 
-import every_query.train as train_module
+import every_query.pretrain.train as train_module
 
 
 def test_run_id_format():

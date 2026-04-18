@@ -194,7 +194,7 @@ def _init_env() -> None:
     os.environ["OMP_NUM_THREADS"] = str(threads_per_file)
 
 
-CONFIGS = str(files("every_query"))
+CONFIGS = str(files("every_query") / "pretrain" / "configs")
 
 
 @hydra.main(version_base="1.3", config_path=CONFIGS, config_name="config.yaml")
