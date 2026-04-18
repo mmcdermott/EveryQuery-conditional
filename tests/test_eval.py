@@ -9,7 +9,7 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
-from every_query.eval import _run_predict, _run_test, _setup_model
+from every_query.evaluate.eval import _run_predict, _run_test, _setup_model
 from every_query.utils.codes import code_slug
 
 # ---------------------------------------------------------------------------
@@ -115,9 +115,9 @@ def _make_train_cfg() -> "DictConfig":  # noqa: F821
 # ---------------------------------------------------------------------------
 
 _SETUP_PATCHES = {
-    "load": "every_query.lightning_module.EveryQueryLightningModule.load_from_checkpoint",
-    "instantiate": "every_query.eval.instantiate",
-    "seed": "every_query.eval.seed_everything",
+    "load": "every_query.model.lightning_module.EveryQueryLightningModule.load_from_checkpoint",
+    "instantiate": "every_query.evaluate.eval.instantiate",
+    "seed": "every_query.evaluate.eval.seed_everything",
 }
 
 
@@ -209,7 +209,7 @@ class TestRunTestOutputSchema:
         task_set_dir, M, train_cfg = run_test_deps
         cfg = _make_run_test_cfg(id_codes=CODES[:1])
         trainer = _make_mock_trainer()
-        with patch("every_query.eval.instantiate", return_value=MagicMock()):
+        with patch("every_query.evaluate.eval.instantiate", return_value=MagicMock()):
             df = _run_test(cfg, train_cfg, M, trainer, task_set_dir, "test_model", DURATIONS)
         assert set(df.columns) == self.EXPECTED_COLUMNS
 
@@ -221,7 +221,7 @@ class TestRunTestOutputSchema:
         )
         metrics = {"held_out/occurs_auc": 0.85, "held_out/censor_auc": 0.90}
         trainer = _make_mock_trainer(test_return=[metrics])
-        with patch("every_query.eval.instantiate", return_value=MagicMock()):
+        with patch("every_query.evaluate.eval.instantiate", return_value=MagicMock()):
             df = _run_test(cfg, train_cfg, M, trainer, task_set_dir, "test_model", DURATIONS)
         assert df["duration_days"].dtype == pl.Int64
         assert df["occurs_auc"].dtype == pl.Float64
@@ -234,7 +234,7 @@ class TestRunTestRowGeneration:
         task_set_dir, M, train_cfg = run_test_deps
         cfg = _make_run_test_cfg(id_codes=CODES, ood_codes=[])
         trainer = _make_mock_trainer()
-        with patch("every_query.eval.instantiate", return_value=MagicMock()):
+        with patch("every_query.evaluate.eval.instantiate", return_value=MagicMock()):
             df = _run_test(cfg, train_cfg, M, trainer, task_set_dir, "m", DURATIONS)
         assert len(df) == len(CODES) * len(DURATIONS)
 
@@ -255,7 +255,7 @@ class TestRunTestRowGeneration:
         trainer = _make_mock_trainer()
         M = _make_mock_model()
         train_cfg = _make_train_cfg()
-        with patch("every_query.eval.instantiate", return_value=MagicMock()):
+        with patch("every_query.evaluate.eval.instantiate", return_value=MagicMock()):
             df = _run_test(cfg, train_cfg, M, trainer, task_set_dir, "m", durations)
         assert len(df) == 3
 
@@ -266,7 +266,7 @@ class TestRunTestRowGeneration:
         trainer = _make_mock_trainer()
         M = _make_mock_model()
         train_cfg = _make_train_cfg()
-        with patch("every_query.eval.instantiate", return_value=MagicMock()):
+        with patch("every_query.evaluate.eval.instantiate", return_value=MagicMock()):
             df = _run_test(cfg, train_cfg, M, trainer, task_set_dir, "m", DURATIONS)
         assert len(df) == 0
 
@@ -278,7 +278,7 @@ class TestRunTestRowGeneration:
         cfg1 = _make_run_test_cfg(id_codes=CODES, ood_codes=[])
         cfg2 = _make_run_test_cfg(id_codes=list(reversed(CODES)), ood_codes=[])
 
-        with patch("every_query.eval.instantiate", return_value=MagicMock()):
+        with patch("every_query.evaluate.eval.instantiate", return_value=MagicMock()):
             df1 = _run_test(cfg1, train_cfg, M, trainer, task_set_dir, "m", DURATIONS)
             df2 = _run_test(cfg2, train_cfg, M, trainer, task_set_dir, "m", DURATIONS)
 
@@ -294,7 +294,7 @@ class TestRunTestRowGeneration:
         trainer = _make_mock_trainer(test_return=[metrics])
 
         cfg = _make_run_test_cfg(id_codes=CODES[:1], ood_codes=[])
-        with patch("every_query.eval.instantiate", return_value=MagicMock()):
+        with patch("every_query.evaluate.eval.instantiate", return_value=MagicMock()):
             df1 = _run_test(cfg, train_cfg, M, trainer, task_set_dir, "m", [30, 90])
             df2 = _run_test(cfg, train_cfg, M, trainer, task_set_dir, "m", [90, 30])
 
@@ -313,7 +313,7 @@ class TestRunTestBucketLabeling:
         trainer = _make_mock_trainer()
         M = _make_mock_model()
         train_cfg = _make_train_cfg()
-        with patch("every_query.eval.instantiate", return_value=MagicMock()):
+        with patch("every_query.evaluate.eval.instantiate", return_value=MagicMock()):
             return _run_test(cfg, train_cfg, M, trainer, task_set_dir, "m", [30])
 
     def test_ood_code_labeled_ood(self, tmp_path):
@@ -339,7 +339,7 @@ class TestRunTestSplitRouting:
         task_set_dir, M, train_cfg = run_test_deps
         cfg = _make_run_test_cfg(id_codes=CODES[:1], ood_codes=[], split="tuning")
         trainer = _make_mock_trainer(validate_return=[{"tuning/occurs_auc": 0.8}])
-        with patch("every_query.eval.instantiate", return_value=MagicMock()):
+        with patch("every_query.evaluate.eval.instantiate", return_value=MagicMock()):
             _run_test(cfg, train_cfg, M, trainer, task_set_dir, "m", [30])
         trainer.validate.assert_called()
         trainer.test.assert_not_called()
@@ -348,7 +348,7 @@ class TestRunTestSplitRouting:
         task_set_dir, M, train_cfg = run_test_deps
         cfg = _make_run_test_cfg(id_codes=CODES[:1], ood_codes=[], split="held_out")
         trainer = _make_mock_trainer(test_return=[{"held_out/occurs_auc": 0.8}])
-        with patch("every_query.eval.instantiate", return_value=MagicMock()):
+        with patch("every_query.evaluate.eval.instantiate", return_value=MagicMock()):
             _run_test(cfg, train_cfg, M, trainer, task_set_dir, "m", [30])
         trainer.test.assert_called()
         trainer.validate.assert_not_called()
@@ -362,7 +362,7 @@ class TestRunTestMetricExtraction:
             trainer = _make_mock_trainer(validate_return=[metrics])
         else:
             trainer = _make_mock_trainer(test_return=[metrics])
-        with patch("every_query.eval.instantiate", return_value=MagicMock()):
+        with patch("every_query.evaluate.eval.instantiate", return_value=MagicMock()):
             return _run_test(cfg, train_cfg, M, trainer, task_set_dir, "m", [30])
 
     def test_held_out_prefix(self, run_test_deps):
@@ -388,7 +388,7 @@ class TestRunTestMetricExtraction:
         task_set_dir, M, train_cfg = run_test_deps
         cfg = _make_run_test_cfg(id_codes=CODES[:1], ood_codes=[], split="held_out")
         trainer = _make_mock_trainer(test_return=[])
-        with patch("every_query.eval.instantiate", return_value=MagicMock()):
+        with patch("every_query.evaluate.eval.instantiate", return_value=MagicMock()):
             df = _run_test(cfg, train_cfg, M, trainer, task_set_dir, "m", [30])
         assert df["occurs_auc"][0] is None
         assert df["censor_auc"][0] is None
@@ -428,7 +428,7 @@ class TestRunPredictOutputSchema:
         cfg = _make_predict_cfg(id_codes=CODES[:1])
         trainer = MagicMock()
         trainer.predict.return_value = [_make_predict_batch(3)]
-        with patch("every_query.eval.instantiate", return_value=MagicMock()):
+        with patch("every_query.evaluate.eval.instantiate", return_value=MagicMock()):
             pred_df, _ = _run_predict(cfg, train_cfg, M, trainer, task_set_dir, "m", [30])
         assert set(pred_df.columns) == {
             "subject_id",
@@ -445,7 +445,7 @@ class TestRunPredictOutputSchema:
         cfg = _make_predict_cfg(id_codes=CODES[:1])
         trainer = MagicMock()
         trainer.predict.return_value = [_make_predict_batch(3)]
-        with patch("every_query.eval.instantiate", return_value=MagicMock()):
+        with patch("every_query.evaluate.eval.instantiate", return_value=MagicMock()):
             _, embed_df = _run_predict(cfg, train_cfg, M, trainer, task_set_dir, "m", [30])
         assert set(embed_df.columns) == {
             "subject_id",
@@ -470,7 +470,7 @@ class TestRunPredictRowGeneration:
         trainer.predict.return_value = [_make_predict_batch(5)]
         M = _make_mock_model()
         train_cfg = _make_train_cfg()
-        with patch("every_query.eval.instantiate", return_value=MagicMock()):
+        with patch("every_query.evaluate.eval.instantiate", return_value=MagicMock()):
             pred_df, embed_df = _run_predict(cfg, train_cfg, M, trainer, task_set_dir, "m", [30])
         # Only 1 code/duration combo has a dir
         assert len(pred_df) == 5
@@ -483,7 +483,7 @@ class TestRunPredictRowGeneration:
         trainer = MagicMock()
         M = _make_mock_model()
         train_cfg = _make_train_cfg()
-        with patch("every_query.eval.instantiate", return_value=MagicMock()):
+        with patch("every_query.evaluate.eval.instantiate", return_value=MagicMock()):
             pred_df, embed_df = _run_predict(cfg, train_cfg, M, trainer, task_set_dir, "m", DURATIONS)
         assert pred_df.is_empty()
         assert embed_df.is_empty()
@@ -494,7 +494,7 @@ class TestRunPredictRowGeneration:
         trainer = MagicMock()
         # 3 batches of 10 samples each
         trainer.predict.return_value = [_make_predict_batch(10, start_id=i * 10) for i in range(3)]
-        with patch("every_query.eval.instantiate", return_value=MagicMock()):
+        with patch("every_query.evaluate.eval.instantiate", return_value=MagicMock()):
             pred_df, _ = _run_predict(cfg, train_cfg, M, trainer, task_set_dir, "m", [30])
         assert len(pred_df) == 30
 
@@ -505,7 +505,7 @@ class TestRunPredictRowGeneration:
         cfg = _make_predict_cfg(id_codes=codes)
         trainer = MagicMock()
         trainer.predict.return_value = [_make_predict_batch(5)]
-        with patch("every_query.eval.instantiate", return_value=MagicMock()):
+        with patch("every_query.evaluate.eval.instantiate", return_value=MagicMock()):
             pred_df, embed_df = _run_predict(cfg, train_cfg, M, trainer, task_set_dir, "m", durations)
         # 2 codes * 2 durations * 5 samples = 20
         assert len(pred_df) == 20
@@ -520,7 +520,7 @@ class TestRunPredictRowGeneration:
         trainer = MagicMock()
         batch = _make_predict_batch(5, start_id=100)
         trainer.predict.return_value = [batch]
-        with patch("every_query.eval.instantiate", return_value=MagicMock()):
+        with patch("every_query.evaluate.eval.instantiate", return_value=MagicMock()):
             pred_df, _ = _run_predict(cfg, train_cfg, M, trainer, task_set_dir, "m", [30])
         expected_ids = list(range(100, 105))
         assert pred_df["subject_id"].to_list() == expected_ids
@@ -557,7 +557,7 @@ class TestMultiCheckpointLoop:
 
             trainer = _make_mock_trainer(test_return=[metrics])
             cfg = _make_run_test_cfg(id_codes=CODES[:1], ood_codes=[])
-            with patch("every_query.eval.instantiate", return_value=MagicMock()):
+            with patch("every_query.evaluate.eval.instantiate", return_value=MagicMock()):
                 df = _run_test(cfg, _make_train_cfg(), M, trainer, task_set_dir, model_name, [30])
             all_dfs.append(df)
 
@@ -602,7 +602,7 @@ class TestMultiCheckpointLoop:
 
             trainer = _make_mock_trainer(test_return=[metrics])
             cfg = _make_run_test_cfg(id_codes=CODES[:2], ood_codes=[])
-            with patch("every_query.eval.instantiate", return_value=MagicMock()):
+            with patch("every_query.evaluate.eval.instantiate", return_value=MagicMock()):
                 df = _run_test(cfg, _make_train_cfg(), M, trainer, task_set_dir, model_name, DURATIONS)
             all_dfs.append(df)
 

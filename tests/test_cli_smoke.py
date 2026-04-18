@@ -8,7 +8,7 @@ imports don't blow up in a fresh interpreter.
 
 Three endpoints (``EQ_train``, ``EQ_evaluate``, ``EQ_gen_eval_tasks``) compose a
 ``{train,eval}_codes`` default group whose canonical file is generated out-of-band
-(see ``src/every_query/sample_codes/``) and is not checked in.  For those we point
+(see ``src/every_query/paper_experiments/sample_codes/``) and is not checked in.  For those we point
 Hydra at a throwaway ``--config-dir`` that supplies an empty-codes smoke variant,
 which preserves the rest of the compose path.
 

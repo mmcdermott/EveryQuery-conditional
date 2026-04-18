@@ -640,7 +640,7 @@ def _resolve_path(cfg_value: str | None, env_var: str, name: str) -> Path:
     )
 
 
-CONFIGS = str(files("every_query"))
+CONFIGS = str(files("every_query") / "generate_tasks" / "configs")
 
 
 @hydra.main(version_base=None, config_path=CONFIGS, config_name="sample_tasks_config")

@@ -29,9 +29,9 @@ from meds import train_split, tuning_split
 from meds_torchdata.config import MEDSTorchDataConfig
 from transformers import ModernBertConfig
 
-from every_query.dataset import EveryQueryBatch, EveryQueryPytorchDataset
-from every_query.lightning_module import EveryQueryLightningModule
+from every_query.data.dataset import EveryQueryBatch, EveryQueryPytorchDataset
 from every_query.model import EveryQueryModel
+from every_query.model.lightning_module import EveryQueryLightningModule
 
 # ── Constants derived from the canonical simple-static MEDS sample data ─
 

@@ -78,7 +78,7 @@ def agg_probs(
     return joined_df, aucs
 
 
-PROCESS_COMPOSITE_CONFIGS = str(files("every_query") / "process_composite")
+PROCESS_COMPOSITE_CONFIGS = str(files("every_query") / "predict" / "external_tasks" / "configs")
 
 
 @hydra.main(

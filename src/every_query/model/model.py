@@ -7,7 +7,7 @@ import torch
 from transformers import AutoConfig, ModernBertConfig, ModernBertModel
 from transformers.modeling_outputs import BaseModelOutput
 
-from .dataset import EveryQueryBatch
+from every_query.data.dataset import EveryQueryBatch
 
 logger = logging.getLogger(__name__)
 

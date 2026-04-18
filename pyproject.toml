@@ -57,12 +57,12 @@ every_query = ["**/*.yaml"]
 
 [project.scripts]
 EQ_process_data = "every_query.preprocessing.__main__:main"
-EQ_train = "every_query.train:main"
-EQ_evaluate = "every_query.eval:main"
-EQ_generate_tasks = "every_query.sample_tasks:main"
-EQ_gen_eval_index = "every_query.eval_suite.gen_index_times:main"
-EQ_gen_eval_tasks = "every_query.eval_suite.gen_task:main"
-EQ_select_model = "every_query.eval_suite.select_model:main"
+EQ_train = "every_query.train.train:main"
+EQ_evaluate = "every_query.evaluate.eval:main"
+EQ_generate_tasks = "every_query.generate_tasks.sample_tasks:main"
+EQ_gen_eval_index = "every_query.evaluate.gen_index_times:main"
+EQ_gen_eval_tasks = "every_query.evaluate.gen_task:main"
+EQ_select_model = "every_query.evaluate.select_model:main"
 
 [tool.coverage.run]
 # Measure coverage for EQ_* CLIs launched via subprocess in tests/test_cli_smoke.py.

@@ -12,7 +12,8 @@ import torch.nn.parameter
 from meds import held_out_split, train_split, tuning_split
 from torchmetrics.classification import BinaryAUROC
 
-from .dataset import EveryQueryBatch
+from every_query.data.dataset import EveryQueryBatch
+
 from .model import EveryQueryModel, EveryQueryOutput
 
 logger = logging.getLogger(__name__)
