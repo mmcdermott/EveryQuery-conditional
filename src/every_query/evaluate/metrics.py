@@ -51,7 +51,32 @@ def compute_metrics(predictions: pl.DataFrame) -> pl.DataFrame:
 
     Returns a dataframe with columns ``code``, ``duration_days``, ``n_rows``, ``n_positive``,
     ``auroc``.  Groups with an all-same-class label return ``auroc = null``.
+
+    Raises:
+        ValueError: if ``predictions`` is missing the ``boolean_value`` column (ground-truth
+            labels are required to compute any metric).
+
+    Examples:
+        >>> import polars as pl
+        >>> preds = pl.DataFrame({
+        ...     "code": ["A", "A", "B", "B"],
+        ...     "duration_days": pl.Series([30.0, 30.0, 30.0, 30.0], dtype=pl.Float32),
+        ...     "boolean_value": [True, False, True, True],
+        ...     "predicted_boolean_probability": [0.9, 0.1, 0.8, 0.7],
+        ... })
+        >>> out = compute_metrics(preds)
+        >>> out.sort("code")[["code", "n_rows", "n_positive", "auroc"]].to_dicts()
+        [{'code': 'A', 'n_rows': 2, 'n_positive': 1, 'auroc': 1.0}, {'code': 'B', 'n_rows': 2, 'n_positive': 2, 'auroc': None}]
+        >>> out["duration_days"].dtype
+        Float32
     """
+    if "boolean_value" not in predictions.columns:
+        raise ValueError(
+            "predictions is missing the 'boolean_value' column — ground-truth labels are "
+            "required to compute metrics.  Run EQ_predict on labelled task data (i.e. a "
+            "TaskQuerySchema parquet that already has boolean_value filled in)."
+        )
+
     rows = []
     for (code, duration_days), group_df in predictions.group_by(["code", "duration_days"]):
         metrics = _metrics_for_group(group_df)
@@ -67,4 +92,4 @@ def compute_metrics(predictions: pl.DataFrame) -> pl.DataFrame:
                 "auroc": pl.Float64,
             }
         )
-    return pl.DataFrame(rows)
+    return pl.DataFrame(rows).with_columns(pl.col("duration_days").cast(pl.Float32))
