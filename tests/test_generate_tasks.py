@@ -56,7 +56,8 @@ def test_sampler_output_schema(eq_sampled_tasks_dir: Path) -> None:
     for col, expected_dtype in expected_schema.items():
         assert col in df.columns, f"column {col!r} missing from sampler output: {df.columns}"
         if expected_dtype is pl.Datetime:
-            # Compare by base type so Datetime subtypes (μs vs ns) don't break the test across polars versions.
+            # Compare by base type so Datetime subtypes (μs vs ns) don't break the test across
+            # polars versions.
             assert df[col].dtype.base_type() == pl.Datetime, f"{col} is not Datetime: {df[col].dtype}"
         else:
             assert df[col].dtype == expected_dtype, (
@@ -162,5 +163,5 @@ def test_n_tasks_knob_is_honored(
     # rows can be filtered out during the join_asof labeling step.
     assert big_df.height >= int(1.5 * small_df.height), (
         f"n_tasks=16 only produced {big_df.height} rows vs. {small_df.height} at n_tasks=8; "
-        f"expected roughly 2x (allowing 25%% label-drop tolerance)"
+        f"expected roughly 2x (allowing 25% label-drop tolerance)"
     )
