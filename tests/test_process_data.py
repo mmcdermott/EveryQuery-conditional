@@ -52,6 +52,11 @@ def test_codes_metadata_schema(eq_preprocessed_dataset: Path) -> None:
     assert codes.height > 0, "codes.parquet is empty — preprocessing produced no vocabulary"
     # vocab_index is used as the token-id contract by the dataloader.  Must be dense and
     # contiguous starting from 1 (index 0 is reserved for padding by the tokenizer).
+    null_idx = codes["code/vocab_index"].null_count()
+    assert null_idx == 0, (
+        f"codes.parquet has {null_idx} rows with null vocab_index — "
+        f"some codes were not assigned a vocabulary slot"
+    )
     idx = sorted(codes["code/vocab_index"].to_list())
     assert idx == list(range(1, len(idx) + 1)), f"vocab_index is not dense 1..N: {idx}"
 
