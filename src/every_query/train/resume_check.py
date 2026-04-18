@@ -1,7 +1,7 @@
 """Validate that a ``do_resume=True`` invocation matches the resumed-from run's config.
 
 Ported from [MEDS_EIC_AR's ``training/files.py``](https://github.com/mmcdermott/MEDS_EIC_AR/blob/main/src/MEDS_EIC_AR/training/files.py)
-with one substantive EQ-side tweak: the ``ALLOWED_DIFFERENCE_KEYS`` deny-list adds a handful
+with one substantive EQ-side tweak: the ``ALLOWED_DIFFERENCE_KEYS`` allow-list adds a handful
 of training-schedule knobs (``trainer.max_steps``, ``trainer.max_epochs``,
 ``trainer.callbacks.early_stopping.patience``, ``datamodule.pin_memory``) that are *legitimate*
 things to override on resume — bumping step count to train longer than originally planned is a
