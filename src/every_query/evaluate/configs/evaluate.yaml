@@ -1,0 +1,18 @@
+# EQ_evaluate (consolidated) — computes per-(code, duration) metrics from an
+# EQ_predict-written PredictionSchema parquet.  See src/every_query/evaluate/evaluate.py
+# and the #82 inventory + #83 consolidation design for context.
+
+defaults:
+  - _self_
+
+# Required: PredictionSchema-conformant parquet written by EQ_predict.
+predictions_parquet: ???
+
+# Required: output metrics parquet path (per-(code, duration_days) rows with n_rows,
+# n_positive, auroc).
+metrics_parquet: ???
+
+hydra:
+  output_subdir: null
+  job:
+    chdir: false
