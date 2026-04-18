@@ -1,7 +1,7 @@
 """CLI-level integration tests for ``every_query.train``.
 
-Tests exercise the full ``pretrain.train.main`` Hydra entry-point (via subprocess) using
-the ``_demo_train.yaml`` config against sampler-shaped task labels.
+Tests exercise the full ``every_query.train.train:main`` Hydra entry-point (via subprocess)
+using the ``_demo_train.yaml`` config against sampler-shaped task labels.
 """
 
 import os
