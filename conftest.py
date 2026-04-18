@@ -27,7 +27,6 @@ invocation.
 """
 
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -215,10 +214,12 @@ def eq_sampled_tasks_dir(eq_preprocessed_dataset: Path, tmp_path_factory: pytest
     """Runs ``EQ_generate_tasks`` for both ``train`` and ``tuning`` splits against
     ``eq_preprocessed_dataset``.
 
-    Returns a directory containing only the labeled output parquets (layout
-    ``{out}/{split}/*.parquet``).  The sampler's caching artifacts (``_artifacts/``) are
-    written to a sibling directory and excluded — MTD globs ``task_labels_dir`` recursively
-    and the artifacts' narrower schema would otherwise break ``pl.concat``.
+    Returns the sampler's ``out_dir`` directly — the contract with downstream tooling
+    (MTD's ``task_labels_dir``, ``EQ_train``'s ``datamodule.config.task_labels_dir``) is
+    that the sampler's output dir *is* the labels dir.  If the sampler leaks non-label
+    parquets into this directory, MTD's ``rglob("*.parquet")`` picks them up, schemas
+    don't match, and ``pl.concat`` on ``labels_df`` fails — which is exactly the
+    production-facing failure mode the integration tests need to catch, not hide.
     """
     intermediate = eq_preprocessed_dataset.parent / "intermediate"
     assert intermediate.exists(), (
@@ -226,14 +227,14 @@ def eq_sampled_tasks_dir(eq_preprocessed_dataset: Path, tmp_path_factory: pytest
         "(produced by EQ_process_data)"
     )
 
-    raw_out = tmp_path_factory.mktemp("eq_tasks_raw")
+    out_dir = tmp_path_factory.mktemp("eq_tasks")
     for split in (train_split, tuning_split):
         run_and_check(
             [
                 "EQ_generate_tasks",
                 f"data_dir={intermediate!s}",
                 f"codes_dir={eq_preprocessed_dataset!s}",
-                f"out_dir={raw_out!s}",
+                f"out_dir={out_dir!s}",
                 f"split={split}",
                 "input_shard=0",
                 "task_shard=0",
@@ -246,17 +247,7 @@ def eq_sampled_tasks_dir(eq_preprocessed_dataset: Path, tmp_path_factory: pytest
             timeout=120.0,
         )
 
-    # Stage just the labeled parquets into a clean dir so MTD's recursive glob doesn't pick up
-    # the sampler's 4-column index artifacts alongside the 6-column labeled rows.
-    clean = tmp_path_factory.mktemp("eq_tasks")
-    for split in (train_split, tuning_split):
-        src_split = raw_out / split
-        dst_split = clean / split
-        dst_split.mkdir(parents=True, exist_ok=True)
-        for fp in src_split.glob("*.parquet"):
-            shutil.copy2(fp, dst_split / fp.name)
-
-    return clean
+    return out_dir
 
 
 @pytest.fixture(scope="session")

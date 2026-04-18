@@ -41,6 +41,35 @@ def test_generate_tasks_writes_both_splits(eq_sampled_tasks_dir: Path) -> None:
         }, f"unexpected columns in {fps[0]}: {df.columns}"
 
 
+def test_generate_tasks_out_dir_contains_only_label_parquets(eq_sampled_tasks_dir: Path) -> None:
+    """Regression guard for the sampler's ``out_dir`` / cache-dir separation.
+
+    Every ``*.parquet`` under ``eq_sampled_tasks_dir`` (the value users pass to
+    ``EQ_train``'s ``datamodule.config.task_labels_dir``) must conform to the label schema.
+    If the sampler regresses and starts leaking its caching artifacts (especially the
+    unlabeled 4-column index parquet) back under ``out_dir``, MTD's
+    ``MEDSTorchDataConfig.task_labels_fps`` glob will pick them up and training fails with
+    a confusing ``polars ShapeError``.  This test catches that regression directly.
+    """
+    import polars as pl
+
+    required_label_cols = {
+        "subject_id",
+        "prediction_time",
+        "boolean_value",
+        "occurs",
+        "query",
+        "duration_days",
+    }
+    for fp in eq_sampled_tasks_dir.rglob("*.parquet"):
+        cols = set(pl.read_parquet(fp).columns)
+        assert required_label_cols.issubset(cols), (
+            f"non-label parquet leaked under the sampler out_dir: {fp} has columns {cols}.  "
+            f"MTD's task_labels_fps globs recursively, so non-label parquets here will break "
+            f"downstream training.  Caching artifacts must live outside out_dir."
+        )
+
+
 def test_train_produces_checkpoint(eq_trained_model_dir: Path) -> None:
     """EQ_train --config-name=_demo_train produces a checkpoint and resolved config."""
     ckpts = list((eq_trained_model_dir / "checkpoints").glob("*.ckpt"))
