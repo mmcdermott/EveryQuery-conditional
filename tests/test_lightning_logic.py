@@ -10,7 +10,7 @@ from functools import partial
 
 import torch
 
-from every_query.lightning_module import EveryQueryLightningModule
+from every_query.model.lightning_module import EveryQueryLightningModule
 
 _CONFIGURED_WD = 0.01
 

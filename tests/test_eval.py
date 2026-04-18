@@ -115,7 +115,7 @@ def _make_train_cfg() -> "DictConfig":  # noqa: F821
 # ---------------------------------------------------------------------------
 
 _SETUP_PATCHES = {
-    "load": "every_query.lightning_module.EveryQueryLightningModule.load_from_checkpoint",
+    "load": "every_query.model.lightning_module.EveryQueryLightningModule.load_from_checkpoint",
     "instantiate": "every_query.eval.instantiate",
     "seed": "every_query.eval.seed_everything",
 }

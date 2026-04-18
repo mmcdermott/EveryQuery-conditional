@@ -22,7 +22,6 @@ import torch
 from meds import train_split
 from meds_torchdata.config import MEDSTorchDataConfig
 
-from every_query.dataset import EveryQueryPytorchDataset
 from every_query.generate_tasks import sample_tasks as st
 from every_query.generate_tasks.sample_tasks import (
     TaskSpec,
@@ -33,6 +32,7 @@ from every_query.generate_tasks.sample_tasks import (
     sample_contexts,
     sample_tasks,
 )
+from every_query.model.dataset import EveryQueryPytorchDataset
 from every_query.utils.seeds import derive_seed
 
 # ---------------------------------------------------------------------------

@@ -13,7 +13,7 @@ from hydra.utils import instantiate
 from lightning.pytorch import seed_everything
 from omegaconf import DictConfig, OmegaConf
 
-from every_query.lightning_module import EveryQueryLightningModule
+from every_query.model.lightning_module import EveryQueryLightningModule
 from every_query.utils.codes import (  # noqa: F401 (values_as_list used by config.yaml)
     code_slug,
     values_as_list,
