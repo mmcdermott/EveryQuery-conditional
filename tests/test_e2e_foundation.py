@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import polars as pl
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -25,20 +27,18 @@ def test_preprocess_produces_metadata(eq_preprocessed_dataset: Path) -> None:
 
 def test_generate_tasks_writes_both_splits(eq_sampled_tasks_dir: Path) -> None:
     """EQ_generate_tasks produces at least one labeled parquet per split."""
-    import polars as pl
-
     for split in ("train", "tuning"):
         fps = list((eq_sampled_tasks_dir / split).glob("*.parquet"))
         assert fps, f"no labeled parquet found under {eq_sampled_tasks_dir / split}"
-        df = pl.read_parquet(fps[0])
-        assert set(df.columns) >= {
+        cols = set(pl.scan_parquet(fps[0]).collect_schema().names())
+        assert cols >= {
             "subject_id",
             "prediction_time",
             "boolean_value",
             "occurs",
             "query",
             "duration_days",
-        }, f"unexpected columns in {fps[0]}: {df.columns}"
+        }, f"unexpected columns in {fps[0]}: {cols}"
 
 
 def test_generate_tasks_out_dir_contains_only_label_parquets(eq_sampled_tasks_dir: Path) -> None:
@@ -51,8 +51,6 @@ def test_generate_tasks_out_dir_contains_only_label_parquets(eq_sampled_tasks_di
     ``MEDSTorchDataConfig.task_labels_fps`` glob will pick them up and training fails with
     a confusing ``polars ShapeError``.  This test catches that regression directly.
     """
-    import polars as pl
-
     required_label_cols = {
         "subject_id",
         "prediction_time",
@@ -62,7 +60,7 @@ def test_generate_tasks_out_dir_contains_only_label_parquets(eq_sampled_tasks_di
         "duration_days",
     }
     for fp in eq_sampled_tasks_dir.rglob("*.parquet"):
-        cols = set(pl.read_parquet(fp).columns)
+        cols = set(pl.scan_parquet(fp).collect_schema().names())
         assert required_label_cols.issubset(cols), (
             f"non-label parquet leaked under the sampler out_dir: {fp} has columns {cols}.  "
             f"MTD's task_labels_fps globs recursively, so non-label parquets here will break "
