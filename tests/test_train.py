@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 import torch
 from omegaconf import OmegaConf
 
-from conftest import _ENSURE_ENV_PLACEHOLDERS, run_and_check
+from conftest import ENSURE_ENV_PLACEHOLDERS, run_and_check
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -115,7 +115,7 @@ def test_resume_advances_global_step(
             "do_resume=True",
             "trainer.max_steps=4",
         ],
-        env=_ENSURE_ENV_PLACEHOLDERS,
+        env=ENSURE_ENV_PLACEHOLDERS,
         timeout=300.0,
     )
 
