@@ -167,7 +167,7 @@ def run_and_check(cmd: list[str], *, env: dict[str, str] | None = None, timeout:
 # Placeholder values for the ``ensure_env()`` gate in ``utils/_env.py``.  The demo Hydra configs
 # do not interpolate any of these env vars, so the actual values are inert — they exist purely
 # to let the gate pass on a clean CI machine with no ``.env`` file.
-_ENSURE_ENV_PLACEHOLDERS: dict[str, str] = {
+ENSURE_ENV_PLACEHOLDERS: dict[str, str] = {
     "PROJECT_DIR": "/tmp",
     "OUTPUT_DIR": "/tmp",
     "TASK_DIR": "/tmp",
@@ -229,6 +229,10 @@ def eq_sampled_tasks_dir(eq_preprocessed_dataset: Path, tmp_path_factory: pytest
 
     out_dir = tmp_path_factory.mktemp("eq_tasks")
     for split in (train_split, tuning_split):
+        # Seed pinned explicitly (not inherited from the config default) so tests that compare
+        # against this fixture's output — notably the reproducibility test in
+        # test_generate_tasks.py — stay anchored to a known value even if the config default
+        # changes.
         run_and_check(
             [
                 "EQ_generate_tasks",
@@ -243,6 +247,7 @@ def eq_sampled_tasks_dir(eq_preprocessed_dataset: Path, tmp_path_factory: pytest
                 "duration_min=1",
                 "duration_max=30",
                 "min_context_per_subject=1",
+                "seed=1",
             ],
             timeout=120.0,
         )
@@ -271,7 +276,7 @@ def eq_trained_model_dir(
             f"datamodule.config.tensorized_cohort_dir={eq_preprocessed_dataset!s}",
             f"datamodule.config.task_labels_dir={eq_sampled_tasks_dir!s}",
         ],
-        env=_ENSURE_ENV_PLACEHOLDERS,
+        env=ENSURE_ENV_PLACEHOLDERS,
         timeout=300.0,
     )
     return output_dir
