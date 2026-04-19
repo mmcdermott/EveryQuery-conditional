@@ -19,7 +19,7 @@ They all train for **2 optimizer steps on random weights** and never observe the
 dynamics. So silent regressions in the gradient path, label alignment, loss-mask
 wiring, or duration-input propagation would pass every one of them.
 
-This test trains for **4000 steps** on a tiny model (~6 minutes on CPU) against a dataset
+This test trains for **2000 steps** on a tiny model (~5-7 min wall time) against a dataset
 where the ground-truth labels are a deterministic function of two per-subject marker
 tokens. It asserts:
 
@@ -288,9 +288,9 @@ Three of the four #123 candidates were evaluated:
     reached 0.697. The Bayes-optimal classifier on that cell is bounded below 1.0 by
     the Bernoulli-sampling-noise floor, and the model's latent-intensity inference from
     a 30-day history didn't approach it in the CPU budget.
-- **Design 2** (this test) clears every threshold on first try in ~3 minutes with
-    perfect AUROC on every cell. The deterministic-marker → label mapping sidesteps the
-    sampling-noise ceiling entirely.
+- **Design 2** (this test) clears every threshold on first try with perfect AUROC
+    (1.000) on every cell at 2000 steps. The deterministic-marker → label mapping
+    sidesteps the sampling-noise ceiling entirely.
 
 Design 2 is the right trade-off for a *training-validity* test: the model isn't being
 asked to estimate a latent variable, it's being asked to attend to a couple of marker
@@ -303,31 +303,28 @@ branch [`test/e2e-training-validity-d1a`][d1a] remains available as a follow-up.
 
 ## Runtime
 
-Target was ≤ 10 minutes CPU per [#123][issue-123]. Actual runtime is CPU-dependent:
+Target was ≤ 10 minutes CPU per [#123][issue-123]. Runs at `trainer.max_steps=2000`:
 
-| Environment                    | Steps | Test wall time |
-| ------------------------------ | ----- | -------------- |
-| Laptop-class CPU               | 2000  | ~3 min         |
-| Laptop-class CPU               | 4000  | ~6 min         |
-| GitHub Actions `ubuntu-latest` | 2000  | ~5 min         |
-| GitHub Actions `ubuntu-latest` | 4000  | ~8 min         |
+| Environment                    | Test wall time |
+| ------------------------------ | -------------- |
+| Laptop-class CPU               | ~6-7 min       |
+| GitHub Actions `ubuntu-latest` | ~5 min         |
 
-(Test wall time = the single `test_trained_model_learns_occurs_and_censor` test, which
-is what counts toward the #123 budget. Full CI test-session wall time including
-everything else runs ~11 min on 3.11 and ~13 min on 3.12.)
+(Test wall time = the single `test_trained_model_learns_occurs_and_censor` test end to
+end, which is what counts toward the #123 budget — includes MEDS preprocessing +
+training + tuning-set inference, not just training. Full CI test-session wall time
+including the other 199 tests runs ~10-11 min.)
 
-Subprocess timeout is set to 1800s (30 min) as a safety ceiling.
+Subprocess timeout is set to 1800s (30 min) as a safety ceiling; the workflow's job
+`timeout-minutes` is 45 (see `.github/workflows/tests.yaml`) for slack beyond that.
 
-Training step count was bumped from 2000 to 4000 after CI observed a Python-3.12
-runner where the model's weight init produced an unlucky optimization trajectory
-— the censor head under-converged at 2000 steps while 3.11 on the same commit
-passed. The root cause is that `train.py` seeds the RNG *after* `instantiate(cfg.lightning_module)`,
-making the weight init platform-RNG-dependent; see the inline comment on
-`oracle_trained_model_dir` for more. A proper fix would move `seed_everything`
-before `instantiate(cfg.lightning_module)`, which would let us drop back to 2000
-steps without flakiness — but that's a training-code change outside the scope of
-this test. Alternatively, this test can be marked `@pytest.mark.slow` and gated
-behind a separate CI workflow if the runtime becomes problematic.
+An earlier iteration of this test used `max_steps=4000` to brute-force past an
+unlucky weight-init trajectory observed on one Python-3.12 CI run (censor AUROC
+under-converged to 0.765 / flat duration means). That was rooted in `train.py`
+calling `seed_everything` *after* `hydra.utils.instantiate(cfg.lightning_module)`,
+so model init was sampled from an unseeded RNG and varied across platforms. Fixed
+in #124 (`fix(train): seed RNG before instantiate()`); once that landed, `max_steps`
+was dropped back to 2000.
 
 ## Gotchas baked into the test (for future readers)
 
