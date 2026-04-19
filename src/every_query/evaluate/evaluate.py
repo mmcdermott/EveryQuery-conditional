@@ -39,8 +39,7 @@ def main(cfg: DictConfig) -> None:
     metrics_parquet = Path(cfg.metrics_parquet)
 
     logger.info(f"Loading predictions from {predictions_parquet}")
-    table = pq.read_table(predictions_parquet)
-    PredictionSchema.align(table)  # raises with field diff on mismatch
+    table = PredictionSchema.align(pq.read_table(predictions_parquet))
     predictions = pl.from_arrow(table)
     logger.info(
         f"Loaded {predictions.height} predictions across "
