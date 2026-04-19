@@ -37,10 +37,14 @@ def _oracle_doctest_shards(tmp_path_factory: pytest.TempPathFactory) -> dict[str
 @pytest.fixture(autouse=True)
 def _inject_oracle_doctest_namespace(
     doctest_namespace: dict, _oracle_doctest_shards: dict[str, pl.DataFrame]
-) -> None:
+):
     doctest_namespace["events"] = _oracle_doctest_shards["events"]
     doctest_namespace["labels"] = _oracle_doctest_shards["labels"]
     doctest_namespace["pl"] = pl
     # Default polars display caps at 10 rows; bump it so the README snapshots can show the
-    # full 13-row code-counts and 10-row marker-pair tables without truncation.
-    pl.Config.set_tbl_rows(20)
+    # full 13-row code-counts and 10-row marker-pair tables without truncation.  Scoped via
+    # `pl.Config` as a context manager so the setting is restored after the doctest runs —
+    # otherwise this test's `set_tbl_rows(20)` would leak into any later-running test that
+    # compares polars' formatted output.
+    with pl.Config(tbl_rows=20):
+        yield

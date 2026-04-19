@@ -377,15 +377,29 @@ def test_trained_model_learns_occurs_and_censor(
     failures: list[str] = []
 
     # ── 1. Censor-head AUROC ─────────────────────────────────────────────────
+    # Censoring is part of the required signal in Design 2 (P_END_D20 guarantees censoring at
+    # d=30), so a single-class censor distribution is itself a regression — fail explicitly
+    # rather than silently skipping the AUROC check.
     censor_true = df["censor_true"].to_list()
     censor_pred = df["censor_pred"].to_list()
-    if len(set(censor_true)) >= 2:
+    censor_classes = set(censor_true)
+    if len(censor_classes) < 2:
+        n_pos = sum(censor_true)
+        failures.append(
+            f"censor label distribution is degenerate — {len(censor_true)} rows, "
+            f"{n_pos} censored, classes={sorted(censor_classes)}.  Expected both classes "
+            f"(P_END_D20 subjects should be censored at d=30, P_END_D100 should not)."
+        )
+    else:
         censor_auroc = float(roc_auc_score(censor_true, censor_pred))
         print(f"\ncensor-head AUROC: {censor_auroc:.3f}")
         if censor_auroc < _CENSOR_AUROC_THRESHOLD:
             failures.append(f"censor AUROC {censor_auroc:.3f} < {_CENSOR_AUROC_THRESHOLD}")
 
     # ── 2. Per-(code, duration) occurs AUROC on non-censored rows ────────────
+    # Each (TARGET, duration) cell is expected to have both occurs=True and occurs=False
+    # after filtering to non-censored subjects (see the windowing table in README.md).  A
+    # degenerate cell means synthesis/labeling regressed, so fail explicitly.
     for duration in _DURATIONS_DAYS:
         cell = df.filter(
             (pl.col("query") == _TARGET_CODE)
@@ -394,8 +408,13 @@ def test_trained_model_learns_occurs_and_censor(
         )
         y_true = cell["occurs_true"].to_list()
         y_pred = cell["occurs_pred"].to_list()
-        if len(set(y_true)) < 2:
-            print(f"  skipping (TARGET, d={duration}): labels all {y_true[0] if y_true else '∅'}")
+        cell_classes = set(y_true)
+        if len(cell_classes) < 2:
+            failures.append(
+                f"occurs label distribution is degenerate at (TARGET, d={duration}): "
+                f"n={len(y_true)}, classes={sorted(cell_classes)}.  Expected both classes "
+                f"from firing+non-firing markers (see README windowing table)."
+            )
             continue
         auroc = float(roc_auc_score(y_true, y_pred))
         print(f"  occurs AUROC (TARGET, d={duration}, n={len(y_true)}): {auroc:.3f}")
