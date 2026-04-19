@@ -147,11 +147,11 @@ class TestPrimitives:
             "task_id",
             "subject_id",
             "prediction_time",
-            "query",
+            "code",
             "duration_days",
         }
         assert index_df["task_id"].to_list() == [0, 0, 1, 1, 2, 2]
-        assert index_df["query"].to_list() == ["X", "X", "Y", "Y", "Z", "Z"]
+        assert index_df["code"].to_list() == ["X", "X", "Y", "Y", "Z", "Z"]
         assert index_df["duration_days"].to_list() == [30, 30, 60, 60, 90, 90]
 
     def test_build_index_df_m_equals_one(self, synthetic_events):
@@ -210,7 +210,7 @@ class TestEvaluateIndexDfEdgeCases:
             {
                 "subject_id": [1],
                 "prediction_time": [datetime(2020, 1, 3)],
-                "query": ["A"],
+                "code": ["A"],
                 "duration_days": [10],
             }
         ).with_columns(pl.col("prediction_time").cast(pl.Datetime("us")))
@@ -246,7 +246,7 @@ class TestEvaluateIndexDfEdgeCases:
                 # Subject 1 is present; subject 2 is not.
                 "subject_id": [1, 2],
                 "prediction_time": [datetime(2020, 1, 1), datetime(2020, 1, 1)],
-                "query": ["A", "A"],
+                "code": ["A", "A"],
                 "duration_days": [10, 10],
             }
         ).with_columns(pl.col("prediction_time").cast(pl.Datetime("us")))
@@ -328,7 +328,7 @@ class TestReadEventShardDtypeNormalization:
             {
                 "subject_id": [1],
                 "prediction_time": [datetime(2020, 1, 1)],
-                "query": ["A"],
+                "code": ["A"],
                 "duration_days": [10],
             }
         ).with_columns(pl.col("prediction_time").cast(pl.Datetime("us")))
@@ -445,7 +445,7 @@ class TestRunWorkerPipeline:
             "prediction_time",
             "boolean_value",
             "occurs",
-            "query",
+            "code",
             "duration_days",
         }
 
@@ -547,7 +547,7 @@ class TestRunWorkerPipeline:
 
         def _task_multiset(fp):
             df = pl.read_parquet(fp)
-            return sorted(zip(df["query"].to_list(), df["duration_days"].to_list(), strict=True))
+            return sorted(zip(df["code"].to_list(), df["duration_days"].to_list(), strict=True))
 
         assert _task_multiset(labels_a_fp) != _task_multiset(labels_b_fp)
 
@@ -590,8 +590,8 @@ class TestRunWorkerPipeline:
         df_1 = pl.read_parquet(labels_1_fp)
 
         # Same tasks across input shards (task_seed depends only on task_shard).
-        tasks_0 = sorted(set(zip(df_0["query"].to_list(), df_0["duration_days"].to_list(), strict=True)))
-        tasks_1 = sorted(set(zip(df_1["query"].to_list(), df_1["duration_days"].to_list(), strict=True)))
+        tasks_0 = sorted(set(zip(df_0["code"].to_list(), df_0["duration_days"].to_list(), strict=True)))
+        tasks_1 = sorted(set(zip(df_1["code"].to_list(), df_1["duration_days"].to_list(), strict=True)))
         assert tasks_0 == tasks_1, "tasks should be identical across input_shards at fixed task_shard"
 
         # ... but the sampled context pairs must differ (context_seed depends on both axes).
@@ -678,7 +678,7 @@ class TestRunWorkerPipeline:
         assert labels_fp is not None
         labels = pl.read_parquet(labels_fp)
         # The queries in the output must all come from codes.parquet under codes_dir.
-        assert set(labels["query"].to_list()) <= set(synthetic_query_codes)
+        assert set(labels["code"].to_list()) <= set(synthetic_query_codes)
 
 
 # ---------------------------------------------------------------------------
@@ -782,7 +782,7 @@ class TestEndToEndWithDataset:
                 {
                     "subject_id": subj,
                     "prediction_time": _E2E_PRED_TIMES[subj],
-                    "query": q,
+                    "code": q,
                     "duration_days": 30,
                 }
                 for subj in _E2E_TRAIN_SUBJECTS
@@ -792,7 +792,7 @@ class TestEndToEndWithDataset:
             {
                 "subject_id": pl.Int64,
                 "prediction_time": pl.Datetime("us"),
-                "query": pl.Utf8,
+                "code": pl.Utf8,
                 "duration_days": pl.Int64,
             }
         )
@@ -806,7 +806,7 @@ class TestEndToEndWithDataset:
             "prediction_time",
             "boolean_value",
             "occurs",
-            "query",
+            "code",
             "duration_days",
         }
         assert labeled.schema["boolean_value"] == pl.Boolean

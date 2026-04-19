@@ -25,7 +25,7 @@ Design decisions (see issue #33):
 - **Censoring**: computed from ``max_time`` per subject (one groupby up-front per shard). Censored
   rows get ``boolean_value=True`` and ``occurs=False`` regardless of whether the event actually
   fired in the window.
-- **Single-pass evaluation**: one ``join_asof(strategy="forward", by=["subject_id","query"])`` across
+- **Single-pass evaluation**: one ``join_asof(strategy="forward", by=["subject_id","code"])`` across
   the whole ``index_df`` against the events table, regardless of how many distinct codes are present.
 """
 
@@ -191,7 +191,7 @@ def build_index_df(
     independently per task.
 
     Returns:
-        ``DataFrame`` with columns ``(task_id, subject_id, prediction_time, query, duration_days)``.
+        ``DataFrame`` with columns ``(task_id, subject_id, prediction_time, code, duration_days)``.
     """
     n_tasks = len(tasks)
 
@@ -201,7 +201,7 @@ def build_index_df(
                 "task_id": pl.Int64,
                 "subject_id": sid_dtype,
                 "prediction_time": pt_dtype,
-                "query": pl.Utf8,
+                "code": pl.Utf8,
                 "duration_days": pl.Int64,
             }
         )
@@ -220,8 +220,8 @@ def build_index_df(
         "task_id",
         np.repeat(np.arange(n_tasks, dtype=np.int64), contexts_per_task),
     )
-    query_col = pl.Series(
-        "query",
+    code_col = pl.Series(
+        "code",
         np.repeat([t.code for t in tasks], contexts_per_task),
         dtype=pl.Utf8,
     )
@@ -231,8 +231,8 @@ def build_index_df(
         dtype=pl.Int64,
     )
 
-    return contexts.with_columns(task_ids, query_col, duration_col).select(
-        "task_id", "subject_id", "prediction_time", "query", "duration_days"
+    return contexts.with_columns(task_ids, code_col, duration_col).select(
+        "task_id", "subject_id", "prediction_time", "code", "duration_days"
     )
 
 
@@ -262,22 +262,28 @@ def evaluate_index_df(
     stored at microsecond precision, which turns ``strategy="forward"``'s ``>=`` into a strict ``>``.
 
     Args:
-        index_df: Output of ``build_index_df``. Must have columns ``subject_id``, ``prediction_time``,
-            ``query``, ``duration_days``. If ``task_id`` is present it is ignored and dropped from
-            the output.
+        index_df: Output of ``build_index_df``.  Must have columns ``subject_id``,
+            ``prediction_time``, ``code``, ``duration_days`` — the ``code`` column names
+            the MEDS code the query is asking about, matching the ``TaskQuerySchema``
+            contract in ``every_query.data.schema``.  If ``task_id`` is present it is
+            ignored and dropped from the output.
         events_df: Shard events with columns ``subject_id``, ``time``, ``code``.
         max_time_per_subject: Output of ``compute_max_time_per_subject``.
 
     Returns:
-        DataFrame with columns ``(subject_id, prediction_time, boolean_value, occurs, query,
-        duration_days)``.
+        DataFrame with columns ``(subject_id, prediction_time, boolean_value, occurs,
+        code, duration_days)``.  Conforms to ``TaskQuerySchema`` on the required columns
+        (``subject_id``, ``prediction_time``, ``code``, ``duration_days``) plus the
+        inherited ``boolean_value``; the extra ``occurs`` column is EQ-specific and
+        currently sits alongside the schema (collapsing ``boolean_value`` / ``occurs``
+        into a single nullable label is tracked in #122).
     """
     out_schema = {
         "subject_id": index_df.schema.get("subject_id", pl.Int64),
         "prediction_time": index_df.schema.get("prediction_time", pl.Datetime("us")),
         "boolean_value": pl.Boolean,
         "occurs": pl.Boolean,
-        "query": pl.Utf8,
+        "code": pl.Utf8,
         "duration_days": pl.Int64,
     }
     if index_df.height == 0:
@@ -286,18 +292,15 @@ def evaluate_index_df(
     # Left side: index rows with a +1µs-shifted prediction_time for the strict-> asof key.
     left = index_df.with_columns(
         (pl.col("prediction_time") + pl.duration(microseconds=1)).alias("_pt_shifted")
-    ).sort(["subject_id", "query", "_pt_shifted"])
+    ).sort(["subject_id", "code", "_pt_shifted"])
 
-    # Right side: events renamed so the join-by column name matches the left.
-    right = (
-        events_df.rename({"code": "query"})
-        .select(["subject_id", "query", "time"])
-        .sort(["subject_id", "query", "time"])
-    )
+    # Right side: events restricted to the columns needed for the asof join.  Both sides
+    # now share the ``code`` column name so no rename is needed.
+    right = events_df.select(["subject_id", "code", "time"]).sort(["subject_id", "code", "time"])
 
     joined = left.join_asof(
         right,
-        by=["subject_id", "query"],
+        by=["subject_id", "code"],
         left_on="_pt_shifted",
         right_on="time",
         strategy="forward",
@@ -330,7 +333,7 @@ def evaluate_index_df(
             pl.col("_censored").alias("boolean_value"),
             (pl.col("_censored").not_() & event_in_window).alias("occurs"),
         )
-        .select("subject_id", "prediction_time", "boolean_value", "occurs", "query", "duration_days")
+        .select("subject_id", "prediction_time", "boolean_value", "occurs", "code", "duration_days")
     )
 
 
@@ -345,8 +348,8 @@ def _read_event_shard(file_path: str | Path) -> pl.DataFrame:
     The parquet schema is normalized explicitly so the returned frame is type-stable regardless
     of how the source shard encoded strings or timestamps:
 
-    - ``code`` is cast to ``pl.Utf8`` so it compares against the ``query`` column of ``index_df``
-      (also ``Utf8``) in ``evaluate_index_df``'s ``join_asof(by=["subject_id","query"])``.  Mixed
+    - ``code`` is cast to ``pl.Utf8`` so it compares against the ``code`` column of ``index_df``
+      (also ``Utf8``) in ``evaluate_index_df``'s ``join_asof(by=["subject_id","code"])``.  Mixed
       ``Categorical``/``Utf8`` or ``<integer vocab index>``/``Utf8`` joins would either raise or
       silently produce zero matches.  Upstream stages may store codes as categoricals or integer
       vocab indices; casting to ``Utf8`` here avoids coupling to either representation.

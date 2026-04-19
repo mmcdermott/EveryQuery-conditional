@@ -134,14 +134,14 @@ def test_labels_match_ground_truth(
             # 1µs-shifted join_asof key, so we mirror with a strict > comparison here.
             subj_events = events.filter(pl.col("subject_id") == subj)
             event_fires = not subj_events.filter(
-                (pl.col("code") == row["query"])
+                (pl.col("code") == row["code"])
                 & (pl.col("time") > row["prediction_time"])
                 & (pl.col("time") < window_end)
             ).is_empty()
             expected_occurs = (not expected_censored) and event_fires
 
             ctx = (
-                f"split={split}, subject_id={subj}, query={row['query']!r}, "
+                f"split={split}, subject_id={subj}, code={row['code']!r}, "
                 f"prediction_time={row['prediction_time']}, duration_days={row['duration_days']}, "
                 f"max_time={max_time}"
             )
@@ -203,7 +203,7 @@ def test_reproducible_with_same_seed(
 
     # Compare by row content (sorted) since file-byte equality is flaky across polars versions.
     # The invariant we care about: same seed → same labeled rows.
-    sort_cols = ["subject_id", "prediction_time", "query", "duration_days"]
+    sort_cols = ["subject_id", "prediction_time", "code", "duration_days"]
     a = fixture_labels.sort(sort_cols)
     b = rerun_labels.sort(sort_cols)
     assert a.equals(b), (

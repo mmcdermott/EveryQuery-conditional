@@ -305,9 +305,9 @@ class EveryQueryPytorchDataset(MEDSPytorchDataset):
         if "occurs" in label_names:
             group_cols.append("occurs")
             out_cols.append("occurs")
-        if "query" in label_names:
-            group_cols.append("query")
-            out_cols.append("query")
+        if "code" in label_names:
+            group_cols.append("code")
+            out_cols.append("code")
         if "duration_days" in label_names:
             group_cols.append("duration_days")
             out_cols.append("duration_days")
@@ -332,12 +332,17 @@ class EveryQueryPytorchDataset(MEDSPytorchDataset):
                 .alias(LabelSchema.prediction_time_name)
             )
 
-        # Extra task annotations
+        # Extra task annotations.  Parquet column name is ``code`` (matches
+        # ``TaskQuerySchema`` in ``every_query.data.schema``); the Python attribute is kept
+        # as ``self.query`` / ``self.has_query`` because the batch-level counterpart
+        # ``EveryQueryBatch.query`` already occupies that name — and the inherited
+        # ``EveryQueryBatch.code`` is the event-sequence-level code tensor, not the query
+        # code.  Renaming either would collide.
         self.has_occurs: bool = "occurs" in self.schema_df.collect_schema().names()
-        self.has_query: bool = "query" in self.schema_df.collect_schema().names()
+        self.has_query: bool = "code" in self.schema_df.collect_schema().names()
         self.has_duration_days: bool = "duration_days" in self.schema_df.collect_schema().names()
         self.occurs = self.schema_df["occurs"] if self.has_occurs else None
-        self.query = self.schema_df["query"] if self.has_query else None
+        self.query = self.schema_df["code"] if self.has_query else None
         self.duration_days = self.schema_df["duration_days"] if self.has_duration_days else None
         # Load code vocabulary mapping (string code -> integer vocab index) for encoding queries
         try:
@@ -364,7 +369,7 @@ class EveryQueryPytorchDataset(MEDSPytorchDataset):
         def read_df(fp: Path) -> pl.DataFrame:
             schema = pq.read_schema(fp)
             extras = []
-            for extra_col in [self.LABEL_COL, "occurs", "query", "duration_days"]:
+            for extra_col in [self.LABEL_COL, "occurs", "code", "duration_days"]:
                 if extra_col in schema.names:
                     extras.append(extra_col)
             label_cols = [*required_cols, *extras]

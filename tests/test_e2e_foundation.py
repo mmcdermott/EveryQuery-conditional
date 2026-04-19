@@ -36,7 +36,7 @@ def test_generate_tasks_writes_both_splits(eq_sampled_tasks_dir: Path) -> None:
             "prediction_time",
             "boolean_value",
             "occurs",
-            "query",
+            "code",
             "duration_days",
         }, f"unexpected columns in {fps[0]}: {cols}"
 
@@ -56,7 +56,7 @@ def test_generate_tasks_out_dir_contains_only_label_parquets(eq_sampled_tasks_di
         "prediction_time",
         "boolean_value",
         "occurs",
-        "query",
+        "code",
         "duration_days",
     }
     for fp in eq_sampled_tasks_dir.rglob("*.parquet"):

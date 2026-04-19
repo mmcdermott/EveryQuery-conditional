@@ -86,14 +86,14 @@ def process_eval_tasks(
                     )
                     .rename({"censored": "boolean_value", code: "occurs"})
                     .with_columns(
-                        pl.lit(code).alias("query"),
+                        pl.lit(code).alias("code"),
                         pl.lit(duration).alias("duration_days"),
                     )
                     .select(
                         "subject_id",
                         "prediction_time",
                         "boolean_value",
-                        "query",
+                        "code",
                         "occurs",
                         "duration_days",
                     )

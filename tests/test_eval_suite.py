@@ -134,7 +134,7 @@ class TestGenTaskOutputSchema:
         process_eval_tasks(index_dir, task_dir_base, out_root, INDEX_HASH, CODES, DURATIONS, "held_out")
 
         df = _read_all_outputs(out_root, INDEX_HASH)
-        expected = {"subject_id", "prediction_time", "boolean_value", "query", "occurs", "duration_days"}
+        expected = {"subject_id", "prediction_time", "boolean_value", "code", "occurs", "duration_days"}
         assert set(df.columns) == expected
 
     def test_no_null_occurs(self, tmp_path):
@@ -177,8 +177,8 @@ class TestGenTaskDurations:
         process_eval_tasks(index_dir, task_dir_base, out1, INDEX_HASH, CODES, [30, 90, 180], "held_out")
         process_eval_tasks(index_dir, task_dir_base, out2, INDEX_HASH, CODES, [180, 30, 90], "held_out")
 
-        df1 = _read_all_outputs(out1, INDEX_HASH).sort("duration_days", "query", "subject_id")
-        df2 = _read_all_outputs(out2, INDEX_HASH).sort("duration_days", "query", "subject_id")
+        df1 = _read_all_outputs(out1, INDEX_HASH).sort("duration_days", "code", "subject_id")
+        df2 = _read_all_outputs(out2, INDEX_HASH).sort("duration_days", "code", "subject_id")
         assert df1.equals(df2)
 
     def test_same_prediction_times_across_durations(self, tmp_path):
@@ -223,7 +223,7 @@ class TestGenTaskCodes:
         process_eval_tasks(index_dir, task_dir_base, out_root, INDEX_HASH, CODES, DURATIONS, "held_out")
 
         df = _read_all_outputs(out_root, INDEX_HASH)
-        assert set(df["query"].unique().to_list()) == set(CODES)
+        assert set(df["code"].unique().to_list()) == set(CODES)
 
     def test_code_order_invariant(self, tmp_path):
         """Changing code order should produce identical output (when sorted)."""
@@ -236,8 +236,8 @@ class TestGenTaskCodes:
             index_dir, task_dir_base, out2, INDEX_HASH, list(reversed(CODES)), DURATIONS, "held_out"
         )
 
-        df1 = _read_all_outputs(out1, INDEX_HASH).sort("duration_days", "query", "subject_id")
-        df2 = _read_all_outputs(out2, INDEX_HASH).sort("duration_days", "query", "subject_id")
+        df1 = _read_all_outputs(out1, INDEX_HASH).sort("duration_days", "code", "subject_id")
+        df2 = _read_all_outputs(out2, INDEX_HASH).sort("duration_days", "code", "subject_id")
         assert df1.equals(df2)
 
     def test_missing_code_skipped(self, tmp_path):
@@ -250,8 +250,8 @@ class TestGenTaskCodes:
         )
 
         df = _read_all_outputs(out_root, INDEX_HASH)
-        assert "FAKE//MISSING" not in df["query"].unique().to_list()
-        assert set(CODES).issubset(set(df["query"].unique().to_list()))
+        assert "FAKE//MISSING" not in df["code"].unique().to_list()
+        assert set(CODES).issubset(set(df["code"].unique().to_list()))
 
 
 # ---------------------------------------------------------------------------
@@ -420,11 +420,11 @@ class TestGenTaskRowCounts:
         process_eval_tasks(index_dir, task_dir_base, out_root, INDEX_HASH, CODES, DURATIONS, "held_out")
 
         df = _read_all_outputs(out_root, INDEX_HASH)
-        counts = df.group_by("duration_days", "query").len()
+        counts = df.group_by("duration_days", "code").len()
 
         # With identical task data per duration, counts should be uniform across durations for each code
         for code in CODES:
-            code_counts = counts.filter(pl.col("query") == code)["len"].to_list()
+            code_counts = counts.filter(pl.col("code") == code)["len"].to_list()
             assert len(set(code_counts)) == 1, f"Row counts differ across durations for code={code}"
 
 
