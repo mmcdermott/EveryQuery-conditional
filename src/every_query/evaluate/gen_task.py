@@ -78,14 +78,26 @@ def process_eval_tasks(
                     print(f"WARNING: code {code} not in shard {task_fp.name} for duration={duration}")
                     continue
 
+                # Collapsed nullable boolean_value per TaskQuerySchema:
+                #   null  → censored
+                #   True  → event occurred (input `<code>=True`)
+                #   False → no event, not censored
+                # Filter step drops rows whose underlying per-code value was null in the
+                # wide input AND weren't censored (a null per-code cell means the matrix
+                # didn't have a value for this (subject, prediction_time) pair — distinct
+                # from "censored" which is the meaningful null).
+                boolean_value = (
+                    pl.when(pl.col("censored")).then(pl.lit(None, dtype=pl.Boolean)).otherwise(pl.col(code))
+                )
                 df = (
                     index_df.join(
                         shard_task_df.select(["subject_id", "prediction_time", "censored", code]),
                         on=["subject_id", "prediction_time"],
                         how="inner",
                     )
-                    .rename({"censored": "boolean_value", code: "occurs"})
+                    .filter(pl.col("censored") | pl.col(code).is_not_null())
                     .with_columns(
+                        boolean_value.alias("boolean_value"),
                         pl.lit(code).alias("query"),
                         pl.lit(duration).alias("duration_days"),
                     )
@@ -94,10 +106,8 @@ def process_eval_tasks(
                         "prediction_time",
                         "boolean_value",
                         "query",
-                        "occurs",
                         "duration_days",
                     )
-                    .filter(pl.col("occurs").is_not_null())
                 )
 
                 df.write_parquet(out_fp)

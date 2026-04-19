@@ -250,13 +250,17 @@ def evaluate_index_df(
     events_df: pl.DataFrame,
     max_time_per_subject: pl.DataFrame,
 ) -> pl.DataFrame:
-    """Label an index DataFrame with ``(boolean_value, occurs)`` via a single ``join_asof``.
+    """Label an index DataFrame with the single nullable ``boolean_value`` column via a single ``join_asof``.
 
-    Semantics:
-        - ``censored = (prediction_time + duration_days) > max_time[subject_id]``
-        - ``occurs = (not censored) AND (next event with matching code falls strictly within
-          (prediction_time, prediction_time + duration_days))``
-        - ``boolean_value = censored``
+    Three-valued semantics (matches ``TaskQuerySchema`` + ``LabelSchema``'s nullable
+    ``boolean_value``):
+
+        - ``boolean_value = null``: censored — ``(prediction_time + duration_days) >
+          max_time[subject_id]``; observation ended before we could see whether the event
+          fired.
+        - ``boolean_value = True``: not censored and an event with matching ``query`` code
+          fell strictly within ``(prediction_time, prediction_time + duration_days)``.
+        - ``boolean_value = False``: not censored and no such event fell within the window.
 
     The ``>`` on event time is enforced by shifting the asof key by ``+1µs`` since datetimes are
     stored at microsecond precision, which turns ``strategy="forward"``'s ``>=`` into a strict ``>``.
@@ -269,14 +273,13 @@ def evaluate_index_df(
         max_time_per_subject: Output of ``compute_max_time_per_subject``.
 
     Returns:
-        DataFrame with columns ``(subject_id, prediction_time, boolean_value, occurs, query,
-        duration_days)``.
+        DataFrame with columns ``(subject_id, prediction_time, boolean_value, query,
+        duration_days)``.  ``boolean_value`` is nullable (``null`` = censored).
     """
     out_schema = {
         "subject_id": index_df.schema.get("subject_id", pl.Int64),
         "prediction_time": index_df.schema.get("prediction_time", pl.Datetime("us")),
         "boolean_value": pl.Boolean,
-        "occurs": pl.Boolean,
         "query": pl.Utf8,
         "duration_days": pl.Int64,
     }
@@ -306,15 +309,15 @@ def evaluate_index_df(
 
     # Rows whose subject is not present in max_time_per_subject (typically a pre-seeded or
     # hand-edited index_df referencing subjects outside this shard) come out of the left join
-    # with max_time=null.  A naïve comparison would produce null booleans, which would break
-    # downstream torch conversion.  Policy: treat unknown-subject rows as fully censored
-    # (boolean_value=True, occurs=False) — the same outcome a real "no future data observed"
-    # row would produce.  We log a warning so the condition is visible.
+    # with max_time=null.  A naïve comparison would produce null booleans, which is the
+    # correct "censored" signal under the collapsed label semantics — so we just log a
+    # warning for visibility and let the `(window_end > max_time).fill_null(True)` below
+    # resolve the missing-subject case to censored.
     n_unknown = joined.filter(pl.col("max_time").is_null()).height
     if n_unknown > 0:
         logger.warning(
             "%d index_df row(s) reference subjects not present in events_df; "
-            "they will be labeled as censored (boolean_value=True, occurs=False).",
+            "they will be labeled as censored (boolean_value=null).",
             n_unknown,
         )
 
@@ -324,13 +327,11 @@ def evaluate_index_df(
     censored = (window_end > pl.col("max_time")).fill_null(True)
     event_in_window = pl.col("time").is_not_null() & (pl.col("time") < window_end)
 
-    return (
-        joined.with_columns(censored.alias("_censored"))
-        .with_columns(
-            pl.col("_censored").alias("boolean_value"),
-            (pl.col("_censored").not_() & event_in_window).alias("occurs"),
-        )
-        .select("subject_id", "prediction_time", "boolean_value", "occurs", "query", "duration_days")
+    # Collapsed nullable label: null when censored, else True/False from event_in_window.
+    boolean_value = pl.when(censored).then(pl.lit(None, dtype=pl.Boolean)).otherwise(event_in_window)
+
+    return joined.with_columns(boolean_value.alias("boolean_value")).select(
+        "subject_id", "prediction_time", "boolean_value", "query", "duration_days"
     )
 
 
