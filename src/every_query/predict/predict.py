@@ -5,7 +5,7 @@ runs per-row inference, writes a :class:`PredictionSchema`-conformant parquet.  
 model selection, no multi-model orchestration — all of that is ``evaluate/`` or
 ``paper_experiments/`` territory.
 
-The implementation groups the input tasks by ``(code, duration_days)`` and dispatches each
+The implementation groups the input tasks by ``(query, duration_days)`` and dispatches each
 group through the existing ``EveryQueryPytorchDataset`` by materializing a temporary
 task-labels parquet in the shape the dataset expects.  This is an MVP approach — a future
 optimization would teach the dataset to ingest a :class:`TaskQuerySchema` parquet directly,
@@ -49,22 +49,26 @@ def _run_one_group(
     model,
     trainer,
     group_df: pl.DataFrame,
-    code: str,
+    query: str,
     duration_days: float,
 ) -> pl.DataFrame:
-    """Run ``trainer.predict`` on one (code, duration) slice.
+    """Run ``trainer.predict`` on one ``(query, duration_days)`` slice.
 
     Materializes a temporary task-labels parquet in the shape the existing
-    ``EveryQueryPytorchDataset`` expects (columns ``subject_id, prediction_time, query,
-    duration_days, boolean_value, occurs``), points the datamodule at it, predicts, and
-    returns a frame with the model's per-row probabilities.
+    ``EveryQueryPytorchDataset`` expects (``subject_id, prediction_time, query,
+    duration_days, boolean_value`` — ``boolean_value`` is nullable per
+    ``TaskQuerySchema``; at predict time we leave it null since no ground-truth label
+    is needed for inference).  Points the datamodule at the tmpfile, predicts, and
+    returns a frame with the model's two-head probabilities.
     """
-    # Shape the slice into what the dataset expects.
+    # Shape the slice into what the dataset expects.  `boolean_value` is left null
+    # (censored-sentinel value) since it's not consumed during inference — the
+    # dataset still splits it into batch.censor / batch.occurs but those are ignored
+    # by the predict path.
     tmp_rows = group_df.select("subject_id", "prediction_time").with_columns(
-        pl.lit(code).alias("query"),
+        pl.lit(query).alias("query"),
         pl.lit(duration_days).cast(pl.Float32).alias("duration_days"),
-        pl.lit(False).alias("boolean_value"),  # placeholder — ignored at predict time
-        pl.lit(False).alias("occurs"),  # placeholder
+        pl.lit(None, dtype=pl.Boolean).alias("boolean_value"),
     )
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -76,17 +80,19 @@ def _run_one_group(
 
         pred_batches = trainer.predict(model=model, datamodule=D, ckpt_path=None)
 
-        s_ids, p_times, probs = [], [], []
+        s_ids, p_times, censor_probs, occurs_probs = [], [], [], []
         for b in pred_batches:
             s_ids.append(b["subject_id"])
             p_times.append(b["prediction_time"])
-            probs.append(b["occurs_probs"])
+            censor_probs.append(b["censor_probs"])
+            occurs_probs.append(b["occurs_probs"])
         if not s_ids:
             return pl.DataFrame(
                 schema={
                     "subject_id": pl.Int64,
                     "prediction_time": pl.Datetime("us"),
-                    "predicted_boolean_probability": pl.Float32,
+                    "censor_prob": pl.Float32,
+                    "occurs_prob": pl.Float32,
                 }
             )
 
@@ -94,7 +100,8 @@ def _run_one_group(
             {
                 "subject_id": torch.cat(s_ids).numpy(),
                 "prediction_time": torch.cat(p_times).numpy(),
-                "predicted_boolean_probability": torch.cat(probs).numpy(),
+                "censor_prob": torch.cat(censor_probs).numpy(),
+                "occurs_prob": torch.cat(occurs_probs).numpy(),
             }
         ).with_columns(pl.col("prediction_time").cast(pl.Datetime("us")))
 
@@ -109,28 +116,28 @@ def main(cfg: DictConfig) -> None:
 
     logger.info(f"Loading tasks from {tasks_parquet}")
     tasks_df = _read_and_validate_tasks(tasks_parquet)
-    logger.info(f"Loaded {tasks_df.height} tasks across {tasks_df['code'].n_unique()} codes")
+    logger.info(f"Loaded {tasks_df.height} tasks across {tasks_df['query'].n_unique()} query codes")
 
     train_cfg, model, trainer = _setup_model(model_run_dir, ckpt_name=ckpt_name)
 
-    # Group by (code, duration_days) — the dataset expects a single-code/duration slice.
+    # Group by (query, duration_days) — the dataset expects a single-query/duration slice.
     per_group_results: list[pl.DataFrame] = []
-    for (code, duration_days), group_df in tasks_df.group_by(["code", "duration_days"]):
-        logger.info(f"Predicting for code={code!r} duration_days={duration_days}")
-        preds = _run_one_group(train_cfg, model, trainer, group_df, code, float(duration_days))
+    for (query, duration_days), group_df in tasks_df.group_by(["query", "duration_days"]):
+        logger.info(f"Predicting for query={query!r} duration_days={duration_days}")
+        preds = _run_one_group(train_cfg, model, trainer, group_df, query, float(duration_days))
         if preds.is_empty():
-            logger.warning(f"No predictions produced for code={code!r} duration={duration_days}")
+            logger.warning(f"No predictions produced for query={query!r} duration={duration_days}")
             continue
         # Tag each result with the grouping key so the join back is unambiguous.
         preds = preds.with_columns(
-            pl.lit(code).alias("code"),
+            pl.lit(query).alias("query"),
             pl.lit(float(duration_days)).cast(pl.Float32).alias("duration_days"),
         )
         per_group_results.append(preds)
 
     if not per_group_results:
         raise RuntimeError(
-            f"No predictions produced — every (code, duration) group was empty.  "
+            f"No predictions produced — every (query, duration) group was empty.  "
             f"Input: {tasks_parquet} with {tasks_df.height} rows."
         )
 
@@ -139,7 +146,7 @@ def main(cfg: DictConfig) -> None:
     # Join back to the original tasks_df so inherited label columns carry through.
     out = tasks_df.join(
         predictions,
-        on=["subject_id", "prediction_time", "code", "duration_days"],
+        on=["subject_id", "prediction_time", "query", "duration_days"],
         how="left",
     )
 
