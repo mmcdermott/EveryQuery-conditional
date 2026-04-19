@@ -1,7 +1,7 @@
 # `predict/`
 
 Inference stage of the EveryQuery pipeline — everything that consumes a trained model
-checkpoint and produces per-`(subject_id, prediction_time, code, duration_days)`
+checkpoint and produces per-`(subject_id, prediction_time, query, duration_days)`
 probabilities.
 
 ## Layout
@@ -9,7 +9,7 @@ probabilities.
 ```
 predict/
 ├── predict.py            → EQ_predict (inference-only Hydra main)
-├── schema.py             → PredictionSchema (TaskQuerySchema + predicted_boolean_probability)
+├── schema.py             → PredictionSchema (TaskQuerySchema + censor_prob + occurs_prob)
 ├── configs/
 │   └── predict.yaml      → required: model_run_dir, tasks_parquet, output_parquet
 └── external_tasks/       → convert + aggregate tasks outside EQ's native vocabulary
@@ -30,10 +30,13 @@ generate_tasks/  +  train/ best_model.ckpt
 ```
 
 `EQ_predict` takes a `TaskQuerySchema`-conformant parquet of rows
-`(subject_id, prediction_time, code, duration_days)` and writes a
-`PredictionSchema`-conformant parquet adding the model's
-`predicted_boolean_probability` per row. No AUCs, no model selection — that's `evaluate/`
-(Phase 2.4, #83).
+`(subject_id, prediction_time, query, duration_days)` and writes a
+`PredictionSchema`-conformant parquet adding the model's two-head probabilities per row:
+`censor_prob` (P(row is censored)) and `occurs_prob` (P(event occurred | not censored)).
+No AUCs, no model selection — that's `evaluate/` (Phase 2.4, #83).
+
+See [#129](https://github.com/payalchandak/EveryQuery/issues/129) for the post-refactor
+discussion on generalizing `occurs_prob` → `label_prob` for non-occurrence task types.
 
 ## External tasks
 
