@@ -260,14 +260,21 @@ def oracle_trained_model_dir(
             "lightning_module.model.config_overrides.num_attention_heads=4",
             "lightning_module.model.config_overrides.intermediate_size=256",
             "lightning_module.model.config_overrides.max_position_embeddings=512",
-            "trainer.max_steps=2000",
+            # Budget note: 2000 steps passed locally (all AUROCs = 1.000) but CI on Python 3.12
+            # hit a run where the censor head under-converged (AUROC 0.765) and the duration
+            # input collapsed (flat 0.339 across durations).  Root cause: `train.py` calls
+            # `hydra.utils.instantiate(cfg.lightning_module)` *before* `seed_everything`, so
+            # the model's weight init is platform-RNG-dependent.  Bumping to 4000 steps gives
+            # unlucky-init runs enough gradient updates to still converge on both heads,
+            # within the 10-min CPU ceiling from #123.
+            "trainer.max_steps=4000",
             "trainer.max_epochs=10000",
             "trainer.limit_val_batches=2",
-            "trainer.val_check_interval=500",
+            "trainer.val_check_interval=1000",
             "lightning_module.optimizer.lr=1e-3",
         ],
         env=ENSURE_ENV_PLACEHOLDERS,
-        timeout=1200.0,
+        timeout=1800.0,
     )
     return output_dir
 
