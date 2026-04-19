@@ -32,7 +32,7 @@ generate_tasks/  +  train/ best_model.ckpt
 `EQ_predict` takes a `TaskQuerySchema`-conformant parquet of rows
 `(subject_id, prediction_time, code, duration_days)` and writes a
 `PredictionSchema`-conformant parquet adding the model's
-`predicted_boolean_probability` per row.  No AUCs, no model selection — that's `evaluate/`
+`predicted_boolean_probability` per row. No AUCs, no model selection — that's `evaluate/`
 (Phase 2.4, #83).
 
 ## External tasks
