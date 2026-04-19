@@ -23,6 +23,7 @@ scope for the initial schema and will be added as the inference / evaluation pip
 evolve.
 """
 
+import polars as pl
 import pyarrow as pa
 from flexible_schema import Optional, Required
 from meds import LabelSchema
@@ -96,3 +97,43 @@ class TaskQuerySchema(LabelSchema):
     # stays optional at the schema level so inference-only inputs (no ground truth)
     # continue to validate.
     boolean_value: Optional(pa.bool_(), nullable=True)
+
+
+def empty_task_query_df() -> pl.DataFrame:
+    """Build an empty polars DataFrame shaped like ``TaskQuerySchema``'s required columns plus the inherited
+    ``boolean_value`` (the collapsed label column).
+
+    Only the required columns + ``boolean_value`` are included — not every
+    ``LabelSchema`` optional column — because (a) that's what the sampler's empty-input
+    fast path needs, and (b) a polars-arrow round-trip coerces ``pa.string`` →
+    ``pa.large_string`` on the inherited ``categorical_value`` column, so a schema-
+    complete empty frame would fail ``TaskQuerySchema.validate`` after the round-trip
+    unless we bypassed polars entirely.  Keeping the shape focused on what downstream
+    writers actually emit avoids that type-drift landmine.
+
+    Callers use this at the empty-input fast path (e.g., ``evaluate_index_df`` when no
+    tasks were sampled) so the produced parquet still aligns to the schema via
+    ``TaskQuerySchema.align`` at the write boundary.
+
+    Examples:
+        >>> df = empty_task_query_df()
+        >>> df.height
+        0
+        >>> set(df.columns) == {
+        ...     TaskQuerySchema.subject_id_name,
+        ...     TaskQuerySchema.prediction_time_name,
+        ...     TaskQuerySchema.query_name,
+        ...     TaskQuerySchema.duration_days_name,
+        ...     TaskQuerySchema.boolean_value_name,
+        ... }
+        True
+    """
+    return pl.DataFrame(
+        schema={
+            TaskQuerySchema.subject_id_name: pl.Int64,
+            TaskQuerySchema.prediction_time_name: pl.Datetime("us"),
+            TaskQuerySchema.query_name: pl.Utf8,
+            TaskQuerySchema.duration_days_name: pl.Float32,
+            TaskQuerySchema.boolean_value_name: pl.Boolean,
+        }
+    )
