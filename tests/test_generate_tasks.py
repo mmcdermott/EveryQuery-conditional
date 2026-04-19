@@ -41,10 +41,20 @@ _MIN_CONTEXT_PER_SUBJECT = 1
 
 
 def _read_train_labels(tasks_dir: Path) -> pl.DataFrame:
-    """Load + concatenate all labeled parquets under the train split of *tasks_dir*."""
+    """Load + concatenate all labeled parquets under the train split of *tasks_dir*.
+
+    Asserts the result is non-empty.  Without that check, an empty-shards regression in
+    `EQ_generate_tasks` would silently turn `test_reproducible_with_same_seed` and
+    `test_n_tasks_knob_is_honored` into vacuous pass cases (e.g., `2 * 0 == 0`).
+    """
     fps = sorted((tasks_dir / "train").glob("*.parquet"))
     assert fps, f"no labeled parquets found under {tasks_dir / 'train'}"
-    return pl.concat([pl.read_parquet(fp) for fp in fps], how="vertical")
+    df = pl.concat([pl.read_parquet(fp) for fp in fps], how="vertical")
+    assert df.height > 0, (
+        f"train labeled parquets under {tasks_dir / 'train'} exist but contain 0 rows; "
+        f"the demo fixture has n_tasks>0 and should always emit at least one label"
+    )
+    return df
 
 
 def _parquet_hash(df: pl.DataFrame) -> str:
@@ -96,6 +106,12 @@ def test_labels_match_ground_truth(
         label_paths = sorted((eq_sampled_tasks_dir / split).glob("*.parquet"))
         assert label_paths, f"no labeled parquets found for split={split} in {eq_sampled_tasks_dir / split}"
         labels = pl.concat([pl.read_parquet(p) for p in label_paths], how="vertical")
+        # Guard against empty-shards regression — without this, the per-row ground-truth
+        # loop below would do zero iterations and the test would pass vacuously.
+        assert labels.height > 0, (
+            f"split={split} produced labeled parquets but 0 rows; ground-truth loop "
+            f"would be vacuous.  Check EQ_generate_tasks for empty-output regression."
+        )
 
         max_time_per_subject = dict(
             events.group_by("subject_id").agg(pl.col("time").max().alias("max_time")).iter_rows()
