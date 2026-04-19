@@ -194,30 +194,10 @@ def _compute_labels(events: pl.DataFrame, subject_ids: list[int]) -> pl.DataFram
     ).with_columns(pl.col("prediction_time").dt.replace_time_zone(None))
 
 
-@pytest.fixture(scope="module")
-def oracle_dataset(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path | list[int]]:
-    meds_dir = tmp_path_factory.mktemp("d2_meds")
-    event_shards = _synthesize_meds(meds_dir, seed=_DATASET_SEED)
-
-    train_subjects = list(range(1000, 1000 + _N_TRAIN_SUBJECTS))
-    tuning_subjects = list(range(2000, 2000 + _N_TUNING_SUBJECTS))
-
-    task_labels_dir = tmp_path_factory.mktemp("d2_labels")
-    for split_name, subjects, events in [
-        (train_split, train_subjects, event_shards[train_split]),
-        (tuning_split, tuning_subjects, event_shards[tuning_split]),
-    ]:
-        labels = _compute_labels(events, subjects)
-        split_dir = task_labels_dir / split_name
-        split_dir.mkdir(parents=True, exist_ok=True)
-        labels.write_parquet(split_dir / "0.parquet")
-
-    return {
-        "meds_dir": meds_dir,
-        "task_labels_dir": task_labels_dir,
-        "train_subjects": train_subjects,
-        "tuning_subjects": tuning_subjects,
-    }
+# `oracle_dataset` is defined in `tests/training_validity/conftest.py` (session-scoped)
+# so the README doctest and this test module share one synthesis run + byte-identical
+# ``events`` / ``labels`` DataFrames.  It's auto-discovered here via pytest's normal
+# conftest lookup — no import needed.
 
 
 @pytest.fixture(scope="module")
