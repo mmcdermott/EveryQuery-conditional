@@ -14,7 +14,11 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12"]
 
-    timeout-minutes: 30
+    # Job budget = the training-validity subprocess ceiling (1800s / 30min) + setup +
+    # the rest of the suite.  Typical slow-test wall time on ubuntu-latest is ~20min, so
+    # 45min leaves ~25min of real slack even if the training run drifts toward its own
+    # ceiling.
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v4

@@ -134,7 +134,7 @@ def _synthesize_meds(out_dir: Path, seed: int = _DATASET_SEED) -> dict[str, pl.D
                 "code": pl.Utf8,
                 "numeric_value": pl.Float64,
             },
-        ).sort(["subject_id", "time"])
+        ).sort(["subject_id", "time", "code"])  # `code` breaks ties between the two day-0 markers
 
     subject_splits = pl.DataFrame(splits_rows, schema={"subject_id": pl.Int64, "split": pl.Utf8})
     all_codes = [_TARGET_CODE, *fire_names, *end_names, *_NOISE_CODES]
@@ -405,9 +405,16 @@ def test_trained_model_learns_occurs_and_censor(
             )
 
     # ── 3. Duration monotonicity ─────────────────────────────────────────────
-    means = [float(df.filter(pl.col("duration_days") == d)["occurs_pred"].mean()) for d in _DURATIONS_DAYS]
+    # Averages over non-censored rows only — the occurs head is loss-masked on censored
+    # samples (model.py: `occurs_loss(..., mask=~batch.censor)`), so its predictions on
+    # those rows are unconstrained and would add noise to the mean.
+    non_censored = df.filter(pl.col("censor_true") == 0)
+    means = [
+        float(non_censored.filter(pl.col("duration_days") == d)["occurs_pred"].mean())
+        for d in _DURATIONS_DAYS
+    ]
     mean_map = dict(zip(_DURATIONS_DAYS, [round(m, 3) for m in means], strict=False))
-    print(f"\n  duration-mean occurs_pred (TARGET): {mean_map}")
+    print(f"\n  duration-mean occurs_pred (TARGET, non-censored): {mean_map}")
     for d1, d2, m1, m2 in zip(_DURATIONS_DAYS[:-1], _DURATIONS_DAYS[1:], means[:-1], means[1:], strict=False):
         if m2 <= m1:
             failures.append(

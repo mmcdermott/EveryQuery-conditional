@@ -231,7 +231,7 @@ markers alone:
 ```python
 >>> subj_1000 = events.filter(pl.col("subject_id") == 1000)
 >>> markers_and_target = ["P_FIRE_D15", "P_END_D100", "TARGET"]
->>> subj_1000.filter(pl.col("code").is_in(markers_and_target)).sort("time")
+>>> subj_1000.filter(pl.col("code").is_in(markers_and_target)).sort(["time", "code"])
 shape: (3, 4)
 ┌────────────┬─────────────────────────┬────────────┬───────────────┐
 │ subject_id ┆ time                    ┆ code       ┆ numeric_value │

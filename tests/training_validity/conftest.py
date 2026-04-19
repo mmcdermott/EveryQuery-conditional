@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import polars as pl
 import pytest
+from meds import train_split
 
 from tests.training_validity.test_training_validity import (
     _DATASET_SEED,
@@ -24,9 +25,12 @@ def _oracle_doctest_shards(tmp_path_factory: pytest.TempPathFactory) -> dict[str
     meds_dir = tmp_path_factory.mktemp("oracle_doctest_meds")
     event_shards = _synthesize_meds(meds_dir, seed=_DATASET_SEED)
     train_subjects = list(range(1000, 1000 + _N_TRAIN_SUBJECTS))
+    # Index via the `meds.train_split` constant (same one `_synthesize_meds` keys the shards
+    # with) rather than the literal `"train"`, so a future MEDS rename doesn't silently break
+    # the doctest.
     return {
-        "events": event_shards["train"],
-        "labels": _compute_labels(event_shards["train"], train_subjects),
+        "events": event_shards[train_split],
+        "labels": _compute_labels(event_shards[train_split], train_subjects),
     }
 
 
