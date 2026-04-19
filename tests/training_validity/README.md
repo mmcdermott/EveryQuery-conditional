@@ -305,12 +305,16 @@ branch [`test/e2e-training-validity-d1a`][d1a] remains available as a follow-up.
 
 Target was ≤ 10 minutes CPU per [#123][issue-123]. Actual runtime is CPU-dependent:
 
-| Environment                    | Steps | Wall time                 |
-| ------------------------------ | ----- | ------------------------- |
-| Laptop-class CPU               | 2000  | ~3 min                    |
-| Laptop-class CPU               | 4000  | ~6 min                    |
-| GitHub Actions `ubuntu-latest` | 2000  | ~11 min                   |
-| GitHub Actions `ubuntu-latest` | 4000  | ~18-22 min (extrapolated) |
+| Environment                    | Steps | Test wall time |
+| ------------------------------ | ----- | -------------- |
+| Laptop-class CPU               | 2000  | ~3 min         |
+| Laptop-class CPU               | 4000  | ~6 min         |
+| GitHub Actions `ubuntu-latest` | 2000  | ~5 min         |
+| GitHub Actions `ubuntu-latest` | 4000  | ~8 min         |
+
+(Test wall time = the single `test_trained_model_learns_occurs_and_censor` test, which
+is what counts toward the #123 budget. Full CI test-session wall time including
+everything else runs ~11 min on 3.11 and ~13 min on 3.12.)
 
 Subprocess timeout is set to 1800s (30 min) as a safety ceiling.
 
