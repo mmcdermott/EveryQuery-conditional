@@ -317,7 +317,8 @@ def task_labels_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
                     "prediction_time": _PRED_TIMES[subj],
                     "boolean_value": bv,
                     "query": query_code,
-                    "duration_days": 30,
+                    # Float to match ``TaskQuerySchema.duration_days`` (``pa.float32``).
+                    "duration_days": 30.0,
                 }
             )
 
@@ -327,7 +328,7 @@ def task_labels_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
                 "subject_id": pl.Int64,
                 "boolean_value": pl.Boolean,
                 "query": pl.Utf8,
-                "duration_days": pl.Int64,
+                "duration_days": pl.Float32,
             }
         )
         df.write_parquet(split_dir / "0.parquet")
@@ -369,7 +370,7 @@ def demo_dataset(
             "subject_id": pl.Int64,
             "boolean_value": pl.Boolean,
             "query": pl.Utf8,
-            "duration_days": pl.Float64,
+            "duration_days": pl.Float32,  # matches TaskQuerySchema
         }
     )
     df.write_parquet(collated_dir / "0.parquet")

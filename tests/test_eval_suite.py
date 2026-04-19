@@ -7,6 +7,7 @@ import polars as pl
 import pytest
 from omegaconf import ListConfig, OmegaConf
 
+from every_query.data.schema import TaskQuerySchema
 from every_query.evaluate.eval import _model_name
 from every_query.evaluate.gen_task import _resolve_codes, process_eval_tasks
 from every_query.utils.codes import code_slug
@@ -129,31 +130,18 @@ class TestResolveCodes:
 
 
 class TestGenTaskOutputSchema:
-    def test_columns(self, tmp_path):
-        """Output conforms to TaskQuerySchema: subject_id, prediction_time, boolean_value,
-        query, duration_days — occurs/censored collapsed into the nullable boolean_value.
+    def test_conforms_to_task_query_schema(self, tmp_path):
+        """Output conforms to ``TaskQuerySchema`` — validated directly via the schema's ``validate()`` method
+        rather than a hand-rolled column-set check.
+
+        Fails with a field-level diff if the producer drifts (extra columns, missing required columns, wrong
+        dtypes).
         """
         index_dir, task_dir_base, out_root = _build_fixtures(tmp_path)
         process_eval_tasks(index_dir, task_dir_base, out_root, INDEX_HASH, CODES, DURATIONS, "held_out")
 
         df = _read_all_outputs(out_root, INDEX_HASH)
-        expected = {"subject_id", "prediction_time", "boolean_value", "query", "duration_days"}
-        assert set(df.columns) == expected
-
-    def test_non_censored_rows_are_non_null(self, tmp_path):
-        """Rows whose underlying per-code value was null in the wide task matrix (and weren't censored) must
-        be dropped, so every remaining non-censored row has a non-null ``boolean_value``.
-
-        Under the collapsed schema, null ``boolean_value``
-        means censored, not missing data.
-        """
-        index_dir, task_dir_base, out_root = _build_fixtures(tmp_path)
-        process_eval_tasks(index_dir, task_dir_base, out_root, INDEX_HASH, CODES, DURATIONS, "held_out")
-
-        df = _read_all_outputs(out_root, INDEX_HASH)
-        # Compute censored by structural meaning rather than reading a separate column.
-        non_null_rows = df.filter(pl.col("boolean_value").is_not_null())
-        assert non_null_rows["boolean_value"].null_count() == 0
+        TaskQuerySchema.validate(df.to_arrow())
 
 
 # ---------------------------------------------------------------------------

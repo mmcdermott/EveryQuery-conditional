@@ -23,8 +23,9 @@ scope for the initial schema and will be added as the inference / evaluation pip
 evolve.
 """
 
+import polars as pl
 import pyarrow as pa
-from flexible_schema import Required
+from flexible_schema import Optional, Required
 from meds import LabelSchema
 
 
@@ -38,9 +39,15 @@ class TaskQuerySchema(LabelSchema):
     both inference input (no label) and evaluation input (label filled in) without a branch.
 
     Attributes:
-        query: The MEDS code the query asks about.  Named ``query`` rather than ``code`` to
-            match the column name already used throughout the sampler / dataset / batch
-            layer (``EveryQueryBatch.code`` is the distinct event-sequence-token tensor).
+        query: The MEDS code the query asks about.  Stored as ``pa.large_string``
+            (polars' ``Utf8`` serializes to ``large_string`` when a DataFrame is
+            converted to arrow, so this matches producer output natively and
+            ``TaskQuerySchema.align()`` works without type coercion; also matches
+            MEDS's own ``DataSchema.code`` convention which uses ``large_string``
+            for the same 2 GB-offset reason).  Named ``query`` rather than ``code``
+            to match the column name already used throughout the sampler / dataset /
+            batch layer (``EveryQueryBatch.code`` is the distinct event-sequence-token
+            tensor).
         duration_days: The horizon, in days (continuous — ``float32``) within which the
             ``query`` code must occur for the query to be positive.  Allowing fractional
             days keeps the contract flexible for future finer-grained horizons.
@@ -84,3 +91,49 @@ class TaskQuerySchema(LabelSchema):
 
     query: Required(pa.large_string(), nullable=False)
     duration_days: Required(pa.float32(), nullable=False)
+    # Override ``boolean_value`` from ``LabelSchema`` (which declares it
+    # ``Optional(bool, nullable=NONE)``) to allow nulls — the EveryQuery task-label
+    # convention is to use null as the "censored" sentinel (closes #122).  The column
+    # stays optional at the schema level so inference-only inputs (no ground truth)
+    # continue to validate.
+    boolean_value: Optional(pa.bool_(), nullable=True)
+
+
+def empty_task_query_df() -> pl.DataFrame:
+    """Build an empty polars DataFrame shaped like ``TaskQuerySchema``'s required columns plus the inherited
+    ``boolean_value`` (the collapsed label column).
+
+    Only the required columns + ``boolean_value`` are included — not every
+    ``LabelSchema`` optional column — because (a) that's what the sampler's empty-input
+    fast path needs, and (b) a polars-arrow round-trip coerces ``pa.string`` →
+    ``pa.large_string`` on the inherited ``categorical_value`` column, so a schema-
+    complete empty frame would fail ``TaskQuerySchema.validate`` after the round-trip
+    unless we bypassed polars entirely.  Keeping the shape focused on what downstream
+    writers actually emit avoids that type-drift landmine.
+
+    Callers use this at the empty-input fast path (e.g., ``evaluate_index_df`` when no
+    tasks were sampled) so the produced parquet still aligns to the schema via
+    ``TaskQuerySchema.align`` at the write boundary.
+
+    Examples:
+        >>> df = empty_task_query_df()
+        >>> df.height
+        0
+        >>> set(df.columns) == {
+        ...     TaskQuerySchema.subject_id_name,
+        ...     TaskQuerySchema.prediction_time_name,
+        ...     TaskQuerySchema.query_name,
+        ...     TaskQuerySchema.duration_days_name,
+        ...     TaskQuerySchema.boolean_value_name,
+        ... }
+        True
+    """
+    return pl.DataFrame(
+        schema={
+            TaskQuerySchema.subject_id_name: pl.Int64,
+            TaskQuerySchema.prediction_time_name: pl.Datetime("us"),
+            TaskQuerySchema.query_name: pl.Utf8,
+            TaskQuerySchema.duration_days_name: pl.Float32,
+            TaskQuerySchema.boolean_value_name: pl.Boolean,
+        }
+    )
