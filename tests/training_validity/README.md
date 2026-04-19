@@ -101,23 +101,29 @@ complex.
 If we want a stricter test that exercises rate-estimation from history, the Design 1a
 branch [`test/e2e-training-validity-d1a`][d1a] remains available as a follow-up.
 
-## Runtime budget
+## Runtime
 
-Target: ≤ 10 minutes CPU per [#123][issue-123]. Current runtime on a laptop-class
-machine:
+Target was ≤ 10 minutes CPU per [#123][issue-123]. Actual runtime is CPU-dependent:
 
-- Preprocessing (`EQ_process_data` on ~150 subjects): ~30s
-- Training (4000 steps, hidden=128, 4-layer, batch=16): ~5-6 minutes
-- Inference + assertions: ~few seconds
+| Environment                    | Steps | Wall time                 |
+| ------------------------------ | ----- | ------------------------- |
+| Laptop-class CPU               | 2000  | ~3 min                    |
+| Laptop-class CPU               | 4000  | ~6 min                    |
+| GitHub Actions `ubuntu-latest` | 2000  | ~11 min                   |
+| GitHub Actions `ubuntu-latest` | 4000  | ~18-22 min (extrapolated) |
 
-Total: ~6-7 minutes. Training step count bumped from 2000 (locally converged in 3
-minutes) to 4000 after CI observed a Python-3.12 runner where the model's weight init
-produced an unlucky optimization trajectory — the censor head under-converged at 2000
-steps while 3.11 on the same commit passed. The root cause is that `train.py` seeds
-the RNG *after* model init, making the weight init platform-dependent; see the inline
-comment on `oracle_trained_model_dir` for more. A proper fix would move `seed_everything`
-before `instantiate(cfg.lightning_module)`, but that's a training-code change outside
-the scope of this test.
+Subprocess timeout is set to 1800s (30 min) as a safety ceiling.
+
+Training step count was bumped from 2000 to 4000 after CI observed a Python-3.12
+runner where the model's weight init produced an unlucky optimization trajectory
+— the censor head under-converged at 2000 steps while 3.11 on the same commit
+passed. The root cause is that `train.py` seeds the RNG *after* `instantiate(cfg.lightning_module)`,
+making the weight init platform-RNG-dependent; see the inline comment on
+`oracle_trained_model_dir` for more. A proper fix would move `seed_everything`
+before `instantiate(cfg.lightning_module)`, which would let us drop back to 2000
+steps without flakiness — but that's a training-code change outside the scope of
+this test. Alternatively, this test can be marked `@pytest.mark.slow` and gated
+behind a separate CI workflow if the runtime becomes problematic.
 
 ## Gotchas baked into the test (for future readers)
 
