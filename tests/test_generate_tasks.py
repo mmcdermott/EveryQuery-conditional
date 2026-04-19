@@ -172,11 +172,24 @@ def test_reproducible_with_same_seed(
     fixture_labels = _read_train_labels(eq_sampled_tasks_dir)
     rerun_labels = _read_train_labels(rerun_out)
 
+    # `subject_id` originates from sampled contexts/index_df and should never be null on a
+    # valid sampler output.  Assert the invariant up-front so any unexpected null rows fail
+    # loudly instead of being silently filtered out by an `is_not_null()` guard (which would
+    # mask both a real sampler regression and any non-label parquet leaking into the split
+    # directory).
+    assert fixture_labels["subject_id"].null_count() == 0, (
+        f"fixture EQ_generate_tasks output has "
+        f"{fixture_labels['subject_id'].null_count()} null subject_id rows"
+    )
+    assert rerun_labels["subject_id"].null_count() == 0, (
+        f"rerun EQ_generate_tasks output has {rerun_labels['subject_id'].null_count()} null subject_id rows"
+    )
+
     # Compare by row content (sorted) since file-byte equality is flaky across polars versions.
     # The invariant we care about: same seed → same labeled rows.
     sort_cols = ["subject_id", "prediction_time", "query", "duration_days"]
-    a = fixture_labels.filter(pl.col("subject_id").is_not_null()).sort(sort_cols)
-    b = rerun_labels.filter(pl.col("subject_id").is_not_null()).sort(sort_cols)
+    a = fixture_labels.sort(sort_cols)
+    b = rerun_labels.sort(sort_cols)
     assert a.equals(b), (
         "two EQ_generate_tasks runs with identical seed produced different labeled output.\n"
         f"fixture hash: {_parquet_hash(a)}  rerun hash: {_parquet_hash(b)}"
