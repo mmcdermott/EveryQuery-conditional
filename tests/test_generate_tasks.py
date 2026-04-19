@@ -41,10 +41,20 @@ _MIN_CONTEXT_PER_SUBJECT = 1
 
 
 def _read_train_labels(tasks_dir: Path) -> pl.DataFrame:
-    """Load + concatenate all labeled parquets under the train split of *tasks_dir*."""
+    """Load + concatenate all labeled parquets under the train split of *tasks_dir*.
+
+    Asserts the result is non-empty.  Without that check, an empty-shards regression in
+    `EQ_generate_tasks` would silently turn `test_reproducible_with_same_seed` and
+    `test_n_tasks_knob_is_honored` into vacuous pass cases (e.g., `2 * 0 == 0`).
+    """
     fps = sorted((tasks_dir / "train").glob("*.parquet"))
     assert fps, f"no labeled parquets found under {tasks_dir / 'train'}"
-    return pl.concat([pl.read_parquet(fp) for fp in fps], how="vertical")
+    df = pl.concat([pl.read_parquet(fp) for fp in fps], how="vertical")
+    assert df.height > 0, (
+        f"train labeled parquets under {tasks_dir / 'train'} exist but contain 0 rows; "
+        f"the demo fixture has n_tasks>0 and should always emit at least one label"
+    )
+    return df
 
 
 def _parquet_hash(df: pl.DataFrame) -> str:
@@ -78,8 +88,30 @@ def test_labels_match_ground_truth(
 
     for split in ("train", "tuning"):
         shard_path = intermediate / "data" / split / "0.parquet"
-        events = pl.read_parquet(shard_path).select(["subject_id", "time", "code"])
-        labels = pl.read_parquet(sorted((eq_sampled_tasks_dir / split).glob("*.parquet"))[0])
+        # Mirror ``_read_event_shard``'s normalization (cast + dedupe + sort) so the ground-
+        # truth recomputation runs over the same frame the sampler labeled.  Skipping this
+        # would let schema-level drift (e.g., upstream storing ``code`` as Categorical or
+        # ``time`` at ns precision) diverge silently between the production path and the
+        # test, hiding real bugs.
+        events = (
+            pl.read_parquet(shard_path)
+            .select(["subject_id", "time", "code"])
+            .with_columns(
+                pl.col("time").cast(pl.Datetime("us")),
+                pl.col("code").cast(pl.Utf8),
+            )
+            .unique()
+            .sort(["subject_id", "time"])
+        )
+        label_paths = sorted((eq_sampled_tasks_dir / split).glob("*.parquet"))
+        assert label_paths, f"no labeled parquets found for split={split} in {eq_sampled_tasks_dir / split}"
+        labels = pl.concat([pl.read_parquet(p) for p in label_paths], how="vertical")
+        # Guard against empty-shards regression — without this, the per-row ground-truth
+        # loop below would do zero iterations and the test would pass vacuously.
+        assert labels.height > 0, (
+            f"split={split} produced labeled parquets but 0 rows; ground-truth loop "
+            f"would be vacuous.  Check EQ_generate_tasks for empty-output regression."
+        )
 
         max_time_per_subject = dict(
             events.group_by("subject_id").agg(pl.col("time").max().alias("max_time")).iter_rows()
@@ -156,11 +188,24 @@ def test_reproducible_with_same_seed(
     fixture_labels = _read_train_labels(eq_sampled_tasks_dir)
     rerun_labels = _read_train_labels(rerun_out)
 
+    # `subject_id` originates from sampled contexts/index_df and should never be null on a
+    # valid sampler output.  Assert the invariant up-front so any unexpected null rows fail
+    # loudly instead of being silently filtered out by an `is_not_null()` guard (which would
+    # mask both a real sampler regression and any non-label parquet leaking into the split
+    # directory).
+    assert fixture_labels["subject_id"].null_count() == 0, (
+        f"fixture EQ_generate_tasks output has "
+        f"{fixture_labels['subject_id'].null_count()} null subject_id rows"
+    )
+    assert rerun_labels["subject_id"].null_count() == 0, (
+        f"rerun EQ_generate_tasks output has {rerun_labels['subject_id'].null_count()} null subject_id rows"
+    )
+
     # Compare by row content (sorted) since file-byte equality is flaky across polars versions.
     # The invariant we care about: same seed → same labeled rows.
     sort_cols = ["subject_id", "prediction_time", "query", "duration_days"]
-    a = fixture_labels.filter(pl.col("subject_id").is_not_null()).sort(sort_cols)
-    b = rerun_labels.filter(pl.col("subject_id").is_not_null()).sort(sort_cols)
+    a = fixture_labels.sort(sort_cols)
+    b = rerun_labels.sort(sort_cols)
     assert a.equals(b), (
         "two EQ_generate_tasks runs with identical seed produced different labeled output.\n"
         f"fixture hash: {_parquet_hash(a)}  rerun hash: {_parquet_hash(b)}"
@@ -200,13 +245,15 @@ def test_n_tasks_knob_is_honored(
     small_df = _read_train_labels(eq_sampled_tasks_dir)
     big_df = _read_train_labels(big_out)
 
-    assert big_df.height > small_df.height, (
-        f"n_tasks=16 did not produce more labeled rows than n_tasks=8 "
-        f"(big={big_df.height}, small={small_df.height}).  The n_tasks knob may be ignored."
-    )
-    # Expected: big ≈ 2x small, since contexts_per_task is the same.  Tolerant assertion since some
-    # rows can be filtered out during the join_asof labeling step.
-    assert big_df.height >= int(1.5 * small_df.height), (
-        f"n_tasks=16 only produced {big_df.height} rows vs. {small_df.height} at n_tasks=8; "
-        f"expected roughly 2x (allowing 25% label-drop tolerance)"
+    # `evaluate_index_df` uses a *left* `join_asof`, so labeled.height == index_df.height
+    # exactly — there's no row drop in the labeling stage.  Doubling `n_tasks` with
+    # `contexts_per_task` held fixed should therefore exactly double the output row count.
+    # A weaker tolerance-based check (e.g. >= 1.5x) would miss a bug that silently caps
+    # `n_tasks` somewhere between small and big (e.g. at 12) — exact-2x catches that.
+    assert big_df.height == 2 * small_df.height, (
+        f"n_tasks=16 produced {big_df.height} rows vs. {small_df.height} at n_tasks=8; "
+        f"expected exactly {2 * small_df.height} when only n_tasks doubles and "
+        f"contexts_per_task is held fixed.  This points at the `n_tasks` flag being "
+        f"ignored, silently capped, or `sample_contexts` dropping rows that should have "
+        f"made it through."
     )
