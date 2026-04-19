@@ -149,12 +149,12 @@ EQ_generate_tasks \
 Sweep across shards with
 `python -m every_query.generate_tasks.sample_tasks -m input_shard=0,1,2,… task_shard=range(0,K)`.
 Each worker writes labeled task parquets under `$TASK_DIR/{split}/*.parquet` idempotently.
-Output columns: `subject_id, prediction_time, boolean_value, occurs, code, duration_days`.
-The `code` column is the MEDS code the query asks about; `duration_days` is the prediction
+Output columns: `subject_id, prediction_time, boolean_value, occurs, query, duration_days`.
+The `query` column is the MEDS code the query asks about; `duration_days` is the prediction
 horizon. These two columns will constitute the `TaskQuerySchema` being defined in
-[#96](https://github.com/payalchandak/EveryQuery/pull/96) (draft PR, closes #80); the extra
+[#96](https://github.com/payalchandak/EveryQuery/pull/96) (open PR, closes #80); the extra
 `occurs` column (EQ's positive-class label) currently sits alongside — collapsing it into
-a single nullable label is tracked in [#122].
+a single nullable label is tracked in [#122] and now in-scope of #96.
 
 ### 3. Train
 
@@ -304,7 +304,7 @@ shared cross-stage task-query schema.
 | [#64](https://github.com/payalchandak/EveryQuery/issues/64)   | Drop gitignored `{train,eval}_codes` defaults (design pick pending)                                                             |
 | [#85](https://github.com/payalchandak/EveryQuery/issues/85)   | Rewrite `sample_codes/` dataset-agnostic — draft PR [#97](https://github.com/payalchandak/EveryQuery/pull/97)                   |
 | [#117](https://github.com/payalchandak/EveryQuery/issues/117) | Env-var audit — phase 1 merged via [#127](https://github.com/payalchandak/EveryQuery/pull/127); phases 2-4 pending              |
-| [#122](https://github.com/payalchandak/EveryQuery/issues/122) | Collapse EQ sampler's `boolean_value` + `occurs` into one nullable label                                                        |
+| [#122](https://github.com/payalchandak/EveryQuery/issues/122) | Collapse EQ sampler's `boolean_value` + `occurs` into one nullable label — in scope of #96                                      |
 | [#125](https://github.com/payalchandak/EveryQuery/issues/125) | Adopt hypothesis-based property tests for the sampler                                                                           |
 | [#59](https://github.com/payalchandak/EveryQuery/issues/59)   | Docs: final rewrite after the refactor settles                                                                                  |
 
