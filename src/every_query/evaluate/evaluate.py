@@ -43,7 +43,7 @@ def main(cfg: DictConfig) -> None:
     predictions = pl.from_arrow(table)
     logger.info(
         f"Loaded {predictions.height} predictions across "
-        f"{predictions['code'].n_unique()} codes × "
+        f"{predictions['code'].n_unique()} codes x "
         f"{predictions['duration_days'].n_unique()} durations"
     )
 
