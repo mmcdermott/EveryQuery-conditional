@@ -110,7 +110,7 @@ def test_reproducible_with_same_seed(
     )
 
     fixture_labels = _read_train_labels(eq_sampled_tasks_dir)
-    rerun_labels = pl.read_parquet(sorted((rerun_out / "train").glob("*.parquet")))
+    rerun_labels = _read_train_labels(rerun_out)
 
     # Compare by row content (sorted) since file-byte equality is flaky across polars versions.
     # The invariant we care about: same seed → same labeled rows.
@@ -148,12 +148,13 @@ def test_n_tasks_knob_is_honored(
             f"duration_min={_DURATION_MIN}",
             f"duration_max={_DURATION_MAX}",
             f"min_context_per_subject={_MIN_CONTEXT_PER_SUBJECT}",
+            "seed=1",  # same seed as the fixture; only n_tasks differs
         ],
         timeout=120.0,
     )
 
     small_df = _read_train_labels(eq_sampled_tasks_dir)
-    big_df = pl.read_parquet(sorted((big_out / "train").glob("*.parquet")))
+    big_df = _read_train_labels(big_out)
 
     assert big_df.height > small_df.height, (
         f"n_tasks=16 did not produce more labeled rows than n_tasks=8 "
