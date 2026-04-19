@@ -78,8 +78,24 @@ def test_labels_match_ground_truth(
 
     for split in ("train", "tuning"):
         shard_path = intermediate / "data" / split / "0.parquet"
-        events = pl.read_parquet(shard_path).select(["subject_id", "time", "code"])
-        labels = pl.read_parquet(sorted((eq_sampled_tasks_dir / split).glob("*.parquet"))[0])
+        # Mirror ``_read_event_shard``'s normalization (cast + dedupe + sort) so the ground-
+        # truth recomputation runs over the same frame the sampler labeled.  Skipping this
+        # would let schema-level drift (e.g., upstream storing ``code`` as Categorical or
+        # ``time`` at ns precision) diverge silently between the production path and the
+        # test, hiding real bugs.
+        events = (
+            pl.read_parquet(shard_path)
+            .select(["subject_id", "time", "code"])
+            .with_columns(
+                pl.col("time").cast(pl.Datetime("us")),
+                pl.col("code").cast(pl.Utf8),
+            )
+            .unique()
+            .sort(["subject_id", "time"])
+        )
+        label_paths = sorted((eq_sampled_tasks_dir / split).glob("*.parquet"))
+        assert label_paths, f"no labeled parquets found for split={split} in {eq_sampled_tasks_dir / split}"
+        labels = pl.concat([pl.read_parquet(p) for p in label_paths], how="vertical")
 
         max_time_per_subject = dict(
             events.group_by("subject_id").agg(pl.col("time").max().alias("max_time")).iter_rows()
@@ -200,13 +216,15 @@ def test_n_tasks_knob_is_honored(
     small_df = _read_train_labels(eq_sampled_tasks_dir)
     big_df = _read_train_labels(big_out)
 
-    assert big_df.height > small_df.height, (
-        f"n_tasks=16 did not produce more labeled rows than n_tasks=8 "
-        f"(big={big_df.height}, small={small_df.height}).  The n_tasks knob may be ignored."
-    )
-    # Expected: big ≈ 2x small, since contexts_per_task is the same.  Tolerant assertion since some
-    # rows can be filtered out during the join_asof labeling step.
-    assert big_df.height >= int(1.5 * small_df.height), (
-        f"n_tasks=16 only produced {big_df.height} rows vs. {small_df.height} at n_tasks=8; "
-        f"expected roughly 2x (allowing 25% label-drop tolerance)"
+    # `evaluate_index_df` uses a *left* `join_asof`, so labeled.height == index_df.height
+    # exactly — there's no row drop in the labeling stage.  Doubling `n_tasks` with
+    # `contexts_per_task` held fixed should therefore exactly double the output row count.
+    # A weaker tolerance-based check (e.g. >= 1.5x) would miss a bug that silently caps
+    # `n_tasks` somewhere between small and big (e.g. at 12) — exact-2x catches that.
+    assert big_df.height == 2 * small_df.height, (
+        f"n_tasks=16 produced {big_df.height} rows vs. {small_df.height} at n_tasks=8; "
+        f"expected exactly {2 * small_df.height} when only n_tasks doubles and "
+        f"contexts_per_task is held fixed.  This points at the `n_tasks` flag being "
+        f"ignored, silently capped, or `sample_contexts` dropping rows that should have "
+        f"made it through."
     )
