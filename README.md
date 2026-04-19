@@ -279,12 +279,12 @@ shared cross-stage task-query schema.
 
 ### Phase 2 status
 
-| Sub-phase                      | Issue                                                       | State                                                                |
-| ------------------------------ | ----------------------------------------------------------- | -------------------------------------------------------------------- |
+| Sub-phase                      | Issue                                                       | State                                                                                |
+| ------------------------------ | ----------------------------------------------------------- | ------------------------------------------------------------------------------------ |
 | 2.1: TaskQuerySchema design    | [#80](https://github.com/payalchandak/EveryQuery/issues/80) | Draft PR [#96](https://github.com/payalchandak/EveryQuery/pull/96) (open for review) |
-| 2.2: EQ_predict                | [#81](https://github.com/payalchandak/EveryQuery/issues/81) | Draft PR [#99](https://github.com/payalchandak/EveryQuery/pull/99)   |
-| 2.3: eval-suite inventory      | [#82](https://github.com/payalchandak/EveryQuery/issues/82) | Open (design)                                                        |
-| 2.4: EQ_evaluate consolidation | [#83](https://github.com/payalchandak/EveryQuery/issues/83) | Draft PR [#100](https://github.com/payalchandak/EveryQuery/pull/100) |
+| 2.2: EQ_predict                | [#81](https://github.com/payalchandak/EveryQuery/issues/81) | Draft PR [#99](https://github.com/payalchandak/EveryQuery/pull/99)                   |
+| 2.3: eval-suite inventory      | [#82](https://github.com/payalchandak/EveryQuery/issues/82) | Open (design)                                                                        |
+| 2.4: EQ_evaluate consolidation | [#83](https://github.com/payalchandak/EveryQuery/issues/83) | Draft PR [#100](https://github.com/payalchandak/EveryQuery/pull/100)                 |
 
 ### E2E testing status ([#104](https://github.com/payalchandak/EveryQuery/issues/104))
 
