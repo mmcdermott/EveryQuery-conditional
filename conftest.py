@@ -88,7 +88,16 @@ def demo_model_config() -> ModernBertConfig:
 
 @pytest.fixture(scope="session")
 def demo_model() -> EveryQueryModel:
-    """Randomly-initialised EveryQueryModel with tiny dimensions."""
+    """Randomly-initialised EveryQueryModel with tiny dimensions, seeded for determinism.
+
+    The seed pin (``torch.manual_seed(0)``) guards against init-RNG-dependent flakiness in
+    tests that compare forward-pass outputs across perturbed inputs — notably
+    ``TestDurationDaysValueAffectsOutput::test_scaling_duration_days_changes_output``, which
+    could produce numerically identical losses before/after scaling ``duration_days`` on
+    unlucky initialisations.  Any test that needs a different initialisation should construct
+    its own model instance rather than mutating this shared fixture.
+    """
+    torch.manual_seed(0)
     model = EveryQueryModel(
         config_overrides=DEMO_CONFIG_OVERRIDES,
         do_demo=True,
