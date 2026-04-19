@@ -42,12 +42,20 @@ def create_eq_task_df(
         output_dir = Path(output_root) / slug
         os.makedirs(output_dir, exist_ok=True)
 
-        # per-code EQ df (no unpivot; one file per input shard)
+        # per-code EQ df conforming to TaskQuerySchema's nullable boolean_value:
+        #   null  → censored (input `censored=True`)
+        #   True  → event occurred (input `<code>=True`)
+        #   False → no event, not censored
+        boolean_value = (
+            pl.when(pl.col("censored")).then(pl.lit(None, dtype=pl.Boolean)).otherwise(pl.col(code))
+        )
         eq_df = (
             joined_df.select([*base_cols + code])
-            .rename({code: "occurs", "censored": "boolean_value"})
-            .with_columns(pl.lit(code).alias("query"))
-            .select(["subject_id", "prediction_time", "query", "boolean_value", "occurs", "task_label"])
+            .with_columns(
+                boolean_value.alias("boolean_value"),
+                pl.lit(code).alias("query"),
+            )
+            .select(["subject_id", "prediction_time", "query", "boolean_value", "task_label"])
         )
 
         out_fp = output_dir / shard_name  # same shard id as original
