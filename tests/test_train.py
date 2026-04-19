@@ -36,7 +36,11 @@ def _highest_step_checkpoint(output_dir: Path) -> tuple[Path, dict]:
     return best_path, best_ckpt
 
 
-def test_resolved_config_captures_overrides(eq_trained_model_dir: Path) -> None:
+def test_resolved_config_captures_overrides(
+    eq_trained_model_dir: Path,
+    eq_preprocessed_dataset: Path,
+    eq_sampled_tasks_dir: Path,
+) -> None:
     """`resolved_config.yaml` records the fully-interpolated config with CLI overrides baked in.
 
     Catches regressions where Hydra overrides are silently dropped between CLI parse and on-disk persistence —
@@ -50,9 +54,18 @@ def test_resolved_config_captures_overrides(eq_trained_model_dir: Path) -> None:
         f"resolved_config.output_dir={cfg.output_dir!r} does not match actual run dir "
         f"{eq_trained_model_dir!r}"
     )
-    # task_labels_dir / tensorized_cohort_dir also came through overrides.
-    assert cfg.datamodule.config.task_labels_dir, "task_labels_dir missing from resolved config"
-    assert cfg.datamodule.config.tensorized_cohort_dir, "tensorized_cohort_dir missing from resolved config"
+    # task_labels_dir / tensorized_cohort_dir overrides must land the *actual* fixture
+    # paths on disk, not a truthy-but-useless sentinel like '???'.  A pure truthiness
+    # check would silently pass if Hydra dropped the override between CLI parse and
+    # save (since '???' is truthy), so assert equality with the expected fixture paths.
+    assert cfg.datamodule.config.task_labels_dir == str(eq_sampled_tasks_dir), (
+        f"resolved_config.task_labels_dir={cfg.datamodule.config.task_labels_dir!r} does "
+        f"not match fixture path {str(eq_sampled_tasks_dir)!r}"
+    )
+    assert cfg.datamodule.config.tensorized_cohort_dir == str(eq_preprocessed_dataset), (
+        f"resolved_config.tensorized_cohort_dir={cfg.datamodule.config.tensorized_cohort_dir!r} "
+        f"does not match fixture path {str(eq_preprocessed_dataset)!r}"
+    )
 
 
 def test_checkpoint_metadata(eq_trained_model_dir: Path) -> None:
@@ -64,46 +77,101 @@ def test_checkpoint_metadata(eq_trained_model_dir: Path) -> None:
     assert ckpt["global_step"] == 2, (
         f"demo training ran for {ckpt['global_step']} steps, expected 2 per _demo_train.yaml"
     )
-    # State dict is non-empty and contains ModernBERT backbone parameters.
+    # State dict is non-empty and carries the model-parameter keys Lightning persists
+    # under the `HF_model.` / `model.` prefixes (loose check rather than a specific
+    # architecture prefix — this test's job is to catch "checkpoint has no weights" as a
+    # regression, not to validate the ModernBERT module tree).
     assert len(ckpt["state_dict"]) > 0
     assert any("HF_model" in k or "model." in k for k in ckpt["state_dict"]), (
-        f"state_dict doesn't appear to contain the model backbone: keys={list(ckpt['state_dict'])[:3]}"
+        f"state_dict doesn't appear to contain model-related parameters: keys={list(ckpt['state_dict'])[:3]}"
     )
 
 
-def test_resume_advances_global_step(
+def _stage_resume_dir(src: Path, dst: Path) -> None:
+    """Copy ``config.yaml`` / ``resolved_config.yaml`` / ``checkpoints/`` into a fresh dir.
+
+    ``config.yaml`` is load-bearing — ``train.py`` uses its presence (``cfg_path.exists()``)
+    to classify the output dir as populated and to enter the ``do_resume`` branch.
+    Without it, ``do_resume=True`` would be silently ignored and a fresh training run would
+    start instead.
+    """
+    for item in ("config.yaml", "resolved_config.yaml", "checkpoints"):
+        if (src / item).is_dir():
+            shutil.copytree(src / item, dst / item)
+        else:
+            shutil.copy2(src / item, dst / item)
+
+
+def test_resume_actually_loads_checkpoint_state(
     eq_trained_model_dir: Path,
     eq_preprocessed_dataset: Path,
     eq_sampled_tasks_dir: Path,
     tmp_path_factory,
 ) -> None:
-    """`do_resume=True` picks up where training left off and advances training.
+    """``do_resume=True`` actually loads the prior checkpoint's state — not a silent restart.
 
-    MEICAR-style differential.  Copy the fixture's trained run to a fresh dir, resume with
-    higher ``max_steps``, assert the resumed checkpoint has advanced past the starting
-    global_step.  A silent reinit-on-resume bug (pre-#86 style) would leave global_step at
-    the original value and fail this test.
+    Two differentials, together, narrow down to "resume is really resuming":
+
+    1. **No-op resume (``max_steps`` == starting ``global_step``)**: a real resume immediately
+       exits ``trainer.fit`` because the max-steps budget is already spent — so both
+       ``global_step`` and the weight tensors stay identical.  A silently-dropped resume
+       that started fresh training would run 2 new optimizer steps against random weights
+       and would land the state_dict somewhere completely different, with ``global_step``
+       back at 2 but tensors mismatching the pre-run snapshot.  Verifying **weights
+       unchanged** here is what distinguishes "resume" from "coincidentally-same-step
+       fresh run" (both advance ``global_step`` to 2; only a real resume keeps the weights).
+    2. **Advancing resume (``max_steps`` > starting ``global_step``)**: after a real resume
+       from step 2 with ``max_steps=4``, at least one parameter tensor has to differ from
+       the starting snapshot (otherwise the optimizer isn't training anything — zero-lr
+       bug, frozen params, or ``trainer.fit`` not actually running).
+
+    Bundling both into one test keeps them on the same staged resume-dir fixture so setup
+    cost amortizes.  Pre-#86-style reinit-on-resume bugs fail the first check; zero-lr /
+    gradient-path regressions fail the second.
     """
-    # Stage the fixture's outputs into a new dir that we're free to mutate without polluting
-    # the session-scoped fixture for other tests.
+    # Stage the fixture's outputs into a fresh dir so we can mutate without polluting the
+    # session-scoped fixture for other tests.
     resume_dir = tmp_path_factory.mktemp("eq_train_resume")
-    for item in ("config.yaml", "resolved_config.yaml", "checkpoints"):
-        src = eq_trained_model_dir / item
-        dst = resume_dir / item
-        if src.is_dir():
-            shutil.copytree(src, dst)
-        else:
-            shutil.copy2(src, dst)
-    # NOTE: copying config.yaml is load-bearing — train.py uses its presence (cfg_path.exists())
-    # to decide whether the output dir is "populated" and to enter the do_resume branch.  Without
-    # it, do_resume=True would be silently ignored and a fresh training run would start instead.
+    _stage_resume_dir(eq_trained_model_dir, resume_dir)
 
     _, start_ckpt = _highest_step_checkpoint(resume_dir)
     starting_step = start_ckpt["global_step"]
     assert starting_step == 2, f"sanity: fixture trained to step 2, got {starting_step}"
+    start_sd = start_ckpt["state_dict"]
 
-    # Resume for 2 more steps.  do_overwrite must be False — the demo config defaults it to True,
-    # and the train entry point prioritizes overwrite when both are set.
+    # ── (1) No-op resume — max_steps == starting global_step ─────────────────────
+    run_and_check(
+        [
+            "EQ_train",
+            "--config-name=_demo_train",
+            f"output_dir={resume_dir!s}",
+            f"datamodule.config.tensorized_cohort_dir={eq_preprocessed_dataset!s}",
+            f"datamodule.config.task_labels_dir={eq_sampled_tasks_dir!s}",
+            "do_overwrite=False",
+            "do_resume=True",
+            f"trainer.max_steps={starting_step}",
+        ],
+        env=ENSURE_ENV_PLACEHOLDERS,
+        timeout=300.0,
+    )
+    _, noop_ckpt = _highest_step_checkpoint(resume_dir)
+    assert noop_ckpt["global_step"] == starting_step, (
+        f"no-op resume (max_steps={starting_step}) advanced global_step "
+        f"{starting_step} → {noop_ckpt['global_step']}; resume likely ignored and fresh "
+        f"training started."
+    )
+    noop_sd = noop_ckpt["state_dict"]
+    assert set(noop_sd.keys()) == set(start_sd.keys()), (
+        "state_dict key set changed across no-op resume — architecture drift?"
+    )
+    differing = [k for k in start_sd if not torch.equal(start_sd[k], noop_sd[k])]
+    assert not differing, (
+        f"no-op resume (max_steps == starting_step) mutated {len(differing)} parameter "
+        f"tensor(s): {differing[:3]}.  Weights must be identical if resume actually loaded "
+        f"the prior checkpoint — if they differ, a fresh training run ran instead."
+    )
+
+    # ── (2) Advancing resume — max_steps > starting global_step ──────────────────
     run_and_check(
         [
             "EQ_train",
@@ -118,32 +186,13 @@ def test_resume_advances_global_step(
         env=ENSURE_ENV_PLACEHOLDERS,
         timeout=300.0,
     )
-
     _, resumed_ckpt = _highest_step_checkpoint(resume_dir)
-    assert resumed_ckpt["global_step"] > starting_step, (
-        f"do_resume=True did not advance global_step "
-        f"(starting={starting_step}, after resume={resumed_ckpt['global_step']}).  "
-        f"Likely silent reinit-on-resume regression."
-    )
-    assert resumed_ckpt["global_step"] == 4, (
-        f"resume with max_steps=4 advanced to global_step={resumed_ckpt['global_step']}, expected 4"
-    )
-
-    # Weights-changed assertion: catches the failure mode where Lightning's trainer.fit is
-    # called with a resumed ckpt but no effective parameter updates actually happen (zero-lr
-    # bug, frozen parameters, optimizer.step silently no-op'd, etc.).  This complements the
-    # global_step checks above: global_step tracks optimizer steps and so *could* also stall
-    # in some of these failure modes, but comparing parameter tensors directly is the more
-    # reliable "did training actually change the model" check.  Compare element-wise across
-    # the full state_dict.
-    start_sd = start_ckpt["state_dict"]
     resumed_sd = resumed_ckpt["state_dict"]
-    assert set(start_sd.keys()) == set(resumed_sd.keys()), (
+    assert set(resumed_sd.keys()) == set(start_sd.keys()), (
         "state_dict key set changed across resume — architecture drift?"
     )
     changed = [k for k in start_sd if not torch.equal(start_sd[k], resumed_sd[k])]
     assert changed, (
-        "global_step advanced but no parameter tensors changed after resume.  "
-        "Likely a gradient-path regression (zero-lr, frozen params, or trainer.fit not "
-        "actually training)."
+        "advancing resume did not change any parameter tensors.  Likely a gradient-path "
+        "regression (zero-lr, frozen params, or trainer.fit not actually training)."
     )
