@@ -280,13 +280,19 @@ def oracle_trained_model_dir(
 
 
 def _load_lightning_module(trained_model_dir: Path) -> EveryQueryLightningModule:
-    ckpts = sorted((trained_model_dir / "checkpoints").glob("*.ckpt"))
-    assert ckpts, f"no checkpoints under {trained_model_dir / 'checkpoints'}"
-    best_path, best_step = None, -1
-    for fp in ckpts:
-        c = torch.load(fp, map_location="cpu", weights_only=False)
-        if c["global_step"] > best_step:
-            best_path, best_step = fp, c["global_step"]
+    """Load the monitor-best checkpoint that ``train.py`` copies to ``best_model.ckpt``.
+
+    ``train.py`` selects the best checkpoint by ``tuning/loss`` (``ModelCheckpoint(monitor=...,
+    save_top_k=1)``) and copies it to ``output_dir/best_model.ckpt``; loading that file
+    directly matches the training contract and avoids the ``last.ckpt`` vs.
+    ``epoch=N-step=M.ckpt`` ambiguity.
+    """
+    best_path = trained_model_dir / "best_model.ckpt"
+    assert best_path.exists(), (
+        f"best_model.ckpt missing under {trained_model_dir} — EQ_train's post-training copy "
+        f"(train.py ~line 272) didn't happen; training likely crashed before the best-ckpt "
+        f"save.  Check the subprocess stderr in the run_and_check log."
+    )
     module = EveryQueryLightningModule.load_from_checkpoint(str(best_path))
     module.eval()
     return module
@@ -297,6 +303,7 @@ _CENSOR_AUROC_THRESHOLD = 0.9
 _PER_CELL_OCCURS_AUROC_THRESHOLD = 0.8
 
 
+@pytest.mark.slow
 def test_trained_model_learns_occurs_and_censor(
     oracle_preprocessed: Path,
     oracle_dataset: dict,
@@ -307,6 +314,15 @@ def test_trained_model_learns_occurs_and_censor(
 
     Collects all per-cell failures before asserting, so the error message shows the full cell
     matrix rather than short-circuiting on the first miss.
+
+    Marked ``slow`` and skipped by default (see ``pyproject.toml`` ``addopts``).  Opt in with
+    ``pytest -m slow`` (run only this) or ``pytest -m 'slow or not slow'`` (run everything).
+    CI's `tests.yaml` uses the latter.
+
+    NOTE: inference runs in-process rather than via a ``EQ_predict`` CLI subprocess because the
+    inference CLI (``feat/eq-predict``, PR #99) is still a draft pending design-doc sign-off
+    on #81.  Once #99 merges, migrate this to a subprocess ``EQ_predict`` call + a
+    ``PredictionSchema`` parquet read, matching the pattern of the other E2E tests.
     """
     module = _load_lightning_module(oracle_trained_model_dir)
 

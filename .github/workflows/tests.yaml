@@ -25,8 +25,12 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Run tests
+        # `-m "slow or not slow"` opts in to the slow-marked integration tests (e.g. the
+        # training-validity test in tests/training_validity/) which pyproject.toml's default
+        # addopts `-m "not slow"` skips for local development.  CI runs the full set.
         run: >
           uv run pytest -v
+          -m "slow or not slow"
           --ignore=docs
           --cov=src
           --cov-report=xml:coverage.xml

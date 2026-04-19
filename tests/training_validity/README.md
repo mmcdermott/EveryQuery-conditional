@@ -75,6 +75,83 @@ Combined with the fire-time and end markers, the windowing logic produces:
 This produces ~20%/40%/70% `occurs=True` at `d=1/7/30` among non-censored subjects
 (hence duration monotonicity), and ~55% censored at `d=30` (driven by `END_D20`).
 
+### Sample data
+
+The doctests below read from the *actual* training shard the test fixture builds —
+`tests/training_validity/conftest.py` calls the same `_synthesize_meds` +
+`_compute_labels` helpers the test uses and exposes the resulting `events` / `labels`
+DataFrames into the doctest namespace. What you see here is literally what the model
+is trained on.
+
+First, a firing, long-lived subject: `subject_id=1000` drew `P_FIRE_D15 + P_END_D100`,
+so the single `TARGET` event fires on day 25 (prediction_time=10, offset=15) and the
+observation window extends to day 100. The two day-0 markers and the day-25 `TARGET`
+event sit inside the full sequence alongside Poisson-drawn noise:
+
+<!-- markdownlint-disable -->
+
+```python
+>>> subject = events.filter(pl.col("subject_id") == 1000).sort("time")
+>>> subject.filter(pl.col("code").is_in(["P_FIRE_D15", "P_END_D100", "TARGET"])).select("time", "code")
+shape: (3, 2)
+┌─────────────────────────┬────────────┐
+│ time                    ┆ code       │
+│ ---                     ┆ ---        │
+│ datetime[μs, UTC]       ┆ str        │
+╞═════════════════════════╪════════════╡
+│ 2020-01-01 00:00:00 UTC ┆ P_END_D100 │
+│ 2020-01-01 00:00:00 UTC ┆ P_FIRE_D15 │
+│ 2020-01-26 00:00:00 UTC ┆ TARGET     │
+└─────────────────────────┴────────────┘
+>>> sorted(subject["code"].unique().to_list())
+['NOISE_0', 'NOISE_1', 'NOISE_2', 'NOISE_3', 'NOISE_4', 'P_END_D100', 'P_FIRE_D15', 'TARGET']
+
+```
+
+The test uses `prediction_time=10`, so the model's view of history ends at day 10 — it
+sees the two markers plus whichever noise events fell in the first 10 days, and must
+predict future `TARGET` firing from just the markers.
+
+<!-- markdownlint-enable -->
+
+Labels for that subject at the three queried durations: `occurs=True` only at `d=30`
+(the window `(10, 40]` contains day 25), and never censored because `P_END_D100`
+extends observation to day 100:
+
+```python
+>>> labels.filter(pl.col("subject_id") == 1000).select("duration_days", "boolean_value", "occurs")
+shape: (3, 3)
+┌───────────────┬───────────────┬────────┐
+│ duration_days ┆ boolean_value ┆ occurs │
+│ ---           ┆ ---           ┆ ---    │
+│ i64           ┆ bool          ┆ bool   │
+╞═══════════════╪═══════════════╪════════╡
+│ 1             ┆ false         ┆ false  │
+│ 7             ┆ false         ┆ false  │
+│ 30            ┆ false         ┆ true   │
+└───────────────┴───────────────┴────────┘
+
+```
+
+Contrast with a short-lived, fast-firing subject: `subject_id=1003` drew
+`P_FIRE_D05 + P_END_D20`, so `TARGET` fires on day 10.5 (inside every duration window)
+and observation ends at day 20, censoring the `d=30` window:
+
+```python
+>>> labels.filter(pl.col("subject_id") == 1003).select("duration_days", "boolean_value", "occurs")
+shape: (3, 3)
+┌───────────────┬───────────────┬────────┐
+│ duration_days ┆ boolean_value ┆ occurs │
+│ ---           ┆ ---           ┆ ---    │
+│ i64           ┆ bool          ┆ bool   │
+╞═══════════════╪═══════════════╪════════╡
+│ 1             ┆ false         ┆ true   │
+│ 7             ┆ false         ┆ true   │
+│ 30            ┆ true          ┆ false  │
+└───────────────┴───────────────┴────────┘
+
+```
+
 ## Why this particular design
 
 Three of the four #123 candidates were evaluated:
