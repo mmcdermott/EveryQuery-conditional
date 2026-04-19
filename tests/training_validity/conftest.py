@@ -37,3 +37,6 @@ def _inject_oracle_doctest_namespace(
     doctest_namespace["events"] = _oracle_doctest_shards["events"]
     doctest_namespace["labels"] = _oracle_doctest_shards["labels"]
     doctest_namespace["pl"] = pl
+    # Default polars display caps at 10 rows; bump it so the README snapshots can show the
+    # full 13-row code-counts and 10-row marker-pair tables without truncation.
+    pl.Config.set_tbl_rows(20)

@@ -77,48 +77,171 @@ This produces ~20%/40%/70% `occurs=True` at `d=1/7/30` among non-censored subjec
 
 ### Sample data
 
-The doctests below read from the *actual* training shard the test fixture builds —
+All snapshots below read from the *actual* training shard the test fixture builds —
 `tests/training_validity/conftest.py` calls the same `_synthesize_meds` +
-`_compute_labels` helpers the test uses and exposes the resulting `events` / `labels`
-DataFrames into the doctest namespace. What you see here is literally what the model
-is trained on.
+`_compute_labels` helpers the test uses and injects the resulting `events` / `labels`
+DataFrames into the doctest namespace. The synthesis seed is pinned to `_DATASET_SEED=1`,
+so these numbers are byte-identical across CI and local runs — when any of them drift,
+something in the synthesis path changed.
 
-First, a firing, long-lived subject: `subject_id=1000` drew `P_FIRE_D15 + P_END_D100`,
-so the single `TARGET` event fires on day 25 (prediction_time=10, offset=15) and the
-observation window extends to day 100. The two day-0 markers and the day-25 `TARGET`
-event sit inside the full sequence alongside Poisson-drawn noise:
-
-<!-- markdownlint-disable -->
+At a glance: 100 training subjects, ~14.8k events — 200 day-0 markers (two per
+subject), 54 `TARGET` events (one per firing-type subject whose observation window
+reaches the fire offset), and ~14.5k Poisson-drawn noise events filling the sequence.
 
 ```python
->>> subject = events.filter(pl.col("subject_id") == 1000).sort("time")
->>> subject.filter(pl.col("code").is_in(["P_FIRE_D15", "P_END_D100", "TARGET"])).select("time", "code")
-shape: (3, 2)
-┌─────────────────────────┬────────────┐
-│ time                    ┆ code       │
-│ ---                     ┆ ---        │
-│ datetime[μs, UTC]       ┆ str        │
-╞═════════════════════════╪════════════╡
-│ 2020-01-01 00:00:00 UTC ┆ P_END_D100 │
-│ 2020-01-01 00:00:00 UTC ┆ P_FIRE_D15 │
-│ 2020-01-26 00:00:00 UTC ┆ TARGET     │
-└─────────────────────────┴────────────┘
->>> sorted(subject["code"].unique().to_list())
-['NOISE_0', 'NOISE_1', 'NOISE_2', 'NOISE_3', 'NOISE_4', 'P_END_D100', 'P_FIRE_D15', 'TARGET']
+>>> events.shape
+(14806, 4)
+>>> events.group_by("code").len().sort("code")
+shape: (13, 2)
+┌────────────┬──────┐
+│ code       ┆ len  │
+│ ---        ┆ ---  │
+│ str        ┆ u32  │
+╞════════════╪══════╡
+│ NOISE_0    ┆ 2872 │
+│ NOISE_1    ┆ 2966 │
+│ NOISE_2    ┆ 2909 │
+│ NOISE_3    ┆ 2877 │
+│ NOISE_4    ┆ 2928 │
+│ P_END_D100 ┆ 48   │
+│ P_END_D20  ┆ 52   │
+│ P_FIRE_D05 ┆ 17   │
+│ P_FIRE_D15 ┆ 18   │
+│ P_FIRE_D5  ┆ 16   │
+│ P_FIRE_D50 ┆ 24   │
+│ P_NEVER    ┆ 25   │
+│ TARGET     ┆ 54   │
+└────────────┴──────┘
 
 ```
 
-The test uses `prediction_time=10`, so the model's view of history ends at day 10 — it
-sees the two markers plus whichever noise events fell in the first 10 days, and must
-predict future `TARGET` firing from just the markers.
-
-<!-- markdownlint-enable -->
-
-Labels for that subject at the three queried durations: `occurs=True` only at `d=30`
-(the window `(10, 40]` contains day 25), and never censored because `P_END_D100`
-extends observation to day 100:
+Each subject draws exactly one fire marker and one end marker at day 0; this is the
+distribution across the 10 possible pairs after the seeded RNG assigns them:
 
 ```python
+>>> markers = events.filter(pl.col("code").str.starts_with("P_"))
+>>> pair_per_subject = (
+...     markers.group_by("subject_id")
+...     .agg(pl.col("code").sort())
+...     .with_columns(pl.col("code").list.join(" + ").alias("pair"))
+... )
+>>> pair_per_subject.group_by("pair").len().sort("pair")
+shape: (10, 2)
+┌─────────────────────────┬─────┐
+│ pair                    ┆ len │
+│ ---                     ┆ --- │
+│ str                     ┆ u32 │
+╞═════════════════════════╪═════╡
+│ P_END_D100 + P_FIRE_D05 ┆ 6   │
+│ P_END_D100 + P_FIRE_D15 ┆ 10  │
+│ P_END_D100 + P_FIRE_D5  ┆ 10  │
+│ P_END_D100 + P_FIRE_D50 ┆ 11  │
+│ P_END_D100 + P_NEVER    ┆ 11  │
+│ P_END_D20 + P_FIRE_D05  ┆ 11  │
+│ P_END_D20 + P_FIRE_D15  ┆ 8   │
+│ P_END_D20 + P_FIRE_D5   ┆ 6   │
+│ P_END_D20 + P_FIRE_D50  ┆ 13  │
+│ P_END_D20 + P_NEVER     ┆ 14  │
+└─────────────────────────┴─────┘
+
+```
+
+The head of the full events DataFrame — both markers for subject 1000 at day 0,
+followed by Poisson noise over the next few days. Subject 1000 drew `P_FIRE_D15`, so
+its `TARGET` event lands on day 25 (past this 10-row head):
+
+```python
+>>> events.head(10)
+shape: (10, 4)
+┌────────────┬────────────────────────────────┬────────────┬───────────────┐
+│ subject_id ┆ time                           ┆ code       ┆ numeric_value │
+│ ---        ┆ ---                            ┆ ---        ┆ ---           │
+│ i64        ┆ datetime[μs, UTC]              ┆ str        ┆ f64           │
+╞════════════╪════════════════════════════════╪════════════╪═══════════════╡
+│ 1000       ┆ 2020-01-01 00:00:00 UTC        ┆ P_END_D100 ┆ null          │
+│ 1000       ┆ 2020-01-01 00:00:00 UTC        ┆ P_FIRE_D15 ┆ null          │
+│ 1000       ┆ 2020-01-01 14:13:03.469283 UTC ┆ NOISE_1    ┆ null          │
+│ 1000       ┆ 2020-01-01 17:15:31.271791 UTC ┆ NOISE_0    ┆ null          │
+│ 1000       ┆ 2020-01-02 16:22:14.730412 UTC ┆ NOISE_2    ┆ null          │
+│ 1000       ┆ 2020-01-02 16:37:17.200863 UTC ┆ NOISE_3    ┆ null          │
+│ 1000       ┆ 2020-01-02 23:50:13.880159 UTC ┆ NOISE_4    ┆ null          │
+│ 1000       ┆ 2020-01-03 03:44:53.346246 UTC ┆ NOISE_4    ┆ null          │
+│ 1000       ┆ 2020-01-03 06:31:01.635866 UTC ┆ NOISE_4    ┆ null          │
+│ 1000       ┆ 2020-01-03 11:00:42.293597 UTC ┆ NOISE_1    ┆ null          │
+└────────────┴────────────────────────────────┴────────────┴───────────────┘
+
+```
+
+The head of the labels DataFrame shows how the marker pair maps onto
+(censored, occurs) across the three durations — three rows per subject, one per
+queried duration:
+
+```python
+>>> labels.head(9)
+shape: (9, 6)
+┌────────────┬─────────────────────┬───────────────┬────────┬────────┬───────────────┐
+│ subject_id ┆ prediction_time     ┆ boolean_value ┆ occurs ┆ query  ┆ duration_days │
+│ ---        ┆ ---                 ┆ ---           ┆ ---    ┆ ---    ┆ ---           │
+│ i64        ┆ datetime[μs]        ┆ bool          ┆ bool   ┆ str    ┆ i64           │
+╞════════════╪═════════════════════╪═══════════════╪════════╪════════╪═══════════════╡
+│ 1000       ┆ 2020-01-11 00:00:00 ┆ false         ┆ false  ┆ TARGET ┆ 1             │
+│ 1000       ┆ 2020-01-11 00:00:00 ┆ false         ┆ false  ┆ TARGET ┆ 7             │
+│ 1000       ┆ 2020-01-11 00:00:00 ┆ false         ┆ true   ┆ TARGET ┆ 30            │
+│ 1001       ┆ 2020-01-11 00:00:00 ┆ false         ┆ false  ┆ TARGET ┆ 1             │
+│ 1001       ┆ 2020-01-11 00:00:00 ┆ false         ┆ false  ┆ TARGET ┆ 7             │
+│ 1001       ┆ 2020-01-11 00:00:00 ┆ false         ┆ true   ┆ TARGET ┆ 30            │
+│ 1002       ┆ 2020-01-11 00:00:00 ┆ false         ┆ false  ┆ TARGET ┆ 1             │
+│ 1002       ┆ 2020-01-11 00:00:00 ┆ false         ┆ false  ┆ TARGET ┆ 7             │
+│ 1002       ┆ 2020-01-11 00:00:00 ┆ true          ┆ false  ┆ TARGET ┆ 30            │
+└────────────┴─────────────────────┴───────────────┴────────┴────────┴───────────────┘
+
+```
+
+Aggregate positive / censored rates across the full 100-subject training split —
+17/33/26 `occurs=True` at d=1/7/30 (monotone, as the duration-monotonicity check
+requires) and 52/100 censored at d=30 (driven by the `P_END_D20` end marker, which
+ends observation at day 20 — inside the 30-day query window):
+
+```python
+>>> labels.group_by("duration_days").agg(
+...     pl.len().alias("n"),
+...     pl.col("boolean_value").sum().alias("n_censored"),
+...     pl.col("occurs").sum().alias("n_occurs"),
+... ).sort("duration_days")
+shape: (3, 4)
+┌───────────────┬─────┬────────────┬──────────┐
+│ duration_days ┆ n   ┆ n_censored ┆ n_occurs │
+│ ---           ┆ --- ┆ ---        ┆ ---      │
+│ i64           ┆ u32 ┆ u32        ┆ u32      │
+╞═══════════════╪═════╪════════════╪══════════╡
+│ 1             ┆ 100 ┆ 0          ┆ 17       │
+│ 7             ┆ 100 ┆ 0          ┆ 33       │
+│ 30            ┆ 100 ┆ 52         ┆ 26       │
+└───────────────┴─────┴────────────┴──────────┘
+
+```
+
+Finally, two subject-level zooms. `subject_id=1000` drew `P_FIRE_D15 + P_END_D100` —
+`TARGET` fires on day 25 (inside only the d=30 window, since prediction_time=10) and
+observation extends to day 100, so nothing is censored. The model's view of history
+ends at prediction_time=day 10, so it sees the two markers plus whichever noise
+events fell in the first 10 days, and must predict future `TARGET` firing from the
+markers alone:
+
+```python
+>>> subj_1000 = events.filter(pl.col("subject_id") == 1000)
+>>> markers_and_target = ["P_FIRE_D15", "P_END_D100", "TARGET"]
+>>> subj_1000.filter(pl.col("code").is_in(markers_and_target)).sort("time")
+shape: (3, 4)
+┌────────────┬─────────────────────────┬────────────┬───────────────┐
+│ subject_id ┆ time                    ┆ code       ┆ numeric_value │
+│ ---        ┆ ---                     ┆ ---        ┆ ---           │
+│ i64        ┆ datetime[μs, UTC]       ┆ str        ┆ f64           │
+╞════════════╪═════════════════════════╪════════════╪═══════════════╡
+│ 1000       ┆ 2020-01-01 00:00:00 UTC ┆ P_END_D100 ┆ null          │
+│ 1000       ┆ 2020-01-01 00:00:00 UTC ┆ P_FIRE_D15 ┆ null          │
+│ 1000       ┆ 2020-01-26 00:00:00 UTC ┆ TARGET     ┆ null          │
+└────────────┴─────────────────────────┴────────────┴───────────────┘
 >>> labels.filter(pl.col("subject_id") == 1000).select("duration_days", "boolean_value", "occurs")
 shape: (3, 3)
 ┌───────────────┬───────────────┬────────┐
@@ -133,9 +256,9 @@ shape: (3, 3)
 
 ```
 
-Contrast with a short-lived, fast-firing subject: `subject_id=1003` drew
-`P_FIRE_D05 + P_END_D20`, so `TARGET` fires on day 10.5 (inside every duration window)
-and observation ends at day 20, censoring the `d=30` window:
+Contrast: `subject_id=1003` drew `P_FIRE_D05 + P_END_D20` — `TARGET` fires on day
+10.5 (inside every duration window) but observation ends at day 20, censoring the
+d=30 window:
 
 ```python
 >>> labels.filter(pl.col("subject_id") == 1003).select("duration_days", "boolean_value", "occurs")
