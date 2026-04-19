@@ -1,14 +1,26 @@
 """End-to-end tests for the ``EQ_generate_tasks`` CLI (sample_tasks).
 
-Runs the real console script against a preprocessed cohort (via the
-``eq_sampled_tasks_dir`` fixture) and verifies the label schema, label semantics,
-reproducibility, and that the ``n_tasks`` knob is actually honored.
+These are integration tests: they run the real console script against the preprocessed
+cohort and verify *behavior*, not internal contracts.  Schema-shape checks, dtype checks,
+and bounds-checking on the sampler primitives live in ``test_sample_tasks.py`` — unit-level
+coverage where those properties are cheap and reliable to assert.
+
+The integration tests here do two things that unit tests can't:
+
+- **Run the CLI**: reproducibility and knob-honor differentials can only be checked
+  against the full argparse → Hydra → ``run_worker`` path.
+- **Validate labels against the real raw data**: re-compute what each row's
+  ``(boolean_value, occurs)`` should be directly from the event shard the sampler read,
+  and assert the sampler's output matches exactly across every row.  This catches bugs
+  that schema-shape assertions would miss (wrong censoring math, off-by-one on the window
+  endpoint, missing subject handling, etc.).
 """
 
 from __future__ import annotations
 
 import hashlib
 import io
+from datetime import timedelta
 from typing import TYPE_CHECKING
 
 import polars as pl
@@ -42,40 +54,72 @@ def _parquet_hash(df: pl.DataFrame) -> str:
     return hashlib.sha256(buf.getvalue()).hexdigest()[:16]
 
 
-def test_sampler_output_schema(eq_sampled_tasks_dir: Path) -> None:
-    """The labeled shards have exactly the columns MTD expects, with the right dtypes."""
-    df = _read_train_labels(eq_sampled_tasks_dir)
-    expected_schema = {
-        "subject_id": pl.Int64,
-        "prediction_time": pl.Datetime,
-        "boolean_value": pl.Boolean,
-        "occurs": pl.Boolean,
-        "query": pl.Utf8,
-        "duration_days": pl.Int64,
-    }
-    for col, expected_dtype in expected_schema.items():
-        assert col in df.columns, f"column {col!r} missing from sampler output: {df.columns}"
-        if expected_dtype is pl.Datetime:
-            # Compare by base type so Datetime subtypes (μs vs ns) don't break the test across
-            # polars versions.
-            assert df[col].dtype.base_type() == pl.Datetime, f"{col} is not Datetime: {df[col].dtype}"
-        else:
-            assert df[col].dtype == expected_dtype, (
-                f"column {col!r} has dtype {df[col].dtype}, expected {expected_dtype}"
+def test_labels_match_ground_truth(
+    eq_preprocessed_dataset: Path,
+    eq_sampled_tasks_dir: Path,
+) -> None:
+    """For every row the sampler emitted, recompute ``(boolean_value, occurs)`` from the raw event shard and
+    assert exact equality — per ``evaluate_index_df`` semantics.
+
+    The sampler's documented semantics (``generate_tasks/sample_tasks.py::evaluate_index_df``):
+
+        window_end    = prediction_time + duration_days
+        censored      = window_end > max_time[subject]
+        event_fires   = exists event(subject, code=query, time in (prediction_time, window_end))
+        boolean_value = censored
+        occurs        = (not censored) AND event_fires
+
+    Recomputing row-by-row catches semantics-level bugs that a schema/shape assertion can't:
+    off-by-one on the window endpoint (``<`` vs ``<=``), censoring using the wrong ``max_time``,
+    ``join_asof`` drift across polars versions, subjects whose code never fires being mislabelled,
+    etc.  Covers every row produced by the fixture, not a handful of hand-picked examples.
+    """
+    intermediate = eq_preprocessed_dataset.parent / "intermediate"
+
+    for split in ("train", "tuning"):
+        shard_path = intermediate / "data" / split / "0.parquet"
+        events = pl.read_parquet(shard_path).select(["subject_id", "time", "code"])
+        labels = pl.read_parquet(sorted((eq_sampled_tasks_dir / split).glob("*.parquet"))[0])
+
+        max_time_per_subject = dict(
+            events.group_by("subject_id").agg(pl.col("time").max().alias("max_time")).iter_rows()
+        )
+
+        # Walk every emitted row.  Simple Python — slow for millions of rows but fine for the
+        # ~20-row fixture output, and the cost is bounded by CPU + parquet I/O, not test
+        # complexity.  Favours readability + ground-truth correctness over vectorisation.
+        for row in labels.iter_rows(named=True):
+            subj = row["subject_id"]
+            window_end = row["prediction_time"] + timedelta(days=row["duration_days"])
+
+            max_time = max_time_per_subject.get(subj)
+            # Sampler policy (per evaluate_index_df docstring): unknown-subject rows resolve to
+            # censored=True.  None case handled via default.
+            expected_censored = max_time is None or window_end > max_time
+
+            # Ground-truth event_fires: any event of the matching code in
+            # (prediction_time, prediction_time + duration_days).  Sampler uses strict-> via a
+            # 1µs-shifted join_asof key, so we mirror with a strict > comparison here.
+            subj_events = events.filter(pl.col("subject_id") == subj)
+            event_fires = not subj_events.filter(
+                (pl.col("code") == row["query"])
+                & (pl.col("time") > row["prediction_time"])
+                & (pl.col("time") < window_end)
+            ).is_empty()
+            expected_occurs = (not expected_censored) and event_fires
+
+            ctx = (
+                f"split={split}, subject_id={subj}, query={row['query']!r}, "
+                f"prediction_time={row['prediction_time']}, duration_days={row['duration_days']}, "
+                f"max_time={max_time}"
             )
-
-
-def test_label_semantics(eq_sampled_tasks_dir: Path) -> None:
-    """Labels obey the documented invariants: duration>0, no nulls in key cols."""
-    df = _read_train_labels(eq_sampled_tasks_dir)
-    assert df.height > 0, "sampler produced an empty labeled shard"
-    # Key columns are never null — the sampler guarantees this per issue #80 design.
-    for col in ("subject_id", "prediction_time", "query", "duration_days"):
-        nulls = df[col].null_count()
-        assert nulls == 0, f"column {col!r} has {nulls} null values in sampler output"
-    # Durations are strictly positive integers within the configured sampling bounds.
-    assert df["duration_days"].min() >= _DURATION_MIN
-    assert df["duration_days"].max() <= _DURATION_MAX
+            assert row["boolean_value"] == expected_censored, (
+                f"boolean_value (censored) mismatch: sampler={row['boolean_value']}, "
+                f"expected={expected_censored}.  {ctx}"
+            )
+            assert row["occurs"] == expected_occurs, (
+                f"occurs mismatch: sampler={row['occurs']}, expected={expected_occurs}.  {ctx}"
+            )
 
 
 def test_reproducible_with_same_seed(
