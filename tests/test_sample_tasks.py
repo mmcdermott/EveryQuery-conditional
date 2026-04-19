@@ -25,6 +25,7 @@ from meds import train_split
 from meds_torchdata.config import MEDSTorchDataConfig
 
 from every_query.data.dataset import EveryQueryPytorchDataset
+from every_query.data.schema import TaskQuerySchema
 from every_query.generate_tasks import sample_tasks as st
 from every_query.generate_tasks.sample_tasks import (
     TaskSpec,
@@ -432,13 +433,9 @@ class TestRunWorkerPipeline:
 
         labels = pl.read_parquet(labels_fp)
         assert labels.height == 32
-        assert set(labels.columns) == {
-            "subject_id",
-            "prediction_time",
-            "boolean_value",
-            "query",
-            "duration_days",
-        }
+        # Schema conformance is the invariant — validate directly against TaskQuerySchema
+        # rather than hand-rolling the column set (which would drift if the schema grows).
+        TaskQuerySchema.validate(labels.to_arrow())
 
     def test_rerun_is_idempotent_noop(self, tmp_path, synthetic_events, synthetic_query_codes):
         """Second invocation with identical args returns ``None`` and leaves outputs untouched."""
@@ -784,22 +781,17 @@ class TestEndToEndWithDataset:
                 "subject_id": pl.Int64,
                 "prediction_time": pl.Datetime("us"),
                 "query": pl.Utf8,
-                "duration_days": pl.Int64,
+                # Float32 to match TaskQuerySchema.duration_days.
+                "duration_days": pl.Float32,
             }
         )
 
         max_time_df = compute_max_time_per_subject(events_df)
         labeled = evaluate_index_df(index_df, events_df, max_time_df)
 
-        # Sanity: schema matches EveryQueryPytorchDataset's expectations exactly.
-        assert set(labeled.columns) == {
-            "subject_id",
-            "prediction_time",
-            "boolean_value",
-            "query",
-            "duration_days",
-        }
-        assert labeled.schema["boolean_value"] == pl.Boolean
+        # Sanity: labeled output conforms to TaskQuerySchema — same check the write path
+        # in ``run_worker`` does, exercised here at the per-function boundary.
+        TaskQuerySchema.validate(labeled.to_arrow())
 
         labels_fp = Path(labels_dir) / "0.parquet"
         labeled.write_parquet(labels_fp)

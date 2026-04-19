@@ -99,7 +99,9 @@ def process_eval_tasks(
                     .with_columns(
                         boolean_value.alias("boolean_value"),
                         pl.lit(code).alias("query"),
-                        pl.lit(duration).alias("duration_days"),
+                        # Float32 to match ``TaskQuerySchema.duration_days`` so the
+                        # output aligns to the schema natively.
+                        pl.lit(duration).cast(pl.Float32).alias("duration_days"),
                     )
                     .select(
                         "subject_id",

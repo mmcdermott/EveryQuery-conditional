@@ -24,7 +24,7 @@ evolve.
 """
 
 import pyarrow as pa
-from flexible_schema import Required
+from flexible_schema import Optional, Required
 from meds import LabelSchema
 
 
@@ -38,9 +38,15 @@ class TaskQuerySchema(LabelSchema):
     both inference input (no label) and evaluation input (label filled in) without a branch.
 
     Attributes:
-        query: The MEDS code the query asks about.  Named ``query`` rather than ``code`` to
-            match the column name already used throughout the sampler / dataset / batch
-            layer (``EveryQueryBatch.code`` is the distinct event-sequence-token tensor).
+        query: The MEDS code the query asks about.  Stored as ``pa.large_string``
+            (polars' ``Utf8`` serializes to ``large_string`` when a DataFrame is
+            converted to arrow, so this matches producer output natively and
+            ``TaskQuerySchema.align()`` works without type coercion; also matches
+            MEDS's own ``DataSchema.code`` convention which uses ``large_string``
+            for the same 2 GB-offset reason).  Named ``query`` rather than ``code``
+            to match the column name already used throughout the sampler / dataset /
+            batch layer (``EveryQueryBatch.code`` is the distinct event-sequence-token
+            tensor).
         duration_days: The horizon, in days (continuous — ``float32``) within which the
             ``query`` code must occur for the query to be positive.  Allowing fractional
             days keeps the contract flexible for future finer-grained horizons.
@@ -84,3 +90,9 @@ class TaskQuerySchema(LabelSchema):
 
     query: Required(pa.large_string(), nullable=False)
     duration_days: Required(pa.float32(), nullable=False)
+    # Override ``boolean_value`` from ``LabelSchema`` (which declares it
+    # ``Optional(bool, nullable=NONE)``) to allow nulls — the EveryQuery task-label
+    # convention is to use null as the "censored" sentinel (closes #122).  The column
+    # stays optional at the schema level so inference-only inputs (no ground truth)
+    # continue to validate.
+    boolean_value: Optional(pa.bool_(), nullable=True)

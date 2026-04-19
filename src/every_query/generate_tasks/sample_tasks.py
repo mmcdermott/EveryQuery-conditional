@@ -39,8 +39,10 @@ from pathlib import Path
 import hydra
 import numpy as np
 import polars as pl
+import pyarrow as pa
 from omegaconf import DictConfig
 
+from every_query.data.schema import TaskQuerySchema
 from every_query.utils.seeds import derive_seed
 
 logger = logging.getLogger(__name__)
@@ -202,7 +204,10 @@ def build_index_df(
                 "subject_id": sid_dtype,
                 "prediction_time": pt_dtype,
                 "query": pl.Utf8,
-                "duration_days": pl.Int64,
+                # ``Float32`` matches ``TaskQuerySchema.duration_days`` (``pa.float32``);
+                # emitting Float32 directly means downstream ``TaskQuerySchema.align()``
+                # calls don't need to coerce types at the write boundary.
+                "duration_days": pl.Float32,
             }
         )
 
@@ -225,10 +230,12 @@ def build_index_df(
         np.repeat([t.code for t in tasks], contexts_per_task),
         dtype=pl.Utf8,
     )
+    # Float32 matches TaskQuerySchema's duration_days type so the final labeled output
+    # aligns to the schema without a type-coercion step at the write boundary.
     duration_col = pl.Series(
         "duration_days",
-        np.repeat([t.duration_days for t in tasks], contexts_per_task).astype(np.int64),
-        dtype=pl.Int64,
+        np.repeat([t.duration_days for t in tasks], contexts_per_task).astype(np.float32),
+        dtype=pl.Float32,
     )
 
     return contexts.with_columns(task_ids, query_col, duration_col).select(
@@ -276,15 +283,17 @@ def evaluate_index_df(
         DataFrame with columns ``(subject_id, prediction_time, boolean_value, query,
         duration_days)``.  ``boolean_value`` is nullable (``null`` = censored).
     """
-    out_schema = {
-        "subject_id": index_df.schema.get("subject_id", pl.Int64),
-        "prediction_time": index_df.schema.get("prediction_time", pl.Datetime("us")),
-        "boolean_value": pl.Boolean,
-        "query": pl.Utf8,
-        "duration_days": pl.Int64,
-    }
+    # Empty-input fast-path: build an empty TaskQuerySchema-conformant table via the
+    # schema itself (rather than hand-rolling a matching polars schema dict).  The
+    # downstream consumer only cares that the column set + dtypes match the schema;
+    # using TaskQuerySchema.schema() directly eliminates the drift risk of keeping two
+    # parallel type lists in sync.
     if index_df.height == 0:
-        return pl.DataFrame(schema=out_schema)
+        arrow_schema = TaskQuerySchema.schema()
+        empty_table = pa.Table.from_pylist([], schema=arrow_schema)
+        return pl.from_arrow(empty_table).select(
+            "subject_id", "prediction_time", "boolean_value", "query", "duration_days"
+        )
 
     # Left side: index rows with a +1µs-shifted prediction_time for the strict-> asof key.
     left = index_df.with_columns(
@@ -483,6 +492,13 @@ def run_worker(
     labeled = evaluate_index_df(index_df, events_df, max_time_df)
     # Downstream MEDS dataloader does not use task_id; it is intentionally absent from the
     # published schema.
+    #
+    # Validate the output against TaskQuerySchema at the write boundary.  The column set
+    # and types should already conform (evaluate_index_df emits schema-shaped output and
+    # duration_days is Float32 from build_index_df), so this is a guardrail against silent
+    # upstream drift rather than a coercion step — if ``align`` has to do any work we
+    # treat that as a bug in the producer, not something the write path papers over.
+    TaskQuerySchema.validate(labeled.to_arrow())
     _atomic_write_parquet(labeled, labels_fp)
     logger.info("Wrote %d labeled rows to %s", labeled.height, labels_fp)
     return labels_fp
