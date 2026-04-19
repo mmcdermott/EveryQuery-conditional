@@ -128,3 +128,20 @@ def test_resume_advances_global_step(
     assert resumed_ckpt["global_step"] == 4, (
         f"resume with max_steps=4 advanced to global_step={resumed_ckpt['global_step']}, expected 4"
     )
+
+    # Weights-changed assertion: catches the failure mode where Lightning's trainer.fit is
+    # called with a resumed ckpt but no gradient updates actually happen (zero-lr bug, frozen
+    # parameters, etc.).  In that case global_step advances (Lightning increments it per batch
+    # regardless of whether optimizer.step fires) but the state_dict is bitwise-identical.
+    # Pick a representative backbone parameter and compare element-wise.
+    start_sd = start_ckpt["state_dict"]
+    resumed_sd = resumed_ckpt["state_dict"]
+    assert set(start_sd.keys()) == set(resumed_sd.keys()), (
+        "state_dict key set changed across resume — architecture drift?"
+    )
+    changed = [k for k in start_sd if not torch.equal(start_sd[k], resumed_sd[k])]
+    assert changed, (
+        "global_step advanced but no parameter tensors changed after resume.  "
+        "Likely a gradient-path regression (zero-lr, frozen params, or trainer.fit not "
+        "actually training)."
+    )
