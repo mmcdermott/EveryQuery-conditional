@@ -65,8 +65,10 @@ def compute_metrics(predictions: pl.DataFrame) -> pl.DataFrame:
         ...     "predicted_boolean_probability": [0.9, 0.1, 0.8, 0.7],
         ... })
         >>> out = compute_metrics(preds)
-        >>> out.sort("code")[["code", "n_rows", "n_positive", "auroc"]].to_dicts()
-        [{'code': 'A', 'n_rows': 2, 'n_positive': 1, 'auroc': 1.0}, {'code': 'B', 'n_rows': 2, 'n_positive': 2, 'auroc': None}]
+        >>> for row in out.sort("code")[["code", "n_rows", "n_positive", "auroc"]].to_dicts():
+        ...     print(row)
+        {'code': 'A', 'n_rows': 2, 'n_positive': 1, 'auroc': 1.0}
+        {'code': 'B', 'n_rows': 2, 'n_positive': 2, 'auroc': None}
         >>> out["duration_days"].dtype
         Float32
     """
