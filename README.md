@@ -50,7 +50,7 @@ src/every_query/
 │   └── external_tasks/                         (ACES + composite aggregation)
 ├── evaluate/           → EQ_evaluate + 3 sibling CLIs  (#83 consolidates into one; draft PR #100)
 ├── model/              (shared: nn.Module + LightningModule)
-├── data/               (shared: PyTorch Dataset + Batch types + TaskQuerySchema)
+├── data/               (shared: PyTorch Dataset + Batch types)
 ├── paper_experiments/  (research-only: ID/OOD splits, ablations, figure code)
 │   └── sample_codes/   (query-code sampling for paper experiments)
 └── utils/              (helpers: seeds, code slugs, env-var validation)
@@ -150,7 +150,9 @@ Sweep across shards with
 `python -m every_query.generate_tasks.sample_tasks -m input_shard=0,1,2,… task_shard=range(0,K)`.
 Each worker writes labeled task parquets under `$TASK_DIR/{split}/*.parquet` idempotently.
 Output columns: `subject_id, prediction_time, boolean_value, occurs, code, duration_days`.
-The `code` column matches `TaskQuerySchema` in `every_query.data.schema`; the extra
+The `code` column is the MEDS code the query asks about; `duration_days` is the prediction
+horizon. These two columns will constitute the `TaskQuerySchema` being defined in
+[#96](https://github.com/payalchandak/EveryQuery/pull/96) (draft PR, closes #80); the extra
 `occurs` column (EQ's positive-class label) currently sits alongside — collapsing it into
 a single nullable label is tracked in [#122].
 
@@ -263,6 +265,7 @@ tests/
 ├── test_model_logic.py             (unit: model heads, censored/occurs loss flip sensitivity)
 ├── test_run_id.py                  (unit: run_id resolver determinism)
 └── training_validity/              (E2E @pytest.mark.slow: model actually learns; see its README)
+    ├── __init__.py
     ├── conftest.py
     ├── README.md
     └── test_training_validity.py
@@ -278,7 +281,7 @@ shared cross-stage task-query schema.
 
 | Sub-phase                      | Issue                                                       | State                                                                |
 | ------------------------------ | ----------------------------------------------------------- | -------------------------------------------------------------------- |
-| 2.1: TaskQuerySchema design    | [#80](https://github.com/payalchandak/EveryQuery/issues/80) | **Merged** via #96 (schema + sampler-side `code` wire)               |
+| 2.1: TaskQuerySchema design    | [#80](https://github.com/payalchandak/EveryQuery/issues/80) | Draft PR [#96](https://github.com/payalchandak/EveryQuery/pull/96) (open for review) |
 | 2.2: EQ_predict                | [#81](https://github.com/payalchandak/EveryQuery/issues/81) | Draft PR [#99](https://github.com/payalchandak/EveryQuery/pull/99)   |
 | 2.3: eval-suite inventory      | [#82](https://github.com/payalchandak/EveryQuery/issues/82) | Open (design)                                                        |
 | 2.4: EQ_evaluate consolidation | [#83](https://github.com/payalchandak/EveryQuery/issues/83) | Draft PR [#100](https://github.com/payalchandak/EveryQuery/pull/100) |
