@@ -42,14 +42,12 @@ def create_eq_task_df(
         output_dir = Path(output_root) / slug
         os.makedirs(output_dir, exist_ok=True)
 
-        # per-code EQ df (no unpivot; one file per input shard).  The ``code`` column
-        # names the MEDS code the query is about, matching the ``TaskQuerySchema``
-        # contract in ``every_query.data.schema``.
+        # per-code EQ df (no unpivot; one file per input shard)
         eq_df = (
             joined_df.select([*base_cols + code])
             .rename({code: "occurs", "censored": "boolean_value"})
-            .with_columns(pl.lit(code).alias("code"))
-            .select(["subject_id", "prediction_time", "code", "boolean_value", "occurs", "task_label"])
+            .with_columns(pl.lit(code).alias("query"))
+            .select(["subject_id", "prediction_time", "query", "boolean_value", "occurs", "task_label"])
         )
 
         out_fp = output_dir / shard_name  # same shard id as original

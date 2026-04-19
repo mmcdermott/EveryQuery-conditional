@@ -176,7 +176,7 @@ def _compute_labels(events: pl.DataFrame, subject_ids: list[int]) -> pl.DataFram
                     "prediction_time": window_start,
                     "boolean_value": censored,
                     "occurs": occurs,
-                    "code": _TARGET_CODE,
+                    "query": _TARGET_CODE,
                     "duration_days": duration_days,
                 }
             )
@@ -188,7 +188,7 @@ def _compute_labels(events: pl.DataFrame, subject_ids: list[int]) -> pl.DataFram
             "prediction_time": pl.Datetime("us", "UTC"),
             "boolean_value": pl.Boolean,
             "occurs": pl.Boolean,
-            "code": pl.Utf8,
+            "query": pl.Utf8,
             "duration_days": pl.Int64,
         },
     ).with_columns(pl.col("prediction_time").dt.replace_time_zone(None))
@@ -322,7 +322,7 @@ def test_trained_model_learns_occurs_and_censor(
             _, outputs = module.model(batch)
         rows.append(
             {
-                "code": dataset.query[i],
+                "query": dataset.query[i],
                 "duration_days": int(dataset.duration_days[i]),
                 "occurs_true": int(item["occurs"]),
                 "censor_true": int(item["boolean_value"]),
@@ -335,7 +335,7 @@ def test_trained_model_learns_occurs_and_censor(
     # Diagnostics — always print, regardless of pass/fail.
     print("\n[Design 2] per-cell label + prediction distribution (tuning):")
     per_cell = (
-        df.group_by(["code", "duration_days"])
+        df.group_by(["query", "duration_days"])
         .agg(
             pl.len().alias("n"),
             pl.col("occurs_true").cast(pl.Float64).mean().alias("p_occurs_true"),
@@ -343,11 +343,11 @@ def test_trained_model_learns_occurs_and_censor(
             pl.col("censor_true").cast(pl.Float64).mean().alias("p_censor_true"),
             pl.col("censor_pred").mean().alias("p_censor_pred"),
         )
-        .sort(["code", "duration_days"])
+        .sort(["query", "duration_days"])
     )
     for r in per_cell.iter_rows(named=True):
         print(
-            f"  {r['code']:8s} d={r['duration_days']:3d}  n={r['n']:3d}  "
+            f"  {r['query']:8s} d={r['duration_days']:3d}  n={r['n']:3d}  "
             f"p(occurs)={r['p_occurs_true']:.3f} (pred {r['p_occurs_pred']:.3f})  "
             f"p(censor)={r['p_censor_true']:.3f} (pred {r['p_censor_pred']:.3f})"
         )
@@ -380,7 +380,7 @@ def test_trained_model_learns_occurs_and_censor(
     # degenerate cell means synthesis/labeling regressed, so fail explicitly.
     for duration in _DURATIONS_DAYS:
         cell = df.filter(
-            (pl.col("code") == _TARGET_CODE)
+            (pl.col("query") == _TARGET_CODE)
             & (pl.col("duration_days") == duration)
             & (pl.col("censor_true") == 0)
         )

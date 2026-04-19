@@ -289,7 +289,7 @@ def task_labels_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
         {task_labels_dir}/{split}/{shard}.parquet
 
-    Columns: ``subject_id, prediction_time, boolean_value, occurs, code, duration_days``.
+    Columns: ``subject_id, prediction_time, boolean_value, occurs, query, duration_days``.
     """
     task_dir = tmp_path_factory.mktemp("eq_task_labels")
 
@@ -305,7 +305,7 @@ def task_labels_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
                     "prediction_time": _PRED_TIMES[subj],
                     "boolean_value": i % 2 == 0,
                     "occurs": i % 3 != 0,
-                    "code": query_code,
+                    "query": query_code,
                     "duration_days": 30,
                 }
             )
@@ -316,7 +316,7 @@ def task_labels_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
                 "subject_id": pl.Int64,
                 "boolean_value": pl.Boolean,
                 "occurs": pl.Boolean,
-                "code": pl.Utf8,
+                "query": pl.Utf8,
                 "duration_days": pl.Int64,
             }
         )
@@ -342,7 +342,7 @@ def demo_dataset(
                 "prediction_time": _PRED_TIMES[subj],
                 "boolean_value": i % 2 == 0,
                 "occurs": i % 3 != 0,
-                "code": query_code,
+                "query": query_code,
                 "duration_days": 30.0,
             }
         )
@@ -353,7 +353,7 @@ def demo_dataset(
             "subject_id": pl.Int64,
             "boolean_value": pl.Boolean,
             "occurs": pl.Boolean,
-            "code": pl.Utf8,
+            "query": pl.Utf8,
             "duration_days": pl.Float64,
         }
     )

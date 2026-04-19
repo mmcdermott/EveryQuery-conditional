@@ -180,7 +180,7 @@ queried duration:
 >>> labels.head(9)
 shape: (9, 6)
 ┌────────────┬─────────────────────┬───────────────┬────────┬────────┬───────────────┐
-│ subject_id ┆ prediction_time     ┆ boolean_value ┆ occurs ┆ code   ┆ duration_days │
+│ subject_id ┆ prediction_time     ┆ boolean_value ┆ occurs ┆ query  ┆ duration_days │
 │ ---        ┆ ---                 ┆ ---           ┆ ---    ┆ ---    ┆ ---           │
 │ i64        ┆ datetime[μs]        ┆ bool          ┆ bool   ┆ str    ┆ i64           │
 ╞════════════╪═════════════════════╪═══════════════╪════════╪════════╪═══════════════╡
