@@ -130,10 +130,12 @@ def test_resume_advances_global_step(
     )
 
     # Weights-changed assertion: catches the failure mode where Lightning's trainer.fit is
-    # called with a resumed ckpt but no gradient updates actually happen (zero-lr bug, frozen
-    # parameters, etc.).  In that case global_step advances (Lightning increments it per batch
-    # regardless of whether optimizer.step fires) but the state_dict is bitwise-identical.
-    # Pick a representative backbone parameter and compare element-wise.
+    # called with a resumed ckpt but no effective parameter updates actually happen (zero-lr
+    # bug, frozen parameters, optimizer.step silently no-op'd, etc.).  This complements the
+    # global_step checks above: global_step tracks optimizer steps and so *could* also stall
+    # in some of these failure modes, but comparing parameter tensors directly is the more
+    # reliable "did training actually change the model" check.  Compare element-wise across
+    # the full state_dict.
     start_sd = start_ckpt["state_dict"]
     resumed_sd = resumed_ckpt["state_dict"]
     assert set(start_sd.keys()) == set(resumed_sd.keys()), (
