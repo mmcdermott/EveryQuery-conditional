@@ -24,7 +24,6 @@ def create_eq_task_df(
     aces_shard_fp: str,
     codes: list[str],
     output_root: str,
-    target_rows: int,
     duration_days: float,
 ) -> int:
     """Convert an ACES task shard + matching EQ all-tasks shard into per-code ``TaskQuerySchema``-conformant
@@ -47,10 +46,8 @@ def create_eq_task_df(
 
     joined_df = aces_shard_df.join(eq_shard_all_tasks_df, on=["subject_id", "prediction_time"], how="left")
 
-    # Production-safe validation: ``assert`` gets stripped under ``python -O``, which
-    # would silently let a malformed join through.  Every (subject_id, prediction_time)
-    # in the ACES shard must be present in the EQ all-tasks shard — a null censored
-    # column means the join failed to match those columns, which is unrecoverable.
+    # Every (subject_id, prediction_time) in the ACES shard must be present in the EQ
+    # all-tasks shard — a null ``censored`` column means the left-join failed to match.
     n_null_censored = joined_df.select(pl.col("censored").null_count()).item()
     if n_null_censored:
         raise ValueError(
@@ -128,7 +125,6 @@ def main(cfg: DictConfig) -> None:
             aces_shard_fp=str(aces_shard_fp),
             codes=cfg.queries,
             output_root=cfg.output_dir,
-            target_rows=cfg.target_rows_per_shard,
             duration_days=float(cfg.duration_days),
         )
 

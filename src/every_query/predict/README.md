@@ -6,19 +6,34 @@ probabilities.
 
 ## Layout
 
+```python
+>>> from pretty_print_directory import PrintConfig
+>>> print_directory("src/every_query/predict", config=PrintConfig(ignore_regex="__pycache__"))
+├── README.md
+├── __init__.py
+├── configs
+│   └── predict.yaml
+├── external_tasks
+│   ├── README.md
+│   ├── __init__.py
+│   ├── aces_to_eq.py
+│   ├── configs
+│   │   ├── aces_to_eq.yaml
+│   │   ├── get_per_code_from_composite_config.yaml
+│   │   └── process_composite_config.yaml
+│   ├── get_per_code_from_composite.py
+│   └── process_composite.py
+├── predict.py
+└── schema.py
+
 ```
-predict/
-├── predict.py            → EQ_predict (inference-only Hydra main)
-├── schema.py             → PredictionSchema (TaskQuerySchema + censor_prob + occurs_prob)
-├── configs/
-│   └── predict.yaml      → required: model_run_dir, tasks_dir, output_parquet
-│                           optional: ckpt_name, split (held_out|tuning)
-└── external_tasks/       → convert + aggregate tasks outside EQ's native vocabulary
-    ├── aces_to_eq.py     → ACES task parquet → EQ task parquet
-    ├── process_composite.py
-    ├── get_per_code_from_composite.py
-    └── configs/
-```
+
+Key files:
+
+- `predict.py` — `EQ_predict` (inference-only Hydra main).
+- `schema.py` — `PredictionSchema` (`TaskQuerySchema` + `censor_prob` + `occurs_prob`).
+- `configs/predict.yaml` — required: `model_run_dir`, `tasks_dir`, `output_parquet`; optional: `ckpt_name`, `split` (`held_out` | `tuning`).
+- `external_tasks/` — convert + aggregate tasks outside EQ's native vocabulary (`aces_to_eq.py`, `process_composite.py`, `get_per_code_from_composite.py`).
 
 ## Pipeline position
 

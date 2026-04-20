@@ -2,7 +2,6 @@ defaults:
   - query_codes: admin_codes
   - _self_
 
-target_rows_per_shard: 400
 task_name: readmiss_30d/
 queries: ${query_codes}
 

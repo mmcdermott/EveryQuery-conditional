@@ -117,10 +117,13 @@ def empty_task_query_df() -> pl.DataFrame:
         >>> df = empty_task_query_df()
         >>> df.height
         0
-        >>> df.columns
-        ['subject_id', 'prediction_time', 'query', 'duration_days', 'boolean_value']
-        >>> df.dtypes
-        [Int64, Datetime(time_unit='us', time_zone=None), String, Float32, Boolean]
+        >>> for name, dtype in df.schema.items():
+        ...     print(f"{name}: {dtype}")
+        subject_id: Int64
+        prediction_time: Datetime(time_unit='us', time_zone=None)
+        query: String
+        duration_days: Float32
+        boolean_value: Boolean
     """
     return pl.DataFrame(
         schema={
