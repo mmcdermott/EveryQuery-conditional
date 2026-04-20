@@ -4,7 +4,7 @@ Evaluation stage of the EveryQuery pipeline. Consumes a `PredictionSchema` parqu
 written by `EQ_predict`, produces a per-`(query, duration_days)` metrics parquet.
 
 `EQ_evaluate` was rewired in Phase 2.5 ([#131](https://github.com/payalchandak/EveryQuery/pull/131))
-to point at the consolidated `evaluate.py` (single-stage, no model instantiation).  The
+to point at the consolidated `evaluate.py` (single-stage, no model instantiation). The
 legacy four-stage evaluator (`eval.py`, `gen_index_times.py`, `gen_task.py`,
 `select_model.py`) is still in-tree for archival reference; full deletion + any
 `paper_experiments/leaderboard/` relocation is tracked on
@@ -21,8 +21,8 @@ predict/ predictions.parquet  ──►  EQ_evaluate  ──►  metrics.parquet
 
 ```bash
 EQ_evaluate \
-    predictions_parquet="$OUTPUT_DIR/predictions.parquet" \
-    metrics_parquet="$OUTPUT_DIR/metrics.parquet"
+	predictions_parquet="$OUTPUT_DIR/predictions.parquet" \
+	metrics_parquet="$OUTPUT_DIR/metrics.parquet"
 ```
 
 One Hydra main. No model instantiation, no trainer loop, no multi-model orchestration.
