@@ -50,11 +50,11 @@ def _metrics_for_group(group_df: pl.DataFrame) -> dict[str, float | int | None]:
     - ``censor_auroc`` — AUROC of ``censor_prob`` vs. ``is_censored`` over all rows
       (``None`` if every row has the same censor status).
     """
-    is_censored = group_df["boolean_value"].is_null().to_list()
-    censor_prob = group_df["censor_prob"].to_list()
+    is_censored = group_df[TaskQuerySchema.boolean_value_name].is_null().to_list()
+    censor_prob = group_df[PredictionSchema.censor_prob_name].to_list()
     censor_auroc = _auroc_or_none(is_censored, censor_prob)
 
-    not_censored = group_df.filter(pl.col("boolean_value").is_not_null())
+    not_censored = group_df.filter(pl.col(TaskQuerySchema.boolean_value_name).is_not_null())
     if not_censored.is_empty():
         return {
             "n_rows": group_df.height,
@@ -64,8 +64,8 @@ def _metrics_for_group(group_df: pl.DataFrame) -> dict[str, float | int | None]:
             "censor_auroc": censor_auroc,
         }
 
-    y_true = not_censored["boolean_value"].to_list()
-    y_score = not_censored["occurs_prob"].to_list()
+    y_true = not_censored[TaskQuerySchema.boolean_value_name].to_list()
+    y_score = not_censored[PredictionSchema.occurs_prob_name].to_list()
     return {
         "n_rows": group_df.height,
         "n_occurs_labeled": not_censored.height,
@@ -159,4 +159,12 @@ def compute_metrics(predictions: pl.DataFrame) -> pl.DataFrame:
                 "censor_auroc": pl.Float64,
             }
         )
-    return pl.DataFrame(rows).with_columns(pl.col(TaskQuerySchema.duration_days_name).cast(pl.Float32))
+    # Cast the AUROC columns to Float64 explicitly — when every group has null AUROCs
+    # (e.g. all single-class, or every row censored), polars would otherwise infer
+    # Null dtype for those columns, producing an unstable on-disk schema where parquet
+    # files from different runs have different types for the same logical column.
+    return pl.DataFrame(rows).with_columns(
+        pl.col(TaskQuerySchema.duration_days_name).cast(pl.Float32),
+        pl.col("occurs_auroc").cast(pl.Float64),
+        pl.col("censor_auroc").cast(pl.Float64),
+    )
