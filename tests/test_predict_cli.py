@@ -107,3 +107,85 @@ def test_eq_predict_end_to_end(
 
     # Every input query is represented in the output.
     assert set(df["query"].to_list()) == set(_QUERY_CODES)
+
+
+def test_eq_predict_preserves_input_row_order(
+    eq_trained_model_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """Multi-query/durations sanity-check: output row identifiers match the input parquet in order.
+
+    Guards the implementation's load-bearing assumption that ``D.test_dataset.schema_df``
+    preserves the input labels frame's row order (per MTD's
+    ``get_task_seq_bounds_and_labels`` guarantee).  If a future MTD bump reorders
+    schema_df rows, the output ``(query, duration_days)`` column would desync from the
+    input parquet and this test would fail.
+    """
+    # Non-alphabetical query order, mixed durations — exercises the order check past
+    # the alphabetical HR/TEMP happy path of the main integration test.
+    rows = [
+        {
+            "subject_id": _HELD_OUT_SUBJECT,
+            "prediction_time": _PRED_TIME,
+            "query": "TEMP",
+            "duration_days": 60.0,
+            "boolean_value": None,
+        },
+        {
+            "subject_id": _HELD_OUT_SUBJECT,
+            "prediction_time": _PRED_TIME,
+            "query": "HR",
+            "duration_days": 30.0,
+            "boolean_value": None,
+        },
+        {
+            "subject_id": _HELD_OUT_SUBJECT,
+            "prediction_time": _PRED_TIME,
+            "query": "TEMP",
+            "duration_days": 30.0,
+            "boolean_value": None,
+        },
+    ]
+    expected_queries = [r["query"] for r in rows]
+    expected_durations = [r["duration_days"] for r in rows]
+
+    df_in = pl.DataFrame(rows).cast(
+        {
+            "subject_id": pl.Int64,
+            "prediction_time": pl.Datetime("us"),
+            "query": pl.Utf8,
+            "duration_days": pl.Float32,
+            "boolean_value": pl.Boolean,
+        }
+    )
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    df_in.write_parquet(tasks_dir / "tasks.parquet")
+    output_parquet = tmp_path / "predictions.parquet"
+
+    env = os.environ.copy()
+    env["PATH"] = _VENV_BIN + os.pathsep + env.get("PATH", "")
+    result = subprocess.run(
+        [
+            "EQ_predict",
+            f"model_run_dir={eq_trained_model_dir}",
+            f"tasks_dir={tasks_dir}",
+            f"output_parquet={output_parquet}",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=300,
+    )
+    assert result.returncode == 0, (
+        f"EQ_predict failed (rc={result.returncode})\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+
+    df_out = pl.from_arrow(pq.read_table(output_parquet))
+    assert df_out["query"].to_list() == expected_queries, (
+        f"Output query order {df_out['query'].to_list()} doesn't match input {expected_queries}"
+    )
+    assert df_out["duration_days"].to_list() == expected_durations, (
+        f"Output duration_days order {df_out['duration_days'].to_list()} doesn't match input "
+        f"{expected_durations}"
+    )

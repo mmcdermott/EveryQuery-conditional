@@ -6,8 +6,7 @@ Takes a trained model run directory and a directory of task-query parquets
 multi-model orchestration — all of that is ``evaluate/`` or ``paper_experiments/``
 territory.
 
-Implementation is a single, order-preserving pass through
-:class:`EveryQueryPytorchDataset`:
+Implementation is a single pass through :class:`EveryQueryPytorchDataset`:
 
 1. Validate ``tasks_dir`` (must be a directory of ``.parquet`` files; warn if more
    than one file is present) and point MTD's ``task_labels_dir`` at it directly.
@@ -17,17 +16,20 @@ Implementation is a single, order-preserving pass through
 2. ``trainer.predict(dataloaders=D.test_dataloader())`` — the dataset handles mixed
    ``(query, duration_days)`` rows natively (``_seeded_getitem`` prepends the
    row's own query token; ``collate`` builds per-item tensors).
-3. Order-preserving ``hstack`` of ``tasks_df`` + the ``(censor_prob, occurs_prob)``
-   columns.  ``tasks_df`` is built by reading the same sorted
-   ``rglob("*.parquet")`` MTD uses internally, so both frames share the same row
-   order.  A row-count mismatch (e.g. a task subject not present in the tensorized
-   held_out split) raises loudly up front.
+3. Build the output directly from ``D.test_dataset.schema_df`` + the predict
+   probabilities.  Schema_df is guaranteed by MTD to preserve the input labels
+   frame's order + length (see
+   ``MEDSPytorchDataset.get_task_seq_bounds_and_labels`` docstring), so no
+   separate re-read of the input parquets is needed.  The ``null``/``True``/
+   ``False`` ``boolean_value`` from the input is reconstructed from the dataset's
+   collapsed ``(censor, occurs)`` pair — inverse of the collapse in
+   ``EveryQueryPytorchDataset.__init__``.
 
-Upstream note: this module re-reads the task parquets that MTD already read
-internally to build ``self.schema_df`` (we need ``tasks_df`` for the ``hstack``
-that preserves inherited ``LabelSchema`` columns).  That duplicate read would
-disappear if MTD exposed an ordered view of the raw input rows — tracked
-separately so we can collapse this once it's available.
+Scope note: inherited ``LabelSchema`` columns beyond ``boolean_value`` (e.g.
+``integer_value``, ``float_value``, ``categorical_value``) are not preserved on
+output — the dataset doesn't carry them through ``schema_df``.  If a caller needs
+those pass-through, a future ``--carry-columns`` opt-in can re-read the input
+parquets for them.
 """
 
 import logging
@@ -50,17 +52,14 @@ logging.basicConfig(level=logging.INFO)
 CONFIGS = str(files("every_query") / "predict" / "configs")
 
 
-def _task_parquets(tasks_dir: Path) -> list[Path]:
-    """Validate ``tasks_dir`` and return the sorted list of task parquet files.
+def _validate_tasks_dir(tasks_dir: Path) -> None:
+    """Validate ``tasks_dir`` before handing it to MTD.
 
-    Raises ``NotADirectoryError`` if ``tasks_dir`` isn't a directory and ``ValueError``
-    if it contains any non-parquet files.  Warns if more than one parquet is present
-    — the typical inference use case is a single flat parquet; multiple files usually
-    indicates the caller pointed us at the training task-labels directory by mistake.
-
-    Sorted-rglob ordering matches ``MEDSTorchDataConfig.task_labels_fps`` exactly, so
-    callers reading via this function can trust their row order lines up with the
-    dataset's.
+    Raises ``NotADirectoryError`` if it isn't a directory, ``ValueError`` if it
+    contains any non-parquet files or is empty, and warns if more than one parquet
+    is present — the typical inference use case is a single flat parquet; multiple
+    files usually indicates the caller pointed us at the training task-labels
+    directory by mistake.
     """
     if not tasks_dir.is_dir():
         raise NotADirectoryError(f"tasks_dir must be a directory, got {tasks_dir}")
@@ -74,17 +73,17 @@ def _task_parquets(tasks_dir: Path) -> list[Path]:
             f"{'...' if len(non_parquet) > 5 else ''}.  Point EQ_predict at a directory "
             f"containing only TaskQuerySchema-conformant parquet files."
         )
-
     parquets = [p for p in all_files if p.suffix == ".parquet"]
+    if not parquets:
+        raise ValueError(f"tasks_dir {tasks_dir} contains no parquet files")
     if len(parquets) > 1:
         logger.warning(
             f"tasks_dir {tasks_dir} contains {len(parquets)} parquet files; all will be "
             f"concatenated.  The typical inference use case is a single flat parquet."
         )
-    return parquets
 
 
-def _warn_out_of_vocab(tasks_df: pl.DataFrame, train_cfg: DictConfig) -> None:
+def _warn_out_of_vocab(task_codes: set[str], train_cfg: DictConfig) -> None:
     """Warn if any task-query codes are missing from the trained model's vocabulary.
 
     Out-of-vocab query codes survive the predict loop (``encode_query`` silently falls
@@ -96,7 +95,6 @@ def _warn_out_of_vocab(tasks_df: pl.DataFrame, train_cfg: DictConfig) -> None:
         logger.warning(f"Cannot resolve training vocabulary — no codes metadata at {metadata_fp}")
         return
     training_vocab = set(pl.read_parquet(metadata_fp, columns=["code"])["code"].to_list())
-    task_codes = set(tasks_df[TaskQuerySchema.query_name].unique().to_list())
     missing = task_codes - training_vocab
     if missing:
         logger.warning(
@@ -137,6 +135,40 @@ def _gather_probabilities(pred_batches: list[dict[str, torch.Tensor]]) -> pl.Dat
     )
 
 
+def _identifiers_from_schema_df(schema_df: pl.DataFrame) -> pl.DataFrame:
+    """Build an output identifier frame from the dataset's post-``__init__`` schema_df.
+
+    Reconstructs the original nullable ``boolean_value`` from the collapsed
+    ``(censor, occurs)`` pair (inverse of the collapse in
+    ``EveryQueryPytorchDataset.__init__``) so the output matches the
+    ``TaskQuerySchema`` ``null``/``True``/``False`` convention.
+
+    ``prediction_time`` is cast back to ``Datetime("us")`` — the dataset stores
+    it as int64 microseconds for the held_out split so ``predict_step`` can push
+    it through a tensor.
+    """
+    out = schema_df.select(
+        TaskQuerySchema.subject_id_name,
+        pl.col(TaskQuerySchema.prediction_time_name).cast(pl.Datetime("us")),
+        TaskQuerySchema.query_name,
+        TaskQuerySchema.duration_days_name,
+    )
+    # The dataset's collapse only runs when the input parquet had ``boolean_value``;
+    # otherwise the output won't carry it either (``PredictionSchema`` treats
+    # ``boolean_value`` as Optional).
+    if "boolean_value" in schema_df.columns and "occurs" in schema_df.columns:
+        # ``schema_df["boolean_value"]`` is the censor indicator; flip back:
+        #   censor=True   → null   (ground truth unobserved)
+        #   censor=False  → occurs (the true outcome)
+        out = out.with_columns(
+            pl.when(schema_df["boolean_value"])
+            .then(pl.lit(None, dtype=pl.Boolean))
+            .otherwise(schema_df["occurs"])
+            .alias(TaskQuerySchema.boolean_value_name)
+        )
+    return out
+
+
 @hydra.main(version_base="1.3", config_path=CONFIGS, config_name="predict")
 def main(cfg: DictConfig) -> None:
     """Run inference and write :class:`PredictionSchema`-conformant output."""
@@ -145,22 +177,16 @@ def main(cfg: DictConfig) -> None:
     output_parquet = Path(cfg.output_parquet)
     ckpt_name = cfg.get("ckpt_name")
 
-    parquets = _task_parquets(tasks_dir)
-    logger.info(f"Loading tasks from {tasks_dir} ({len(parquets)} parquet file(s))")
-    # ``pl.concat`` on an empty list raises; guard.
-    if not parquets:
-        raise ValueError(f"tasks_dir {tasks_dir} contains no parquet files")
-    # Match MTD's sorted-rglob ordering so hstack alignment is guaranteed.
-    tasks_df = pl.concat([pl.read_parquet(fp) for fp in parquets], how="vertical")
-    logger.info(
-        f"Loaded {tasks_df.height} tasks across {tasks_df[TaskQuerySchema.query_name].n_unique()} query codes"
-    )
+    _validate_tasks_dir(tasks_dir)
+    logger.info(f"Loading tasks from {tasks_dir}")
 
     train_cfg, model, trainer = setup_model(model_run_dir, ckpt_name=ckpt_name)
-    _warn_out_of_vocab(tasks_df, train_cfg)
-
     train_cfg.datamodule.config.task_labels_dir = str(tasks_dir)
     D = instantiate(train_cfg.datamodule)
+
+    _warn_out_of_vocab(set(D.test_dataset.query.unique().to_list()), train_cfg)
+    logger.info(f"Loaded {len(D.test_dataset)} tasks across {D.test_dataset.query.n_unique()} query codes")
+
     # Pass ``test_dataloader()`` directly — MTD's ``Datamodule`` has no
     # ``predict_dataloader``, so ``trainer.predict(datamodule=D)`` would hit the base
     # class's ``MisconfigurationException``.  ``test_dataloader`` is the held_out
@@ -168,27 +194,21 @@ def main(cfg: DictConfig) -> None:
     pred_batches = trainer.predict(model=model, dataloaders=D.test_dataloader(), ckpt_path=None)
 
     probs = _gather_probabilities(pred_batches)
+    identifiers = _identifiers_from_schema_df(D.test_dataset.schema_df)
 
-    # Order-preservation check: the dataset reads ``sorted(tasks_dir.rglob("*.parquet"))``
-    # exactly like ``_task_parquets`` above, and the dataloader is ``shuffle=False``, so
-    # predictions come back 1:1 matched with ``tasks_df`` rows.  A mismatch means the
-    # dataset filtered some rows out — typically a task subject not in the tensorized
-    # held_out split — and downstream index-based pairing would silently misalign.
-    # Fail loudly.
-    if probs.height != tasks_df.height:
+    # MTD guarantees ``schema_df`` preserves the input labels frame's length + order
+    # (see ``get_task_seq_bounds_and_labels`` docstring), and ``test_dataloader``
+    # uses ``shuffle=False`` — so ``probs`` comes back 1:1 matched with
+    # ``identifiers``.  A row-count mismatch would indicate a silent invariant
+    # violation; fail loudly.
+    if probs.height != identifiers.height:
         raise RuntimeError(
-            f"Prediction row count ({probs.height}) doesn't match task row count "
-            f"({tasks_df.height}) — {tasks_df.height - probs.height} task rows were "
-            f"dropped by the dataset, most likely because those subjects aren't present "
-            f"in the tensorized held_out split at "
-            f"{train_cfg.datamodule.config.tensorized_cohort_dir}.  Predict only on "
-            f"subjects whose tensorized data lives in the held_out split."
+            f"Prediction row count ({probs.height}) doesn't match dataset row count "
+            f"({identifiers.height}).  This is an MTD invariant violation — "
+            f"``test_dataloader`` should have yielded one prediction per schema_df row."
         )
 
-    # Horizontal concat — ``probs`` is in dataset order, which matches ``tasks_df``.
-    # No key-based join, so all inherited ``LabelSchema`` columns on ``tasks_df``
-    # carry through unchanged.
-    out = tasks_df.hstack(probs)
+    out = identifiers.hstack(probs)
 
     output_parquet.parent.mkdir(parents=True, exist_ok=True)
     # Final canonicalization pass — ``align`` casts / reorders columns to match the
