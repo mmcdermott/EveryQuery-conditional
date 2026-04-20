@@ -9,9 +9,10 @@ The CLI is intentionally narrow: no model instantiation, no trainer loop, no mul
 orchestration.  Cross-model comparison (pairwise win-rate ranking, what the old
 ``EQ_select_model`` did) moves to ``paper_experiments/`` per the #82 inventory.
 
-Entry-point rewiring to point ``EQ_evaluate`` at this module happens in a follow-up
-consolidation wave after the #82 inventory is signed off; the current ``EQ_evaluate``
-console script still points at the legacy ``evaluate/eval.py`` until then.
+``EQ_evaluate`` now points at this module (rewired in Phase 2.5, see #131).  The legacy
+four-stage evaluator (``every_query.evaluate.eval``) is still in-tree for archival
+reference but is no longer a console-script entry point.  Full file deletion +
+``paper_experiments/leaderboard/`` relocation is tracked on #83.
 """
 
 import logging

@@ -231,7 +231,7 @@ def _read_query_codes(codes_or_path: list[str] | str | Path) -> list[str]:
     p = Path(str(codes_or_path))
     if p.is_dir():
         p = p / "metadata" / "codes.parquet"
-    return pl.read_parquet(p, columns=["code"])["code"].to_list()
+    return pl.read_parquet(p, columns=["code"])["code"].unique().sort().to_list()
 
 
 def _labels_fp(out_dir: Path, split: str, input_shard: str) -> Path:
@@ -269,7 +269,7 @@ def run_worker(
     events_df = _read_event_shard(shard_path)
     logger.info("Loaded %d events from %s", events_df.height, shard_path)
 
-    pt_seed = derive_seed(seed, "prediction_times", input_shard)
+    pt_seed = derive_seed(seed, "prediction_times", split, input_shard)
     pred_times = sample_prediction_times_per_subject(
         events_df=events_df,
         k=prediction_times_per_subject,
