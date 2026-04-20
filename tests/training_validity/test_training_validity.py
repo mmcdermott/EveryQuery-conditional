@@ -216,9 +216,53 @@ def oracle_preprocessed(oracle_dataset: dict, tmp_path_factory: pytest.TempPathF
 
 
 @pytest.fixture(scope="module")
+def oracle_task_labels_dir(
+    oracle_preprocessed: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Path:
+    """Runs ``EQ_generate_training_tasks`` on the preprocessed oracle dataset.
+
+    Training labels for ``oracle_trained_model_dir``.  Replaces the in-process
+    ``_compute_labels`` path used prior to this PR so the label-generation path exercises
+    the actual CLI end-to-end.  The oracle-specific single-prediction-time labels
+    written by ``oracle_dataset`` (via ``_compute_labels``) are still used for the
+    ``EQ_predict`` inference step + AUROC assertions — updating inference to
+    ``EQ_generate_evaluation_tasks`` is deferred post-release (see the issue filed
+    alongside this PR).
+
+    The intermediate dir is at ``oracle_preprocessed.parent / "intermediate"`` —
+    same sibling-layout convention as ``eq_preprocessed_dataset`` in the root
+    ``conftest.py``.
+    """
+    intermediate = oracle_preprocessed.parent / "intermediate"
+    task_labels_dir = tmp_path_factory.mktemp("d2_cli_tasks")
+    for split in (train_split, tuning_split):
+        run_and_check(
+            [
+                "EQ_generate_training_tasks",
+                f"data_dir={intermediate!s}",
+                f"codes_dir={oracle_preprocessed!s}",
+                f"out_dir={task_labels_dir!s}",
+                f"split={split}",
+                "input_shard=0",
+                "task_shard=0",
+                "n_tasks=20",
+                "contexts_per_task=20",
+                "duration_min=1",
+                "duration_max=30",
+                "min_context_per_subject=2",
+                "seed=1",
+            ],
+            env=ENSURE_ENV_PLACEHOLDERS,
+            timeout=120.0,
+        )
+    return task_labels_dir
+
+
+@pytest.fixture(scope="module")
 def oracle_trained_model_dir(
     oracle_preprocessed: Path,
-    oracle_dataset: dict,
+    oracle_task_labels_dir: Path,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Path:
     output_dir = tmp_path_factory.mktemp("d2_train_out")
@@ -228,7 +272,7 @@ def oracle_trained_model_dir(
             "--config-name=_demo_train",
             f"output_dir={output_dir!s}",
             f"datamodule.config.tensorized_cohort_dir={oracle_preprocessed!s}",
-            f"datamodule.config.task_labels_dir={oracle_dataset['task_labels_dir']!s}",
+            f"datamodule.config.task_labels_dir={oracle_task_labels_dir!s}",
             f"query.codes=[{_TARGET_CODE}]",
             "datamodule.batch_size=16",
             "datamodule.config.max_seq_len=128",
