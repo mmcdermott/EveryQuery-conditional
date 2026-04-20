@@ -36,7 +36,7 @@ EQ_process_data       EQ_generate_training_tasks         EQ_train       EQ_predi
 `train/` produces a run directory at
 `$OUTPUT_DIR/outputs/<YYYY-MM-DD>/<HH-MM-SS>/` containing `best_model.ckpt`,
 `config.yaml` (used config), `resolved_config.yaml` (used config with all
-interpolations resolved — consumed by `eval.py` / downstream loaders), and a
+interpolations resolved — consumed by downstream loaders), and a
 `checkpoints/` dir with epoch-indexed checkpoints.
 
 ## Resume behavior

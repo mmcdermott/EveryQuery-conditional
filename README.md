@@ -15,7 +15,7 @@ Given a tensorized MEDS cohort, EveryQuery trains a ModernBERT-style encoder to 
 `(code, duration)` combinations.
 
 > [!NOTE]
-> The Phase-1 + Phase-2 refactor from [#54](https://github.com/payalchandak/EveryQuery/issues/54) has landed: the full `preprocess → generate_training_tasks / generate_evaluation_tasks → train → predict → evaluate` pipeline uses the cross-stage [`TaskQuerySchema`](src/every_query/data/schema.py) throughout. `EQ_evaluate` now resolves to the single-stage evaluator that consumes `PredictionSchema` parquets; the legacy four-stage evaluator (`every_query.evaluate.eval`) is in-tree for archival reference but is no longer a console-script entry point. See [Roadmap](#roadmap) for the remaining #83 cleanup.
+> The Phase-1 + Phase-2 refactor from [#54](https://github.com/payalchandak/EveryQuery/issues/54) has landed: the full `preprocess → generate_training_tasks / generate_evaluation_tasks → train → predict → evaluate` pipeline uses the cross-stage [`TaskQuerySchema`](src/every_query/data/schema.py) throughout. `EQ_evaluate` now resolves to the single-stage evaluator that consumes `PredictionSchema` parquets; the legacy four-stage evaluator has been deleted (recover from git history if needed). See [Roadmap](#roadmap) for the remaining #83 cleanup.
 
 ## Install
 
@@ -75,7 +75,7 @@ and end-to-end subprocess tests that run the real script against a fixture cohor
 | `EQ_predict`                   | inference        | Consume a `TaskQuerySchema` parquet dir + checkpoint, emit a `PredictionSchema` parquet (`censor_prob`, `occurs_prob`)  | smoke; E2E `test_predict_cli.py` (row-order preserved); exercised by `tests/training_validity/` (slow)                   |
 | `EQ_evaluate`                  | metrics          | Consume a `PredictionSchema` parquet, write per-`(query, duration_days)` metrics (`occurs_auroc`, `censor_auroc`, etc.) | smoke; E2E `test_evaluate_cli.py`; exercised by `tests/training_validity/` (slow)                                        |
 
-The legacy four-stage evaluator (`every_query.evaluate.eval`, with `gen_index_times`, `gen_task`, `select_model` siblings) is still in-tree for archival reference but is no longer a console-script entry point — [#83](https://github.com/payalchandak/EveryQuery/issues/83) tracks its full retirement (file deletions + any `paper_experiments/leaderboard/` relocation).
+The legacy four-stage evaluator (`every_query.evaluate.eval`, with `gen_index_times`, `gen_task`, `select_model` siblings) has been deleted; recover from git history if needed. [#83](https://github.com/payalchandak/EveryQuery/issues/83) tracks any `paper_experiments/leaderboard/` relocation for cross-model comparison.
 
 ## Pipeline
 
@@ -255,8 +255,6 @@ tests/
 ├── test_predict_cli.py             (E2E: EQ_predict against a trained checkpoint + row-order preservation)
 ├── test_evaluate_cli.py            (E2E: EQ_evaluate on a synthetic PredictionSchema parquet)
 ├── test_e2e_foundation.py          (E2E: full preprocess → generate_training_tasks → train pipeline chains)
-├── test_eval.py                    (unit: legacy eval.py helpers, archival)
-├── test_eval_suite.py              (unit: legacy gen_task.py, archival)
 ├── test_dataset_logic.py           (unit: EveryQueryPytorchDataset + EveryQueryBatch)
 ├── test_lightning_logic.py         (unit: LightningModule loss wiring, mask semantics)
 ├── test_model_logic.py             (unit: model heads, censored/occurs loss flip sensitivity)
@@ -276,13 +274,13 @@ shared cross-stage task-query schema.
 
 ### Phase 2 status
 
-| Sub-phase                         | Issue                                                       | State                                                                                                                                                                          |
-| --------------------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 2.1: TaskQuerySchema design       | [#80](https://github.com/payalchandak/EveryQuery/issues/80) | ✅ merged via [#96](https://github.com/payalchandak/EveryQuery/pull/96) (also closes #122)                                                                                     |
-| 2.2: EQ_predict                   | [#81](https://github.com/payalchandak/EveryQuery/issues/81) | ✅ merged via [#99](https://github.com/payalchandak/EveryQuery/pull/99)                                                                                                        |
-| 2.3: eval-suite inventory         | [#82](https://github.com/payalchandak/EveryQuery/issues/82) | Decisions captured on the issue + reflected in #100's scope; no code change needed                                                                                             |
-| 2.4: EQ_evaluate consolidation    | [#83](https://github.com/payalchandak/EveryQuery/issues/83) | 🟡 new `evaluate.py` is the `EQ_evaluate` entry point (rewired in this PR); `every_query.evaluate.eval` + siblings still in-tree for archival reference, full deletion pending |
-| 2.5: EQ_generate_evaluation_tasks | (part of this PR)                                           | ✅ new dense-grid task-generator endpoint to feed `EQ_predict`; training-task endpoint renamed to `EQ_generate_training_tasks` for clarity                                     |
+| Sub-phase                         | Issue                                                       | State                                                                                                                                                           |
+| --------------------------------- | ----------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 2.1: TaskQuerySchema design       | [#80](https://github.com/payalchandak/EveryQuery/issues/80) | ✅ merged via [#96](https://github.com/payalchandak/EveryQuery/pull/96) (also closes #122)                                                                      |
+| 2.2: EQ_predict                   | [#81](https://github.com/payalchandak/EveryQuery/issues/81) | ✅ merged via [#99](https://github.com/payalchandak/EveryQuery/pull/99)                                                                                         |
+| 2.3: eval-suite inventory         | [#82](https://github.com/payalchandak/EveryQuery/issues/82) | Decisions captured on the issue + reflected in #100's scope; no code change needed                                                                              |
+| 2.4: EQ_evaluate consolidation    | [#83](https://github.com/payalchandak/EveryQuery/issues/83) | ✅ new `evaluate.py` is the `EQ_evaluate` entry point (rewired in this PR); `every_query.evaluate.eval` + siblings deleted — recover from git history if needed |
+| 2.5: EQ_generate_evaluation_tasks | (part of this PR)                                           | ✅ new dense-grid task-generator endpoint to feed `EQ_predict`; training-task endpoint renamed to `EQ_generate_training_tasks` for clarity                      |
 
 ### E2E testing status ([#104](https://github.com/payalchandak/EveryQuery/issues/104))
 

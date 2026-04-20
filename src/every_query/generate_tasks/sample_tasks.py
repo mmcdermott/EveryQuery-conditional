@@ -40,7 +40,7 @@ import hydra
 import numpy as np
 import polars as pl
 from meds import DataSchema
-from omegaconf import DictConfig
+from omegaconf import DictConfig, ListConfig
 
 from every_query.data.schema import TaskQuerySchema, empty_task_query_df
 from every_query.utils.seeds import derive_seed
@@ -393,20 +393,29 @@ def _read_event_shard(file_path: str | Path) -> pl.DataFrame:
     )
 
 
-def _read_query_codes(codes_dir: str | Path) -> list[str]:
-    """Read the universe of query codes from ``{codes_dir}/metadata/codes.parquet``.
+def read_query_codes(codes_or_path: list[str] | ListConfig | str | Path) -> list[str]:
+    """Resolve a query-code list — from an explicit CLI list, a metadata dir, or a codes parquet.
 
-    ``codes_dir`` is the metadata root (``$PROCESSED`` in the standard layout), **not** the event
-    shard root (``$INTERMEDIATE``).  Event shards live under ``$INTERMEDIATE/data/...`` while query
-    codes live under ``$PROCESSED/metadata/codes.parquet``; these are typically distinct
-    subdirectories of ``$DATA_DIR`` (see ``.env.example``) and the sampler should not conflate them.
+    Accepts:
+    - an explicit list (from Hydra ``codes: [A, B, C]`` or a code-group YAML default),
+    - a metadata root directory (``codes.parquet`` is expected at ``{dir}/metadata/codes.parquet``
+      — matches the ``$PROCESSED`` layout), or
+    - a direct path to a ``codes.parquet`` file.
 
-    The ``.unique()`` result is explicitly sorted because polars' default hash-based unique is
-    order-unstable across distinct DataFrame instances, which would make ``sample_tasks``
-    non-deterministic with respect to the tasks seed across workers reading the same metadata file.
+    The ``.unique().sort()`` makes the returned list deterministic across workers reading
+    the same metadata file (polars' default hash-based unique is order-unstable across
+    DataFrame instances, which would make any seed tied to the list non-deterministic).
+
+    Shared by both ``sample_tasks.main`` and ``sample_evaluation_tasks.main``.
     """
-    codes_fp = Path(codes_dir) / "metadata" / "codes.parquet"
-    return pl.read_parquet(codes_fp).select("code").unique().sort("code").to_series().to_list()
+    if isinstance(codes_or_path, list | ListConfig):
+        return list(codes_or_path)
+    if codes_or_path is None:
+        raise ValueError("codes must be a list of query codes or a path to codes.parquet")
+    p = Path(str(codes_or_path))
+    if p.is_dir():
+        p = p / "metadata" / "codes.parquet"
+    return pl.read_parquet(p, columns=["code"])["code"].unique().sort().to_list()
 
 
 def _unique_tmp_path(fp: Path) -> Path:
@@ -482,7 +491,7 @@ def run_worker(
         logger.info("Labels already exist at %s, skipping.", labels_fp)
         return None
 
-    query_codes = _read_query_codes(codes_dir)
+    query_codes = read_query_codes(codes_dir)
     tasks_seed = derive_seed(seed, "tasks", task_shard)
     tasks = sample_tasks(
         n=n_tasks,

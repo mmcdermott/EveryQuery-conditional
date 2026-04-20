@@ -10,9 +10,9 @@ orchestration.  Cross-model comparison (pairwise win-rate ranking, what the old
 ``EQ_select_model`` did) moves to ``paper_experiments/`` per the #82 inventory.
 
 ``EQ_evaluate`` now points at this module (rewired in Phase 2.5, see #131).  The legacy
-four-stage evaluator (``every_query.evaluate.eval``) is still in-tree for archival
-reference but is no longer a console-script entry point.  Full file deletion +
-``paper_experiments/leaderboard/`` relocation is tracked on #83.
+four-stage evaluator (``every_query.evaluate.eval`` and siblings) has been deleted;
+recover from git history if needed.  ``paper_experiments/leaderboard/`` relocation for
+cross-model comparison is tracked on #83.
 """
 
 import logging

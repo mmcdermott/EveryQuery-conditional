@@ -61,12 +61,11 @@ EQ_generate_training_tasks = "every_query.generate_tasks.sample_tasks:main"
 EQ_generate_evaluation_tasks = "every_query.generate_tasks.sample_evaluation_tasks:main"
 EQ_train = "every_query.train.train:main"
 EQ_predict = "every_query.predict.predict:main"
-# EQ_evaluate now points at the new single-stage evaluator (consumes a
-# PredictionSchema parquet, emits per-(query, duration_days) metrics).  The
-# legacy four-stage evaluator is still in-tree at every_query.evaluate.eval but
-# is no longer a console-script entry point; the sibling legacy CLIs
-# (EQ_gen_eval_index, EQ_gen_eval_tasks, EQ_select_model) are also retired per
-# the #83 consolidation wave.
+# EQ_evaluate points at the single-stage evaluator (consumes a PredictionSchema
+# parquet, emits per-(query, duration_days) metrics).  The legacy four-stage
+# evaluator (every_query.evaluate.eval + siblings, and its sibling CLIs
+# EQ_gen_eval_index / EQ_gen_eval_tasks / EQ_select_model) has been deleted per
+# the #83 consolidation wave; recover from git history if needed.
 EQ_evaluate = "every_query.evaluate.evaluate:main"
 
 [tool.coverage.run]

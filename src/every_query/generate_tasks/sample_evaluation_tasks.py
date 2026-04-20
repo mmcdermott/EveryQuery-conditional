@@ -30,7 +30,7 @@ from pathlib import Path
 import hydra
 import polars as pl
 from meds import DataSchema
-from omegaconf import DictConfig, ListConfig
+from omegaconf import DictConfig
 
 from every_query.data.schema import TaskQuerySchema, empty_task_query_df
 from every_query.generate_tasks.sample_tasks import (
@@ -39,6 +39,7 @@ from every_query.generate_tasks.sample_tasks import (
     _resolve_path,
     compute_max_time_per_subject,
     evaluate_index_df,
+    read_query_codes,
 )
 from every_query.utils.seeds import derive_seed
 
@@ -217,23 +218,6 @@ def build_evaluation_index_df(
 # ---------------------------------------------------------------------------
 
 
-def _read_query_codes(codes_or_path: list[str] | str | Path) -> list[str]:
-    """Resolve the query-code list.
-
-    Accepts either (a) an explicit list of codes (from Hydra ``codes: [A, B, C]``
-    or a code-group YAML default) or (b) a path to a ``codes.parquet`` (fallback:
-    use the model's full vocabulary).
-    """
-    if isinstance(codes_or_path, list | ListConfig):
-        return list(codes_or_path)
-    if codes_or_path is None:
-        raise ValueError("codes must be a list of query codes or a path to codes.parquet")
-    p = Path(str(codes_or_path))
-    if p.is_dir():
-        p = p / "metadata" / "codes.parquet"
-    return pl.read_parquet(p, columns=["code"])["code"].unique().sort().to_list()
-
-
 def _labels_fp(out_dir: Path, split: str, input_shard: str) -> Path:
     return out_dir / split / f"{input_shard}.parquet"
 
@@ -342,9 +326,9 @@ def main(cfg: DictConfig) -> None:
     codes_cfg = cfg.get("codes")
     if codes_cfg is None:
         codes_dir = _resolve_path(cfg.get("codes_dir"), "PROCESSED", "codes_dir")
-        codes = _read_query_codes(codes_dir)
+        codes = read_query_codes(codes_dir)
     else:
-        codes = _read_query_codes(codes_cfg)
+        codes = read_query_codes(codes_cfg)
 
     # Durations must be whole-day ints — silent truncation (e.g. ``0.5 → 0``) would
     # change the window semantics.  ``TaskQuerySchema.duration_days`` is float32 on

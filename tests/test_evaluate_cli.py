@@ -2,8 +2,8 @@
 
 ``EQ_evaluate`` now resolves to ``every_query.evaluate.evaluate:main``: consumes a
 ``PredictionSchema`` parquet written by ``EQ_predict`` and emits per-``(query,
-duration_days)`` metrics.  The legacy four-stage evaluator (``every_query.evaluate.eval``)
-is still in-tree for archival reference but is no longer a console-script entry point.
+duration_days)`` metrics.  The legacy four-stage evaluator has been deleted; recover
+from git history if archival reference is needed.
 
 This test exercises the full subprocess path: schema-aligned parquet read,
 per-``(query, duration_days)`` metric computation, aligned parquet write.
