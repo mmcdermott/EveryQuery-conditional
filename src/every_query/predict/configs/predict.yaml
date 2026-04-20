@@ -1,8 +1,9 @@
 # EQ_predict — inference-only entry point.
 #
-# Reads a TaskQuerySchema-conformant parquet, runs the trained model's predict_step per row,
-# writes a PredictionSchema-conformant parquet.  See src/every_query/predict/predict.py and
-# the design-doc comment on #81 for the full contract.
+# Reads all TaskQuerySchema-conformant parquets under tasks_dir, runs the trained
+# model's predict_step per row, writes a PredictionSchema-conformant parquet.  See
+# src/every_query/predict/predict.py and the design-doc comment on #81 for the full
+# contract.
 
 defaults:
   - _self_
@@ -11,9 +12,12 @@ defaults:
 # resolved_config.yaml (the pattern EveryQuery's train.py writes).
 model_run_dir: ???
 
-# Required: path to a parquet conformant to every_query.data.schema.TaskQuerySchema
-# (subject_id, prediction_time, query, duration_days; inherited label columns optional).
-tasks_parquet: ???
+# Required: path to a directory of TaskQuerySchema-conformant parquet files
+# (subject_id, prediction_time, query, duration_days; inherited label columns
+# optional).  Every file under this directory is passed to the dataset — callers
+# should provide a clean directory containing only task parquets.  Ideally a
+# single parquet file sits in the dir.
+tasks_dir: ???
 
 # Required: path to write the output parquet.  Conforms to
 # every_query.predict.schema.PredictionSchema (TaskQuerySchema + censor_prob + occurs_prob;

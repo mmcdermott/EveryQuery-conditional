@@ -1,38 +1,41 @@
 """Inference-only entry point — ``EQ_predict``.
 
-Takes a trained model run directory and a task-query parquet (:class:`TaskQuerySchema`),
-runs per-row inference, writes a :class:`PredictionSchema`-conformant parquet.  No AUCs, no
-model selection, no multi-model orchestration — all of that is ``evaluate/`` or
-``paper_experiments/`` territory.
+Takes a trained model run directory and a directory of task-query parquets
+(:class:`TaskQuerySchema`), runs per-row inference, writes a
+:class:`PredictionSchema`-conformant parquet.  No AUCs, no model selection, no
+multi-model orchestration — all of that is ``evaluate/`` or ``paper_experiments/``
+territory.
 
 Implementation is a single, order-preserving pass through
 :class:`EveryQueryPytorchDataset`:
 
-1. Load + align the caller's flat ``TaskQuerySchema`` parquet, write it into a tmpdir
-   that we point ``task_labels_dir`` at.  The tmpdir is there only because MTD's
-   ``MEDSTorchDataConfig`` requires ``task_labels_dir`` to be a directory it can
-   ``rglob("*.parquet")`` — we use an empty tmpdir so the glob finds exactly our
-   aligned file and nothing else.  The dataset scans across all parquets under
-   ``task_labels_dir`` regardless of subdir layout, so we don't need a per-split
-   subdir; the ``held_out`` split comes from ``Datamodule.test_dataset``.
+1. Validate ``tasks_dir`` (must be a directory of ``.parquet`` files; warn if more
+   than one file is present) and point MTD's ``task_labels_dir`` at it directly.
+   No rewrite, no tmpdir, no input-side type coercion — if the parquets are
+   malformed the dataset will surface that, and the output gets a canonical dtype
+   pass via ``PredictionSchema.align`` at write.
 2. ``trainer.predict(dataloaders=D.test_dataloader())`` — the dataset handles mixed
-   ``(query, duration_days)`` rows natively (``_seeded_getitem`` prepends the row's
-   own query token; ``collate`` builds per-item tensors).
+   ``(query, duration_days)`` rows natively (``_seeded_getitem`` prepends the
+   row's own query token; ``collate`` builds per-item tensors).
 3. Order-preserving ``hstack`` of ``tasks_df`` + the ``(censor_prob, occurs_prob)``
-   columns: ``test_dataloader`` uses ``shuffle=False`` and the dataset reads a single
-   shard in sorted file order, so per-row probabilities come back in the same order
-   as ``tasks_df`` rows.  A row-count mismatch (e.g., a task subject not present in
-   the tensorized held_out split) raises loudly up front.
+   columns.  ``tasks_df`` is built by reading the same sorted
+   ``rglob("*.parquet")`` MTD uses internally, so both frames share the same row
+   order.  A row-count mismatch (e.g. a task subject not present in the tensorized
+   held_out split) raises loudly up front.
+
+Upstream note: this module re-reads the task parquets that MTD already read
+internally to build ``self.schema_df`` (we need ``tasks_df`` for the ``hstack``
+that preserves inherited ``LabelSchema`` columns).  That duplicate read would
+disappear if MTD exposed an ordered view of the raw input rows — tracked
+separately so we can collapse this once it's available.
 """
 
 import logging
-import tempfile
 from importlib.resources import files
 from pathlib import Path
 
 import hydra
 import polars as pl
-import pyarrow.parquet as pq
 import torch
 from hydra.utils import instantiate
 from omegaconf import DictConfig
@@ -47,14 +50,38 @@ logging.basicConfig(level=logging.INFO)
 CONFIGS = str(files("every_query") / "predict" / "configs")
 
 
-def _read_and_validate_tasks(tasks_parquet: Path) -> pl.DataFrame:
-    """Load a task-query parquet aligned to :class:`TaskQuerySchema`.
+def _task_parquets(tasks_dir: Path) -> list[Path]:
+    """Validate ``tasks_dir`` and return the sorted list of task parquet files.
 
-    Uses ``align()`` so the returned frame is guaranteed type-coerced + column-ordered;
-    ``align()`` still errors on missing/extra columns or unreconcilable type drift so
-    the contract is upheld.
+    Raises ``NotADirectoryError`` if ``tasks_dir`` isn't a directory and ``ValueError``
+    if it contains any non-parquet files.  Warns if more than one parquet is present
+    — the typical inference use case is a single flat parquet; multiple files usually
+    indicates the caller pointed us at the training task-labels directory by mistake.
+
+    Sorted-rglob ordering matches ``MEDSTorchDataConfig.task_labels_fps`` exactly, so
+    callers reading via this function can trust their row order lines up with the
+    dataset's.
     """
-    return pl.from_arrow(TaskQuerySchema.align(pq.read_table(tasks_parquet)))
+    if not tasks_dir.is_dir():
+        raise NotADirectoryError(f"tasks_dir must be a directory, got {tasks_dir}")
+
+    all_files = sorted(p for p in tasks_dir.rglob("*") if p.is_file())
+    non_parquet = [p for p in all_files if p.suffix != ".parquet"]
+    if non_parquet:
+        raise ValueError(
+            f"tasks_dir {tasks_dir} contains non-parquet files: "
+            f"{[str(p.relative_to(tasks_dir)) for p in non_parquet[:5]]}"
+            f"{'...' if len(non_parquet) > 5 else ''}.  Point EQ_predict at a directory "
+            f"containing only TaskQuerySchema-conformant parquet files."
+        )
+
+    parquets = [p for p in all_files if p.suffix == ".parquet"]
+    if len(parquets) > 1:
+        logger.warning(
+            f"tasks_dir {tasks_dir} contains {len(parquets)} parquet files; all will be "
+            f"concatenated.  The typical inference use case is a single flat parquet."
+        )
+    return parquets
 
 
 def _warn_out_of_vocab(tasks_df: pl.DataFrame, train_cfg: DictConfig) -> None:
@@ -114,12 +141,17 @@ def _gather_probabilities(pred_batches: list[dict[str, torch.Tensor]]) -> pl.Dat
 def main(cfg: DictConfig) -> None:
     """Run inference and write :class:`PredictionSchema`-conformant output."""
     model_run_dir = Path(cfg.model_run_dir)
-    tasks_parquet = Path(cfg.tasks_parquet)
+    tasks_dir = Path(cfg.tasks_dir)
     output_parquet = Path(cfg.output_parquet)
     ckpt_name = cfg.get("ckpt_name")
 
-    logger.info(f"Loading tasks from {tasks_parquet}")
-    tasks_df = _read_and_validate_tasks(tasks_parquet)
+    parquets = _task_parquets(tasks_dir)
+    logger.info(f"Loading tasks from {tasks_dir} ({len(parquets)} parquet file(s))")
+    # ``pl.concat`` on an empty list raises; guard.
+    if not parquets:
+        raise ValueError(f"tasks_dir {tasks_dir} contains no parquet files")
+    # Match MTD's sorted-rglob ordering so hstack alignment is guaranteed.
+    tasks_df = pl.concat([pl.read_parquet(fp) for fp in parquets], how="vertical")
     logger.info(
         f"Loaded {tasks_df.height} tasks across {tasks_df[TaskQuerySchema.query_name].n_unique()} query codes"
     )
@@ -127,34 +159,26 @@ def main(cfg: DictConfig) -> None:
     train_cfg, model, trainer = setup_model(model_run_dir, ckpt_name=ckpt_name)
     _warn_out_of_vocab(tasks_df, train_cfg)
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # Empty tmpdir is required only because ``MEDSTorchDataConfig.task_labels_dir``
-        # must be a directory (it's ``rglob``'d for ``*.parquet``).  The dataset
-        # doesn't care about subdir structure — a single file at the top level is
-        # fine.  Writing the already-aligned ``tasks_df`` rather than symlinking the
-        # user's file ensures canonical dtypes land on disk before the dataset reads.
-        tasks_df.write_parquet(Path(tmpdir) / "tasks.parquet")
-
-        train_cfg.datamodule.config.task_labels_dir = tmpdir
-        D = instantiate(train_cfg.datamodule)
-        # Pass ``test_dataloader()`` directly — MTD's ``Datamodule`` has no
-        # ``predict_dataloader``, so ``trainer.predict(datamodule=D)`` would hit the
-        # base class's ``MisconfigurationException``.  ``test_dataloader`` is the
-        # held_out loader with ``shuffle=False``.
-        pred_batches = trainer.predict(model=model, dataloaders=D.test_dataloader(), ckpt_path=None)
-        dataset_height = len(D.test_dataset)
+    train_cfg.datamodule.config.task_labels_dir = str(tasks_dir)
+    D = instantiate(train_cfg.datamodule)
+    # Pass ``test_dataloader()`` directly — MTD's ``Datamodule`` has no
+    # ``predict_dataloader``, so ``trainer.predict(datamodule=D)`` would hit the base
+    # class's ``MisconfigurationException``.  ``test_dataloader`` is the held_out
+    # loader with ``shuffle=False``.
+    pred_batches = trainer.predict(model=model, dataloaders=D.test_dataloader(), ckpt_path=None)
 
     probs = _gather_probabilities(pred_batches)
 
-    # Order-preservation check: the dataset reads our single task parquet in file
-    # order and the dataloader is ``shuffle=False``, so predictions come back 1:1
-    # matched with ``tasks_df`` rows.  A mismatch means the dataset filtered some
-    # rows out — typically a task subject that isn't in the tensorized held_out
-    # split — and downstream index-based pairing would silently misalign.  Fail loudly.
+    # Order-preservation check: the dataset reads ``sorted(tasks_dir.rglob("*.parquet"))``
+    # exactly like ``_task_parquets`` above, and the dataloader is ``shuffle=False``, so
+    # predictions come back 1:1 matched with ``tasks_df`` rows.  A mismatch means the
+    # dataset filtered some rows out — typically a task subject not in the tensorized
+    # held_out split — and downstream index-based pairing would silently misalign.
+    # Fail loudly.
     if probs.height != tasks_df.height:
         raise RuntimeError(
             f"Prediction row count ({probs.height}) doesn't match task row count "
-            f"({tasks_df.height}) — {tasks_df.height - dataset_height} task rows were "
+            f"({tasks_df.height}) — {tasks_df.height - probs.height} task rows were "
             f"dropped by the dataset, most likely because those subjects aren't present "
             f"in the tensorized held_out split at "
             f"{train_cfg.datamodule.config.tensorized_cohort_dir}.  Predict only on "
@@ -167,6 +191,9 @@ def main(cfg: DictConfig) -> None:
     out = tasks_df.hstack(probs)
 
     output_parquet.parent.mkdir(parents=True, exist_ok=True)
+    # Final canonicalization pass — ``align`` casts / reorders columns to match the
+    # schema's canonical arrow layout, so the written parquet is schema-conformant
+    # regardless of whatever dtypes the input happened to have.
     aligned = PredictionSchema.align(out.to_arrow())
     pl.from_arrow(aligned).write_parquet(output_parquet)
     logger.info(f"Wrote {out.height} predictions to {output_parquet}")

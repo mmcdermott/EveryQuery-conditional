@@ -4,10 +4,11 @@ Acceptance criterion from #81: *"CPU-only integration test in ``tests/test_predi
 that exercises the full subprocess path."*
 
 Uses the session-scoped ``eq_trained_model_dir`` fixture (a real trained demo checkpoint +
-``resolved_config.yaml``) and builds a ``TaskQuerySchema``-conformant tasks parquet whose
-subjects live in the ``held_out`` split of the training cohort.  Runs ``EQ_predict`` in a
-subprocess and verifies the output is ``PredictionSchema``-conformant with probabilities in
-``[0, 1]`` and one row per input task.
+``resolved_config.yaml``) and builds a ``TaskQuerySchema``-conformant tasks *directory*
+with a single parquet, whose subjects live in the ``held_out`` split of the training
+cohort.  Runs ``EQ_predict`` in a subprocess and verifies the output is
+``PredictionSchema``-conformant with probabilities in ``[0, 1]`` and one row per input
+task.
 """
 
 from __future__ import annotations
@@ -36,8 +37,8 @@ _DURATION_DAYS = 30.0
 
 
 @pytest.fixture(scope="module")
-def predict_tasks_parquet(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """A tiny TaskQuerySchema-conformant parquet for EQ_predict's input."""
+def predict_tasks_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """A directory containing a single TaskQuerySchema-conformant parquet for EQ_predict."""
     rows = [
         {
             "subject_id": _HELD_OUT_SUBJECT,
@@ -57,21 +58,20 @@ def predict_tasks_parquet(tmp_path_factory: pytest.TempPathFactory) -> Path:
             "boolean_value": pl.Boolean,
         }
     )
-    out = tmp_path_factory.mktemp("eq_predict_tasks") / "tasks.parquet"
-    df.write_parquet(out)
-    return out
+    tasks_dir = tmp_path_factory.mktemp("eq_predict_tasks")
+    df.write_parquet(tasks_dir / "tasks.parquet")
+    return tasks_dir
 
 
 def test_eq_predict_end_to_end(
     eq_trained_model_dir: Path,
-    predict_tasks_parquet: Path,
+    predict_tasks_dir: Path,
     tmp_path: Path,
 ) -> None:
     """``EQ_predict`` runs end-to-end and produces a ``PredictionSchema``-conformant parquet.
 
-    Exercises the full subprocess entry point — console-script resolution, Hydra config
-    compose, model checkpoint load, per-``(query, duration_days)`` predict loop, join-back
-    to preserve inherited label columns, schema-aligned write.
+    Exercises the full subprocess entry point — console-script resolution, Hydra config compose, model
+    checkpoint load, single predict pass, row-order-preserved hstack with tasks_df, schema-aligned write.
     """
     output_parquet = tmp_path / "predictions.parquet"
 
@@ -81,7 +81,7 @@ def test_eq_predict_end_to_end(
     cmd = [
         "EQ_predict",
         f"model_run_dir={eq_trained_model_dir}",
-        f"tasks_parquet={predict_tasks_parquet}",
+        f"tasks_dir={predict_tasks_dir}",
         f"output_parquet={output_parquet}",
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=300)
