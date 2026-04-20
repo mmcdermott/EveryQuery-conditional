@@ -226,9 +226,9 @@ def oracle_task_labels_dir(
     ``_compute_labels`` path used prior to this PR so the label-generation path exercises
     the actual CLI end-to-end.  The oracle-specific single-prediction-time labels
     written by ``oracle_dataset`` (via ``_compute_labels``) are still used for the
-    ``EQ_predict`` inference step + AUROC assertions — updating inference to
-    ``EQ_generate_evaluation_tasks`` is deferred post-release (see the issue filed
-    alongside this PR).
+    ``EQ_predict`` inference step + AUROC assertions.  A follow-on issue should
+    track migrating inference to ``EQ_generate_evaluation_tasks`` so the full
+    pipeline (generate_tasks → train → predict → evaluate) runs through the CLI.
 
     The intermediate dir is at ``oracle_preprocessed.parent / "intermediate"`` —
     same sibling-layout convention as ``eq_preprocessed_dataset`` in the root
