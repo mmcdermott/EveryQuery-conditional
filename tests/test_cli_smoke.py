@@ -6,12 +6,6 @@ proves the ``[project.scripts]`` entry resolved, the package config
 directory resolved via ``importlib.resources.files()``, and module-level
 imports don't blow up in a fresh interpreter.
 
-Three endpoints (``EQ_train``, ``EQ_evaluate``, ``EQ_gen_eval_tasks``) compose a
-``{train,eval}_codes`` default group whose canonical file is generated out-of-band
-(see ``src/every_query/paper_experiments/sample_codes/``) and is not checked in.  For those we point
-Hydra at a throwaway ``--config-dir`` that supplies an empty-codes smoke variant,
-which preserves the rest of the compose path.
-
 Child-process coverage is picked up automatically via
 ``[tool.coverage.run] patch = ["subprocess"]`` in ``pyproject.toml`` — no
 per-subprocess env wiring required.
@@ -29,27 +23,30 @@ import pytest
 _VENV_BIN = str(Path(sys.executable).parent)
 
 # (console_script, extra_args) — extras inject a smoke code-group for configs
-# whose defaults pull an out-of-tree YAML.
+# whose defaults pull an out-of-tree YAML (``EQ_train``'s ``train_codes``
+# default group is the only one that needs this today).
 _ENTRYPOINTS: list[tuple[str, list[str]]] = [
     ("EQ_process_data", []),
     ("EQ_train", ["train_codes=smoke"]),
-    ("EQ_evaluate", ["eval_codes=smoke"]),
-    ("EQ_generate_tasks", []),
-    ("EQ_gen_eval_index", []),
-    ("EQ_gen_eval_tasks", ["eval_codes=smoke"]),
-    ("EQ_select_model", []),
+    ("EQ_generate_training_tasks", []),
+    ("EQ_generate_evaluation_tasks", []),
     ("EQ_predict", []),
+    ("EQ_evaluate", []),
 ]
 
 
 @pytest.fixture(scope="module")
 def smoke_config_dir(tmp_path_factory) -> Path:
-    """Temp Hydra search dir supplying empty ``train_codes`` / ``eval_codes``."""
+    """Temp Hydra search dir supplying an empty ``train_codes`` group.
+
+    Only ``EQ_train`` pulls a gitignored default (``train_codes/<hash>.yaml``)
+    today; the other CLIs either take explicit params (``EQ_predict``,
+    ``EQ_evaluate``, ``EQ_generate_evaluation_tasks``) or have self-contained
+    defaults (``EQ_process_data``, ``EQ_generate_training_tasks``).
+    """
     d = tmp_path_factory.mktemp("eq_smoke_cfg")
     (d / "train_codes").mkdir()
     (d / "train_codes" / "smoke.yaml").write_text("codes: []\n")
-    (d / "eval_codes").mkdir()
-    (d / "eval_codes" / "smoke.yaml").write_text("id: []\nood: []\n")
     return d
 
 

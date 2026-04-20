@@ -8,7 +8,6 @@ unified AUROC criteria can be assessed cleanly.
 
 from __future__ import annotations
 
-import sys
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -277,13 +276,11 @@ def test_trained_model_learns_occurs_and_censor(
     ``pytest -m slow`` (run only this) or ``pytest -m 'slow or not slow'`` (run everything).
     CI's `tests.yaml` uses the latter.
 
-    Both stages — inference (``EQ_predict``) and metrics
-    (``every_query.evaluate.evaluate``) — run as subprocesses against actual CLI
-    outputs, so the unified criteria land on what a caller would get in production,
-    not an in-process recomputation.  Predictions go against the tuning split (that's
-    where this test's synthetic validation data lives).  The evaluate stage is
-    reached via ``python -m`` since ``EQ_evaluate`` still points at the legacy
-    four-stage pipeline pending the #83 rewire.
+    Both stages — inference (``EQ_predict``) and metrics (``EQ_evaluate``) — run
+    as subprocesses against actual CLI outputs, so the unified criteria land on
+    what a caller would get in production, not an in-process recomputation.
+    Predictions go against the tuning split (that's where this test's synthetic
+    validation data lives).
     """
     # ── Stage 1: EQ_predict → PredictionSchema parquet ──────────────────────
     predictions_parquet = tmp_path / "predictions.parquet"
@@ -300,16 +297,11 @@ def test_trained_model_learns_occurs_and_censor(
         timeout=600.0,
     )
 
-    # ── Stage 2: every_query.evaluate.evaluate → metrics parquet ────────────
-    # Reach it via ``python -m`` — ``EQ_evaluate`` still points at the legacy
-    # four-stage pipeline pending the #83 rewire.  Once that lands, this becomes
-    # a straight ``EQ_evaluate`` console-script call.
+    # ── Stage 2: EQ_evaluate → metrics parquet ──────────────────────────────
     metrics_parquet = tmp_path / "metrics.parquet"
     run_and_check(
         [
-            sys.executable,
-            "-m",
-            "every_query.evaluate.evaluate",
+            "EQ_evaluate",
             f"predictions_parquet={predictions_parquet!s}",
             f"metrics_parquet={metrics_parquet!s}",
         ],

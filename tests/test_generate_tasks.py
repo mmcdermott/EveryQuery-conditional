@@ -1,4 +1,4 @@
-"""End-to-end tests for the ``EQ_generate_tasks`` CLI (sample_tasks).
+"""End-to-end tests for the ``EQ_generate_training_tasks`` CLI (sample_tasks).
 
 These are integration tests: they run the real console script against the preprocessed
 cohort and verify *behavior*, not internal contracts.  Schema-shape checks, dtype checks,
@@ -44,7 +44,7 @@ def _read_train_labels(tasks_dir: Path) -> pl.DataFrame:
     """Load + concatenate all labeled parquets under the train split of *tasks_dir*.
 
     Asserts the result is non-empty.  Without that check, an empty-shards regression in
-    `EQ_generate_tasks` would silently turn `test_reproducible_with_same_seed` and
+    `EQ_generate_training_tasks` would silently turn `test_reproducible_with_same_seed` and
     `test_n_tasks_knob_is_honored` into vacuous pass cases (e.g., `2 * 0 == 0`).
     """
     fps = sorted((tasks_dir / "train").glob("*.parquet"))
@@ -110,7 +110,7 @@ def test_labels_match_ground_truth(
         # loop below would do zero iterations and the test would pass vacuously.
         assert labels.height > 0, (
             f"split={split} produced labeled parquets but 0 rows; ground-truth loop "
-            f"would be vacuous.  Check EQ_generate_tasks for empty-output regression."
+            f"would be vacuous.  Check EQ_generate_training_tasks for empty-output regression."
         )
 
         max_time_per_subject = dict(
@@ -170,7 +170,7 @@ def test_reproducible_with_same_seed(
     rerun_out = tmp_path_factory.mktemp("eq_tasks_rerun")
     run_and_check(
         [
-            "EQ_generate_tasks",
+            "EQ_generate_training_tasks",
             f"data_dir={intermediate!s}",
             f"codes_dir={eq_preprocessed_dataset!s}",
             f"out_dir={rerun_out!s}",
@@ -196,11 +196,11 @@ def test_reproducible_with_same_seed(
     # mask both a real sampler regression and any non-label parquet leaking into the split
     # directory).
     assert fixture_labels["subject_id"].null_count() == 0, (
-        f"fixture EQ_generate_tasks output has "
+        f"fixture EQ_generate_training_tasks output has "
         f"{fixture_labels['subject_id'].null_count()} null subject_id rows"
     )
     assert rerun_labels["subject_id"].null_count() == 0, (
-        f"rerun EQ_generate_tasks output has {rerun_labels['subject_id'].null_count()} null subject_id rows"
+        f"rerun EQ_generate_training_tasks output has {rerun_labels['subject_id'].null_count()} null subject_id rows"
     )
 
     # Compare by row content (sorted) since file-byte equality is flaky across polars versions.
@@ -209,7 +209,7 @@ def test_reproducible_with_same_seed(
     a = fixture_labels.sort(sort_cols)
     b = rerun_labels.sort(sort_cols)
     assert a.equals(b), (
-        "two EQ_generate_tasks runs with identical seed produced different labeled output.\n"
+        "two EQ_generate_training_tasks runs with identical seed produced different labeled output.\n"
         f"fixture hash: {_parquet_hash(a)}  rerun hash: {_parquet_hash(b)}"
     )
 
@@ -227,7 +227,7 @@ def test_n_tasks_knob_is_honored(
     big_out = tmp_path_factory.mktemp("eq_tasks_big")
     run_and_check(
         [
-            "EQ_generate_tasks",
+            "EQ_generate_training_tasks",
             f"data_dir={intermediate!s}",
             f"codes_dir={eq_preprocessed_dataset!s}",
             f"out_dir={big_out!s}",

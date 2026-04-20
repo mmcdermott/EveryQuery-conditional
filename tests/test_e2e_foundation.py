@@ -26,7 +26,7 @@ def test_preprocess_produces_metadata(eq_preprocessed_dataset: Path) -> None:
 
 
 def test_generate_tasks_writes_both_splits(eq_sampled_tasks_dir: Path) -> None:
-    """EQ_generate_tasks produces at least one labeled parquet per split."""
+    """EQ_generate_training_tasks produces at least one labeled parquet per split."""
     for split in ("train", "tuning"):
         fps = list((eq_sampled_tasks_dir / split).glob("*.parquet"))
         assert fps, f"no labeled parquet found under {eq_sampled_tasks_dir / split}"

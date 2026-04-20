@@ -21,8 +21,8 @@ Training stage of the EveryQuery pipeline. Home of the `EQ_train` console script
 ## Pipeline position
 
 ```
-preprocessing/     →  generate_tasks/   →  train/   →  (predict/evaluate come later)
-EQ_process_data       EQ_generate_tasks     EQ_train
+preprocessing/     →  generate_tasks/                 →  train/      →  predict/    →  evaluate/
+EQ_process_data       EQ_generate_training_tasks         EQ_train       EQ_predict      EQ_evaluate
 ```
 
 `train/` consumes two artifacts from upstream:
