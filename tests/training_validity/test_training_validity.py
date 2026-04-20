@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import polars as pl
-import pyarrow.parquet as pq
 import pytest
 from meds import DatasetMetadataSchema, train_split, tuning_split
 from meds_testing_helpers.dataset import MEDSDataset
@@ -317,7 +316,7 @@ def test_trained_model_learns_occurs_and_censor(
         env=ENSURE_ENV_PLACEHOLDERS,
         timeout=60.0,
     )
-    metrics = pl.from_arrow(pq.read_table(metrics_parquet)).sort(["query", "duration_days"])
+    metrics = pl.read_parquet(metrics_parquet).sort(["query", "duration_days"])
     # Full diagnostic dump regardless of pass/fail.
     print("\n[Design 2] per-(query, duration_days) metrics (tuning):")
     for row in metrics.iter_rows(named=True):
@@ -373,7 +372,7 @@ def test_trained_model_learns_occurs_and_censor(
     #    (model.py: ``occurs_loss(..., mask=~batch.censor)``), so its predictions on
     #    those rows are unconstrained and would add noise to the mean.  Not a per-cell
     #    metric — lives on the predictions parquet rather than the metrics parquet.
-    predictions = pl.from_arrow(pq.read_table(predictions_parquet))
+    predictions = pl.read_parquet(predictions_parquet)
     non_censored = predictions.filter(pl.col("boolean_value").is_not_null())
     means = [
         float(non_censored.filter(pl.col("duration_days") == float(d))["occurs_prob"].mean())
