@@ -41,6 +41,7 @@ import polars as pl
 import pyarrow.parquet as pq
 import torch
 from hydra.utils import instantiate
+from meds import held_out_split, tuning_split
 from omegaconf import DictConfig
 
 from every_query.data.schema import TaskQuerySchema
@@ -242,6 +243,12 @@ def _identifiers_from_schema_df(schema_df: pl.DataFrame) -> pl.DataFrame:
     return out
 
 
+_SPLIT_TO_DATAMODULE_ATTRS: dict[str, tuple[str, str]] = {
+    tuning_split: ("val_dataset", "val_dataloader"),
+    held_out_split: ("test_dataset", "test_dataloader"),
+}
+
+
 @hydra.main(version_base="1.3", config_path=CONFIGS, config_name="predict")
 def main(cfg: DictConfig) -> None:
     """Run inference and write :class:`PredictionSchema`-conformant output."""
@@ -249,36 +256,47 @@ def main(cfg: DictConfig) -> None:
     tasks_dir = Path(cfg.tasks_dir)
     output_parquet = Path(cfg.output_parquet)
     ckpt_name = cfg.get("ckpt_name")
+    split = cfg.get("split", held_out_split)
+
+    if split not in _SPLIT_TO_DATAMODULE_ATTRS:
+        raise ValueError(
+            f"split must be one of {sorted(_SPLIT_TO_DATAMODULE_ATTRS)}, got {split!r}.  "
+            f"The 'train' split is disallowed because MTD's train_dataloader shuffles, "
+            f"which would break the order-preserving hstack."
+        )
 
     _validate_tasks_dir(tasks_dir)
-    logger.info(f"Loading tasks from {tasks_dir}")
+    logger.info(f"Loading tasks from {tasks_dir} (split={split})")
 
     train_cfg, model, trainer = setup_model(model_run_dir, ckpt_name=ckpt_name)
     train_cfg.datamodule.config.task_labels_dir = str(tasks_dir)
     D = instantiate(train_cfg.datamodule)
 
-    _warn_out_of_vocab(set(D.test_dataset.query.unique().to_list()), train_cfg)
-    logger.info(f"Loaded {len(D.test_dataset)} tasks across {D.test_dataset.query.n_unique()} query codes")
+    dataset_attr, dataloader_attr = _SPLIT_TO_DATAMODULE_ATTRS[split]
+    dataset = getattr(D, dataset_attr)
+    dataloader = getattr(D, dataloader_attr)()
 
-    # Pass ``test_dataloader()`` directly — MTD's ``Datamodule`` has no
+    _warn_out_of_vocab(set(dataset.query.unique().to_list()), train_cfg)
+    logger.info(f"Loaded {len(dataset)} tasks across {dataset.query.n_unique()} query codes")
+
+    # Pass the split's dataloader directly — MTD's ``Datamodule`` has no
     # ``predict_dataloader``, so ``trainer.predict(datamodule=D)`` would hit the base
-    # class's ``MisconfigurationException``.  ``test_dataloader`` is the held_out
-    # loader with ``shuffle=False``.
-    pred_batches = trainer.predict(model=model, dataloaders=D.test_dataloader(), ckpt_path=None)
+    # class's ``MisconfigurationException``.  ``val_dataloader`` / ``test_dataloader``
+    # both use ``shuffle=False``.
+    pred_batches = trainer.predict(model=model, dataloaders=dataloader, ckpt_path=None)
 
     probs = _gather_probabilities(pred_batches)
-    identifiers = _identifiers_from_schema_df(D.test_dataset.schema_df)
+    identifiers = _identifiers_from_schema_df(dataset.schema_df)
 
     # MTD guarantees ``schema_df`` preserves the input labels frame's length + order
-    # (see ``get_task_seq_bounds_and_labels`` docstring), and ``test_dataloader``
-    # uses ``shuffle=False`` — so ``probs`` comes back 1:1 matched with
-    # ``identifiers``.  A row-count mismatch would indicate a silent invariant
-    # violation; fail loudly.
+    # (see ``get_task_seq_bounds_and_labels`` docstring), and the dataloader is
+    # ``shuffle=False`` — so ``probs`` comes back 1:1 matched with ``identifiers``.
+    # A row-count mismatch would indicate a silent invariant violation; fail loudly.
     if probs.height != identifiers.height:
         raise RuntimeError(
             f"Prediction row count ({probs.height}) doesn't match dataset row count "
             f"({identifiers.height}).  This is an MTD invariant violation — "
-            f"``test_dataloader`` should have yielded one prediction per schema_df row."
+            f"the dataloader should have yielded one prediction per schema_df row."
         )
 
     out = identifiers.hstack(probs)

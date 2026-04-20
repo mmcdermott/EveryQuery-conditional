@@ -28,6 +28,12 @@ output_parquet: ???
 # If null, falls back to best_model.ckpt then checkpoints/last.ckpt.
 ckpt_name: null
 
+# Optional: which tensorized-cohort split to predict on.  Must be "held_out" (typical
+# inference — unseen data) or "tuning" (intermediate validation during model
+# development — the training-validity E2E uses this).  "train" is disallowed: MTD's
+# train_dataloader shuffles, which would break the order-preserving hstack.
+split: held_out
+
 hydra:
   output_subdir: null
   job:
