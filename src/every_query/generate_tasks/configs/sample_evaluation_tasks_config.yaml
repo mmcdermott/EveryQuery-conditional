@@ -1,0 +1,51 @@
+# Hydra config for the evaluation-task label generator.
+#
+# Sibling to `sample_tasks_config.yaml` (pretraining-shape, scattered tasks).  Where
+# `sample_tasks` draws random (code, duration) per row, this endpoint samples K
+# prediction times per subject and cross-joins them with the full (codes x durations)
+# grid — the dense shape `EQ_evaluate` needs to compute per-(query, duration_days)
+# metrics over a split.
+#
+# Sweep across shards with:
+#   python -m every_query.generate_tasks.sample_evaluation_tasks -m input_shard=0,1,2,...
+#
+# Path roots follow the same fallback pattern as sample_tasks (resolved in `main()`
+# via `load_dotenv()` + env-var fallback):
+#   data_dir  -> $INTERMEDIATE   (event shards live under `{data_dir}/data/{split}/*.parquet`)
+#   codes_dir -> $PROCESSED      (query universe under `{codes_dir}/metadata/codes.parquet`);
+#                                 ignored when `codes:` is passed explicitly
+#   out_dir   -> $TASK_DIR       (labeled shards land at {out_dir}/eval/{split}/*.parquet —
+#                                 separate `eval/` subdir so they don't collide with
+#                                 `sample_tasks`'s pretraining outputs at {out_dir}/{split}/*)
+
+data_dir: null
+codes_dir: null
+out_dir: null
+
+split: held_out # typical inference split; use `tuning` for intermediate validation.
+input_shard: "0" # basename (without .parquet) of the MEDS shard for this worker.
+seed: 1
+
+# How many prediction times to sample per subject.  The dense grid is
+# `prediction_times_per_subject x len(codes) x len(durations)` rows per subject.
+prediction_times_per_subject: 5
+
+# Minimum prior events a subject must have accumulated before a prediction time is
+# valid.  Same semantics as `sample_tasks_config.yaml`.
+min_context_per_subject: 50
+
+# Codes to evaluate.  Either an explicit list (`codes: [HR, TEMP]`), or leave as
+# null to load the full query vocabulary from `{codes_dir}/metadata/codes.parquet`.
+codes: null
+
+# Duration-day horizons to evaluate at every prediction time.  Must be a list of
+# ints; no log-uniform sampling here (unlike `sample_tasks`) — evaluation wants a
+# fixed, caller-specified duration grid.
+durations: [1, 7, 30, 90, 365]
+
+overwrite: false
+
+hydra:
+  output_subdir: null
+  job:
+    chdir: false

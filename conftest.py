@@ -182,11 +182,11 @@ def eq_preprocessed_dataset(simple_static_MEDS: Path, tmp_path_factory: pytest.T
     """Runs ``EQ_process_data do_demo=True`` against ``simple_static_MEDS``.
 
     Returns the tensorized-cohort output dir (``final/``), ready to feed into
-    ``EQ_generate_tasks`` and ``EQ_train`` as ``codes_dir`` and ``tensorized_cohort_dir``
+    ``EQ_generate_training_tasks`` and ``EQ_train`` as ``codes_dir`` and ``tensorized_cohort_dir``
     respectively.
 
     Sibling ``intermediate/`` dir is also produced (needed as ``data_dir`` for
-    ``EQ_generate_tasks``) and stored alongside ``final/`` — callers can reach it via
+    ``EQ_generate_training_tasks``) and stored alongside ``final/`` — callers can reach it via
     ``eq_preprocessed_dataset.parent / "intermediate"``.
     """
     root = tmp_path_factory.mktemp("eq_preprocessed")
@@ -210,7 +210,7 @@ def eq_preprocessed_dataset(simple_static_MEDS: Path, tmp_path_factory: pytest.T
 
 @pytest.fixture(scope="session")
 def eq_sampled_tasks_dir(eq_preprocessed_dataset: Path, tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """Runs ``EQ_generate_tasks`` for both ``train`` and ``tuning`` splits against
+    """Runs ``EQ_generate_training_tasks`` for both ``train`` and ``tuning`` splits against
     ``eq_preprocessed_dataset``.
 
     Returns the sampler's ``out_dir`` directly — the contract with downstream tooling
@@ -234,7 +234,7 @@ def eq_sampled_tasks_dir(eq_preprocessed_dataset: Path, tmp_path_factory: pytest
         # changes.
         run_and_check(
             [
-                "EQ_generate_tasks",
+                "EQ_generate_training_tasks",
                 f"data_dir={intermediate!s}",
                 f"codes_dir={eq_preprocessed_dataset!s}",
                 f"out_dir={out_dir!s}",

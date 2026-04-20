@@ -21,8 +21,8 @@ Training stage of the EveryQuery pipeline. Home of the `EQ_train` console script
 ## Pipeline position
 
 ```
-preprocessing/     →  generate_tasks/   →  train/   →  (predict/evaluate come later)
-EQ_process_data       EQ_generate_tasks     EQ_train
+preprocessing/     →  generate_tasks/                 →  train/      →  predict/    →  evaluate/
+EQ_process_data       EQ_generate_training_tasks         EQ_train       EQ_predict      EQ_evaluate
 ```
 
 `train/` consumes two artifacts from upstream:
@@ -36,7 +36,7 @@ EQ_process_data       EQ_generate_tasks     EQ_train
 `train/` produces a run directory at
 `$OUTPUT_DIR/outputs/<YYYY-MM-DD>/<HH-MM-SS>/` containing `best_model.ckpt`,
 `config.yaml` (used config), `resolved_config.yaml` (used config with all
-interpolations resolved — consumed by `eval.py` / downstream loaders), and a
+interpolations resolved — consumed by downstream loaders), and a
 `checkpoints/` dir with epoch-indexed checkpoints.
 
 ## Resume behavior

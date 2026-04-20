@@ -235,8 +235,8 @@ def main(cfg: DictConfig) -> float | None:
     # Ensure output_dir exists *after* any overwrite rmtree above, then write the config for this
     # run.  On resume (without overwrite) we keep the original run's config untouched so the
     # resumed run stays bit-identical to the first.  On overwrite the previous rmtree wiped the
-    # old config; writing it here restores reproducibility for any downstream tool (e.g.
-    # ``eval.py`` loads ``resolved_config.yaml`` from the run dir).  Fixes #31.
+    # old config; writing it here restores reproducibility for downstream tools that load
+    # ``resolved_config.yaml`` from the run dir.  Fixes #31.
     os.makedirs(output_dir, exist_ok=True)
     if not cfg.do_resume or cfg.do_overwrite:
         OmegaConf.save(cfg, output_dir / "config.yaml")

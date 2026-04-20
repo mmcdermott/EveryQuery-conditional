@@ -1,11 +1,11 @@
-"""Subprocess integration test for the new consolidated ``EQ_evaluate`` entry point.
+"""Subprocess integration test for the consolidated ``EQ_evaluate`` entry point.
 
-PR #100 lands ``every_query.evaluate.evaluate`` alongside the legacy
-``every_query.evaluate.eval`` without rewiring the ``EQ_evaluate`` console script —
-the rewiring is part of a follow-up consolidation wave pending #82 sign-off.  Until
-then, the new main is reachable as ``python -m every_query.evaluate.evaluate``.
+``EQ_evaluate`` now resolves to ``every_query.evaluate.evaluate:main``: consumes a
+``PredictionSchema`` parquet written by ``EQ_predict`` and emits per-``(query,
+duration_days)`` metrics.  The legacy four-stage evaluator has been deleted; recover
+from git history if archival reference is needed.
 
-This test exercises that module-level invocation path: schema-aligned parquet read,
+This test exercises the full subprocess path: schema-aligned parquet read,
 per-``(query, duration_days)`` metric computation, aligned parquet write.
 """
 
@@ -64,7 +64,7 @@ def _make_predictions_parquet(tmp_path: Path) -> Path:
 
 
 def test_evaluate_end_to_end(tmp_path: Path) -> None:
-    """``python -m every_query.evaluate.evaluate`` produces a per-group metrics parquet."""
+    """``EQ_evaluate`` produces a per-group metrics parquet."""
     predictions_parquet = _make_predictions_parquet(tmp_path)
     metrics_parquet = tmp_path / "metrics.parquet"
 
@@ -72,9 +72,7 @@ def test_evaluate_end_to_end(tmp_path: Path) -> None:
     env["PATH"] = _VENV_BIN + os.pathsep + env.get("PATH", "")
 
     cmd = [
-        sys.executable,
-        "-m",
-        "every_query.evaluate.evaluate",
+        "EQ_evaluate",
         f"predictions_parquet={predictions_parquet}",
         f"metrics_parquet={metrics_parquet}",
     ]
