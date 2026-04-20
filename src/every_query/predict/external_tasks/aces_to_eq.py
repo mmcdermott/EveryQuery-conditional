@@ -47,7 +47,17 @@ def create_eq_task_df(
 
     joined_df = aces_shard_df.join(eq_shard_all_tasks_df, on=["subject_id", "prediction_time"], how="left")
 
-    assert joined_df.select(pl.col("censored").null_count()).item() == 0
+    # Production-safe validation: ``assert`` gets stripped under ``python -O``, which
+    # would silently let a malformed join through.  Every (subject_id, prediction_time)
+    # in the ACES shard must be present in the EQ all-tasks shard — a null censored
+    # column means the join failed to match those columns, which is unrecoverable.
+    n_null_censored = joined_df.select(pl.col("censored").null_count()).item()
+    if n_null_censored:
+        raise ValueError(
+            f"{n_null_censored} (subject_id, prediction_time) rows in {aces_shard_fp} "
+            f"did not match any row in {eq_shard_fp} — left-join produced null ``censored``.  "
+            f"Check that the EQ all-tasks shard covers every ACES prediction time."
+        )
 
     base_cols = ["subject_id", "prediction_time", "task_label", "censored"]
 
