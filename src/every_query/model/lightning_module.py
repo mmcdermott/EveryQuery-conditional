@@ -287,21 +287,18 @@ class EveryQueryLightningModule(L.LightningModule):
     def predict_step(self, batch: EveryQueryBatch) -> dict[str, torch.Tensor]:
         """Produce prediction outputs (probabilities, embeddings, labels) for one batch.
 
-        ``query`` and ``duration_days`` are forwarded from the batch so downstream
-        consumers (``EQ_predict``) can label each prediction row without needing to
-        reconstruct the grouping themselves — the per-row identifiers ride along with
-        the per-row probabilities.  ``query`` is the integer vocab index here (the
-        model's own representation); EQ_predict inverts it via the dataset's
-        ``code_to_index`` map to recover the MEDS code string.
+        ``query`` and ``duration_days`` ride along from the batch so downstream
+        consumers that inspect predictions at the batch level don't have to re-derive
+        them.  Per-row identifiers (``subject_id`` / ``prediction_time``) are not
+        needed here — ``EQ_predict`` labels output rows by indexing the dataset's
+        ``schema_df`` in dataloader order, so there's no benefit to round-tripping
+        them through a tensor.
 
         Examples:
-            >>> pred_batch = copy.copy(sample_batch)
-            >>> pred_batch.subject_id = torch.tensor([1, 2])
-            >>> pred_batch.prediction_time = torch.tensor([100, 200])
-            >>> result = demo_lightning_module.predict_step(pred_batch)
+            >>> result = demo_lightning_module.predict_step(sample_batch)
             >>> sorted(result.keys()) == [
             ...     'censor', 'censor_probs', 'duration_days', 'occurs', 'occurs_probs',
-            ...     'prediction_time', 'query', 'query_embed', 'subject_id',
+            ...     'query', 'query_embed',
             ... ]
             True
             >>> result['query_embed'].shape[1] == demo_model_config.hidden_size
@@ -328,8 +325,6 @@ class EveryQueryLightningModule(L.LightningModule):
 
         empty_tensor = torch.tensor([])
         return {
-            "subject_id": batch.subject_id.detach().cpu(),
-            "prediction_time": batch.prediction_time.detach().cpu(),
             "occurs_probs": outputs.occurs_probs.detach().cpu(),
             "censor_probs": outputs.censor_probs.detach().cpu(),
             "occurs": batch.occurs.detach().cpu() if batch.occurs is not None else empty_tensor,

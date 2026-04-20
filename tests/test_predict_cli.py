@@ -23,6 +23,7 @@ import polars as pl
 import pyarrow.parquet as pq
 import pytest
 
+from every_query.data.schema import TaskQuerySchema
 from every_query.predict.schema import PredictionSchema
 
 _VENV_BIN = str(Path(sys.executable).parent)
@@ -36,30 +37,32 @@ _QUERY_CODES = ["HR", "TEMP"]
 _DURATION_DAYS = 30.0
 
 
+def _write_tasks_parquet(fp: Path, columns: dict[str, list]) -> None:
+    """Write a TaskQuerySchema-aligned parquet from a column dict.
+
+    Routes the frame through ``TaskQuerySchema.align`` so the on-disk dtypes match
+    the schema without callers having to restate every ``pl.Int64`` / ``pl.Float32``
+    cast at each test site.
+    """
+    df = pl.DataFrame(columns)
+    aligned = TaskQuerySchema.align(df.to_arrow())
+    pl.from_arrow(aligned).write_parquet(fp)
+
+
 @pytest.fixture(scope="module")
 def predict_tasks_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """A directory containing a single TaskQuerySchema-conformant parquet for EQ_predict."""
-    rows = [
-        {
-            "subject_id": _HELD_OUT_SUBJECT,
-            "prediction_time": _PRED_TIME,
-            "query": code,
-            "duration_days": _DURATION_DAYS,
-            "boolean_value": None,
-        }
-        for code in _QUERY_CODES
-    ]
-    df = pl.DataFrame(rows).cast(
-        {
-            "subject_id": pl.Int64,
-            "prediction_time": pl.Datetime("us"),
-            "query": pl.Utf8,
-            "duration_days": pl.Float32,
-            "boolean_value": pl.Boolean,
-        }
-    )
     tasks_dir = tmp_path_factory.mktemp("eq_predict_tasks")
-    df.write_parquet(tasks_dir / "tasks.parquet")
+    _write_tasks_parquet(
+        tasks_dir / "tasks.parquet",
+        {
+            "subject_id": [_HELD_OUT_SUBJECT] * len(_QUERY_CODES),
+            "prediction_time": [_PRED_TIME] * len(_QUERY_CODES),
+            "query": _QUERY_CODES,
+            "duration_days": [_DURATION_DAYS] * len(_QUERY_CODES),
+            "boolean_value": [None] * len(_QUERY_CODES),
+        },
+    )
     return tasks_dir
 
 
@@ -123,44 +126,21 @@ def test_eq_predict_preserves_input_row_order(
     """
     # Non-alphabetical query order, mixed durations — exercises the order check past
     # the alphabetical HR/TEMP happy path of the main integration test.
-    rows = [
-        {
-            "subject_id": _HELD_OUT_SUBJECT,
-            "prediction_time": _PRED_TIME,
-            "query": "TEMP",
-            "duration_days": 60.0,
-            "boolean_value": None,
-        },
-        {
-            "subject_id": _HELD_OUT_SUBJECT,
-            "prediction_time": _PRED_TIME,
-            "query": "HR",
-            "duration_days": 30.0,
-            "boolean_value": None,
-        },
-        {
-            "subject_id": _HELD_OUT_SUBJECT,
-            "prediction_time": _PRED_TIME,
-            "query": "TEMP",
-            "duration_days": 30.0,
-            "boolean_value": None,
-        },
-    ]
-    expected_queries = [r["query"] for r in rows]
-    expected_durations = [r["duration_days"] for r in rows]
+    expected_queries = ["TEMP", "HR", "TEMP"]
+    expected_durations = [60.0, 30.0, 30.0]
 
-    df_in = pl.DataFrame(rows).cast(
-        {
-            "subject_id": pl.Int64,
-            "prediction_time": pl.Datetime("us"),
-            "query": pl.Utf8,
-            "duration_days": pl.Float32,
-            "boolean_value": pl.Boolean,
-        }
-    )
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
-    df_in.write_parquet(tasks_dir / "tasks.parquet")
+    _write_tasks_parquet(
+        tasks_dir / "tasks.parquet",
+        {
+            "subject_id": [_HELD_OUT_SUBJECT] * len(expected_queries),
+            "prediction_time": [_PRED_TIME] * len(expected_queries),
+            "query": expected_queries,
+            "duration_days": expected_durations,
+            "boolean_value": [None] * len(expected_queries),
+        },
+    )
     output_parquet = tmp_path / "predictions.parquet"
 
     env = os.environ.copy()

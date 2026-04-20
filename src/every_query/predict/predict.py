@@ -60,6 +60,52 @@ def _validate_tasks_dir(tasks_dir: Path) -> None:
     is present — the typical inference use case is a single flat parquet; multiple
     files usually indicates the caller pointed us at the training task-labels
     directory by mistake.
+
+    Examples:
+        A directory with a single parquet file is the happy path:
+
+        >>> import tempfile
+        >>> with tempfile.TemporaryDirectory() as tmpdir:
+        ...     d = Path(tmpdir)
+        ...     (d / "tasks.parquet").touch()
+        ...     _validate_tasks_dir(d)  # no output, no error
+
+        Non-directory argument raises ``NotADirectoryError``:
+
+        >>> with tempfile.TemporaryDirectory() as tmpdir:
+        ...     f = Path(tmpdir) / "tasks.parquet"
+        ...     f.touch()
+        ...     _validate_tasks_dir(f)
+        Traceback (most recent call last):
+            ...
+        NotADirectoryError: tasks_dir must be a directory, got .../tasks.parquet
+
+        Empty directory raises ``ValueError``:
+
+        >>> with tempfile.TemporaryDirectory() as tmpdir:
+        ...     _validate_tasks_dir(Path(tmpdir))
+        Traceback (most recent call last):
+            ...
+        ValueError: tasks_dir ... contains no parquet files
+
+        Any non-parquet file in the tree raises ``ValueError``:
+
+        >>> with tempfile.TemporaryDirectory() as tmpdir:
+        ...     d = Path(tmpdir)
+        ...     (d / "tasks.parquet").touch()
+        ...     (d / "README.md").touch()
+        ...     _validate_tasks_dir(d)
+        Traceback (most recent call last):
+            ...
+        ValueError: tasks_dir ... contains non-parquet files: ['README.md']...
+
+        Multiple parquet files pass but log a warning (caller can inspect logs):
+
+        >>> with tempfile.TemporaryDirectory() as tmpdir:
+        ...     d = Path(tmpdir)
+        ...     (d / "a.parquet").touch()
+        ...     (d / "b.parquet").touch()
+        ...     _validate_tasks_dir(d)  # succeeds, warning is logged not raised
     """
     if not tasks_dir.is_dir():
         raise NotADirectoryError(f"tasks_dir must be a directory, got {tasks_dir}")
@@ -89,6 +135,36 @@ def _warn_out_of_vocab(task_codes: set[str], train_cfg: DictConfig) -> None:
     Out-of-vocab query codes survive the predict loop (``encode_query`` silently falls
     back to ``PAD_INDEX``) but produce effectively-uniform predictions.  Log a warning
     at startup so the caller notices rather than silently getting garbage probabilities.
+
+    Examples:
+        Happy path — every task code is present in the training vocab, no warning:
+
+        >>> import tempfile
+        >>> from omegaconf import OmegaConf
+        >>> with tempfile.TemporaryDirectory() as tmpdir:
+        ...     meta_dir = Path(tmpdir) / "metadata"
+        ...     meta_dir.mkdir()
+        ...     pl.DataFrame({"code": ["A", "B", "C"]}).write_parquet(meta_dir / "codes.parquet")
+        ...     cfg = OmegaConf.create({"datamodule": {"config": {"tensorized_cohort_dir": tmpdir}}})
+        ...     _warn_out_of_vocab({"A", "B"}, cfg)  # no raise, no logged warning
+
+        Out-of-vocab codes trigger a warning (raised-vs-logged distinction: this is a
+        soft signal, not an error — malformed inputs get visible-but-survivable
+        degradation rather than a hard stop):
+
+        >>> with tempfile.TemporaryDirectory() as tmpdir:
+        ...     meta_dir = Path(tmpdir) / "metadata"
+        ...     meta_dir.mkdir()
+        ...     pl.DataFrame({"code": ["A"]}).write_parquet(meta_dir / "codes.parquet")
+        ...     cfg = OmegaConf.create({"datamodule": {"config": {"tensorized_cohort_dir": tmpdir}}})
+        ...     _warn_out_of_vocab({"A", "MISSING"}, cfg)  # logs warning, no raise
+
+        Missing metadata file also warns rather than erroring — predict should still
+        be able to run against a training dir that happens to lack the metadata:
+
+        >>> with tempfile.TemporaryDirectory() as tmpdir:
+        ...     cfg = OmegaConf.create({"datamodule": {"config": {"tensorized_cohort_dir": tmpdir}}})
+        ...     _warn_out_of_vocab({"A"}, cfg)  # logs warning, no raise
     """
     metadata_fp = Path(train_cfg.datamodule.config.tensorized_cohort_dir) / "metadata" / "codes.parquet"
     if not metadata_fp.is_file():
@@ -142,14 +218,10 @@ def _identifiers_from_schema_df(schema_df: pl.DataFrame) -> pl.DataFrame:
     ``(censor, occurs)`` pair (inverse of the collapse in
     ``EveryQueryPytorchDataset.__init__``) so the output matches the
     ``TaskQuerySchema`` ``null``/``True``/``False`` convention.
-
-    ``prediction_time`` is cast back to ``Datetime("us")`` — the dataset stores
-    it as int64 microseconds for the held_out split so ``predict_step`` can push
-    it through a tensor.
     """
     out = schema_df.select(
         TaskQuerySchema.subject_id_name,
-        pl.col(TaskQuerySchema.prediction_time_name).cast(pl.Datetime("us")),
+        TaskQuerySchema.prediction_time_name,
         TaskQuerySchema.query_name,
         TaskQuerySchema.duration_days_name,
     )
