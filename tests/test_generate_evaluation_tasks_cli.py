@@ -100,7 +100,7 @@ def test_eq_generate_evaluation_tasks_deterministic(
     eq_preprocessed_dataset: Path,
     tmp_path: Path,
 ) -> None:
-    """Two runs with the same seed produce byte-identical output parquets."""
+    """Two runs with the same seed produce equivalent parquet contents (row-for-row)."""
     intermediate = eq_preprocessed_dataset.parent / "intermediate"
     common_args: list[str] = [
         f"data_dir={intermediate!s}",

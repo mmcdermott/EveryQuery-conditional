@@ -18,9 +18,9 @@ Pipeline:
 
 Seeding:
     Prediction-time sampling is deterministic in ``(seed, input_shard, split)``.
-    There is no task-axis analogue of :func:`sample_tasks.derive_seed` here —
-    the task axis is fully specified by ``(codes, durations)``, so only the
-    prediction-time sampler needs randomness.
+    There is no task-axis analogue of :func:`every_query.utils.seeds.derive_seed`
+    here — the task axis is fully specified by ``(codes, durations)``, so only
+    the prediction-time sampler needs randomness.
 """
 
 import logging
@@ -346,7 +346,21 @@ def main(cfg: DictConfig) -> None:
     else:
         codes = _read_query_codes(codes_cfg)
 
-    durations = [int(d) for d in cfg.durations]
+    # Durations must be whole-day ints — silent truncation (e.g. ``0.5 → 0``) would
+    # change the window semantics.  ``TaskQuerySchema.duration_days`` is float32 on
+    # disk, but the CLI contract here is integer days; fractional durations are a
+    # deliberate-future-feature (see #129), not a silent-today feature.
+    durations: list[int] = []
+    for i, d in enumerate(cfg.durations):
+        if isinstance(d, bool) or not isinstance(d, int | float):
+            raise TypeError(f"cfg.durations[{i}] must be a number, got {type(d).__name__}: {d!r}")
+        if not float(d).is_integer():
+            raise ValueError(
+                f"cfg.durations[{i}] must be a whole-day integer, got {d!r}.  "
+                f"Fractional horizons aren't supported by this CLI yet — see #129."
+            )
+        durations.append(int(d))
+
     split = cfg.split
     input_shard = str(cfg.input_shard)
 

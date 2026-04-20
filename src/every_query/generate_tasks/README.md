@@ -63,7 +63,7 @@ The pretraining generator's seed derivation (`utils.seeds.derive_seed`)
 separates task-axis and context-axis randomness so fixing `task_shard` across
 `input_shard` values evaluates the *same* tasks on *different* patients; the
 evaluation generator only has a prediction-time axis (codes and durations are
-caller-specified), so its seed derives on `(seed, input_shard)` alone. Each
+caller-specified), so its seed derives on `(seed, split, input_shard)`. Each
 worker writes idempotently; re-running is a no-op.
 
 ## Related
