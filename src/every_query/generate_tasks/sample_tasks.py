@@ -466,7 +466,7 @@ def _labels_fp(out_dir: Path, split: str, input_shard: str, task_shard: int) -> 
 def run_worker(
     data_dir: Path,
     out_dir: Path,
-    codes_dir: Path,
+    codes_dir: list[str] | ListConfig | str | Path,
     split: str,
     input_shard: str,
     task_shard: int,
@@ -574,12 +574,19 @@ def main(cfg: DictConfig) -> None:
 
     data_dir = _resolve_path(cfg.get("data_dir"), "INTERMEDIATE", "data_dir")
     out_dir = _resolve_path(cfg.get("out_dir"), "TASK_DIR", "out_dir")
-    codes_dir = _resolve_path(cfg.get("codes_dir"), "PROCESSED", "codes_dir")
+
+    # ``codes: [A, B, ...]`` (explicit CLI override) takes precedence over ``codes_dir``;
+    # falls back to reading the full vocab from ``{codes_dir}/metadata/codes.parquet``.
+    # Matches the ``sample_evaluation_tasks`` contract.
+    codes_cfg = cfg.get("codes")
+    codes_source = (
+        codes_cfg if codes_cfg is not None else _resolve_path(cfg.get("codes_dir"), "PROCESSED", "codes_dir")
+    )
 
     run_worker(
         data_dir=data_dir,
         out_dir=out_dir,
-        codes_dir=codes_dir,
+        codes_dir=codes_source,
         split=str(cfg.split),
         input_shard=str(cfg.input_shard),
         task_shard=int(cfg.task_shard),
