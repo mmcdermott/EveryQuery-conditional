@@ -409,7 +409,11 @@ def read_query_codes(codes_or_path: list[str] | ListConfig | str | Path) -> list
     Shared by both ``sample_tasks.main`` and ``sample_evaluation_tasks.main``.
     """
     if isinstance(codes_or_path, list | ListConfig):
-        return list(codes_or_path)
+        # Order-preserving dedup: duplicates in a user-provided ``codes: [A, A, B]``
+        # list would silently inflate the task grid / sampling distribution.  The
+        # parquet branch below already dedups via ``.unique().sort()``.
+        seen: set[str] = set()
+        return [c for c in codes_or_path if not (c in seen or seen.add(c))]
     if codes_or_path is None:
         raise ValueError("codes must be a list of query codes or a path to codes.parquet")
     p = Path(str(codes_or_path))

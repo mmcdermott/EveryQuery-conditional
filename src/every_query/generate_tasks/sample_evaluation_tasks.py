@@ -126,15 +126,38 @@ def sample_prediction_times_per_subject(
     if k == 0 or candidates.height == 0:
         return candidates.head(0)
 
-    # Per-subject sample: shuffle within each subject's candidates (deterministically
-    # via a seed-derived per-row integer), rank 1..n, keep the first k.  Simpler
-    # than per-subject ``.sample`` loops and still order-stable on the input.
-    shuffled = candidates.with_columns(
-        pl.int_range(0, pl.len()).shuffle(seed=seed).over(DataSchema.subject_id_name).alias("_rank")
+    # Per-subject sample: derive a per-row sampling key from
+    # ``hash(subject_id, prediction_time, seed)``, rank within each subject by that
+    # key, and keep the first ``k``.  ``pl.int_range(...).shuffle(seed).over(s)``
+    # re-applies the same shuffle pattern to every subject, so two subjects with the
+    # same candidate count would deterministically receive identical positional
+    # selections — a per-row hash avoids that while staying deterministic in
+    # ``(events_df, k, min_context_per_subject, seed)``.
+    shuffled = (
+        candidates.with_columns(
+            pl.concat_str(
+                [
+                    pl.col(DataSchema.subject_id_name).cast(pl.Utf8),
+                    pl.col(TaskQuerySchema.prediction_time_name).cast(pl.Utf8),
+                    pl.lit(str(seed)),
+                ],
+                separator="|",
+            )
+            .hash()
+            .alias("_sample_key")
+        )
+        .sort(
+            [
+                DataSchema.subject_id_name,
+                "_sample_key",
+                TaskQuerySchema.prediction_time_name,
+            ]
+        )
+        .with_columns(pl.int_range(0, pl.len()).over(DataSchema.subject_id_name).alias("_rank"))
     )
     return (
         shuffled.filter(pl.col("_rank") < k)
-        .drop("_rank")
+        .drop(["_sample_key", "_rank"])
         .sort([DataSchema.subject_id_name, TaskQuerySchema.prediction_time_name])
     )
 
