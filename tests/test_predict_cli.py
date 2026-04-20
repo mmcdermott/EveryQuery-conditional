@@ -4,10 +4,11 @@ Acceptance criterion from #81: *"CPU-only integration test in ``tests/test_predi
 that exercises the full subprocess path."*
 
 Uses the session-scoped ``eq_trained_model_dir`` fixture (a real trained demo checkpoint +
-``resolved_config.yaml``) and builds a ``TaskQuerySchema``-conformant tasks parquet whose
-subjects live in the ``held_out`` split of the training cohort.  Runs ``EQ_predict`` in a
-subprocess and verifies the output is ``PredictionSchema``-conformant with probabilities in
-``[0, 1]`` and one row per input task.
+``resolved_config.yaml``) and builds a ``TaskQuerySchema``-conformant tasks *directory*
+with a single parquet, whose subjects live in the ``held_out`` split of the training
+cohort.  Runs ``EQ_predict`` in a subprocess and verifies the output is
+``PredictionSchema``-conformant with probabilities in ``[0, 1]`` and one row per input
+task.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ import polars as pl
 import pyarrow.parquet as pq
 import pytest
 
+from every_query.data.schema import TaskQuerySchema
 from every_query.predict.schema import PredictionSchema
 
 _VENV_BIN = str(Path(sys.executable).parent)
@@ -35,43 +37,44 @@ _QUERY_CODES = ["HR", "TEMP"]
 _DURATION_DAYS = 30.0
 
 
+def _write_tasks_parquet(fp: Path, columns: dict[str, list]) -> None:
+    """Write a TaskQuerySchema-aligned parquet from a column dict.
+
+    Routes the frame through ``TaskQuerySchema.align`` for dtypes (so test sites
+    don't restate per-column ``pl.Int64`` / ``pl.Float32`` casts) and writes the
+    aligned arrow table directly via ``pyarrow.parquet`` — no extra polars
+    round-trip on the way out.
+    """
+    aligned = TaskQuerySchema.align(pl.DataFrame(columns).to_arrow())
+    pq.write_table(aligned, fp)
+
+
 @pytest.fixture(scope="module")
-def predict_tasks_parquet(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """A tiny TaskQuerySchema-conformant parquet for EQ_predict's input."""
-    rows = [
+def predict_tasks_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """A directory containing a single TaskQuerySchema-conformant parquet for EQ_predict."""
+    tasks_dir = tmp_path_factory.mktemp("eq_predict_tasks")
+    _write_tasks_parquet(
+        tasks_dir / "tasks.parquet",
         {
-            "subject_id": _HELD_OUT_SUBJECT,
-            "prediction_time": _PRED_TIME,
-            "query": code,
-            "duration_days": _DURATION_DAYS,
-            "boolean_value": None,
-        }
-        for code in _QUERY_CODES
-    ]
-    df = pl.DataFrame(rows).cast(
-        {
-            "subject_id": pl.Int64,
-            "prediction_time": pl.Datetime("us"),
-            "query": pl.Utf8,
-            "duration_days": pl.Float32,
-            "boolean_value": pl.Boolean,
-        }
+            "subject_id": [_HELD_OUT_SUBJECT] * len(_QUERY_CODES),
+            "prediction_time": [_PRED_TIME] * len(_QUERY_CODES),
+            "query": _QUERY_CODES,
+            "duration_days": [_DURATION_DAYS] * len(_QUERY_CODES),
+            "boolean_value": [None] * len(_QUERY_CODES),
+        },
     )
-    out = tmp_path_factory.mktemp("eq_predict_tasks") / "tasks.parquet"
-    df.write_parquet(out)
-    return out
+    return tasks_dir
 
 
 def test_eq_predict_end_to_end(
     eq_trained_model_dir: Path,
-    predict_tasks_parquet: Path,
+    predict_tasks_dir: Path,
     tmp_path: Path,
 ) -> None:
     """``EQ_predict`` runs end-to-end and produces a ``PredictionSchema``-conformant parquet.
 
-    Exercises the full subprocess entry point — console-script resolution, Hydra config
-    compose, model checkpoint load, per-``(query, duration_days)`` predict loop, join-back
-    to preserve inherited label columns, schema-aligned write.
+    Exercises the full subprocess entry point — console-script resolution, Hydra config compose, model
+    checkpoint load, single predict pass, row-order-preserved hstack with tasks_df, schema-aligned write.
     """
     output_parquet = tmp_path / "predictions.parquet"
 
@@ -81,7 +84,7 @@ def test_eq_predict_end_to_end(
     cmd = [
         "EQ_predict",
         f"model_run_dir={eq_trained_model_dir}",
-        f"tasks_parquet={predict_tasks_parquet}",
+        f"tasks_dir={predict_tasks_dir}",
         f"output_parquet={output_parquet}",
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=300)
@@ -107,3 +110,62 @@ def test_eq_predict_end_to_end(
 
     # Every input query is represented in the output.
     assert set(df["query"].to_list()) == set(_QUERY_CODES)
+
+
+def test_eq_predict_preserves_input_row_order(
+    eq_trained_model_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """Multi-query/durations sanity-check: output row identifiers match the input parquet in order.
+
+    Guards the implementation's load-bearing assumption that ``D.test_dataset.schema_df``
+    preserves the input labels frame's row order (per MTD's
+    ``get_task_seq_bounds_and_labels`` guarantee).  If a future MTD bump reorders
+    schema_df rows, the output ``(query, duration_days)`` column would desync from the
+    input parquet and this test would fail.
+    """
+    # Non-alphabetical query order, mixed durations — exercises the order check past
+    # the alphabetical HR/TEMP happy path of the main integration test.
+    expected_queries = ["TEMP", "HR", "TEMP"]
+    expected_durations = [60.0, 30.0, 30.0]
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    _write_tasks_parquet(
+        tasks_dir / "tasks.parquet",
+        {
+            "subject_id": [_HELD_OUT_SUBJECT] * len(expected_queries),
+            "prediction_time": [_PRED_TIME] * len(expected_queries),
+            "query": expected_queries,
+            "duration_days": expected_durations,
+            "boolean_value": [None] * len(expected_queries),
+        },
+    )
+    output_parquet = tmp_path / "predictions.parquet"
+
+    env = os.environ.copy()
+    env["PATH"] = _VENV_BIN + os.pathsep + env.get("PATH", "")
+    result = subprocess.run(
+        [
+            "EQ_predict",
+            f"model_run_dir={eq_trained_model_dir}",
+            f"tasks_dir={tasks_dir}",
+            f"output_parquet={output_parquet}",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=300,
+    )
+    assert result.returncode == 0, (
+        f"EQ_predict failed (rc={result.returncode})\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+
+    df_out = pl.from_arrow(pq.read_table(output_parquet))
+    assert df_out["query"].to_list() == expected_queries, (
+        f"Output query order {df_out['query'].to_list()} doesn't match input {expected_queries}"
+    )
+    assert df_out["duration_days"].to_list() == expected_durations, (
+        f"Output duration_days order {df_out['duration_days'].to_list()} doesn't match input "
+        f"{expected_durations}"
+    )
