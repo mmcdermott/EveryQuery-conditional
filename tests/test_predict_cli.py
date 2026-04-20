@@ -40,13 +40,13 @@ _DURATION_DAYS = 30.0
 def _write_tasks_parquet(fp: Path, columns: dict[str, list]) -> None:
     """Write a TaskQuerySchema-aligned parquet from a column dict.
 
-    Routes the frame through ``TaskQuerySchema.align`` so the on-disk dtypes match
-    the schema without callers having to restate every ``pl.Int64`` / ``pl.Float32``
-    cast at each test site.
+    Routes the frame through ``TaskQuerySchema.align`` for dtypes (so test sites
+    don't restate per-column ``pl.Int64`` / ``pl.Float32`` casts) and writes the
+    aligned arrow table directly via ``pyarrow.parquet`` — no extra polars
+    round-trip on the way out.
     """
-    df = pl.DataFrame(columns)
-    aligned = TaskQuerySchema.align(df.to_arrow())
-    pl.from_arrow(aligned).write_parquet(fp)
+    aligned = TaskQuerySchema.align(pl.DataFrame(columns).to_arrow())
+    pq.write_table(aligned, fp)
 
 
 @pytest.fixture(scope="module")

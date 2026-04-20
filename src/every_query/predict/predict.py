@@ -38,6 +38,7 @@ from pathlib import Path
 
 import hydra
 import polars as pl
+import pyarrow.parquet as pq
 import torch
 from hydra.utils import instantiate
 from omegaconf import DictConfig
@@ -284,10 +285,11 @@ def main(cfg: DictConfig) -> None:
 
     output_parquet.parent.mkdir(parents=True, exist_ok=True)
     # Final canonicalization pass — ``align`` casts / reorders columns to match the
-    # schema's canonical arrow layout, so the written parquet is schema-conformant
-    # regardless of whatever dtypes the input happened to have.
+    # schema's canonical arrow layout, and we write the aligned arrow table directly
+    # via pyarrow so the schema-coerced dtypes actually land on disk (a polars
+    # round-trip would re-infer types from the aligned data, which defeats the point).
     aligned = PredictionSchema.align(out.to_arrow())
-    pl.from_arrow(aligned).write_parquet(output_parquet)
+    pq.write_table(aligned, output_parquet)
     logger.info(f"Wrote {out.height} predictions to {output_parquet}")
 
 
