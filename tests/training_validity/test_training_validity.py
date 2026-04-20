@@ -8,16 +8,15 @@ unified AUROC criteria can be assessed cleanly.
 
 from __future__ import annotations
 
+import sys
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import numpy as np
 import polars as pl
-import pyarrow.parquet as pq
 import pytest
 from meds import DatasetMetadataSchema, train_split, tuning_split
 from meds_testing_helpers.dataset import MEDSDataset
-from sklearn.metrics import roc_auc_score
 
 from conftest import ENSURE_ENV_PLACEHOLDERS, run_and_check
 
@@ -278,11 +277,15 @@ def test_trained_model_learns_occurs_and_censor(
     ``pytest -m slow`` (run only this) or ``pytest -m 'slow or not slow'`` (run everything).
     CI's `tests.yaml` uses the latter.
 
-    Inference runs through ``EQ_predict`` as a subprocess — same path a caller would use
-    in production — so the unified criteria land on the actual CLI output rather than
-    an in-process model forward.  Predictions go against the tuning split (that's where
-    this test's synthetic validation data lives).
+    Both stages — inference (``EQ_predict``) and metrics
+    (``every_query.evaluate.evaluate``) — run as subprocesses against actual CLI
+    outputs, so the unified criteria land on what a caller would get in production,
+    not an in-process recomputation.  Predictions go against the tuning split (that's
+    where this test's synthetic validation data lives).  The evaluate stage is
+    reached via ``python -m`` since ``EQ_evaluate`` still points at the legacy
+    four-stage pipeline pending the #83 rewire.
     """
+    # ── Stage 1: EQ_predict → PredictionSchema parquet ──────────────────────
     predictions_parquet = tmp_path / "predictions.parquet"
     tuning_tasks_dir = oracle_dataset["task_labels_dir"] / tuning_split
     run_and_check(
@@ -297,98 +300,86 @@ def test_trained_model_learns_occurs_and_censor(
         timeout=600.0,
     )
 
-    # PredictionSchema output: subject_id, prediction_time, query, duration_days,
-    # boolean_value (null=censored), censor_prob, occurs_prob.  Convert to the
-    # (occurs_true, censor_true, occurs_pred, censor_pred) shape the criteria check.
-    predictions = pl.from_arrow(pq.read_table(predictions_parquet))
-    df = predictions.with_columns(
-        pl.col("boolean_value").is_null().cast(pl.Int64).alias("censor_true"),
-        pl.col("boolean_value").fill_null(False).cast(pl.Int64).alias("occurs_true"),
-        pl.col("duration_days").cast(pl.Int64).alias("duration_days"),
-        pl.col("censor_prob").cast(pl.Float64).alias("censor_pred"),
-        pl.col("occurs_prob").cast(pl.Float64).alias("occurs_pred"),
-    ).select("query", "duration_days", "occurs_true", "censor_true", "occurs_pred", "censor_pred")
-
-    # Diagnostics — always print, regardless of pass/fail.
-    print("\n[Design 2] per-cell label + prediction distribution (tuning):")
-    per_cell = (
-        df.group_by(["query", "duration_days"])
-        .agg(
-            pl.len().alias("n"),
-            pl.col("occurs_true").cast(pl.Float64).mean().alias("p_occurs_true"),
-            pl.col("occurs_pred").mean().alias("p_occurs_pred"),
-            pl.col("censor_true").cast(pl.Float64).mean().alias("p_censor_true"),
-            pl.col("censor_pred").mean().alias("p_censor_pred"),
-        )
-        .sort(["query", "duration_days"])
+    # ── Stage 2: every_query.evaluate.evaluate → metrics parquet ────────────
+    # Reach it via ``python -m`` — ``EQ_evaluate`` still points at the legacy
+    # four-stage pipeline pending the #83 rewire.  Once that lands, this becomes
+    # a straight ``EQ_evaluate`` console-script call.
+    metrics_parquet = tmp_path / "metrics.parquet"
+    run_and_check(
+        [
+            sys.executable,
+            "-m",
+            "every_query.evaluate.evaluate",
+            f"predictions_parquet={predictions_parquet!s}",
+            f"metrics_parquet={metrics_parquet!s}",
+        ],
+        env=ENSURE_ENV_PLACEHOLDERS,
+        timeout=60.0,
     )
-    for r in per_cell.iter_rows(named=True):
+    metrics = pl.read_parquet(metrics_parquet).sort(["query", "duration_days"])
+    # Full diagnostic dump regardless of pass/fail.
+    print("\n[Design 2] per-(query, duration_days) metrics (tuning):")
+    for row in metrics.iter_rows(named=True):
         print(
-            f"  {r['query']:8s} d={r['duration_days']:3d}  n={r['n']:3d}  "
-            f"p(occurs)={r['p_occurs_true']:.3f} (pred {r['p_occurs_pred']:.3f})  "
-            f"p(censor)={r['p_censor_true']:.3f} (pred {r['p_censor_pred']:.3f})"
+            f"  {row['query']:8s} d={int(row['duration_days']):3d}  "
+            f"n={row['n_rows']:3d} labeled={row['n_occurs_labeled']:3d} "
+            f"pos={row['n_positive']:3d}  "
+            f"occurs_auroc={row['occurs_auroc']}  censor_auroc={row['censor_auroc']}"
         )
 
+    # ── Stage 3: assertions on the metrics parquet + monotonicity on preds ──
     failures: list[str] = []
 
-    # ── 1. Censor-head AUROC ─────────────────────────────────────────────────
-    # Censoring is part of the required signal in Design 2 (P_END_D20 guarantees censoring at
-    # d=30), so a single-class censor distribution is itself a regression — fail explicitly
-    # rather than silently skipping the AUROC check.
-    censor_true = df["censor_true"].to_list()
-    censor_pred = df["censor_pred"].to_list()
-    censor_classes = set(censor_true)
-    if len(censor_classes) < 2:
-        n_pos = sum(censor_true)
-        failures.append(
-            f"censor label distribution is degenerate — {len(censor_true)} rows, "
-            f"{n_pos} censored, classes={sorted(censor_classes)}.  Expected both classes "
-            f"(P_END_D20 subjects should be censored at d=30, P_END_D100 should not)."
-        )
-    else:
-        censor_auroc = float(roc_auc_score(censor_true, censor_pred))
-        print(f"\ncensor-head AUROC: {censor_auroc:.3f}")
-        if censor_auroc < _CENSOR_AUROC_THRESHOLD:
-            failures.append(f"censor AUROC {censor_auroc:.3f} < {_CENSOR_AUROC_THRESHOLD}")
-
-    # ── 2. Per-(code, duration) occurs AUROC on non-censored rows ────────────
-    # Each (TARGET, duration) cell is expected to have both occurs=True and occurs=False
-    # after filtering to non-censored subjects (see the windowing table in README.md).  A
-    # degenerate cell means synthesis/labeling regressed, so fail explicitly.
-    for duration in _DURATIONS_DAYS:
-        cell = df.filter(
-            (pl.col("query") == _TARGET_CODE)
-            & (pl.col("duration_days") == duration)
-            & (pl.col("censor_true") == 0)
-        )
-        y_true = cell["occurs_true"].to_list()
-        y_pred = cell["occurs_pred"].to_list()
-        cell_classes = set(y_true)
-        if len(cell_classes) < 2:
+    # 1. Per-cell `occurs_auroc` on non-censored rows must meet threshold.  Every
+    #    (TARGET, duration) cell is expected to have both classes after filtering
+    #    out censored subjects (see the windowing table in README.md) — a null
+    #    occurs_auroc from `evaluate.evaluate` means the cell went single-class,
+    #    which is a synthesis/labeling regression.
+    for row in metrics.filter(pl.col("query") == _TARGET_CODE).iter_rows(named=True):
+        d = int(row["duration_days"])
+        if row["occurs_auroc"] is None:
             failures.append(
-                f"occurs label distribution is degenerate at (TARGET, d={duration}): "
-                f"n={len(y_true)}, classes={sorted(cell_classes)}.  Expected both classes "
-                f"from firing+non-firing markers (see README windowing table)."
+                f"occurs_auroc is null at (TARGET, d={d}), n_labeled={row['n_occurs_labeled']}, "
+                f"n_positive={row['n_positive']}.  Expected both occurs classes from "
+                f"firing+non-firing markers (see README windowing table)."
             )
             continue
-        auroc = float(roc_auc_score(y_true, y_pred))
-        print(f"  occurs AUROC (TARGET, d={duration}, n={len(y_true)}): {auroc:.3f}")
-        if auroc < _PER_CELL_OCCURS_AUROC_THRESHOLD:
+        if row["occurs_auroc"] < _PER_CELL_OCCURS_AUROC_THRESHOLD:
             failures.append(
-                f"per-cell AUROC (TARGET, d={duration}) is {auroc:.3f} < {_PER_CELL_OCCURS_AUROC_THRESHOLD}"
+                f"per-cell occurs_auroc (TARGET, d={d}) is {row['occurs_auroc']:.3f} < "
+                f"{_PER_CELL_OCCURS_AUROC_THRESHOLD}"
             )
 
-    # ── 3. Duration monotonicity ─────────────────────────────────────────────
-    # Averages over non-censored rows only — the occurs head is loss-masked on censored
-    # samples (model.py: `occurs_loss(..., mask=~batch.censor)`), so its predictions on
-    # those rows are unconstrained and would add noise to the mean.
-    non_censored = df.filter(pl.col("censor_true") == 0)
+    # 2. Censor head — only d=30 has mixed censor labels in Design 2 (P_END_D20's
+    #    max_time=20 < window_end=40; P_END_D100's doesn't).  d=1 and d=7 are
+    #    single-class-censor by construction, so `evaluate.evaluate` reports null
+    #    censor_auroc there.  Assert the threshold on the one defined cell.
+    censor_cells = metrics.filter(pl.col("censor_auroc").is_not_null())
+    if censor_cells.is_empty():
+        failures.append(
+            "censor_auroc is null for every (query, duration_days) cell — expected "
+            "at least d=30 to mix P_END_D20 (censored) and P_END_D100 (not censored)."
+        )
+    else:
+        for row in censor_cells.iter_rows(named=True):
+            if row["censor_auroc"] < _CENSOR_AUROC_THRESHOLD:
+                failures.append(
+                    f"censor_auroc (query={row['query']}, d={int(row['duration_days'])}) is "
+                    f"{row['censor_auroc']:.3f} < {_CENSOR_AUROC_THRESHOLD}"
+                )
+
+    # 3. Duration monotonicity — the occurs head is loss-masked on censored samples
+    #    (model.py: ``occurs_loss(..., mask=~batch.censor)``), so its predictions on
+    #    those rows are unconstrained and would add noise to the mean.  Not a per-cell
+    #    metric — lives on the predictions parquet rather than the metrics parquet.
+    predictions = pl.read_parquet(predictions_parquet)
+    non_censored = predictions.filter(pl.col("boolean_value").is_not_null())
     means = [
-        float(non_censored.filter(pl.col("duration_days") == d)["occurs_pred"].mean())
+        float(non_censored.filter(pl.col("duration_days") == float(d))["occurs_prob"].mean())
         for d in _DURATIONS_DAYS
     ]
     mean_map = dict(zip(_DURATIONS_DAYS, [round(m, 3) for m in means], strict=False))
-    print(f"\n  duration-mean occurs_pred (TARGET, non-censored): {mean_map}")
+    print(f"\n  duration-mean occurs_prob (TARGET, non-censored): {mean_map}")
     for d1, d2, m1, m2 in zip(_DURATIONS_DAYS[:-1], _DURATIONS_DAYS[1:], means[:-1], means[1:], strict=False):
         if m2 <= m1:
             failures.append(

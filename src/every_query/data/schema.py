@@ -75,10 +75,8 @@ class TaskQuerySchema(LabelSchema):
         ...      "query": "ICD//I10", "duration_days": 30.0, "boolean_value": False},
         ... ])
         >>> aligned = TaskQuerySchema.align(data)
-        >>> set(f.name for f in aligned.schema) >= {
-        ...     "subject_id", "prediction_time", "query", "duration_days", "boolean_value"
-        ... }
-        True
+        >>> [f.name for f in aligned.schema]
+        ['subject_id', 'prediction_time', 'boolean_value', 'query', 'duration_days']
 
         Fractional durations are supported:
 
@@ -119,14 +117,13 @@ def empty_task_query_df() -> pl.DataFrame:
         >>> df = empty_task_query_df()
         >>> df.height
         0
-        >>> set(df.columns) == {
-        ...     TaskQuerySchema.subject_id_name,
-        ...     TaskQuerySchema.prediction_time_name,
-        ...     TaskQuerySchema.query_name,
-        ...     TaskQuerySchema.duration_days_name,
-        ...     TaskQuerySchema.boolean_value_name,
-        ... }
-        True
+        >>> for name, dtype in df.schema.items():
+        ...     print(f"{name}: {dtype}")
+        subject_id: Int64
+        prediction_time: Datetime(time_unit='us', time_zone=None)
+        query: String
+        duration_days: Float32
+        boolean_value: Boolean
     """
     return pl.DataFrame(
         schema={

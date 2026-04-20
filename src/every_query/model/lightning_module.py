@@ -296,29 +296,25 @@ class EveryQueryLightningModule(L.LightningModule):
 
         Examples:
             >>> result = demo_lightning_module.predict_step(sample_batch)
-            >>> sorted(result.keys()) == [
-            ...     'censor', 'censor_probs', 'duration_days', 'occurs', 'occurs_probs',
-            ...     'query', 'query_embed',
-            ... ]
-            True
-            >>> result['query_embed'].shape[1] == demo_model_config.hidden_size
-            True
-            >>> result['query_embed'].shape[0]
-            2
+            >>> sorted(result.keys())
+            ['censor', 'censor_probs', 'duration_days', 'occurs', 'occurs_probs', 'query', 'query_embed']
+
+        ``query_embed`` is one ``hidden_size``-wide row per batch item:
+
+            >>> demo_model_config.hidden_size
+            64
+            >>> result['query_embed'].shape
+            torch.Size([2, 64])
 
         ``query`` / ``duration_days`` carry the per-row identifiers straight from the
-        input batch:
+        input batch (one scalar per batch item):
 
-            >>> result['query'].shape == (2,)
-            True
-            >>> result['duration_days'].shape == (2,)
-            True
+            >>> result['query'].shape, result['duration_days'].shape
+            (torch.Size([2]), torch.Size([2]))
 
         Probabilities come from sigmoid, so they lie in [0, 1]:
 
-            >>> result['censor_probs'].min().item() >= 0
-            True
-            >>> result['censor_probs'].max().item() <= 1
+            >>> 0.0 <= result['censor_probs'].min().item() <= result['censor_probs'].max().item() <= 1.0
             True
         """
         _, outputs = self.model(batch)

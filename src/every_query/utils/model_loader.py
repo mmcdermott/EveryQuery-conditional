@@ -51,7 +51,11 @@ def setup_model(model_run_dir: str | Path, ckpt_name: str | None = None):
         raise NotADirectoryError(f"{model_run_dir} is not a directory")
 
     train_cfg = OmegaConf.load(model_run_dir / "resolved_config.yaml")
-    train_cfg.trainer.logger = ""
+    # Disable the training-time logger for inference: ``Trainer(logger=...)`` expects
+    # ``bool | Logger | Iterable[Logger] | None`` per the Lightning contract.  Leaving
+    # the training-time config in place would try to re-init a wandb run during
+    # predict/evaluate; ``False`` turns it off cleanly.
+    train_cfg.trainer.logger = False
 
     seed = train_cfg.get("seed", 42)
     if seed is not None:
