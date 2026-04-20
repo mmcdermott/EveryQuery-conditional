@@ -220,50 +220,58 @@ def oracle_task_labels_dir(
     oracle_preprocessed: Path,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Path:
-    """Runs ``EQ_generate_training_tasks`` on the preprocessed oracle dataset.
+    """Runs ``EQ_generate_evaluation_tasks`` to produce dense-grid training labels.
 
-    Training labels for ``oracle_trained_model_dir``.  Replaces the in-process
-    ``_compute_labels`` path used prior to this PR so the label-generation path exercises
-    the actual CLI end-to-end.  The oracle-specific single-prediction-time labels
-    written by ``oracle_dataset`` (via ``_compute_labels``) are still used for the
-    ``EQ_predict`` inference step + AUROC assertions.  A follow-on issue should
-    track migrating inference to ``EQ_generate_evaluation_tasks`` so the full
-    pipeline (generate_tasks → train → predict → evaluate) runs through the CLI.
+    Training labels for ``oracle_trained_model_dir``.  Uses the evaluation-tasks
+    endpoint (not the pretraining scattered sampler) so training rows land at
+    exactly the three evaluation durations ``[1, 7, 30]`` with ``codes=[TARGET]``
+    — matching the pre-PR ``_compute_labels`` dense shape.  Training on the
+    scattered shape (``EQ_generate_training_tasks`` with log-uniform durations in
+    ``[1, 30]``) left only ~20 labels near each evaluation-duration cell, which
+    was insufficient to converge the occurs head at ``d=1`` and ``d=7`` (CI run
+    24686804952 hit ``AUROC(d=1)=0.557`` at threshold 0.8).
+
+    Both endpoints emit ``TaskQuerySchema``-conformant parquets, so the train
+    loader consumes either shape identically.
+
+    The oracle-specific single-prediction-time labels written by ``oracle_dataset``
+    (via ``_compute_labels``) are still used for the ``EQ_predict`` inference step
+    + AUROC assertions.  A follow-on issue should track migrating inference to
+    ``EQ_generate_evaluation_tasks`` so the full pipeline
+    (generate_tasks → train → predict → evaluate) runs through the CLI.
 
     The intermediate dir is at ``oracle_preprocessed.parent / "intermediate"`` —
     same sibling-layout convention as ``eq_preprocessed_dataset`` in the root
     ``conftest.py``.
     """
     intermediate = oracle_preprocessed.parent / "intermediate"
-    task_labels_dir = tmp_path_factory.mktemp("d2_cli_tasks")
+    out_root = tmp_path_factory.mktemp("d2_cli_tasks")
     for split in (train_split, tuning_split):
         run_and_check(
             [
-                "EQ_generate_training_tasks",
+                "EQ_generate_evaluation_tasks",
                 f"data_dir={intermediate!s}",
                 f"codes_dir={oracle_preprocessed!s}",
-                f"out_dir={task_labels_dir!s}",
+                f"out_dir={out_root!s}",
                 f"split={split}",
                 "input_shard=0",
-                "task_shard=0",
-                # Pin to the oracle target code — without this, ``n_tasks=20`` draws
-                # (code, duration) pairs uniformly over the full oracle vocab
-                # (~20+ codes) and the downstream ``query.codes=[TARGET]`` training
-                # filter keeps only the ~1/vocab rows that happen to match TARGET.
-                # That collapses the training signal to chance (confirmed empirically
-                # — the oracle AUROC on TARGET went to ~0.5 without this pin).
                 f"codes=[{_TARGET_CODE}]",
-                "n_tasks=20",
-                "contexts_per_task=20",
-                "duration_min=1",
-                "duration_max=30",
+                # Dense grid at exactly the three evaluation durations; matches the
+                # pre-PR ``_compute_labels`` shape (80 subjects * ~5 candidate times
+                # * 3 durations ~ 1200 rows/split focused on TARGET).
+                "durations=[1,7,30]",
+                "prediction_times_per_subject=20",
                 "min_context_per_subject=2",
                 "seed=1",
             ],
             env=ENSURE_ENV_PLACEHOLDERS,
             timeout=120.0,
         )
-    return task_labels_dir
+    # ``EQ_generate_evaluation_tasks`` writes to ``{out_root}/eval/{split}/*.parquet``
+    # (the ``eval/`` subdir is baked in so eval-shape labels don't collide with
+    # pretraining-shape labels in ``$TASK_DIR``).  MTD's ``task_labels_dir``
+    # expects ``{dir}/{split}/*.parquet`` directly — point at ``{out_root}/eval``.
+    return out_root / "eval"
 
 
 @pytest.fixture(scope="module")
