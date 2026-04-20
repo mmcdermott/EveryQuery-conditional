@@ -12,11 +12,12 @@ defaults:
 model_run_dir: ???
 
 # Required: path to a parquet conformant to every_query.data.schema.TaskQuerySchema
-# (subject_id, prediction_time, code, duration_days; inherited label columns optional).
+# (subject_id, prediction_time, query, duration_days; inherited label columns optional).
 tasks_parquet: ???
 
 # Required: path to write the output parquet.  Conforms to
-# every_query.predict.schema.PredictionSchema (TaskQuerySchema + predicted_boolean_probability).
+# every_query.predict.schema.PredictionSchema (TaskQuerySchema + censor_prob + occurs_prob;
+# see #129 for the post-refactor occurs_prob → label_prob generalization discussion).
 output_parquet: ???
 
 # Optional: pick a specific checkpoint name under model_run_dir/checkpoints/.
