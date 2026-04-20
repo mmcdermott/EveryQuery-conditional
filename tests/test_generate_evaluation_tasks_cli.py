@@ -15,13 +15,16 @@ Checks:
 
 from __future__ import annotations
 
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import polars as pl
 import pyarrow.parquet as pq
 
 from conftest import ENSURE_ENV_PLACEHOLDERS, run_and_check
 from every_query.data.schema import TaskQuerySchema
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def test_eq_generate_evaluation_tasks_end_to_end(

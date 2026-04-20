@@ -200,7 +200,8 @@ def test_reproducible_with_same_seed(
         f"{fixture_labels['subject_id'].null_count()} null subject_id rows"
     )
     assert rerun_labels["subject_id"].null_count() == 0, (
-        f"rerun EQ_generate_training_tasks output has {rerun_labels['subject_id'].null_count()} null subject_id rows"
+        f"rerun EQ_generate_training_tasks output has "
+        f"{rerun_labels['subject_id'].null_count()} null subject_id rows"
     )
 
     # Compare by row content (sorted) since file-byte equality is flaky across polars versions.
