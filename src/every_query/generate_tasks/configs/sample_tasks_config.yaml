@@ -17,13 +17,6 @@ data_dir: null
 codes_dir: null
 out_dir: null
 
-# Explicit query-code list override.  When set (e.g. ``codes: [HR, TEMP]``), takes
-# precedence over ``codes_dir`` — the sampler draws tasks from this list instead of
-# reading the full vocab from ``{codes_dir}/metadata/codes.parquet``.  Useful for
-# focused training runs (e.g. oracle / signal-validity tests) where the default
-# uniform draw over a large vocab would dilute the per-code training signal.
-codes: null
-
 split: train
 input_shard: "0" # basename (without .parquet) of the MEDS shard for this worker
 task_shard: 0 # slice of the task/context axis; vary this under `-m` to cover the task space
