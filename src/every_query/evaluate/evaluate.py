@@ -2,16 +2,16 @@
 
 Replaces the four-stage eval pipeline (``EQ_gen_eval_index`` → ``EQ_gen_eval_tasks`` →
 the old ``EQ_evaluate`` → ``EQ_select_model``) with a single CLI that consumes a
-:class:`PredictionSchema` parquet written by ``EQ_predict`` and emits a per-`(code,
-duration)` metrics parquet.
+:class:`PredictionSchema` parquet written by ``EQ_predict`` and emits a per-``(query,
+duration_days)`` metrics parquet.
 
 The CLI is intentionally narrow: no model instantiation, no trainer loop, no multi-model
 orchestration.  Cross-model comparison (pairwise win-rate ranking, what the old
 ``EQ_select_model`` did) moves to ``paper_experiments/`` per the #82 inventory.
 
-This is a draft — entry-point rewiring to point `EQ_evaluate` at this module happens in
-the consolidation wave after the #82 inventory is signed off; the current `EQ_evaluate`
-still points at the legacy `evaluate/eval.py`.
+Entry-point rewiring to point ``EQ_evaluate`` at this module happens in a follow-up
+consolidation wave after the #82 inventory is signed off; the current ``EQ_evaluate``
+console script still points at the legacy ``evaluate/eval.py`` until then.
 """
 
 import logging
@@ -43,7 +43,7 @@ def main(cfg: DictConfig) -> None:
     predictions = pl.from_arrow(table)
     logger.info(
         f"Loaded {predictions.height} predictions across "
-        f"{predictions['code'].n_unique()} codes x "
+        f"{predictions['query'].n_unique()} queries x "
         f"{predictions['duration_days'].n_unique()} durations"
     )
 

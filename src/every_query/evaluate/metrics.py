@@ -1,18 +1,28 @@
 """Metrics computation over :class:`PredictionSchema`-conformant parquets.
 
 Pure-numpy pipeline — no Lightning trainer, no datamodule.  Consumes what ``EQ_predict``
-writes (a parquet of `(subject_id, prediction_time, code, duration_days,
-predicted_boolean_probability, boolean_value)`) and produces a per-group metrics table.
+writes (a parquet of ``(subject_id, prediction_time, query, duration_days, boolean_value,
+censor_prob, occurs_prob)``) and produces a per-``(query, duration_days)`` metrics table.
 
-Initial metric is AUROC computed per `(code, duration_days)` group via ``sklearn``.  Extends
-naturally to other metrics as the paper's needs solidify (calibration, Brier score, etc.) —
-one-line additions in :func:`_metrics_for_group`.
+Computes two AUROCs per group, one per model head:
+
+- ``occurs_auroc`` — ``occurs_prob`` vs. ``boolean_value``, the headline task metric.
+  Censored rows (``boolean_value`` is null) are dropped before the AUROC computation
+  since the label is undefined there and ``occurs_prob`` is loss-masked during training.
+- ``censor_auroc`` — ``censor_prob`` vs. ``is_censored = boolean_value.is_null()``, a
+  sanity check that the censor head agrees with the data's own censoring indicator.
+
+Extends naturally to other metrics as the paper's needs solidify (calibration, Brier
+score, etc.) — one-line additions in :func:`_metrics_for_group`.
 """
 
 import logging
 
 import polars as pl
 from sklearn.metrics import roc_auc_score
+
+from every_query.data.schema import TaskQuerySchema
+from every_query.predict.schema import PredictionSchema
 
 logger = logging.getLogger(__name__)
 
@@ -25,73 +35,128 @@ def _auroc_or_none(y_true: list[bool], y_score: list[float]) -> float | None:
 
 
 def _metrics_for_group(group_df: pl.DataFrame) -> dict[str, float | int | None]:
-    """Compute metrics for one ``(code, duration_days)`` slice of predictions.
+    """Compute metrics for one ``(query, duration_days)`` slice of predictions.
 
-    Input frame carries at least ``boolean_value`` and ``predicted_boolean_probability`` for
-    a single query.  Output row has ``n_rows``, ``n_positive``, and one AUROC column.  Adding
-    more metrics is a one-liner here — keep metrics definitions in one place rather than
-    scattered across eval configs.
+    Input frame carries at least ``boolean_value``, ``censor_prob``, ``occurs_prob`` for a
+    single ``(query, duration_days)`` pair.
+
+    Returns a dict with:
+
+    - ``n_rows`` — total rows in the group.
+    - ``n_occurs_labeled`` — rows with non-null ``boolean_value`` (i.e. not censored).
+    - ``n_positive`` — rows where ``boolean_value`` is ``True``.
+    - ``occurs_auroc`` — AUROC of ``occurs_prob`` vs. ``boolean_value`` over not-censored rows
+      (``None`` if all labels are the same class, or if every row is censored).
+    - ``censor_auroc`` — AUROC of ``censor_prob`` vs. ``is_censored`` over all rows
+      (``None`` if every row has the same censor status).
     """
-    # Drop rows with no ground-truth label (shouldn't be common post-#80 but guard anyway).
-    labeled = group_df.filter(pl.col("boolean_value").is_not_null())
-    if labeled.is_empty():
-        return {"n_rows": 0, "n_positive": 0, "auroc": None}
+    is_censored = group_df["boolean_value"].is_null().to_list()
+    censor_prob = group_df["censor_prob"].to_list()
+    censor_auroc = _auroc_or_none(is_censored, censor_prob)
 
-    y_true = labeled["boolean_value"].to_list()
-    y_score = labeled["predicted_boolean_probability"].to_list()
+    not_censored = group_df.filter(pl.col("boolean_value").is_not_null())
+    if not_censored.is_empty():
+        return {
+            "n_rows": group_df.height,
+            "n_occurs_labeled": 0,
+            "n_positive": 0,
+            "occurs_auroc": None,
+            "censor_auroc": censor_auroc,
+        }
+
+    y_true = not_censored["boolean_value"].to_list()
+    y_score = not_censored["occurs_prob"].to_list()
     return {
-        "n_rows": labeled.height,
+        "n_rows": group_df.height,
+        "n_occurs_labeled": not_censored.height,
         "n_positive": int(sum(y_true)),
-        "auroc": _auroc_or_none(y_true, y_score),
+        "occurs_auroc": _auroc_or_none(y_true, y_score),
+        "censor_auroc": censor_auroc,
     }
 
 
 def compute_metrics(predictions: pl.DataFrame) -> pl.DataFrame:
-    """Group :class:`PredictionSchema`-shaped rows by ``(code, duration_days)`` and compute metrics.
+    """Group :class:`PredictionSchema`-shaped rows by ``(query, duration_days)`` and compute metrics.
 
-    Returns a dataframe with columns ``code``, ``duration_days``, ``n_rows``, ``n_positive``,
-    ``auroc``.  Groups with an all-same-class label return ``auroc = null``.
+    Returns a dataframe with columns ``query``, ``duration_days``, ``n_rows``,
+    ``n_occurs_labeled``, ``n_positive``, ``occurs_auroc``, ``censor_auroc``.
 
     Raises:
-        ValueError: if ``predictions`` is missing the ``boolean_value`` column (ground-truth
-            labels are required to compute any metric).
+        ValueError: if ``predictions`` is missing any of the required input columns.
 
     Examples:
+        Two queries over two durations, censored rows mixed in via null
+        ``boolean_value``.  Query ``A`` at duration 30 has two labeled rows with
+        differing labels (AUROC defined).  Query ``B`` at duration 30 has two labeled
+        rows both positive (AUROC undefined, null).  Every row has a censor probability,
+        so the censor AUROC is computed across the entire group.
+
         >>> import polars as pl
         >>> preds = pl.DataFrame({
-        ...     "code": ["A", "A", "B", "B"],
-        ...     "duration_days": pl.Series([30.0, 30.0, 30.0, 30.0], dtype=pl.Float32),
-        ...     "boolean_value": [True, False, True, True],
-        ...     "predicted_boolean_probability": [0.9, 0.1, 0.8, 0.7],
+        ...     "query": ["A", "A", "A", "B", "B", "B"],
+        ...     "duration_days": pl.Series(
+        ...         [30.0, 30.0, 30.0, 30.0, 30.0, 30.0], dtype=pl.Float32
+        ...     ),
+        ...     "boolean_value": [True, False, None, True, True, None],
+        ...     "censor_prob": [0.05, 0.10, 0.90, 0.02, 0.08, 0.80],
+        ...     "occurs_prob": [0.9, 0.1, 0.5, 0.8, 0.7, 0.5],
         ... })
-        >>> out = compute_metrics(preds)
-        >>> for row in out.sort("code")[["code", "n_rows", "n_positive", "auroc"]].to_dicts():
-        ...     print(row)
-        {'code': 'A', 'n_rows': 2, 'n_positive': 1, 'auroc': 1.0}
-        {'code': 'B', 'n_rows': 2, 'n_positive': 2, 'auroc': None}
+        >>> out = compute_metrics(preds).sort("query")
+        >>> for row in out.iter_rows(named=True):
+        ...     print(f"{row['query']} n={row['n_rows']} pos={row['n_positive']} "
+        ...           f"occurs_auroc={row['occurs_auroc']} censor_auroc={row['censor_auroc']}")
+        A n=3 pos=1 occurs_auroc=1.0 censor_auroc=1.0
+        B n=3 pos=2 occurs_auroc=None censor_auroc=1.0
         >>> out["duration_days"].dtype
         Float32
+
+        Empty input yields an empty frame with the right shape:
+
+        >>> empty = pl.DataFrame(schema={
+        ...     "query": pl.Utf8, "duration_days": pl.Float32,
+        ...     "boolean_value": pl.Boolean,
+        ...     "censor_prob": pl.Float32, "occurs_prob": pl.Float32,
+        ... })
+        >>> compute_metrics(empty).shape
+        (0, 7)
     """
-    if "boolean_value" not in predictions.columns:
+    required = {
+        TaskQuerySchema.query_name,
+        TaskQuerySchema.duration_days_name,
+        TaskQuerySchema.boolean_value_name,
+        PredictionSchema.censor_prob_name,
+        PredictionSchema.occurs_prob_name,
+    }
+    missing = required - set(predictions.columns)
+    if missing:
         raise ValueError(
-            "predictions is missing the 'boolean_value' column — ground-truth labels are "
-            "required to compute metrics.  Run EQ_predict on labelled task data (i.e. a "
-            "TaskQuerySchema parquet that already has boolean_value filled in)."
+            f"predictions is missing required column(s) {sorted(missing)} — compute_metrics "
+            f"needs a PredictionSchema-conformant frame from EQ_predict."
         )
 
     rows = []
-    for (code, duration_days), group_df in predictions.group_by(["code", "duration_days"]):
+    for (query, duration_days), group_df in predictions.group_by(
+        [TaskQuerySchema.query_name, TaskQuerySchema.duration_days_name]
+    ):
         metrics = _metrics_for_group(group_df)
-        rows.append({"code": code, "duration_days": float(duration_days), **metrics})
+        rows.append(
+            {
+                TaskQuerySchema.query_name: query,
+                TaskQuerySchema.duration_days_name: float(duration_days),
+                **metrics,
+            }
+        )
 
     if not rows:
         return pl.DataFrame(
             schema={
-                "code": pl.Utf8,
-                "duration_days": pl.Float32,
+                TaskQuerySchema.query_name: pl.Utf8,
+                TaskQuerySchema.duration_days_name: pl.Float32,
                 "n_rows": pl.Int64,
+                "n_occurs_labeled": pl.Int64,
                 "n_positive": pl.Int64,
-                "auroc": pl.Float64,
+                "occurs_auroc": pl.Float64,
+                "censor_auroc": pl.Float64,
             }
         )
-    return pl.DataFrame(rows).with_columns(pl.col("duration_days").cast(pl.Float32))
+    return pl.DataFrame(rows).with_columns(pl.col(TaskQuerySchema.duration_days_name).cast(pl.Float32))
