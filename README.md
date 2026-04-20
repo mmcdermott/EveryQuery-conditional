@@ -45,7 +45,8 @@ src/every_query/
 ├── generate_tasks/     → EQ_generate_tasks      (TaskQuerySchema-conformant task parquets)
 ├── train/              → EQ_train               (train the model)
 ├── predict/            → EQ_predict             (inference; consumes TaskQuerySchema, emits PredictionSchema)
-│   └── external_tasks/                         (ACES + composite aggregation; entry points on #95)
+│   └── external_tasks/                         (ACES + composite aggregation — currently `python -m` only;
+│                                                  [#62](https://github.com/payalchandak/EveryQuery/issues/62) tracks promoting to console scripts, draft PR [#95](https://github.com/payalchandak/EveryQuery/pull/95))
 ├── evaluate/           → EQ_evaluate (legacy) + new evaluate.py (#83 rewire pending)
 ├── model/              (shared: nn.Module + LightningModule)
 ├── data/               (shared: PyTorch Dataset + Batch types + TaskQuerySchema)
@@ -83,28 +84,29 @@ and end-to-end subprocess tests that run the real script against a fixture cohor
 ### Current (on `dev`)
 
 ```
-           MEDS cohort  ──►  EQ_process_data  ──►  tensorized cohort ($FINAL_DATA_DIR)
-                                                                     │
-                                                                     ▼
-                                                         EQ_generate_tasks
-                                                                     │  TaskQuerySchema parquets
-                                                                     ▼
-                                                                EQ_train  ──►  best_model.ckpt
-                                                                                     │
-                                                                                     ▼
-                                                                                EQ_predict  ──►  PredictionSchema parquet
-                                                                                                           │
-                                                                                     ┌─────────────────────┤
-                                                                                     │                     │
-                                                                                     ▼                     ▼
-                                             python -m every_query.evaluate.evaluate      EQ_evaluate (legacy, ignores
-                                                          │                                 the PredictionSchema path —
-                                                          ▼                                 runs its own inference loop
-                                                 per-(query, duration_days)                 against the sliced task
-                                                       metrics                              parquets + sibling CLIs)
+    MEDS cohort  ──►  EQ_process_data  ──►  tensorized cohort ($FINAL_DATA_DIR)
+                                                          │
+                                                          ▼
+                                                 EQ_generate_tasks
+                                                          │  TaskQuerySchema parquets
+                                                          ▼
+                                                     EQ_train  ──►  best_model.ckpt
+                                                                            │
+                                              ┌─────────────────────────────┴────────────────────────────┐
+                                              │                                                          │
+                                  New-path (PredictionSchema-based):                  Legacy-path (runs its own inference):
+                                              │                                                          │
+                                              ▼                                                          │
+                                         EQ_predict                                 EQ_gen_eval_index  ──►  EQ_gen_eval_tasks
+                                              │   PredictionSchema parquet                               │
+                                              ▼                                                          ▼
+                              python -m every_query.evaluate.evaluate                     EQ_evaluate  ──►  per-code AUCs
+                                              │                                                          │
+                                              ▼                                                          ▼
+                                   per-(query, duration_days) metrics                          EQ_select_model
 ```
 
-Both evaluator paths ship in this release; the legacy one is what `EQ_evaluate` resolves to today, and the new path is reachable via `python -m`. [#83](https://github.com/payalchandak/EveryQuery/issues/83) tracks the rewire that consolidates to a single `EQ_evaluate` pointing at the new module.
+Both branches ship in this release. The new path is the Phase-2.4 target shape: `EQ_predict` writes a `PredictionSchema` parquet, the new evaluator computes per-`(query, duration_days)` metrics from it. The legacy path is what `EQ_evaluate` resolves to today and runs its own inference loop against the sliced `EQ_gen_eval_tasks` output — it does **not** consume the `PredictionSchema` parquet. [#83](https://github.com/payalchandak/EveryQuery/issues/83) tracks the rewire that retires the legacy branch and points `EQ_evaluate` at the new module.
 
 ### 1. Preprocess
 
