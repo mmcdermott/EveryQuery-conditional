@@ -64,7 +64,7 @@ def _make_predictions_parquet(tmp_path: Path) -> Path:
 
 
 def test_evaluate_end_to_end(tmp_path: Path) -> None:
-    """``python -m every_query.evaluate.evaluate`` produces a per-group metrics parquet."""
+    """``EQ_evaluate`` produces a per-group metrics parquet."""
     predictions_parquet = _make_predictions_parquet(tmp_path)
     metrics_parquet = tmp_path / "metrics.parquet"
 

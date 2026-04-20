@@ -139,4 +139,4 @@ def test_eq_generate_evaluation_tasks_deterministic(
             TaskQuerySchema.duration_days_name,
         ]
     )
-    assert df_a.equals(df_b), "EQ_generate_evaluation_tasks should be deterministic in (seed, input_shard)"
+    assert df_a.equals(df_b), "EQ_generate_evaluation_tasks should be deterministic in (seed, split, input_shard)"
