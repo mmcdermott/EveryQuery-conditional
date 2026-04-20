@@ -13,6 +13,8 @@ from meds_torchdata.config import MEDSTorchDataConfig
 from meds_torchdata.types import BatchMode, MEDSTorchBatch
 from nested_ragged_tensors.ragged_numpy import JointNestedRaggedTensorDict
 
+from every_query.data.schema import TaskQuerySchema
+
 logger = logging.getLogger(__name__)
 
 
@@ -347,10 +349,10 @@ class EveryQueryPytorchDataset(MEDSPytorchDataset):
         # bool→tensor conversion doesn't tolerate nulls).
         schema_cols = self.schema_df.collect_schema().names()
         is_legacy_two_col = "occurs" in schema_cols
-        if "boolean_value" in schema_cols and not is_legacy_two_col:
-            raw = pl.col("boolean_value")
+        if TaskQuerySchema.boolean_value_name in schema_cols and not is_legacy_two_col:
+            raw = pl.col(TaskQuerySchema.boolean_value_name)
             self.schema_df = self.schema_df.with_columns(
-                raw.is_null().alias("boolean_value"),
+                raw.is_null().alias(TaskQuerySchema.boolean_value_name),
                 raw.fill_null(False).alias("occurs"),
             )
             schema_cols = self.schema_df.collect_schema().names()
@@ -359,15 +361,17 @@ class EveryQueryPytorchDataset(MEDSPytorchDataset):
             # censor-indicator) column so ``_seeded_getitem`` and ``collate`` see the
             # correct values.
             if getattr(self, "has_task_labels", False):
-                self.labels = self.schema_df["boolean_value"]
+                self.labels = self.schema_df[TaskQuerySchema.boolean_value_name]
 
         # Extra task annotations
         self.has_occurs: bool = "occurs" in schema_cols
-        self.has_query: bool = "query" in schema_cols
-        self.has_duration_days: bool = "duration_days" in schema_cols
+        self.has_query: bool = TaskQuerySchema.query_name in schema_cols
+        self.has_duration_days: bool = TaskQuerySchema.duration_days_name in schema_cols
         self.occurs = self.schema_df["occurs"] if self.has_occurs else None
-        self.query = self.schema_df["query"] if self.has_query else None
-        self.duration_days = self.schema_df["duration_days"] if self.has_duration_days else None
+        self.query = self.schema_df[TaskQuerySchema.query_name] if self.has_query else None
+        self.duration_days = (
+            self.schema_df[TaskQuerySchema.duration_days_name] if self.has_duration_days else None
+        )
         # Load code vocabulary mapping (string code -> integer vocab index) for encoding queries
         try:
             code_meta = pl.read_parquet(
@@ -397,7 +401,12 @@ class EveryQueryPytorchDataset(MEDSPytorchDataset):
             # derived in __init__ from boolean_value.is_null().  Keep it in the list for
             # backward compatibility with any legacy label parquets that still carry it
             # explicitly — harmless if absent.
-            for extra_col in [self.LABEL_COL, "occurs", "query", "duration_days"]:
+            for extra_col in [
+                self.LABEL_COL,
+                "occurs",
+                TaskQuerySchema.query_name,
+                TaskQuerySchema.duration_days_name,
+            ]:
                 if extra_col in schema.names:
                     extras.append(extra_col)
             label_cols = [*required_cols, *extras]

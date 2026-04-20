@@ -11,7 +11,8 @@ predict/
 ├── predict.py            → EQ_predict (inference-only Hydra main)
 ├── schema.py             → PredictionSchema (TaskQuerySchema + censor_prob + occurs_prob)
 ├── configs/
-│   └── predict.yaml      → required: model_run_dir, tasks_parquet, output_parquet
+│   └── predict.yaml      → required: model_run_dir, tasks_dir, output_parquet
+│                           optional: ckpt_name, split (held_out|tuning)
 └── external_tasks/       → convert + aggregate tasks outside EQ's native vocabulary
     ├── aces_to_eq.py     → ACES task parquet → EQ task parquet
     ├── process_composite.py
@@ -25,15 +26,17 @@ predict/
 generate_tasks/  +  train/ best_model.ckpt
        │                     │
        ▼                     ▼
-     tasks.parquet  ──►  predict/  ──►  predictions.parquet  ──►  evaluate/
-     (TaskQuerySchema)                  (PredictionSchema)
+     tasks_dir/    ──►  predict/  ──►  predictions.parquet  ──►  evaluate/
+     *.parquet                         (PredictionSchema)
+     (TaskQuerySchema)
 ```
 
-`EQ_predict` takes a `TaskQuerySchema`-conformant parquet of rows
-`(subject_id, prediction_time, query, duration_days)` and writes a
-`PredictionSchema`-conformant parquet adding the model's two-head probabilities per row:
-`censor_prob` (P(row is censored)) and `occurs_prob` (P(event occurred | not censored)).
-No AUCs, no model selection — that's `evaluate/` (Phase 2.4, #83).
+`EQ_predict` takes a directory of `TaskQuerySchema`-conformant parquet files — rows of
+`(subject_id, prediction_time, query, duration_days)` plus optional inherited label
+columns — and writes a `PredictionSchema`-conformant parquet adding the model's two-head
+probabilities per row: `censor_prob` (P(row is censored)) and `occurs_prob`
+(P(event occurred | not censored)). No AUCs, no model selection — that's
+`evaluate/` (Phase 2.4, #83).
 
 See [#129](https://github.com/payalchandak/EveryQuery/issues/129) for the post-refactor
 discussion on generalizing `occurs_prob` → `label_prob` for non-occurrence task types.
