@@ -246,6 +246,13 @@ def oracle_task_labels_dir(
                 f"split={split}",
                 "input_shard=0",
                 "task_shard=0",
+                # Pin to the oracle target code — without this, ``n_tasks=20`` draws
+                # (code, duration) pairs uniformly over the full oracle vocab
+                # (~20+ codes) and the downstream ``query.codes=[TARGET]`` training
+                # filter keeps only the ~1/vocab rows that happen to match TARGET.
+                # That collapses the training signal to chance (confirmed empirically
+                # — the oracle AUROC on TARGET went to ~0.5 without this pin).
+                f"codes=[{_TARGET_CODE}]",
                 "n_tasks=20",
                 "contexts_per_task=20",
                 "duration_min=1",
