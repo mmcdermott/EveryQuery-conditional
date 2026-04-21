@@ -31,9 +31,12 @@ _VENV_BIN = str(Path(sys.executable).parent)
 # Subject lives in the ``held_out`` split of the ``simple_static_sharded_by_split``
 # testing dataset used by ``eq_preprocessed_dataset``.  Prediction time falls inside
 # 1500733's event sequence (2010-06-03).
+# Query codes must exist in the model's training vocab — ``EQ_predict`` now hard-errors
+# on out-of-vocab codes (was: warn).  These are real codes in the
+# ``simple_static_sharded_by_split`` testing dataset's vocab after preprocessing.
 _HELD_OUT_SUBJECT = 1500733
 _PRED_TIME = datetime(2010, 6, 3, 15, 0, 0)
-_QUERY_CODES = ["HR", "TEMP"]
+_QUERY_CODES = ["DISCHARGE", "DOB"]
 _DURATION_DAYS = 30.0
 
 
@@ -126,7 +129,7 @@ def test_eq_predict_preserves_input_row_order(
     """
     # Non-alphabetical query order, mixed durations — exercises the order check past
     # the alphabetical HR/TEMP happy path of the main integration test.
-    expected_queries = ["TEMP", "HR", "TEMP"]
+    expected_queries = ["DOB", "DISCHARGE", "DOB"]
     expected_durations = [60.0, 30.0, 30.0]
 
     tasks_dir = tmp_path / "tasks"

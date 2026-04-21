@@ -109,6 +109,12 @@ def empty_task_query_df() -> pl.DataFrame:
     unless we bypassed polars entirely.  Keeping the shape focused on what downstream
     writers actually emit avoids that type-drift landmine.
 
+    Polars dtypes are derived from ``TaskQuerySchema``'s arrow types at call time
+    (``pl.from_arrow`` on an empty arrow table) rather than hardcoded — so any future
+    change to the PyArrow type declarations flows through automatically instead of
+    drifting silently.  ``pa.large_string`` coerces to ``pl.Utf8`` in polars' type
+    system, which is the correct mapping here.
+
     Callers use this at the empty-input fast path (e.g., ``evaluate_index_df`` when no
     tasks were sampled) so the produced parquet still aligns to the schema via
     ``TaskQuerySchema.align`` at the write boundary.
@@ -125,12 +131,12 @@ def empty_task_query_df() -> pl.DataFrame:
         duration_days: Float32
         boolean_value: Boolean
     """
-    return pl.DataFrame(
-        schema={
-            TaskQuerySchema.subject_id_name: pl.Int64,
-            TaskQuerySchema.prediction_time_name: pl.Datetime("us"),
-            TaskQuerySchema.query_name: pl.Utf8,
-            TaskQuerySchema.duration_days_name: pl.Float32,
-            TaskQuerySchema.boolean_value_name: pl.Boolean,
-        }
-    )
+    field_names = [
+        TaskQuerySchema.subject_id_name,
+        TaskQuerySchema.prediction_time_name,
+        TaskQuerySchema.query_name,
+        TaskQuerySchema.duration_days_name,
+        TaskQuerySchema.boolean_value_name,
+    ]
+    pa_fields = [pa.field(name, getattr(TaskQuerySchema, f"{name}_dtype")) for name in field_names]
+    return pl.from_arrow(pa.schema(pa_fields).empty_table())
