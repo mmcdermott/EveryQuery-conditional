@@ -1,12 +1,14 @@
-"""Tests for ``every_query.sample_tasks`` (sampling-first PT task label generator).
+"""Tests for ``every_query.generate_tasks`` (sampling-first PT task label generator).
 
 Structure:
 
 - ``TestPrimitives`` — unit tests for the pure building blocks.
-- ``TestEvaluateAgainstReference`` — bit-identity cross-check of ``evaluate_index_df`` against the
-  ``tasks_reference`` oracle on a shared synthetic fixture.
-- ``TestRunWorkerPipeline`` — artifact-level tests for the three-stage idempotent pipeline:
-  stage skip on rerun, overwrite, seed-axis independence, pre-seeded tasks.
+- ``TestEvaluateIndexDfEdgeCases`` — hand-crafted edge cases for ``evaluate_index_df`` (strict-``>``
+  semantics, missing-subject handling).
+- ``TestRunWorkerPipeline`` — pipeline-level tests: the worker writes one output (labels), is
+  idempotent on rerun, regenerates on ``overwrite=True``, preserves the seed-derived axis
+  invariants across input and task shards, and — since the cache was removed — returns stale
+  labels silently if a config is changed without ``overwrite=True`` (caller-enforced contract).
 - ``TestEndToEndWithDataset`` — smoke test that builds sampler-shaped labels referencing real
   subject IDs from ``tensorized_cohort_dir``, feeds them through ``EveryQueryPytorchDataset``, and
   pushes one collated batch through ``demo_model``.  Verifies schema compatibility with the
@@ -22,19 +24,19 @@ import torch
 from meds import train_split
 from meds_torchdata.config import MEDSTorchDataConfig
 
-from every_query import sample_tasks as st
-from every_query import tasks_reference
-from every_query.dataset import EveryQueryPytorchDataset
-from every_query.sample_tasks import (
+from every_query.data.dataset import EveryQueryPytorchDataset
+from every_query.data.schema import TaskQuerySchema
+from every_query.generate_tasks import sample_tasks as st
+from every_query.generate_tasks.sample_tasks import (
     TaskSpec,
     build_index_df,
     compute_max_time_per_subject,
-    derive_seed,
     evaluate_index_df,
     run_worker,
     sample_contexts,
     sample_tasks,
 )
+from every_query.utils.seeds import derive_seed
 
 # ---------------------------------------------------------------------------
 # Shared synthetic fixtures
@@ -43,11 +45,7 @@ from every_query.sample_tasks import (
 
 @pytest.fixture
 def synthetic_events() -> pl.DataFrame:
-    """A deterministic events DataFrame: 3 subjects x 30 events x 5 codes, 10d spacing.
-
-    Shape matches the ``test_tasks.py`` fixture so the same data exercises both the old
-    wide-matrix pipeline and the new sampler.
-    """
+    """A deterministic events DataFrame: 3 subjects x 30 events x 5 codes, 10d spacing."""
     codes = ["ICD//A01", "ICD//B02", "ICD//C03", "MED//D04", "MED//E05"]
     base = datetime(2020, 1, 1)
     rows = [
@@ -184,101 +182,19 @@ class TestPrimitives:
 
 
 # ---------------------------------------------------------------------------
-# Cross-check: sampler vs reference oracle
+# evaluate_index_df edge cases
 # ---------------------------------------------------------------------------
 
 
-def _reference_long(
-    events_df: pl.DataFrame,
-    query_codes: list[str],
-    min_context: int,
-    duration_days: int,
-) -> pl.DataFrame:
-    """Run the reference pipeline and unpivot the wide matrix to the sampler's long schema.
-
-    Produces columns ``(subject_id, prediction_time, boolean_value, occurs, query, duration_days)``
-    to match :func:`sample_tasks.evaluate_index_df` exactly.
-    """
-    duration = {"days": duration_days}
-    ref_censor = tasks_reference.compute_censor_dataframe(events_df, min_context, duration)
-    ref_wide = tasks_reference.build_task_label_matrix(events_df, ref_censor, query_codes, duration)
-    # Wide columns: subject_id, prediction_time, censored, <code_1>, ..., <code_N>
-    long = (
-        ref_wide.unpivot(
-            index=["subject_id", "prediction_time", "censored"],
-            variable_name="query",
-            value_name="occurs",
-        )
-        .with_columns(pl.col("occurs").fill_null(False))
-        .with_columns(
-            pl.col("censored").alias("boolean_value"),
-            pl.lit(duration_days, dtype=pl.Int64).alias("duration_days"),
-        )
-        .select("subject_id", "prediction_time", "boolean_value", "occurs", "query", "duration_days")
-    )
-    return long
-
-
-def _sampler_long(
-    events_df: pl.DataFrame,
-    query_codes: list[str],
-    min_context: int,
-    duration_days: int,
-) -> pl.DataFrame:
-    """Run the sampler evaluator over the full (subject x pt x code) cross-product for one duration.
-
-    This bypasses :func:`sample_tasks.sample_tasks` / :func:`sample_tasks.sample_contexts` — we don't
-    want the equivalence test to depend on sampler randomness.  The equivalence claim is that for
-    *any* index_df row, the labels from ``evaluate_index_df`` agree with the reference.
-    """
-    from every_query import tasks as new_tasks
-
-    base_df = new_tasks.compute_base_prediction_times(events_df, min_context).select(
-        "subject_id", "prediction_time"
-    )
-    codes_df = pl.DataFrame({"query": query_codes}, schema={"query": pl.Utf8})
-    index_df = base_df.join(codes_df, how="cross").with_columns(
-        pl.lit(duration_days, dtype=pl.Int64).alias("duration_days")
-    )
-    max_time_df = compute_max_time_per_subject(events_df)
-    return evaluate_index_df(index_df, events_df, max_time_df)
-
-
-def _sort_long(df: pl.DataFrame) -> pl.DataFrame:
-    return df.sort(["subject_id", "prediction_time", "query"]).select(
-        "subject_id", "prediction_time", "boolean_value", "occurs", "query", "duration_days"
-    )
-
-
-class TestEvaluateAgainstReference:
-    """Bit-identity cross-check of ``evaluate_index_df`` against ``tasks_reference``."""
-
-    @pytest.mark.parametrize("duration_days", [30, 90, 180, 365])
-    def test_labels_match_reference(self, synthetic_events, synthetic_query_codes, duration_days):
-        ref = _sort_long(_reference_long(synthetic_events, synthetic_query_codes, 5, duration_days))
-        new = _sort_long(_sampler_long(synthetic_events, synthetic_query_codes, 5, duration_days))
-
-        # `boolean_value` and `occurs` must agree — the rest is schema/metadata.
-        cols = ["subject_id", "prediction_time", "query", "boolean_value", "occurs"]
-        assert ref.select(cols).equals(new.select(cols)), (
-            f"Label mismatch at duration={duration_days}; "
-            f"ref={ref.select(cols).head(5)}, new={new.select(cols).head(5)}"
-        )
-
-    def test_codes_not_in_shard_are_all_false(self, synthetic_events):
-        """A query code with no events anywhere in the shard should produce ``occurs=False`` for every
-        uncensored row (and ``occurs=False`` for censored rows, matching reference)."""
-        query_codes = ["ICD//A01", "FAKE//Z99"]
-        ref = _sort_long(_reference_long(synthetic_events, query_codes, 5, 90))
-        new = _sort_long(_sampler_long(synthetic_events, query_codes, 5, 90))
-
-        new_fake = new.filter(pl.col("query") == "FAKE//Z99")
-        assert not new_fake["occurs"].any()
-        cols = ["subject_id", "prediction_time", "query", "boolean_value", "occurs"]
-        assert ref.select(cols).equals(new.select(cols))
+class TestEvaluateIndexDfEdgeCases:
+    """Hand-crafted edge-case tests for ``evaluate_index_df``."""
 
     def test_event_exactly_at_prediction_time_is_excluded(self):
-        """``prediction_time == event_time`` must not count as an occurrence (strict ``>``)."""
+        """``prediction_time == event_time`` must not count as an occurrence (strict ``>``).
+
+        Under the collapsed ``TaskQuerySchema`` label: non-censored row with an event in
+        the window → ``boolean_value = True``; non-censored row without → ``False``.
+        """
         events = pl.DataFrame(
             {
                 "subject_id": [1, 1, 1, 1, 1],
@@ -294,7 +210,7 @@ class TestEvaluateAgainstReference:
         ).sort(["subject_id", "time"])
 
         # Construct one index row at prediction_time = 2020-01-03. The event at 2020-01-03
-        # should NOT count. The next event is 2020-01-04, which is within 10d → occurs=True.
+        # should NOT count. The next event is 2020-01-04, which is within 10d → True.
         index_df = pl.DataFrame(
             {
                 "subject_id": [1],
@@ -305,23 +221,17 @@ class TestEvaluateAgainstReference:
         ).with_columns(pl.col("prediction_time").cast(pl.Datetime("us")))
         max_time_df = compute_max_time_per_subject(events)
         result = evaluate_index_df(index_df, events, max_time_df)
-        assert result["boolean_value"].to_list() == [False]
-        assert result["occurs"].to_list() == [True]
+        assert result["boolean_value"].to_list() == [True]
 
-        # Now with duration=0: no window → occurs=False (and not censored because 2020-01-03
+        # Now with duration=0: no window → False (and not censored because 2020-01-03
         # + 0 days = 2020-01-03 which is <= 2021-01-01).
         index_df_zero = index_df.with_columns(pl.lit(0, dtype=pl.Int64).alias("duration_days"))
         result_zero = evaluate_index_df(index_df_zero, events, max_time_df)
-        assert result_zero["occurs"].to_list() == [False]
+        assert result_zero["boolean_value"].to_list() == [False]
 
     def test_unknown_subject_is_treated_as_censored(self, caplog):
-        """An index_df row referencing a subject absent from events_df must not produce null booleans — the
-        torch collate can't consume nulls.
-
-        Policy: treat missing-subject rows as
-        censored (boolean_value=True, occurs=False) and emit a warning so the condition is
-        visible to the user.
-        """
+        """An index_df row referencing a subject absent from events_df resolves to censored (``boolean_value =
+        null``) under the collapsed schema, and emits a warning."""
         events = pl.DataFrame(
             {
                 "subject_id": [1],
@@ -341,17 +251,12 @@ class TestEvaluateAgainstReference:
         ).with_columns(pl.col("prediction_time").cast(pl.Datetime("us")))
 
         max_time_df = compute_max_time_per_subject(events)
-        with caplog.at_level("WARNING", logger="every_query.sample_tasks"):
+        with caplog.at_level("WARNING", logger="every_query.generate_tasks.sample_tasks"):
             result = evaluate_index_df(index_df, events, max_time_df)
 
-        # Neither row produces a null label.
-        assert result["boolean_value"].null_count() == 0
-        assert result["occurs"].null_count() == 0
-
-        # Subject 2 (unknown) → censored, not occurred.
+        # Subject 2 (unknown) → censored → null boolean_value.
         unknown = result.filter(pl.col("subject_id") == 2)
-        assert unknown["boolean_value"].to_list() == [True]
-        assert unknown["occurs"].to_list() == [False]
+        assert unknown["boolean_value"].to_list() == [None]
 
         # Warning was emitted with a count.
         assert any("not present in events_df" in record.message for record in caplog.records), (
@@ -424,9 +329,8 @@ class TestReadEventShardDtypeNormalization:
 
         result = evaluate_index_df(index_df, events, compute_max_time_per_subject(events))
         # Uncensored (max_time = 2021-01-01 is way past prediction + 10d) and the next "A"
-        # event is 2020-01-02, which is strictly within the window → occurs=True.
-        assert result["boolean_value"].to_list() == [False]
-        assert result["occurs"].to_list() == [True]
+        # event is 2020-01-02, which is strictly within the window → boolean_value=True.
+        assert result["boolean_value"].to_list() == [True]
 
 
 class TestAtomicWriteConcurrency:
@@ -450,14 +354,6 @@ class TestAtomicWriteConcurrency:
         # Clean up the placeholder tmpfiles mkstemp creates.
         a.unlink(missing_ok=True)
         b.unlink(missing_ok=True)
-
-    def test_atomic_write_text_round_trip(self, tmp_path):
-        fp = tmp_path / "out.json"
-        st._atomic_write_text(fp, '{"hello": "world"}')
-        assert fp.read_text() == '{"hello": "world"}'
-        # No orphan tmpfiles should linger after a successful write.
-        orphans = [p for p in tmp_path.iterdir() if p.name != "out.json"]
-        assert orphans == []
 
     def test_atomic_write_parquet_round_trip(self, tmp_path):
         fp = tmp_path / "out.parquet"
@@ -505,7 +401,14 @@ def _write_fake_cohort(
 
 
 class TestRunWorkerPipeline:
-    def test_writes_all_three_artifacts(self, tmp_path, synthetic_events, synthetic_query_codes):
+    def test_writes_only_labels_parquet(self, tmp_path, synthetic_events, synthetic_query_codes):
+        """The worker writes exactly one on-disk artifact per call: the labels parquet.
+
+        Regression guard: prior versions wrote a ``tasks.json`` + unlabeled-index parquet +
+        run-meta sidecar under ``out_dir``, and the index parquet (schema-incompatible with
+        labels) was silently globbed as a task-label by MTD downstream, breaking training.
+        Catching any future re-introduction of intermediate artifacts alongside labels.
+        """
         data_dir, codes_dir = _write_fake_cohort(tmp_path, synthetic_events, synthetic_query_codes)
         out_dir = tmp_path / "out"
         labels_fp = run_worker(
@@ -524,19 +427,15 @@ class TestRunWorkerPipeline:
         )
         assert labels_fp is not None
         assert labels_fp.exists()
-        assert (out_dir / "_artifacts" / "tasks" / "train" / "0__0000.json").exists()
-        assert (out_dir / "_artifacts" / "index" / "train" / "0__0000.parquet").exists()
+        # Exactly one file under out_dir, exactly labels_fp.  No sidecars, no cache parquets.
+        all_files = [p for p in out_dir.rglob("*") if p.is_file()]
+        assert all_files == [labels_fp], f"expected only {labels_fp}, got {all_files}"
 
         labels = pl.read_parquet(labels_fp)
         assert labels.height == 32
-        assert set(labels.columns) == {
-            "subject_id",
-            "prediction_time",
-            "boolean_value",
-            "occurs",
-            "query",
-            "duration_days",
-        }
+        # Schema conformance is the invariant — validate directly against TaskQuerySchema
+        # rather than hand-rolling the column set (which would drift if the schema grows).
+        TaskQuerySchema.validate(labels.to_arrow())
 
     def test_rerun_is_idempotent_noop(self, tmp_path, synthetic_events, synthetic_query_codes):
         """Second invocation with identical args returns ``None`` and leaves outputs untouched."""
@@ -565,11 +464,17 @@ class TestRunWorkerPipeline:
         assert first.read_bytes() == first_bytes  # untouched
 
     def test_overwrite_regenerates(self, tmp_path, synthetic_events, synthetic_query_codes):
-        """``overwrite=True`` must actually regenerate; ``overwrite=False`` must not.
+        """``overwrite=True`` regenerates labels; ``overwrite=False`` returns the existing file.
 
-        Captures bytes before and after each rerun and asserts the invariant directly — the earlier version of
-        this test only checked that the tasks file existed and was non-None, which would pass even if
-        overwrite were silently ignored (Copilot review on #41).
+        With the caching removed, sampler behavior is now:
+        - ``overwrite=False`` + labels exist: return ``None``, leave labels untouched.
+        - ``overwrite=True``: re-runs end-to-end, labels reflect the new inputs.
+        - ``overwrite=False`` + no labels: labels are computed and written.
+
+        Note: because there is no longer a meta-sidecar check, changing the config WITHOUT
+        ``overwrite`` is a silent no-op — the caller is responsible for passing
+        ``overwrite=True`` when they've changed sampling parameters.  See the
+        ``test_stale_labels_on_config_change_without_overwrite`` guard below.
         """
         data_dir, codes_dir = _write_fake_cohort(tmp_path, synthetic_events, synthetic_query_codes)
         out_dir = tmp_path / "out"
@@ -588,30 +493,28 @@ class TestRunWorkerPipeline:
         }
         first = run_worker(seed=1, **kwargs)
         assert first is not None
+        first_bytes = first.read_bytes()
 
-        tasks_path = out_dir / "_artifacts" / "tasks" / "train" / "0__0000.json"
-        first_label_bytes = first.read_bytes()
-        first_task_bytes = tasks_path.read_bytes()
-
-        # No-op rerun with same seed: bytes untouched.
+        # No-op rerun with same seed: labels untouched, worker returns None.
         skipped = run_worker(seed=1, **kwargs)
         assert skipped is None
-        assert first.read_bytes() == first_label_bytes
-        assert tasks_path.read_bytes() == first_task_bytes
+        assert first.read_bytes() == first_bytes
 
-        # Overwrite with a different seed: both labels and tasks must change.
+        # Overwrite with a different seed: labels must change.
         second = run_worker(seed=2, overwrite=True, **kwargs)
         assert second is not None
         assert first == second  # same path
-        assert second.read_bytes() != first_label_bytes, (
+        assert second.read_bytes() != first_bytes, (
             "overwrite=True with a new seed did not change the labels parquet"
-        )
-        assert tasks_path.read_bytes() != first_task_bytes, (
-            "overwrite=True with a new seed did not change the tasks JSON"
         )
 
     def test_task_shard_axis_changes_tasks(self, tmp_path, synthetic_events, synthetic_query_codes):
-        """Fixing ``input_shard`` and varying ``task_shard`` must change the sampled tasks."""
+        """Fixing ``input_shard`` and varying ``task_shard`` must change the sampled tasks.
+
+        Since the tasks JSON is no longer persisted, read the labels parquet and compare the
+        ``(query, duration_days)`` multiset — that's the full surface of what "tasks" means
+        downstream.
+        """
         data_dir, codes_dir = _write_fake_cohort(tmp_path, synthetic_events, synthetic_query_codes)
         out_dir = tmp_path / "out"
         kwargs = {
@@ -627,16 +530,18 @@ class TestRunWorkerPipeline:
             "duration_max": 365,
             "min_context_per_subject": 5,
         }
-        run_worker(task_shard=0, **kwargs)
-        run_worker(task_shard=1, **kwargs)
+        labels_a_fp = run_worker(task_shard=0, **kwargs)
+        labels_b_fp = run_worker(task_shard=1, **kwargs)
 
-        tasks_a = (out_dir / "_artifacts" / "tasks" / "train" / "0__0000.json").read_text()
-        tasks_b = (out_dir / "_artifacts" / "tasks" / "train" / "0__0001.json").read_text()
-        assert tasks_a != tasks_b
+        def _task_multiset(fp):
+            df = pl.read_parquet(fp)
+            return sorted(zip(df["query"].to_list(), df["duration_days"].to_list(), strict=True))
+
+        assert _task_multiset(labels_a_fp) != _task_multiset(labels_b_fp)
 
     def test_input_shard_axis_preserves_tasks(self, tmp_path, synthetic_events, synthetic_query_codes):
-        """Fixing ``task_shard`` and varying ``input_shard`` must keep the same task list but still draw
-        *different* contexts.
+        """Fixing ``task_shard`` and varying ``input_shard`` keeps the same tasks but draws *different*
+        contexts.
 
         This is what enables ``hydra -m input_shard=range(K)`` to evaluate *the same* sampled tasks
         across every shard — a key property for producing a coherent PT dataset — while ensuring
@@ -666,34 +571,38 @@ class TestRunWorkerPipeline:
             "duration_max": 365,
             "min_context_per_subject": 5,
         }
-        run_worker(input_shard="0", **kwargs)
-        run_worker(input_shard="1", **kwargs)
+        labels_0_fp = run_worker(input_shard="0", **kwargs)
+        labels_1_fp = run_worker(input_shard="1", **kwargs)
 
-        # Same tasks across input shards.
-        tasks_0 = (out_dir / "_artifacts" / "tasks" / "train" / "0__0000.json").read_text()
-        tasks_1 = (out_dir / "_artifacts" / "tasks" / "train" / "1__0000.json").read_text()
+        df_0 = pl.read_parquet(labels_0_fp)
+        df_1 = pl.read_parquet(labels_1_fp)
+
+        # Same tasks across input shards (task_seed depends only on task_shard).
+        tasks_0 = sorted(set(zip(df_0["query"].to_list(), df_0["duration_days"].to_list(), strict=True)))
+        tasks_1 = sorted(set(zip(df_1["query"].to_list(), df_1["duration_days"].to_list(), strict=True)))
         assert tasks_0 == tasks_1, "tasks should be identical across input_shards at fixed task_shard"
 
-        # ... but the sampled context *pairs* must differ, since the context seed depends on
-        # input_shard.  Compare the (subject_id, prediction_time) multiset rather than the raw
-        # parquet bytes to avoid flakiness from parquet metadata / row-order.
-        index_0 = pl.read_parquet(out_dir / "_artifacts" / "index" / "train" / "0__0000.parquet")
-        index_1 = pl.read_parquet(out_dir / "_artifacts" / "index" / "train" / "1__0000.parquet")
-        pairs_0 = set(index_0.select("subject_id", "prediction_time").iter_rows())
-        pairs_1 = set(index_1.select("subject_id", "prediction_time").iter_rows())
+        # ... but the sampled context pairs must differ (context_seed depends on both axes).
+        pairs_0 = set(df_0.select("subject_id", "prediction_time").iter_rows())
+        pairs_1 = set(df_1.select("subject_id", "prediction_time").iter_rows())
         assert pairs_0 != pairs_1, (
             "contexts should differ across input_shards at fixed task_shard "
             "(contexts_seed depends on both axes)"
         )
 
-    def test_config_mismatch_raises_without_overwrite(
+    def test_stale_labels_on_config_change_without_overwrite(
         self, tmp_path, synthetic_events, synthetic_query_codes
     ):
-        """A second run with a different sampling config must not silently reuse stale artifacts.
+        """Documents the contract: config changes without ``overwrite=True`` return stale labels.
 
-        Catches the failure mode Copilot flagged on #41: without a meta sidecar check, the
-        artifact filename only keys on ``(split, input_shard, task_shard)``, so changing
-        ``seed``, ``n_tasks``, etc. would silently reuse the old output.
+        This used to raise ``ValueError`` via a meta-sidecar check.  That check was removed along
+        with the rest of the sampler cache because the sidecar and its associated intermediate
+        artifacts leaked into ``task_labels_dir`` and broke downstream training.  The contract now
+        is simpler but *caller-enforced*: if you change ``seed``, ``n_tasks``, etc., pass
+        ``overwrite=True`` or point at a fresh ``out_dir``.
+
+        This test pins that behavior so a future reviewer sees the tradeoff explicitly rather than
+        discovering it via surprise in production.
         """
         data_dir, codes_dir = _write_fake_cohort(tmp_path, synthetic_events, synthetic_query_codes)
         out_dir = tmp_path / "out"
@@ -712,77 +621,19 @@ class TestRunWorkerPipeline:
         }
         first = run_worker(n_tasks=16, **kwargs)
         assert first is not None
+        assert pl.read_parquet(first).height == 16
 
-        # Changing n_tasks without overwrite must fail loudly.
-        with pytest.raises(ValueError, match="worker config"):
-            run_worker(n_tasks=32, **kwargs)
-
-        # overwrite=True bypasses the check and actually regenerates.
-        second = run_worker(n_tasks=32, overwrite=True, **kwargs)
-        assert second is not None
-        labels = pl.read_parquet(second)
-        assert labels.height == 32, "overwrite with n_tasks=32 should produce 32 labels"
-
-    def test_config_mismatch_raises_on_seed_change(self, tmp_path, synthetic_events, synthetic_query_codes):
-        """Changing only ``seed`` is the other obvious way to produce silent staleness."""
-        data_dir, codes_dir = _write_fake_cohort(tmp_path, synthetic_events, synthetic_query_codes)
-        out_dir = tmp_path / "out"
-        kwargs = {
-            "data_dir": data_dir,
-            "codes_dir": codes_dir,
-            "out_dir": out_dir,
-            "split": "train",
-            "input_shard": "0",
-            "task_shard": 0,
-            "n_tasks": 8,
-            "contexts_per_task": 1,
-            "duration_min": 10,
-            "duration_max": 365,
-            "min_context_per_subject": 5,
-        }
-        run_worker(seed=1, **kwargs)
-        with pytest.raises(ValueError, match="seed"):
-            run_worker(seed=999, **kwargs)
-
-    def test_missing_meta_is_tolerated(self, tmp_path, synthetic_events, synthetic_query_codes):
-        """Legacy or hand-injected artifacts without a meta sidecar must still load.
-
-        This preserves the pre-seeding workflow: a user drops tasks.json by hand (without any
-        corresponding meta file) and reruns; the sampler loads the preseeded tasks verbatim.
-        """
-        data_dir, codes_dir = _write_fake_cohort(tmp_path, synthetic_events, synthetic_query_codes)
-        out_dir = tmp_path / "out"
-        kwargs = {
-            "data_dir": data_dir,
-            "codes_dir": codes_dir,
-            "out_dir": out_dir,
-            "split": "train",
-            "input_shard": "0",
-            "task_shard": 0,
-            "seed": 1,
-            "n_tasks": 8,
-            "contexts_per_task": 1,
-            "duration_min": 10,
-            "duration_max": 365,
-            "min_context_per_subject": 5,
-        }
-        # First run: creates artifacts and meta.
-        first = run_worker(**kwargs)
-        assert first is not None
-
-        # Delete the meta sidecar to simulate a legacy / pre-meta artifact.
-        run_meta_fp = out_dir / "_artifacts" / "runs" / "train" / "0__0000.json"
-        assert run_meta_fp.exists()
-        run_meta_fp.unlink()
-
-        # Rerun with the same config: should succeed (labels already exist, no-op path).
-        skipped = run_worker(**kwargs)
+        # Changing n_tasks without overwrite → no-op (labels still have 16 rows).
+        skipped = run_worker(n_tasks=32, **kwargs)
         assert skipped is None
+        assert pl.read_parquet(first).height == 16, (
+            "no-op path returned stale labels silently — expected behavior post-cache-removal"
+        )
 
-        # Rerun with a changed config: should also succeed (no meta to validate against);
-        # labels already exist so it's a no-op regardless.
-        skipped2 = run_worker(**{**kwargs, "n_tasks": 99})
-        assert skipped2 is None
+        # overwrite=True actually regenerates.
+        regenerated = run_worker(n_tasks=32, overwrite=True, **kwargs)
+        assert regenerated is not None
+        assert pl.read_parquet(regenerated).height == 32
 
     def test_codes_dir_is_read_from_a_distinct_root(self, tmp_path, synthetic_events, synthetic_query_codes):
         """Smoke test that codes_dir is actually read *from* codes_dir, not data_dir.
@@ -816,34 +667,6 @@ class TestRunWorkerPipeline:
         labels = pl.read_parquet(labels_fp)
         # The queries in the output must all come from codes.parquet under codes_dir.
         assert set(labels["query"].to_list()) <= set(synthetic_query_codes)
-
-    def test_preseeded_tasks_are_honored(self, tmp_path, synthetic_events, synthetic_query_codes):
-        """Dropping a ``tasks.json`` on disk before run → the sampler uses it verbatim."""
-        data_dir, codes_dir = _write_fake_cohort(tmp_path, synthetic_events, synthetic_query_codes)
-        out_dir = tmp_path / "out"
-
-        preset = [TaskSpec("ICD//A01", 30), TaskSpec("MED//D04", 60)]
-        tasks_fp = out_dir / "_artifacts" / "tasks" / "train" / "0__0000.json"
-        st.save_tasks(preset, tasks_fp)
-
-        labels_fp = run_worker(
-            data_dir=data_dir,
-            codes_dir=codes_dir,
-            out_dir=out_dir,
-            split="train",
-            input_shard="0",
-            task_shard=0,
-            seed=999,  # would normally draw different tasks
-            n_tasks=2,
-            contexts_per_task=1,
-            duration_min=10,
-            duration_max=365,
-            min_context_per_subject=5,
-        )
-        assert labels_fp is not None
-        labels = pl.read_parquet(labels_fp)
-        assert sorted(labels["query"].unique().to_list()) == sorted(["ICD//A01", "MED//D04"])
-        assert sorted(labels["duration_days"].unique().to_list()) == [30, 60]
 
 
 # ---------------------------------------------------------------------------
@@ -907,7 +730,7 @@ _E2E_QUERIES = ["HR", "TEMP"]
 
 
 class TestEndToEndWithDataset:
-    """Sanity-check that sampler output is a drop-in replacement for ``collate_tasks`` output.
+    """Sanity-check that sampler output is a drop-in replacement for the dataset's task-labels contract.
 
     We don't run ``run_worker`` here because the sampler's shard-reading path expects string-coded
     events from an early preprocessing stage that the test fixture does not expose (the tensorized
@@ -958,24 +781,17 @@ class TestEndToEndWithDataset:
                 "subject_id": pl.Int64,
                 "prediction_time": pl.Datetime("us"),
                 "query": pl.Utf8,
-                "duration_days": pl.Int64,
+                # Float32 to match TaskQuerySchema.duration_days.
+                "duration_days": pl.Float32,
             }
         )
 
         max_time_df = compute_max_time_per_subject(events_df)
         labeled = evaluate_index_df(index_df, events_df, max_time_df)
 
-        # Sanity: schema matches EveryQueryPytorchDataset's expectations exactly.
-        assert set(labeled.columns) == {
-            "subject_id",
-            "prediction_time",
-            "boolean_value",
-            "occurs",
-            "query",
-            "duration_days",
-        }
-        assert labeled.schema["boolean_value"] == pl.Boolean
-        assert labeled.schema["occurs"] == pl.Boolean
+        # Sanity: labeled output conforms to TaskQuerySchema — same check the write path
+        # in ``run_worker`` does, exercised here at the per-function boundary.
+        TaskQuerySchema.validate(labeled.to_arrow())
 
         labels_fp = Path(labels_dir) / "0.parquet"
         labeled.write_parquet(labels_fp)

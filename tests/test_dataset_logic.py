@@ -9,7 +9,7 @@ import copy
 
 import torch
 
-from every_query.dataset import EveryQueryBatch, EveryQueryPytorchDataset
+from every_query.data.dataset import EveryQueryBatch, EveryQueryPytorchDataset
 
 
 class TestQueryTokenPrependedAtPosition0:

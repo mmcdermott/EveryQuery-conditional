@@ -1,19 +1,32 @@
 """Root conftest — session-scoped fixture DAG for the EveryQuery test suite.
 
-Fixture dependency graph (all session-scoped)::
+In-process fixtures (objects live in the test interpreter)::
 
     demo_model ──────────► demo_lightning_module
+
+    simple_static_MEDS ──► tensorized_cohort_dir
                                     │
                                     ▼
-    simple_static_MEDS ──► tensorized_cohort_dir  trained_model_ckpt (Phase 3)
-            │                       │
-            ▼                       ▼
-    task_parquet_dir        demo_dataset ◄─── (collated task labels)
-                                │
-                                ▼
-                           sample_batch
+                               demo_dataset
+                                    │
+                                    ▼
+                               sample_batch
+
+CLI-chain fixtures (run real ``EQ_*`` console scripts via subprocess; each returns the
+output directory so downstream tests / fixtures can chain off it)::
+
+    simple_static_MEDS ──► eq_preprocessed_dataset
+                                    │
+                                    ├────► eq_sampled_tasks_dir
+                                    │             │
+                                    │             ▼
+                                    └────► eq_trained_model_dir
+
+All fixtures in this file are ``scope="session"`` — each runs at most once per pytest
+invocation.
 """
 
+import os
 import subprocess
 import sys
 import tempfile
@@ -30,9 +43,9 @@ from meds import train_split, tuning_split
 from meds_torchdata.config import MEDSTorchDataConfig
 from transformers import ModernBertConfig
 
-from every_query.dataset import EveryQueryBatch, EveryQueryPytorchDataset
-from every_query.lightning_module import EveryQueryLightningModule
+from every_query.data.dataset import EveryQueryBatch, EveryQueryPytorchDataset
 from every_query.model import EveryQueryModel
+from every_query.model.lightning_module import EveryQueryLightningModule
 
 # ── Constants derived from the canonical simple-static MEDS sample data ─
 
@@ -75,7 +88,8 @@ def demo_model_config() -> ModernBertConfig:
 
 @pytest.fixture(scope="session")
 def demo_model() -> EveryQueryModel:
-    """Randomly-initialised EveryQueryModel with tiny dimensions."""
+    """Seeded, tiny EveryQueryModel for CPU-only testing."""
+    torch.manual_seed(0)
     model = EveryQueryModel(
         config_overrides=DEMO_CONFIG_OVERRIDES,
         do_demo=True,
@@ -101,8 +115,6 @@ _VENV_BIN = str(Path(sys.executable).parent)
 @pytest.fixture(scope="session")
 def tensorized_MEDS_dataset(simple_static_MEDS: Path) -> Path:
     """Override upstream fixture so ``MTD_preprocess`` (and its children) resolve from the active venv."""
-    import os
-
     env = os.environ.copy()
     env["PATH"] = _VENV_BIN + os.pathsep + env.get("PATH", "")
 
@@ -123,40 +135,203 @@ def tensorized_cohort_dir(tensorized_MEDS_dataset: Path) -> Path:
     return tensorized_MEDS_dataset
 
 
-@pytest.fixture(scope="session")
-def task_parquet_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """Pre-collation task parquets in the layout ``collate_tasks`` expects.
+# ── CLI-chain fixtures ──────────────────────────────────────────────────
+# These run the real ``EQ_*`` console scripts via subprocess and return the output
+# directory.  Use these in integration tests that want to exercise the actual CLI
+# surface; use the in-process ``demo_dataset`` / ``sample_batch`` fixtures above for
+# narrower unit tests that just need a model forward pass.
 
-    Layout::
 
-        {task_dir}/{duration}/{split}/{shard}.parquet
+def run_and_check(cmd: list[str], *, env: dict[str, str] | None = None, timeout: float = 180.0):
+    """Run ``cmd`` in a subprocess with the venv bin on ``PATH``; raise on nonzero exit.
 
-    Columns: ``subject_id, prediction_time, censored, HR, TEMP``
+    The exception message includes captured stdout / stderr so a failing CI log points at the
+    concrete error rather than just a return-code.  ``env`` merges into (rather than replaces)
+    the parent env so PATH / PYTHONPATH etc. survive.
     """
-    task_dir = tmp_path_factory.mktemp("eq_tasks")
+    full_env = os.environ.copy()
+    full_env["PATH"] = _VENV_BIN + os.pathsep + full_env.get("PATH", "")
+    if env:
+        full_env.update(env)
 
-    for duration in [30, 31]:
-        for split, subjects in [(train_split, _TRAIN_SUBJECTS), (tuning_split, _TUNING_SUBJECTS)]:
-            split_dir = task_dir / str(duration) / split
-            split_dir.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, env=full_env, timeout=timeout)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Command failed (rc={result.returncode}):\n"
+            f"  cmd: {' '.join(cmd)}\n"
+            f"  stdout:\n{result.stdout}\n"
+            f"  stderr:\n{result.stderr}"
+        )
+    return result
 
-            n = len(subjects)
-            df = pl.DataFrame(
+
+# Placeholder values for the ``ensure_env()`` gate in ``utils/_env.py``.  The demo Hydra configs
+# do not interpolate any of these env vars, so the actual values are inert — they exist purely
+# to let the gate pass on a clean CI machine with no ``.env`` file.
+ENSURE_ENV_PLACEHOLDERS: dict[str, str] = {
+    "PROJECT_DIR": "/tmp",
+    "OUTPUT_DIR": "/tmp",
+    "TASK_DIR": "/tmp",
+    "FINAL_DATA_DIR": "/tmp",
+    "WANDB_ENTITY": "test",
+}
+
+
+@pytest.fixture(scope="session")
+def eq_preprocessed_dataset(simple_static_MEDS: Path, tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Runs ``EQ_process_data do_demo=True`` against ``simple_static_MEDS``.
+
+    Returns the tensorized-cohort output dir (``final/``), ready to feed into
+    ``EQ_generate_training_tasks`` and ``EQ_train`` as ``codes_dir`` and ``tensorized_cohort_dir``
+    respectively.
+
+    Sibling ``intermediate/`` dir is also produced (needed as ``data_dir`` for
+    ``EQ_generate_training_tasks``) and stored alongside ``final/`` — callers can reach it via
+    ``eq_preprocessed_dataset.parent / "intermediate"``.
+    """
+    root = tmp_path_factory.mktemp("eq_preprocessed")
+    intermediate = root / "intermediate"
+    final = root / "final"
+    run_and_check(
+        [
+            "EQ_process_data",
+            f"input_dir={simple_static_MEDS!s}",
+            f"intermediate_dir={intermediate!s}",
+            f"output_dir={final!s}",
+            "do_demo=True",
+        ],
+        timeout=300.0,
+    )
+    assert (final / "metadata" / "codes.parquet").exists(), (
+        f"EQ_process_data exited 0 but did not produce the expected metadata file under {final}"
+    )
+    return final
+
+
+@pytest.fixture(scope="session")
+def eq_sampled_tasks_dir(eq_preprocessed_dataset: Path, tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Runs ``EQ_generate_training_tasks`` for both ``train`` and ``tuning`` splits against
+    ``eq_preprocessed_dataset``.
+
+    Returns the sampler's ``out_dir`` directly — the contract with downstream tooling
+    (MTD's ``task_labels_dir``, ``EQ_train``'s ``datamodule.config.task_labels_dir``) is
+    that the sampler's output dir *is* the labels dir.  If the sampler leaks non-label
+    parquets into this directory, MTD's ``rglob("*.parquet")`` picks them up, schemas
+    don't match, and ``pl.concat`` on ``labels_df`` fails — which is exactly the
+    production-facing failure mode the integration tests need to catch, not hide.
+    """
+    intermediate = eq_preprocessed_dataset.parent / "intermediate"
+    assert intermediate.exists(), (
+        "eq_sampled_tasks_dir expects eq_preprocessed_dataset.parent / 'intermediate' to exist "
+        "(produced by EQ_process_data)"
+    )
+
+    out_dir = tmp_path_factory.mktemp("eq_tasks")
+    for split in (train_split, tuning_split):
+        # Seed pinned explicitly (not inherited from the config default) so tests that compare
+        # against this fixture's output — notably the reproducibility test in
+        # test_generate_tasks.py — stay anchored to a known value even if the config default
+        # changes.
+        run_and_check(
+            [
+                "EQ_generate_training_tasks",
+                f"data_dir={intermediate!s}",
+                f"codes_dir={eq_preprocessed_dataset!s}",
+                f"out_dir={out_dir!s}",
+                f"split={split}",
+                "input_shard=0",
+                "task_shard=0",
+                "n_tasks=8",
+                "contexts_per_task=2",
+                "duration_min=1",
+                "duration_max=30",
+                "min_context_per_subject=1",
+                "seed=1",
+            ],
+            timeout=120.0,
+        )
+
+    return out_dir
+
+
+@pytest.fixture(scope="session")
+def eq_trained_model_dir(
+    eq_preprocessed_dataset: Path,
+    eq_sampled_tasks_dir: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Path:
+    """Runs ``EQ_train --config-name=_demo_train`` to produce a checkpoint.
+
+    Returns the training ``output_dir``.  Callers should find a checkpoint under
+    ``{output_dir}/checkpoints/last.ckpt`` and a resolved config under
+    ``{output_dir}/resolved_config.yaml``.
+    """
+    output_dir = tmp_path_factory.mktemp("eq_train_out")
+    run_and_check(
+        [
+            "EQ_train",
+            "--config-name=_demo_train",
+            f"output_dir={output_dir!s}",
+            f"datamodule.config.tensorized_cohort_dir={eq_preprocessed_dataset!s}",
+            f"datamodule.config.task_labels_dir={eq_sampled_tasks_dir!s}",
+        ],
+        env=ENSURE_ENV_PLACEHOLDERS,
+        timeout=300.0,
+    )
+    return output_dir
+
+
+@pytest.fixture(scope="session")
+def task_labels_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Sampler-output-shaped task labels for both splits, in long format.
+
+    Layout matches ``sample_tasks.run_worker`` output::
+
+        {task_labels_dir}/{split}/{shard}.parquet
+
+    Columns: ``subject_id, prediction_time, boolean_value, query, duration_days``.
+    Conforms to ``TaskQuerySchema`` — ``boolean_value`` is nullable (null=censored,
+    True=event occurred, False=no event and not censored).
+    """
+    task_dir = tmp_path_factory.mktemp("eq_task_labels")
+
+    for split, subjects in [(train_split, _TRAIN_SUBJECTS), (tuning_split, _TUNING_SUBJECTS)]:
+        split_dir = task_dir / split
+        split_dir.mkdir(parents=True, exist_ok=True)
+
+        rows = []
+        for i, (subj, query_code) in enumerate((s, q) for s in subjects for q in _QUERY_CODES):
+            # Alternate the three-valued state so downstream tests see each:
+            #   i % 3 == 0 → censored  (null)
+            #   i % 3 == 1 → occurred  (True)
+            #   i % 3 == 2 → no event  (False)
+            if i % 3 == 0:
+                bv = None
+            elif i % 3 == 1:
+                bv = True
+            else:
+                bv = False
+            rows.append(
                 {
-                    "subject_id": subjects,
-                    "prediction_time": [_PRED_TIMES[s] for s in subjects],
-                    "censored": [i % 2 == 0 for i in range(n)],
-                    "HR": [i % 2 == 1 for i in range(n)],
-                    "TEMP": [i % 2 == 0 for i in range(n)],
+                    "subject_id": subj,
+                    "prediction_time": _PRED_TIMES[subj],
+                    "boolean_value": bv,
+                    "query": query_code,
+                    # Float to match ``TaskQuerySchema.duration_days`` (``pa.float32``).
+                    "duration_days": 30.0,
                 }
-            ).cast({"prediction_time": pl.Datetime("us")})
+            )
 
-            df.write_parquet(split_dir / "0.parquet")
-
-    import json
-
-    with open(task_dir / "sampled_durations.json", "w") as f:
-        json.dump([30, 31], f)
+        df = pl.DataFrame(rows).cast(
+            {
+                "prediction_time": pl.Datetime("us"),
+                "subject_id": pl.Int64,
+                "boolean_value": pl.Boolean,
+                "query": pl.Utf8,
+                "duration_days": pl.Float32,
+            }
+        )
+        df.write_parquet(split_dir / "0.parquet")
 
     return task_dir
 
@@ -166,18 +341,24 @@ def demo_dataset(
     tensorized_cohort_dir: Path,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> EveryQueryPytorchDataset:
-    """``EveryQueryPytorchDataset`` for the *train* split backed by collated task labels."""
+    """``EveryQueryPytorchDataset`` for the *train* split backed by sampler-shaped task labels."""
 
     collated_dir = tmp_path_factory.mktemp("eq_collated")
 
     rows = []
     for i, (subj, query_code) in enumerate((s, q) for s in _TRAIN_SUBJECTS for q in _QUERY_CODES):
+        # Three-valued nullable boolean_value per TaskQuerySchema.
+        if i % 3 == 0:
+            bv = None
+        elif i % 3 == 1:
+            bv = True
+        else:
+            bv = False
         rows.append(
             {
                 "subject_id": subj,
                 "prediction_time": _PRED_TIMES[subj],
-                "boolean_value": i % 2 == 0,
-                "occurs": i % 3 != 0,
+                "boolean_value": bv,
                 "query": query_code,
                 "duration_days": 30.0,
             }
@@ -188,9 +369,8 @@ def demo_dataset(
             "prediction_time": pl.Datetime("us"),
             "subject_id": pl.Int64,
             "boolean_value": pl.Boolean,
-            "occurs": pl.Boolean,
             "query": pl.Utf8,
-            "duration_days": pl.Float64,
+            "duration_days": pl.Float32,  # matches TaskQuerySchema
         }
     )
     df.write_parquet(collated_dir / "0.parquet")

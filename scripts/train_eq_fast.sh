@@ -42,6 +42,6 @@ uv run python -c "import sys; print('Executable:', sys.executable)"
 
 export HYDRA_FULL_ERROR=1
 
-srun uv run python src/every_query/train.py --config-name=fast_config "$@"
+srun uv run python -m every_query.train.train --config-name=fast_config "$@"
 
 echo "Finished at $(date)"

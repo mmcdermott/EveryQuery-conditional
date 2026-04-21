@@ -1,7 +1,7 @@
 """CLI-level integration tests for ``every_query.train``.
 
-Tests exercise ``collate_tasks`` (direct call) and the full ``train.main``
-Hydra entry-point (via subprocess) using the ``_demo_train.yaml`` config.
+Tests exercise the full ``every_query.train.train:main`` Hydra entry-point (via subprocess)
+using the ``_demo_train.yaml`` config against sampler-shaped task labels.
 """
 
 import os
@@ -9,34 +9,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-import polars as pl
 import pytest
-from meds import train_split, tuning_split
-from omegaconf import DictConfig, OmegaConf
-
-from every_query.train import collate_tasks
 
 _VENV_BIN = str(Path(sys.executable).parent)
 
 
-def _build_collate_cfg(task_parquet_dir: Path) -> DictConfig:
-    """Minimal DictConfig for ``collate_tasks`` matching the ``task_parquet_dir`` fixture."""
-    return OmegaConf.create(
-        {
-            "query": {
-                "task_dir": str(task_parquet_dir),
-                "codes": ["HR", "TEMP"],
-                "duration_min": 30,
-                "duration_max": 32,
-                "sample_times_per_subject": 5,
-            },
-            "seed": 1,
-        }
-    )
-
-
 def _run_train_subprocess(
-    task_parquet_dir: Path,
+    task_labels_dir: Path,
     tensorized_cohort_dir: Path,
     output_dir: Path,
     *,
@@ -44,25 +23,18 @@ def _run_train_subprocess(
     do_overwrite: bool = True,
     extra_overrides: list[str] | None = None,
 ) -> subprocess.CompletedProcess:
-    """Run ``python -m every_query.train`` as a subprocess with the demo config."""
+    """Run ``python -m every_query.train.train`` as a subprocess with the demo config."""
     env = os.environ.copy()
     env["PATH"] = _VENV_BIN + os.pathsep + env.get("PATH", "")
     # Provide dummy env vars so ensure_env() passes in the subprocess.
     # Hydra CLI overrides control the actual paths used by the test.
-    for var in (
-        "PROJECT_DIR",
-        "OUTPUT_DIR",
-        "TASK_DIR",
-        "PROCESSED",
-        "INTERMEDIATE",
-        "FINAL_DATA_DIR",
-    ):
+    for var in ("PROJECT_DIR", "OUTPUT_DIR", "TASK_DIR", "FINAL_DATA_DIR"):
         env.setdefault(var, str(output_dir))
     env.setdefault("WANDB_ENTITY", "test")
 
     overrides = [
         f"output_dir={output_dir}",
-        f"query.task_dir={task_parquet_dir}",
+        f"datamodule.config.task_labels_dir={task_labels_dir}",
         f"datamodule.config.tensorized_cohort_dir={tensorized_cohort_dir}",
         f"do_resume={str(do_resume).lower()}",
         f"do_overwrite={str(do_overwrite).lower()}",
@@ -74,7 +46,7 @@ def _run_train_subprocess(
     cmd = [
         sys.executable,
         "-m",
-        "every_query.train",
+        "every_query.train.train",
         "--config-name=_demo_train",
         *overrides,
     ]
@@ -82,47 +54,13 @@ def _run_train_subprocess(
     return subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=180)
 
 
-# ── test_collate_tasks ──────────────────────────────────────────────────
-
-
-class TestCollateTasks:
-    """``collate_tasks`` reads per-duration task parquets and writes collated shards."""
-
-    @pytest.fixture()
-    def collated_dir(self, task_parquet_dir) -> Path:
-        cfg = _build_collate_cfg(task_parquet_dir)
-        return Path(collate_tasks(cfg))
-
-    def test_creates_collated_directory(self, collated_dir):
-        """Output lives under ``{task_dir}/collated/{hash}/``."""
-        assert collated_dir.is_dir()
-        assert collated_dir.parent.name == "collated"
-
-    def test_train_and_tuning_splits_written(self, collated_dir):
-        """Both train and tuning splits contain at least one parquet shard."""
-        for split in [train_split, tuning_split]:
-            split_dir = collated_dir / split
-            assert split_dir.is_dir(), f"Missing {split} split directory"
-            parquets = list(split_dir.glob("*.parquet"))
-            assert len(parquets) > 0, f"No parquets in {split} split"
-
-    def test_output_parquet_columns(self, collated_dir):
-        """Collated parquets have the expected EveryQuery task schema."""
-        df = pl.read_parquet(collated_dir / train_split / "0.parquet")
-        expected = {"subject_id", "prediction_time", "boolean_value", "occurs", "query", "duration_days"}
-        assert expected == set(df.columns)
-
-
-# ── test_train_cli_runs ─────────────────────────────────────────────────
-
-
 class TestTrainCliRuns:
     """Full training run via subprocess with ``_demo_train.yaml``."""
 
     @pytest.fixture(scope="class")
-    def training_output(self, task_parquet_dir, tensorized_cohort_dir, tmp_path_factory) -> Path:
+    def training_output(self, task_labels_dir, tensorized_cohort_dir, tmp_path_factory) -> Path:
         output_dir = tmp_path_factory.mktemp("cli_train")
-        result = _run_train_subprocess(task_parquet_dir, tensorized_cohort_dir, output_dir)
+        result = _run_train_subprocess(task_labels_dir, tensorized_cohort_dir, output_dir)
         assert result.returncode == 0, (
             f"train.py failed (rc={result.returncode}).\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
@@ -144,23 +82,20 @@ class TestTrainCliRuns:
         assert (training_output / "best_model.ckpt").is_file()
 
 
-# ── test_train_resume ───────────────────────────────────────────────────
-
-
 class TestTrainResume:
     """Resuming from an existing checkpoint completes without error."""
 
     @pytest.fixture(scope="class")
-    def resumed_output(self, task_parquet_dir, tensorized_cohort_dir, tmp_path_factory) -> Path:
+    def resumed_output(self, task_labels_dir, tensorized_cohort_dir, tmp_path_factory) -> Path:
         output_dir = tmp_path_factory.mktemp("cli_resume")
 
-        initial = _run_train_subprocess(task_parquet_dir, tensorized_cohort_dir, output_dir)
+        initial = _run_train_subprocess(task_labels_dir, tensorized_cohort_dir, output_dir)
         assert initial.returncode == 0, (
             f"Initial training failed (rc={initial.returncode}).\nstderr:\n{initial.stderr}"
         )
 
         resumed = _run_train_subprocess(
-            task_parquet_dir,
+            task_labels_dir,
             tensorized_cohort_dir,
             output_dir,
             do_resume=True,
@@ -180,3 +115,117 @@ class TestTrainResume:
 
     def test_best_model_present_after_resume(self, resumed_output):
         assert (resumed_output / "best_model.ckpt").is_file()
+
+
+class TestTrainOverwriteReRun:
+    """Re-running ``EQ_train`` with ``do_overwrite=True`` into a populated output_dir must leave a readable
+    ``config.yaml`` + ``resolved_config.yaml`` behind.
+
+    Regression guard for #31: the
+    pre-fix code wiped the dir via ``shutil.rmtree`` but only re-saved the config on the fresh-dir
+    branch, so overwrite re-runs silently produced runs that downstream tools (notably
+    ``eval.py``, which loads ``resolved_config.yaml``) couldn't inspect.
+    """
+
+    @pytest.fixture(scope="class")
+    def overwrite_output(self, task_labels_dir, tensorized_cohort_dir, tmp_path_factory) -> Path:
+        output_dir = tmp_path_factory.mktemp("cli_overwrite")
+
+        first = _run_train_subprocess(task_labels_dir, tensorized_cohort_dir, output_dir)
+        assert first.returncode == 0, (
+            f"Initial training failed (rc={first.returncode}).\nstderr:\n{first.stderr}"
+        )
+        assert (output_dir / "config.yaml").is_file()
+
+        overwritten = _run_train_subprocess(
+            task_labels_dir,
+            tensorized_cohort_dir,
+            output_dir,
+            do_overwrite=True,
+            do_resume=False,
+        )
+        assert overwritten.returncode == 0, (
+            f"Overwrite re-run failed (rc={overwritten.returncode}).\nstderr:\n{overwritten.stderr}"
+        )
+        return output_dir
+
+    def test_config_yaml_present_after_overwrite(self, overwrite_output):
+        assert (overwrite_output / "config.yaml").is_file()
+
+    def test_resolved_config_yaml_present_after_overwrite(self, overwrite_output):
+        assert (overwrite_output / "resolved_config.yaml").is_file()
+
+
+class TestTrainOverwriteAndResumeBothTrue:
+    """When ``do_overwrite=True`` AND ``do_resume=True`` are set together, the warning at the top of ``main``
+    documents that *overwrite wins* and the directory is cleared.
+
+    Config-writing should
+    therefore also behave as if we were overwriting — not silently skipped the way a pure resume
+    would do.  Without the ``cfg.do_overwrite`` guard on the save, this combination produces an
+    output dir whose config.yaml was wiped and never rewritten.  Regression guard for the edge
+    case caught in Copilot's review of #31.
+    """
+
+    @pytest.fixture(scope="class")
+    def both_flags_output(self, task_labels_dir, tensorized_cohort_dir, tmp_path_factory) -> Path:
+        output_dir = tmp_path_factory.mktemp("cli_both_flags")
+
+        first = _run_train_subprocess(task_labels_dir, tensorized_cohort_dir, output_dir)
+        assert first.returncode == 0, (
+            f"Initial training failed (rc={first.returncode}).\nstderr:\n{first.stderr}"
+        )
+
+        # Both flags simultaneously — overwrite should win (the warning at the top of main() says so).
+        both = _run_train_subprocess(
+            task_labels_dir,
+            tensorized_cohort_dir,
+            output_dir,
+            do_overwrite=True,
+            do_resume=True,
+        )
+        assert both.returncode == 0, (
+            f"Run with do_overwrite=do_resume=True failed (rc={both.returncode}).\nstderr:\n{both.stderr}"
+        )
+        return output_dir
+
+    def test_config_yaml_present_after_both_flags(self, both_flags_output):
+        assert (both_flags_output / "config.yaml").is_file()
+
+    def test_resolved_config_yaml_present_after_both_flags(self, both_flags_output):
+        assert (both_flags_output / "resolved_config.yaml").is_file()
+
+
+class TestTrainResumeRejectsStructuralDrift:
+    """``do_resume=True`` must refuse to proceed when the new invocation disagrees with the resumed-from
+    config on a structural key (anything not in ``ALLOWED_DIFFERENCE_KEYS``).
+
+    Regression guard for #91.  Note ``TestTrainResume`` above covers the complementary case —
+    resume with a bumped ``trainer.max_steps`` (an ALLOWED_DIFFERENCE key) succeeds.
+    """
+
+    def test_max_seq_len_drift_is_rejected(
+        self, task_labels_dir, tensorized_cohort_dir, tmp_path_factory
+    ) -> None:
+        output_dir = tmp_path_factory.mktemp("cli_resume_drift")
+
+        first = _run_train_subprocess(task_labels_dir, tensorized_cohort_dir, output_dir)
+        assert first.returncode == 0, (
+            f"Initial training failed (rc={first.returncode}).\nstderr:\n{first.stderr}"
+        )
+
+        drifted = _run_train_subprocess(
+            task_labels_dir,
+            tensorized_cohort_dir,
+            output_dir,
+            do_resume=True,
+            do_overwrite=False,
+            extra_overrides=["datamodule.config.max_seq_len=32"],
+        )
+        assert drifted.returncode != 0, (
+            f"Expected resume with drifted max_seq_len to fail, but it succeeded.\n"
+            f"stdout:\n{drifted.stdout}\nstderr:\n{drifted.stderr}"
+        )
+        assert "max_seq_len" in drifted.stderr, (
+            f"Expected error to name 'max_seq_len', got:\n{drifted.stderr}"
+        )

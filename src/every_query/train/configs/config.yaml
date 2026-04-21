@@ -1,0 +1,110 @@
+defaults:
+  - _self_
+  - train_codes: 10000_ID__8db2be6fadf8
+
+output_dir: ${oc.env:OUTPUT_DIR}/${run_id:}/
+do_overwrite: true
+do_resume: false
+seed: 140799
+
+query:
+  codes: ${train_codes.codes}
+
+datamodule:
+  _target_: meds_torchdata.extensions.lightning_datamodule.Datamodule
+  data_class: every_query.data.dataset.EveryQueryPytorchDataset
+  config:
+    _target_: meds_torchdata.MEDSTorchDataConfig
+    tensorized_cohort_dir: ${oc.env:FINAL_DATA_DIR}
+    task_labels_dir: ${oc.env:TASK_DIR}
+    static_inclusion_mode: omit
+    seq_sampling_strategy: to_end
+    max_seq_len: 1028
+  batch_size: 32
+  num_workers: 1
+  pin_memory: True
+
+lightning_module:
+  _target_: every_query.model.lightning_module.EveryQueryLightningModule
+  model:
+    _target_: every_query.model.EveryQueryModel
+    precision: "16-mixed"
+    do_demo: false
+    do_grad_ckpt: false
+    mlp_dropout: 0.1
+    num_hidden_layers: 12
+  optimizer:
+    _target_: torch.optim.AdamW
+    _partial_: true
+    lr: 1e-5 # starting point (common LR for transformers)
+    weight_decay: 0.05 # recommended for regularization
+    eps: 1.0e-8 # default epsilon
+    betas: [0.9, 0.999] # default betas (standard)
+    amsgrad: false # default amsgrad (standard)
+    fused: false # default fused (standard)
+  LR_scheduler:
+    _target_: transformers.get_cosine_schedule_with_warmup
+    _partial_: true
+    num_warmup_steps: ${int_prod:0.05,${.num_training_steps}} # ~10% of training steps
+    num_training_steps: ${trainer.max_steps}
+    num_cycles: 0.5
+
+trainer:
+  _target_: lightning.pytorch.trainer.Trainer
+  logger:
+    _target_: pytorch_lightning.loggers.wandb.WandbLogger
+    name: "queries=${list_len:${query.codes}}_${run_id:}"
+    save_dir: "${trainer.default_root_dir}/loggers"
+    offline: False
+    id: null # pass correct id to resume experiment!
+    anonymous: null # enable anonymous logging
+    project: EveryQuery
+    log_model: False # upload lightning ckpts
+    prefix: "" # a string to put at the beginning of metric keys
+    entity: ${oc.env:WANDB_ENTITY}
+    config:
+      query_codes: ${train_codes.codes}
+      num_query_codes: ${list_len:${train_codes.codes}}
+  callbacks:
+    _target_: __main__.values_as_list
+    learning_rate_monitor:
+      _target_: lightning.pytorch.callbacks.LearningRateMonitor
+    model_checkpoint:
+      _target_: lightning.pytorch.callbacks.ModelCheckpoint
+      dirpath: ${trainer.default_root_dir}/checkpoints
+      monitor: "tuning/loss"
+      verbose: False
+      save_last: True # additionally always save an exact copy of the last checkpoint to a file last.ckpt
+      save_top_k: -1 # save k best models (determined by above metric)
+      mode: "min"
+      save_weights_only: False
+      every_n_train_steps: null
+    early_stopping:
+      _target_: lightning.pytorch.callbacks.EarlyStopping
+      monitor: "tuning/loss" # quantity to be monitored, must be specified !!!
+      min_delta: 5.0e-5 # minimum change in the monitored quantity to qualify as an improvement
+      patience: 20 # number of checks with no improvement after which training will be stopped
+      verbose: True # verbosity mode
+      mode: "min" # "max" means higher metric value is better, can be also "min"
+      strict: True # whether to crash the training if monitor is not found in the validation metrics
+      check_finite: True # when set True, stops training when the monitor becomes NaN or infinite
+      stopping_threshold: null # stop training immediately once the monitored quantity reaches this
+      divergence_threshold: null # stop training as soon as the monitored quantity becomes worse than this
+      check_on_train_epoch_end: false # set to false so that early stopping is checked after each validation loop
+  default_root_dir: ${output_dir}
+  min_epochs: 0 # prevents early stopping
+  max_epochs: null # We don't control the max epochs, we control the max steps.
+  max_steps: 40000
+  accelerator: "auto"
+  devices: 1
+  strategy: "auto"
+  accumulate_grad_batches: 4 # set to 1 for no gradient accumulation, >1 for gradient accumulation
+  log_every_n_steps: 50
+  # perform a validation loop every N training epochs
+  check_val_every_n_epoch: 1
+  val_check_interval: 0.05 # validate 10 times per epoch
+  limit_val_batches: 100 # use only up to N validation batches to speed up training
+  # set True to to ensure deterministic results
+  # makes training slower but gives more reproducibility than just setting seeds
+  deterministic: False
+  gradient_clip_val: 1.0

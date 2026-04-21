@@ -14,8 +14,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from conftest import DEMO_CONFIG_OVERRIDES
-from every_query.lightning_module import EveryQueryLightningModule
 from every_query.model import EveryQueryModel, EveryQueryOutput
+from every_query.model.lightning_module import EveryQueryLightningModule
 
 # ── test_model_forward_shape ────────────────────────────────────────────
 

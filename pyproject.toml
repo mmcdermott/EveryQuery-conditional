@@ -27,7 +27,7 @@ dependencies = [
   "filelock==3.19.1",
   "pytest==8.4.2",
   "meds-transforms==0.5.3",
-  "meds-torch-data[lightning]~=0.6.3",
+  "meds-torch-data[lightning]~=0.7.0",
   "transformers>=4.48.0",
   "torch==2.8.0",
   "torchmetrics==1.8.2",
@@ -55,7 +55,25 @@ every_query = ["**/*.yaml"]
 
 [project.optional-dependencies] # Add any optional dependencies here, installable via `pip install .[extra]`
 
-[project.scripts] # Add any console scripts here
+[project.scripts]
+EQ_process_data = "every_query.preprocessing.__main__:main"
+EQ_generate_training_tasks = "every_query.generate_tasks.sample_tasks:main"
+EQ_generate_evaluation_tasks = "every_query.generate_tasks.sample_evaluation_tasks:main"
+EQ_train = "every_query.train.train:main"
+EQ_predict = "every_query.predict.predict:main"
+# EQ_evaluate points at the single-stage evaluator (consumes a PredictionSchema
+# parquet, emits per-(query, duration_days) metrics).  The legacy four-stage
+# evaluator (every_query.evaluate.eval + siblings, and its sibling CLIs
+# EQ_gen_eval_index / EQ_gen_eval_tasks / EQ_select_model) has been deleted per
+# the #83 consolidation wave; recover from git history if needed.
+EQ_evaluate = "every_query.evaluate.evaluate:main"
+
+[tool.coverage.run]
+# Measure coverage for EQ_* CLIs launched via subprocess in tests/test_cli_smoke.py.
+# coverage's `patch = ["subprocess"]` replaces the removed pytest-cov 7.0 subprocess hook
+# and implies parallel=true.  See
+# https://pytest-cov.readthedocs.io/en/latest/subprocess-support.html
+patch = ["subprocess"]
 
 [tool.pytest.ini_options] # Default pytest options
 addopts = [
@@ -65,8 +83,12 @@ addopts = [
   "--ignore=AGENTS.md",
   "--ignore=CONTRIBUTORS.md",
   "--doctest-glob=*.md",
+  "-m",
+  "not slow", # Skip slow integration tests by default; opt-in via `-m slow` or `-m "slow or not slow"`.
 ]
-markers = [] # Add any custom pytest markers here
+markers = [
+  "slow: heavy integration tests that train a real model (~5 min CI, ~5-7 min laptop). Skipped by default; run with `pytest -m slow` or `pytest -m 'slow or not slow'` to include.",
+]
 doctest_optionflags = ["NORMALIZE_WHITESPACE", "ELLIPSIS"]
 
 [project.urls]
