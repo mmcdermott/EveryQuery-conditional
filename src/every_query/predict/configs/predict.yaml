@@ -34,6 +34,11 @@ ckpt_name: null
 # train_dataloader shuffles, which would break the order-preserving hstack.
 split: held_out
 
+# Optional: overwrite ``output_parquet`` if it already exists.  Default false so an
+# existing predictions file is never silently clobbered — re-running against the
+# same output path without this flag raises ``FileExistsError`` at startup.
+overwrite: false
+
 hydra:
   output_subdir: null
   job:

@@ -22,7 +22,8 @@ class PredictionSchema(TaskQuerySchema):
 
     Inherits every column from :class:`every_query.data.schema.TaskQuerySchema` —
     ``subject_id``, ``prediction_time``, ``query``, ``duration_days``, plus the inherited
-    optional label columns (``boolean_value`` nullable, per ``LabelSchema``).  Adds:
+    optional label columns (``boolean_value`` nullable, per ``TaskQuerySchema``'s
+    override — ``LabelSchema`` itself declares it non-nullable).  Adds:
 
     Attributes:
         censor_prob: Model-reported probability that the row is censored (observation

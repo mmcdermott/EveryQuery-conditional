@@ -131,15 +131,18 @@ def _validate_tasks_dir(tasks_dir: Path) -> None:
         )
 
 
-def _warn_out_of_vocab(task_codes: set[str], train_cfg: DictConfig) -> None:
-    """Warn if any task-query codes are missing from the trained model's vocabulary.
+def _check_vocab(task_codes: set[str], train_cfg: DictConfig) -> None:
+    """Raise if any task-query codes are missing from the trained model's vocabulary.
 
     Out-of-vocab query codes survive the predict loop (``encode_query`` silently falls
-    back to ``PAD_INDEX``) but produce effectively-uniform predictions.  Log a warning
-    at startup so the caller notices rather than silently getting garbage probabilities.
+    back to ``PAD_INDEX``) but produce effectively-uniform (garbage) predictions — so
+    the caller's ``predictions.parquet`` would silently contain rows whose probabilities
+    have no relationship to the model.  Raise at startup rather than write misleading
+    output.  Missing metadata is also a hard error: without the training vocab we can't
+    validate inputs at all.
 
     Examples:
-        Happy path — every task code is present in the training vocab, no warning:
+        Happy path — every task code is present in the training vocab:
 
         >>> import tempfile
         >>> from omegaconf import OmegaConf
@@ -148,36 +151,45 @@ def _warn_out_of_vocab(task_codes: set[str], train_cfg: DictConfig) -> None:
         ...     meta_dir.mkdir()
         ...     pl.DataFrame({"code": ["A", "B", "C"]}).write_parquet(meta_dir / "codes.parquet")
         ...     cfg = OmegaConf.create({"datamodule": {"config": {"tensorized_cohort_dir": tmpdir}}})
-        ...     _warn_out_of_vocab({"A", "B"}, cfg)  # no raise, no logged warning
+        ...     _check_vocab({"A", "B"}, cfg)  # no raise
 
-        Out-of-vocab codes trigger a warning (raised-vs-logged distinction: this is a
-        soft signal, not an error — malformed inputs get visible-but-survivable
-        degradation rather than a hard stop):
+        Out-of-vocab codes raise ``ValueError``:
 
         >>> with tempfile.TemporaryDirectory() as tmpdir:
         ...     meta_dir = Path(tmpdir) / "metadata"
         ...     meta_dir.mkdir()
         ...     pl.DataFrame({"code": ["A"]}).write_parquet(meta_dir / "codes.parquet")
         ...     cfg = OmegaConf.create({"datamodule": {"config": {"tensorized_cohort_dir": tmpdir}}})
-        ...     _warn_out_of_vocab({"A", "MISSING"}, cfg)  # logs warning, no raise
+        ...     try:
+        ...         _check_vocab({"A", "MISSING"}, cfg)
+        ...     except ValueError as e:
+        ...         print(str(e).split(".  ")[0])
+        1 of 2 task-query codes are not in the model's training vocabulary
 
-        Missing metadata file also warns rather than erroring — predict should still
-        be able to run against a training dir that happens to lack the metadata:
+        Missing metadata file also raises — we can't run inference without being
+        able to confirm the inputs match the model's training vocab:
 
         >>> with tempfile.TemporaryDirectory() as tmpdir:
         ...     cfg = OmegaConf.create({"datamodule": {"config": {"tensorized_cohort_dir": tmpdir}}})
-        ...     _warn_out_of_vocab({"A"}, cfg)  # logs warning, no raise
+        ...     try:
+        ...         _check_vocab({"A"}, cfg)
+        ...     except FileNotFoundError as e:
+        ...         print("FileNotFoundError")
+        FileNotFoundError
     """
     metadata_fp = Path(train_cfg.datamodule.config.tensorized_cohort_dir) / "metadata" / "codes.parquet"
     if not metadata_fp.is_file():
-        logger.warning(f"Cannot resolve training vocabulary — no codes metadata at {metadata_fp}")
-        return
+        raise FileNotFoundError(
+            f"Cannot resolve training vocabulary — no codes metadata at {metadata_fp}.  "
+            f"EQ_predict needs this to validate task codes against the model's vocab."
+        )
     training_vocab = set(pl.read_parquet(metadata_fp, columns=["code"])["code"].to_list())
     missing = task_codes - training_vocab
     if missing:
-        logger.warning(
+        raise ValueError(
             f"{len(missing)} of {len(task_codes)} task-query codes are not in the model's training "
-            f"vocabulary and will be PAD-encoded (predictions will be near-uniform for these rows): "
+            f"vocabulary.  Out-of-vocab codes would be PAD-encoded and produce near-uniform "
+            f"probabilities; refuse rather than write misleading predictions.  Missing codes: "
             f"{sorted(missing)[:10]}{'...' if len(missing) > 10 else ''}"
         )
 
@@ -257,12 +269,19 @@ def main(cfg: DictConfig) -> None:
     output_parquet = Path(cfg.output_parquet)
     ckpt_name = cfg.get("ckpt_name")
     split = cfg.get("split", held_out_split)
+    overwrite = bool(cfg.get("overwrite", False))
 
     if split not in _SPLIT_TO_DATAMODULE_ATTRS:
         raise ValueError(
             f"split must be one of {sorted(_SPLIT_TO_DATAMODULE_ATTRS)}, got {split!r}.  "
             f"The 'train' split is disallowed because MTD's train_dataloader shuffles, "
             f"which would break the order-preserving hstack."
+        )
+
+    if output_parquet.exists() and not overwrite:
+        raise FileExistsError(
+            f"output_parquet {output_parquet} already exists.  Pass overwrite=true to replace, "
+            f"or point at a new path — EQ_predict refuses to silently clobber existing output."
         )
 
     _validate_tasks_dir(tasks_dir)
@@ -276,13 +295,26 @@ def main(cfg: DictConfig) -> None:
     dataset = getattr(D, dataset_attr)
     dataloader = getattr(D, dataloader_attr)()
 
-    _warn_out_of_vocab(set(dataset.query.unique().to_list()), train_cfg)
+    # Enforce order-preserving iteration — the ``hstack`` below assumes the dataloader
+    # yields rows in ``schema_df`` order.  MTD's val/test dataloaders use
+    # ``SequentialSampler`` by default, but asserting here turns a silent correctness
+    # bug (shuffled probs stitched to the wrong identifiers) into a loud startup error
+    # if that ever changes.
+    sampler = getattr(dataloader, "sampler", None)
+    sampler_cls = type(sampler).__name__ if sampler is not None else None
+    if sampler_cls != "SequentialSampler":
+        raise RuntimeError(
+            f"{dataloader_attr} must use SequentialSampler to preserve row order for the "
+            f"predictions hstack; got {sampler_cls!r}.  Re-check the MTD datamodule config."
+        )
+
+    _check_vocab(set(dataset.query.unique().to_list()), train_cfg)
     logger.info(f"Loaded {len(dataset)} tasks across {dataset.query.n_unique()} query codes")
 
     # Pass the split's dataloader directly — MTD's ``Datamodule`` has no
     # ``predict_dataloader``, so ``trainer.predict(datamodule=D)`` would hit the base
-    # class's ``MisconfigurationException``.  ``val_dataloader`` / ``test_dataloader``
-    # both use ``shuffle=False``.
+    # class's ``MisconfigurationException``.  The SequentialSampler check above
+    # guarantees order preservation.
     pred_batches = trainer.predict(model=model, dataloaders=dataloader, ckpt_path=None)
 
     probs = _gather_probabilities(pred_batches)

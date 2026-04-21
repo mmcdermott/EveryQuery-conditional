@@ -16,12 +16,16 @@ REQUIRED_ENV_VARS = (
     "FINAL_DATA_DIR",
     "WANDB_ENTITY",
 )
-# `PROCESSED` and `INTERMEDIATE` used to live here too but no Hydra config
-# interpolates `${oc.env:PROCESSED}` or `${oc.env:INTERMEDIATE}`.  Their only use is a
-# dotenv fallback inside `sample_tasks.py::_resolve_path`, which already tolerates
-# missing env vars when config values are supplied (the normal CLI path).  Keeping
-# them in the gate was pure friction: demo fixtures / `--help` invocations had to
-# set throwaway placeholder values for no actual resolution.  See #117.
+# `PROCESSED` and `INTERMEDIATE` are used by the preprocessing pipeline (the dirs it
+# writes to) and by the generate_tasks stage as dotenv fallbacks inside
+# `sample_tasks.py::_resolve_path` / `sample_evaluation_tasks.py::_resolve_path`.
+# They're not gated by this `REQUIRED_ENV_VARS` check because:
+#   1. `_resolve_path` already tolerates a missing env var when the caller supplies the
+#      path directly (the normal CLI / test path).
+#   2. No Hydra config interpolates `${oc.env:PROCESSED}` or `${oc.env:INTERMEDIATE}`,
+#      so demo fixtures / `--help` invocations don't need throwaway placeholders.
+# If you're running a full fresh-machine setup that includes preprocessing, set both
+# in `.env` (see `.env.example`).  See #117 for the history.
 
 
 def ensure_env() -> None:
