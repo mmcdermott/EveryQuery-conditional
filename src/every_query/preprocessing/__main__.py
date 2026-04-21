@@ -53,7 +53,7 @@ def main(cfg: DictConfig):
 
         pipeline_config_fp = (CONFIGS / "_reshard_data.yaml") if cfg.do_reshard else (CONFIGS / "_data.yaml")
         _run_stage(
-            ["MEDS_transform-pipeline", f"pipeline_config_fp={pipeline_config_fp!s}"],
+            ["MEDS_transform-pipeline", str(pipeline_config_fp)],
             env=env,
         )
 

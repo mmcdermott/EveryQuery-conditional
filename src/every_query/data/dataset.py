@@ -269,12 +269,17 @@ class QueryData(NamedTuple):
 
 
 class EveryQueryPytorchDataset(MEDSPytorchDataset):
+    EXTRA_LABEL_COLS: ClassVar[tuple[str, ...]] = ("occurs", "query", "duration_days")
+
     @classmethod
     def get_task_seq_bounds_and_labels(cls, label_df: pl.DataFrame, schema_df: pl.DataFrame) -> pl.DataFrame:
         """Returns the event-level allowed input sequence boundaries and labels for each task sample.
 
-        This function is guaranteed to output an index of the same order and length as `label_df`. Subjects
-        not present in `schema_df` will be included in the output, with null labels and indices.
+        Delegates to the upstream implementation (memory-efficient `join_asof`-based) and then
+        hstacks EveryQuery's task-specific annotation columns (`occurs`, `query`, `duration_days`)
+        onto the result. Alignment relies on the upstream guarantee that surviving rows are
+        returned in `label_df` input order; we semi-filter `label_df` to the same surviving
+        subject set so row `i` of `base` corresponds to row `i` of `surviving`.
 
         Args:
             label_df: The DataFrame containing the task labels, in the MEDS Label DF schema.
@@ -282,44 +287,18 @@ class EveryQueryPytorchDataset(MEDSPytorchDataset):
 
         Returns:
             A copy of the labels DataFrame, restricted to included subjects, with the appropriate end indices
-            for each task sample. Labels will be present if the `cls.LABEL_COL` is present in the input.
+            for each task sample. Labels will be present if the `cls.LABEL_COL` is present in the input,
+            along with any EveryQuery annotation columns present in `label_df`.
         """
-
-        end_idx_expr = (
-            pl.col(DataSchema.time_name)
-            .search_sorted(pl.col(LabelSchema.prediction_time_name), side="right")
-            .last()
-            .alias(cls.END_IDX)
-        )
-
-        group_cols = ["_row", DataSchema.subject_id_name, LabelSchema.prediction_time_name]
-        out_cols = [DataSchema.subject_id_name, cls.END_IDX, LabelSchema.prediction_time_name]
-
-        label_names = label_df.collect_schema().names()
-
-        if cls.LABEL_COL in label_names:
-            group_cols.append(cls.LABEL_COL)
-            out_cols.append(cls.LABEL_COL)
-
-        # Include pass-through task annotations if present
-        if "occurs" in label_names:
-            group_cols.append("occurs")
-            out_cols.append("occurs")
-        if "query" in label_names:
-            group_cols.append("query")
-            out_cols.append("query")
-        if "duration_days" in label_names:
-            group_cols.append("duration_days")
-            out_cols.append("duration_days")
-
-        return (
-            label_df.join(schema_df, on=DataSchema.subject_id_name, how="inner", maintain_order="left")
-            .with_row_index("_row")
-            .explode(DataSchema.time_name)
-            .group_by(group_cols, maintain_order=True)
-            .agg(end_idx_expr)
-            .select(out_cols)
-        )
+        base = super().get_task_seq_bounds_and_labels(label_df, schema_df)
+        extras = [c for c in cls.EXTRA_LABEL_COLS if c in label_df.collect_schema().names()]
+        if not extras:
+            return base
+        sid = DataSchema.subject_id_name
+        # Upstream guarantees input-order preservation for surviving rows (inner-join on subject_id).
+        # hstack-align the extras by semi-filtering label_df to the same surviving row set.
+        surviving = label_df.join(schema_df.lazy().select(sid).unique().collect(), on=sid, how="semi")
+        return base.hstack(surviving.select(extras))
 
     def __init__(self, cfg: MEDSTorchDataConfig, split: str):
         super().__init__(cfg, split)
