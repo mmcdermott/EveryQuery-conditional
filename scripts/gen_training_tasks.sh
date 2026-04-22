@@ -21,6 +21,7 @@ set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
 
 set -a
+# shellcheck source=/dev/null
 source .env
 set +a
 
@@ -28,5 +29,5 @@ mkdir -p logs
 
 uv run EQ_generate_training_tasks -m \
     split=train \
-    input_shard=${SLURM_ARRAY_TASK_ID} \
+    input_shard="${SLURM_ARRAY_TASK_ID}" \
     task_shard='range(0,16)'
