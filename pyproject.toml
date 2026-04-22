@@ -19,29 +19,45 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-  "polars~=1.30.0",
-  "pyarrow==21.0.0",
-  "hydra-core==1.3.2",
-  "numpy==2.3.3",
-  "meds==0.4.0",
-  "filelock==3.19.1",
-  "pytest==8.4.2",
-  "meds-transforms==0.5.3",
-  "meds-torch-data[lightning]~=0.7.0",
-  "transformers>=4.48.0",
-  "torch==2.8.0",
-  "torchmetrics==1.8.2",
-  "lightning==2.5.5",
-  "dotenv==0.9.9",
-  "wandb>=0.22.3",
-  "ipykernel>=7.2.0",
-  "scikit-learn>=1.6.0",
+  # Upper bounds are set at the next major version for every library that follows semver —
+  # this is the loosest range we can ship without relying on a not-yet-released major being
+  # backwards-compatible.  Tighter ranges (`meds-torch-data ~=0.9.0`) are upstream-opinionated
+  # pre-1.0 libraries whose minor bumps have been breaking in practice.  Lower bounds are the
+  # oldest version that exposes the APIs EveryQuery actually uses; where that's hard to verify
+  # cheaply, we anchor at the version that was shipping when the dep was first added.
+  "polars>=1.35,<2",
+  "pyarrow>=17,<22",
+  "hydra-core>=1.3,<2",
+  "numpy>=2,<3",
+  "meds>=0.4,<0.5",
+  "filelock>=3.13,<4",
+  "pytest>=8,<9",
+  "meds-transforms>=0.6.7,<0.7",
+  "meds-torch-data[lightning]~=0.9.0",
+  "transformers>=4.48,<5",
+  "torch>=2.6,<3",
+  "torchmetrics>=1.4,<2",
+  "lightning>=2.3,<3",
+  "dotenv>=0.9.9,<1",
+  "wandb>=0.22.3,<1",
+  "ipykernel>=7.2,<8",
+  "scikit-learn>=1.6,<2",
+  "matplotlib>=3.9,<4",
 ] # Add your runtime dependencies here
 
 [dependency-groups]
 dev = [
-  "pre-commit<4", "ruff", "pytest", "pytest-cov", "pretty-print-directory", "meds_testing_helpers~=0.3.0",
-  "yaml_to_disk"
+  "pre-commit<4",
+  "ruff",
+  "pytest",
+  "pytest-cov",
+  "pretty-print-directory",
+  # Pinned to 0.3.0 because 0.3.1 switches the simple_static fixture's birth code
+  # from `DOB` to `MEDS_BIRTH`, which breaks `tests/test_predict_cli.py::_QUERY_CODES`
+  # without a code change.  Revisit once the fixture stabilises upstream.
+  "meds_testing_helpers==0.3.0",
+  "yaml_to_disk",
+  "hydra-submitit-launcher>=1.2.0",
 ] # Add your development (lint, test) dependencies here
 docs = [] # Add your documentation dependencies here (I recommend mkdocs-material)
 
