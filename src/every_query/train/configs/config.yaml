@@ -19,8 +19,8 @@ datamodule:
     task_labels_dir: ${oc.env:TASK_DIR}
     static_inclusion_mode: omit
     seq_sampling_strategy: to_end
-    max_seq_len: 1028
-  batch_size: 32
+    max_seq_len: 256
+  batch_size: 128
   num_workers: 1
   pin_memory: True
 
@@ -94,11 +94,11 @@ trainer:
   default_root_dir: ${output_dir}
   min_epochs: 0 # prevents early stopping
   max_epochs: null # We don't control the max epochs, we control the max steps.
-  max_steps: 40000
+  max_steps: 80000
   accelerator: "auto"
   devices: 1
   strategy: "auto"
-  accumulate_grad_batches: 4 # set to 1 for no gradient accumulation, >1 for gradient accumulation
+  accumulate_grad_batches: 1 # set to 1 for no gradient accumulation, >1 for gradient accumulation
   log_every_n_steps: 50
   # perform a validation loop every N training epochs
   check_val_every_n_epoch: 1
