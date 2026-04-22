@@ -4,12 +4,14 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --time=04:00:00
-#SBATCH --output=logs/gen_train_%j.out
+#SBATCH --array=0-291%20
+#SBATCH --output=logs/gen_train_%A_%a.out
 #SBATCH --mail-user=gbk2114@cumc.columbia.edu
 #SBATCH --mail-type=END,FAIL
 #
-# Runs the full training-tasks sweep sequentially in one job:
-#   input_shard=0..291 x task_shard=0..15 = 4672 workers
+# Parallelizes the training-tasks sweep across input shards via a SLURM job array.
+# Each array task runs its 16 task_shards as a Hydra multirun.
+#   input_shard=0..291 (array tasks), task_shard=0..15 (per-task multirun)
 #
 # Usage:
 #   sbatch scripts/gen_training_tasks.sh
@@ -26,5 +28,5 @@ mkdir -p logs
 
 uv run EQ_generate_training_tasks -m \
     split=train \
-    input_shard='range(0,292)' \
+    input_shard=${SLURM_ARRAY_TASK_ID} \
     task_shard='range(0,16)'
