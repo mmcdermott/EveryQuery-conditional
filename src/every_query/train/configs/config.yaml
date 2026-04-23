@@ -59,7 +59,7 @@ trainer:
     prefix: "" # a string to put at the beginning of metric keys
     entity: ${oc.env:WANDB_ENTITY}
   callbacks:
-    _target_: __main__.values_as_list
+    _target_: every_query.train.train.values_as_list
     learning_rate_monitor:
       _target_: lightning.pytorch.callbacks.LearningRateMonitor
     model_checkpoint:
