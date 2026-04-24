@@ -33,7 +33,7 @@ dependencies = [
   "torchmetrics==1.8.2",
   "lightning==2.5.5",
   "dotenv==0.9.9",
-  "wandb>=0.22.3",
+  "wandb>=0.26.0",
   "ipykernel>=7.2.0",
   "scikit-learn>=1.6.0",
 ] # Add your runtime dependencies here
