@@ -28,7 +28,7 @@ lightning_module:
     do_demo: false
     do_grad_ckpt: false
     mlp_dropout: 0.1
-    num_hidden_layers: 12
+    num_hidden_layers: 22
   optimizer:
     _target_: torch.optim.AdamW
     _partial_: true
@@ -68,7 +68,7 @@ trainer:
       monitor: "tuning/loss"
       verbose: False
       save_last: True # additionally always save an exact copy of the last checkpoint to a file last.ckpt
-      save_top_k: -1 # save k best models (determined by above metric)
+      save_top_k: 3 # save k best models (determined by above metric)
       mode: "min"
       save_weights_only: False
       every_n_train_steps: null
