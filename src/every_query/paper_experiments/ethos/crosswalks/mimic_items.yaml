@@ -18,6 +18,7 @@ mappings:
     eq_meaning: "Start of patient record / first event token"
     ethos_tokens:
       - "HOSPITAL_ADMISSION"
+    source: "direct:event_alignment"
     rationale: >-
       EQ's TIMELINE//START fires at the first event of a patient's record.
       Token frequencies match closely (EQ n=200,773 / ETHOS n=297,949), and
@@ -27,18 +28,21 @@ mappings:
     eq_meaning: "Dextrose 5% IV fluid (MIMIC inputevents 220949)"
     ethos_tokens:
       - "ATC//B05//BLOOD_SUBSTITUTES_AND_PERFUSION_SOLUTIONS"
+    source: "physionet/mimic-iv-demo:icu/d_items.csv+llm"
     rationale: "Dextrose 5% is ATC B05BA03 -- IV solution; rolled up to B05."
 
   - eq_code: "INFUSION_START//221794"
     eq_meaning: "Furosemide (Lasix) (MIMIC inputevents 221794)"
     ethos_tokens:
       - "ATC//C03//DIURETICS"
+    source: "physionet/mimic-iv-demo:icu/d_items.csv+llm"
     rationale: "Furosemide is ATC C03CA01 (diuretic); rolled up to C03."
 
   - eq_code: "INFUSION_START//225168"
     eq_meaning: "Packed Red Blood Cells (MIMIC inputevents 225168)"
     ethos_tokens:
       - "ATC//B05//BLOOD_SUBSTITUTES_AND_PERFUSION_SOLUTIONS"
+    source: "physionet/mimic-iv-demo:icu/d_items.csv+llm"
     rationale: "PRBC transfusion belongs to ATC B05A (blood substitutes); B05 class."
 
   - eq_code: "INFUSION_END//227536"
@@ -46,6 +50,7 @@ mappings:
     ethos_tokens:
       - "ATC//A12//MINERAL_SUPPLEMENTS"
       - "ATC//B05//BLOOD_SUBSTITUTES_AND_PERFUSION_SOLUTIONS"
+    source: "physionet/mimic-iv-demo:icu/d_items.csv+llm"
     rationale: >-
       Potassium chloride is ATC A12BA01 (mineral supplement). When
       administered via CRRT it is an electrolyte solution (B05X). We OR both
@@ -55,6 +60,7 @@ mappings:
     eq_meaning: "Dexmedetomidine (Precedex) sedative infusion (MIMIC inputevents 229420)"
     ethos_tokens:
       - "ATC//N05//PSYCHOLEPTICS"
+    source: "physionet/mimic-iv-demo:icu/d_items.csv+llm"
     rationale: >-
       Dexmedetomidine is ATC N05CM18 (other hypnotics/sedatives); rolled up
       to N05 (psycholeptics) which is the broadest sedative/anxiolytic class.
@@ -64,6 +70,7 @@ mappings:
     ethos_tokens:
       - "ICD//CM//ENCOUNTER_FOR_CARE_INVOLVING_RENAL_DIALYSIS"
       - "ICD//CM//CHRONIC_KIDNEY_DISEASE_(CKD)"
+    source: "physionet/mimic-iv-demo:icu/d_items.csv+llm"
     rationale: >-
       Hemodialysis-output measurement happens during dialysis encounters; we
       proxy via the dialysis encounter and underlying CKD diagnosis tokens.
@@ -73,6 +80,7 @@ mappings:
     eq_meaning: "CK-MB (cardiac biomarker, MIMIC chartevents 227445)"
     ethos_tokens:
       - "ICD//CM//ACUTE_MYOCARDIAL_INFARCTION"
+    source: "physionet/mimic-iv-demo:icu/d_items.csv+llm"
     rationale: >-
       CK-MB is ordered when myocardial infarction is suspected; elevated
       values (the [11, 20) ng/mL bin is clearly elevated -- normal CK-MB is
@@ -82,6 +90,7 @@ mappings:
     eq_meaning: "Pressure ulcer #2 length (MIMIC chartevents 228724)"
     ethos_tokens:
       - "ICD//CM//PRESSURE_ULCER"
+    source: "physionet/mimic-iv-demo:icu/d_items.csv+llm"
     rationale: >-
       Pressure-ulcer length measurement is recorded for patients who already
       have a pressure ulcer; this is the underlying ICD diagnosis.

@@ -13,18 +13,21 @@ mappings:
     eq_meaning: "Parkinson's disease"
     ethos_tokens:
       - "ICD//CM//PARKINSON'S_DISEASE"
+    source: "llm:claude_clinical_knowledge"
     rationale: "Direct semantic match to ICD-10 G20."
 
   - eq_code: DIAGNOSIS//ICD//9//4271
     eq_meaning: "Paroxysmal supraventricular tachycardia"
     ethos_tokens:
       - "ICD//CM//PAROXYSMAL_TACHYCARDIA"
+    source: "llm:claude_clinical_knowledge"
     rationale: "Direct match to ICD-10 I47."
 
   - eq_code: DIAGNOSIS//ICD//9//5856
     eq_meaning: "End-stage renal disease (ESRD)"
     ethos_tokens:
       - "ICD//CM//CHRONIC_KIDNEY_DISEASE_(CKD)"
+    source: "llm:claude_clinical_knowledge"
     rationale: >-
       ICD-9 585.6 is ESRD; ICD-10 N18 is CKD with N18.6 specifically being ESRD.
       ETHOS's CKD label captures the N18 family. Alternative tokens (HCPCS
@@ -36,6 +39,7 @@ mappings:
     ethos_tokens:
       - "ICD//CM//OTHER_DISORDERS_OF_MUSCLE"
       - "ICD//CM//PAIN_NOT_ELSEWHERE_CLASSIFIED"
+    source: "llm:claude_clinical_knowledge"
     rationale: >-
       ETHOS has no exact "pain in limb" token. The two listed are the closest
       semantic proxies (other muscle disorders + general unclassified pain);
@@ -49,6 +53,7 @@ mappings:
       - "ICD//CM//CHRONIC_ISCHEMIC_HEART_DISEASE"
       - "ICD//CM//ANGINA_PECTORIS"
       - "ICD//CM//ATHEROSCLEROSIS"
+    source: "llm:claude_clinical_knowledge"
     rationale: >-
       I25.118 is a 5-digit child of I25 (chronic ischemic heart disease) with
       angina pectoris. The three ETHOS tokens together capture the I25 family
@@ -61,6 +66,7 @@ mappings:
     ethos_tokens:
       - "ICD//CM//FRACTURE_OF_FOOT_AND_TOE_EXCEPT_ANKLE"
       - "ICD//CM//FRACTURE_OF_LOWER_LEG_INCLUDING_ANKLE"
+    source: "llm:claude_clinical_knowledge"
     rationale: >-
       ETHOS uses chunked ICD-PCS tokens that don't carry procedure semantics
       directly. We map this procedure to the underlying fracture diagnosis as

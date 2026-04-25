@@ -206,6 +206,7 @@ def build_exact(eq_codes: list[str], ethos_vocab: set[str]) -> pl.DataFrame:
             "token_pattern": c,
             "match_kind": "literal",
             "provenance": "exact-match",
+            "mapping_source": "code:string_equality",
         }
         for c in eq_codes
         if c in ethos_vocab
@@ -231,6 +232,7 @@ def build_drop_bin(eq_codes: list[str], ethos_vocab: set[str]) -> pl.DataFrame:
                     "token_pattern": token,
                     "match_kind": "literal",
                     "provenance": "drop-bin/upper-units",
+                    "mapping_source": "code:strip_value_bin+upper_units",
                 }
             )
     return pl.DataFrame(rows, schema=_schema())
@@ -284,6 +286,7 @@ def build_quantile(
                 "token_pattern": f"{token_lab}|{token_q}",
                 "match_kind": "lab+next_qk",
                 "provenance": f"deciles/idx={idx}",
+                "mapping_source": "meds-codes.parquet:values_quantiles_or_sibling_bins",
             }
         )
     return pl.DataFrame(rows, schema=_schema())
@@ -330,6 +333,7 @@ def build_crosswalk(
             targets = [c for c in eq_codes if c.startswith(prefix)]
             if not targets:
                 continue
+        entry_source = entry.get("source", f"unspecified:{crosswalk_path.name}")
         for tok in entry.get("ethos_tokens", []):
             if tok not in ethos_vocab:
                 continue
@@ -341,6 +345,7 @@ def build_crosswalk(
                         "token_pattern": tok,
                         "match_kind": "literal",
                         "provenance": f"{tier_name}/{crosswalk_path.name}",
+                        "mapping_source": entry_source,
                     }
                 )
     return pl.DataFrame(rows, schema=_schema())
@@ -352,6 +357,7 @@ def build_union(prior: pl.DataFrame) -> pl.DataFrame:
     return prior.with_columns(
         pl.lit("union").alias("tier"),
         ("from-" + pl.col("tier")).alias("provenance"),
+        # mapping_source is preserved from the underlying primary-tier row
     ).unique(subset=["query", "token_pattern", "match_kind"])
 
 
@@ -362,6 +368,7 @@ def _schema() -> dict[str, type]:
         "token_pattern": pl.String,
         "match_kind": pl.String,
         "provenance": pl.String,
+        "mapping_source": pl.String,
     }
 
 

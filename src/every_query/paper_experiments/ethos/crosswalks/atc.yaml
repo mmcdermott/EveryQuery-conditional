@@ -16,12 +16,14 @@ mappings:
     eq_meaning: "Carbidopa/Levodopa, anti-Parkinson combination drug"
     ethos_tokens:
       - "ATC//N04//ANTI-PARKINSON_DRUGS"
+    source: "llm:claude_clinical_knowledge"
     rationale: "Carbidopa-Levodopa is ATC N04BA02; rolling up to N04 class."
 
   - eq_code: "MEDICATION//Gabapentin//Delayed Administered"
     eq_meaning: "Gabapentin, antiepileptic / neuropathic pain"
     ethos_tokens:
       - "ATC//N03//ANTIEPILEPTICS"
+    source: "llm:claude_clinical_knowledge"
     rationale: "Gabapentin is ATC N03AX12; rolling up to N03 class."
 
   - eq_code: "MEDICATION//START//Mupirocin Nasal Ointment 2%"
@@ -29,6 +31,7 @@ mappings:
     ethos_tokens:
       - "ATC//R01//NASAL_PREPARATIONS"
       - "ATC//D06//ANTIBIOTICS_AND_CHEMOTHERAPEUTICS_FOR_DERMATOLOGICAL_USE"
+    source: "llm:claude_clinical_knowledge"
     rationale: >-
       Mupirocin nasal is ATC R01AX06; the same active ingredient as topical
       D06AX09. We OR both since either nasal or dermatological tokens could
@@ -38,10 +41,12 @@ mappings:
     eq_meaning: "Captopril, ACE inhibitor"
     ethos_tokens:
       - "ATC//C09//AGENTS_ACTING_ON_THE_RENIN-ANGIOTENSIN_SYSTEM"
+    source: "llm:claude_clinical_knowledge"
     rationale: "Captopril is ATC C09AA01; rolling up to C09 class."
 
   - eq_code: "MEDICATION//STOP//Doxycycline Hyclate"
     eq_meaning: "Doxycycline, tetracycline-class systemic antibiotic"
     ethos_tokens:
       - "ATC//J01//ANTIBIOTICS_AND_ANTIBACTERIALS_FOR_SYSTEMIC_USE"
+    source: "llm:claude_clinical_knowledge"
     rationale: "Doxycycline is ATC J01AA02; rolling up to J01 class."
