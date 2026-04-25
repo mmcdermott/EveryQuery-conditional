@@ -52,6 +52,7 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CROSSWALK_DIR = Path(__file__).parent / "crosswalks"
 ICD_CROSSWALK_PATH = CROSSWALK_DIR / "icd.yaml"
 ATC_CROSSWALK_PATH = CROSSWALK_DIR / "atc.yaml"
+MIMIC_ITEMS_CROSSWALK_PATH = CROSSWALK_DIR / "mimic_items.yaml"
 
 
 def _client() -> storage.Client:
@@ -304,6 +305,11 @@ def build_crosswalk(
 ) -> pl.DataFrame:
     """Emit literal-match rows for each (eq_code, ethos_token) pair declared in the crosswalk YAML.
 
+    If a YAML entry's ``eq_code`` does NOT carry a ``//value_[..)`` segment,
+    it acts as a prefix and applies to every EQ code that starts with
+    ``eq_code + "//value_["``. This lets one YAML entry cover all value bins
+    of a given lab/infusion item-id without enumerating each bin.
+
     Skips token patterns that aren't actually in the ETHOS vocab (so a stale
     crosswalk entry is silently dropped rather than producing predictions
     that always miss).
@@ -311,22 +317,32 @@ def build_crosswalk(
     eq_set = set(eq_codes)
     rows: list[dict] = []
     for entry in _load_crosswalk(crosswalk_path):
-        eq = entry["eq_code"]
-        if eq not in eq_set:
-            # Crosswalk references a code we don't have in EQ AUC results -- skip.
+        eq_pattern = entry["eq_code"]
+        targets: list[str]
+        if eq_pattern in eq_set:
+            targets = [eq_pattern]
+        elif VALUE_BIN_RE.search(eq_pattern):
+            # YAML had a value-bin we don't have in EQ -- skip.
             continue
+        else:
+            # Treat eq_pattern as a prefix; match any binned EQ code that starts with it.
+            prefix = eq_pattern + "//value_["
+            targets = [c for c in eq_codes if c.startswith(prefix)]
+            if not targets:
+                continue
         for tok in entry.get("ethos_tokens", []):
             if tok not in ethos_vocab:
                 continue
-            rows.append(
-                {
-                    "query": eq,
-                    "tier": tier_name,
-                    "token_pattern": tok,
-                    "match_kind": "literal",
-                    "provenance": f"{tier_name}/{crosswalk_path.name}",
-                }
-            )
+            for eq in targets:
+                rows.append(
+                    {
+                        "query": eq,
+                        "tier": tier_name,
+                        "token_pattern": tok,
+                        "match_kind": "literal",
+                        "provenance": f"{tier_name}/{crosswalk_path.name}",
+                    }
+                )
     return pl.DataFrame(rows, schema=_schema())
 
 
@@ -416,7 +432,10 @@ def main() -> None:
     quantile = build_quantile(eq_codes, ethos_vocab, meds_q)
     icd_xw = build_crosswalk(eq_codes, ethos_vocab, ICD_CROSSWALK_PATH, "icd_crosswalk")
     atc_xw = build_crosswalk(eq_codes, ethos_vocab, ATC_CROSSWALK_PATH, "atc_crosswalk")
-    primary = pl.concat([exact, drop_bin, quantile, icd_xw, atc_xw], how="vertical")
+    mimic_xw = build_crosswalk(
+        eq_codes, ethos_vocab, MIMIC_ITEMS_CROSSWALK_PATH, "mimic_item_crosswalk"
+    )
+    primary = pl.concat([exact, drop_bin, quantile, icd_xw, atc_xw, mimic_xw], how="vertical")
     union = build_union(primary)
     mapping = pl.concat([primary, union], how="vertical")
 

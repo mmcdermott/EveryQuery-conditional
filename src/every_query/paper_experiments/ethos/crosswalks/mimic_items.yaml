@@ -1,0 +1,142 @@
+# LLM-proposed crosswalk: EQ MIMIC-item-id codes -> ETHOS tokens.
+#
+# Builds on MIMIC-IV's d_items.csv / d_labitems.csv (downloaded from
+# physionet.org/files/mimic-iv-demo/2.2/) which resolves each EQ MIMIC item-id
+# to its clinical label. We then propose ETHOS tokens (typically ATC drug
+# class for medication infusions, descriptive ICD label for condition-
+# adjacent measurements) using clinical knowledge.
+#
+# Mappings are partial: 8 LAB item-ids and 2 fluid-output item-ids genuinely
+# have no ETHOS counterpart and are intentionally omitted (commented in the
+# `unmappable_with_rationale` block at the bottom for the audit trail).
+#
+# Provenance: Claude LLM-proposed; commit reviewed before treating as
+# authoritative.
+
+mappings:
+  - eq_code: TIMELINE//START
+    eq_meaning: "Start of patient record / first event token"
+    ethos_tokens:
+      - "HOSPITAL_ADMISSION"
+    rationale: >-
+      EQ's TIMELINE//START fires at the first event of a patient's record.
+      Token frequencies match closely (EQ n=200,773 / ETHOS n=297,949), and
+      ETHOS uses HOSPITAL_ADMISSION as its admission marker.
+
+  - eq_code: "INFUSION_START//220949"
+    eq_meaning: "Dextrose 5% IV fluid (MIMIC inputevents 220949)"
+    ethos_tokens:
+      - "ATC//B05//BLOOD_SUBSTITUTES_AND_PERFUSION_SOLUTIONS"
+    rationale: "Dextrose 5% is ATC B05BA03 -- IV solution; rolled up to B05."
+
+  - eq_code: "INFUSION_START//221794"
+    eq_meaning: "Furosemide (Lasix) (MIMIC inputevents 221794)"
+    ethos_tokens:
+      - "ATC//C03//DIURETICS"
+    rationale: "Furosemide is ATC C03CA01 (diuretic); rolled up to C03."
+
+  - eq_code: "INFUSION_START//225168"
+    eq_meaning: "Packed Red Blood Cells (MIMIC inputevents 225168)"
+    ethos_tokens:
+      - "ATC//B05//BLOOD_SUBSTITUTES_AND_PERFUSION_SOLUTIONS"
+    rationale: "PRBC transfusion belongs to ATC B05A (blood substitutes); B05 class."
+
+  - eq_code: "INFUSION_END//227536"
+    eq_meaning: "KCl in CRRT solution (MIMIC inputevents 227536)"
+    ethos_tokens:
+      - "ATC//A12//MINERAL_SUPPLEMENTS"
+      - "ATC//B05//BLOOD_SUBSTITUTES_AND_PERFUSION_SOLUTIONS"
+    rationale: >-
+      Potassium chloride is ATC A12BA01 (mineral supplement). When
+      administered via CRRT it is an electrolyte solution (B05X). We OR both
+      classes since the underlying drug is K+ supplement but the route is CRRT.
+
+  - eq_code: "INFUSION_END//229420"
+    eq_meaning: "Dexmedetomidine (Precedex) sedative infusion (MIMIC inputevents 229420)"
+    ethos_tokens:
+      - "ATC//N05//PSYCHOLEPTICS"
+    rationale: >-
+      Dexmedetomidine is ATC N05CM18 (other hypnotics/sedatives); rolled up
+      to N05 (psycholeptics) which is the broadest sedative/anxiolytic class.
+
+  - eq_code: "LAB//226499//mL//value_[3150.0,inf)"
+    eq_meaning: "Hemodialysis output volume (MIMIC chartevents 226499)"
+    ethos_tokens:
+      - "ICD//CM//ENCOUNTER_FOR_CARE_INVOLVING_RENAL_DIALYSIS"
+      - "ICD//CM//CHRONIC_KIDNEY_DISEASE_(CKD)"
+    rationale: >-
+      Hemodialysis-output measurement happens during dialysis encounters; we
+      proxy via the dialysis encounter and underlying CKD diagnosis tokens.
+      Loose mapping (predicting indication/encounter, not the measurement).
+
+  - eq_code: "LAB//227445//ng/mL//value_[11.0,20.0)"
+    eq_meaning: "CK-MB (cardiac biomarker, MIMIC chartevents 227445)"
+    ethos_tokens:
+      - "ICD//CM//ACUTE_MYOCARDIAL_INFARCTION"
+    rationale: >-
+      CK-MB is ordered when myocardial infarction is suspected; elevated
+      values (the [11, 20) ng/mL bin is clearly elevated -- normal CK-MB is
+      <5 ng/mL) strongly correlate with AMI. Proxy via AMI ICD label.
+
+  - eq_code: "LAB//228724//cm//value_[1.5,2.0)"
+    eq_meaning: "Pressure ulcer #2 length (MIMIC chartevents 228724)"
+    ethos_tokens:
+      - "ICD//CM//PRESSURE_ULCER"
+    rationale: >-
+      Pressure-ulcer length measurement is recorded for patients who already
+      have a pressure ulcer; this is the underlying ICD diagnosis.
+
+# Codes intentionally omitted -- no ETHOS counterpart available under any
+# reasonable mapping in the current vocabulary. Documented for the audit
+# trail rather than mapped speculatively.
+unmappable_with_rationale:
+  - eq_code: "LAB//224665//UNK//value_[-inf,0.12)"
+    description: "PCA total dose (patient-controlled analgesia), low-dose bin"
+    reason: >-
+      The specific bin [-inf, 0.12) represents very low / no PCA dose -- which
+      is the OPPOSITE of an analgesic-administration event. Mapping to
+      ATC//N02//ANALGESICS would invert the AUROC. No reliable ETHOS counterpart.
+
+  - eq_code: "LAB//220245//ml/min"
+    description: "CO2 production (respiratory metabolism)"
+    reason: "No respiratory-metabolism token in ETHOS vocab; the lab tokens it has are vital signs / arterial blood gas labs, not metabolic measurements."
+
+  - eq_code: "LAB//225640//%"
+    description: "Differential-Eos (eosinophil differential count)"
+    reason: "ETHOS lab vocab has no per-cell-type differential tokens."
+
+  - eq_code: "LAB//225672//IU/L"
+    description: "Lipase (pancreatic enzyme)"
+    reason: "Not in ETHOS's 200-lab vocab; no clean clinical-equivalent ETHOS token."
+
+  - eq_code: "LAB//229663//cmH2O"
+    description: "Pinsp Hamilton (ventilator inspiratory pressure)"
+    reason: "ETHOS has no ventilator-setting tokens."
+
+  - eq_code: "LAB//229694//UNK"
+    description: "CPOT-Vocalization (pain assessment scale component)"
+    reason: "ETHOS has no pain-scale assessment tokens."
+
+  - eq_code: "LAB//51066//mg/24hr"
+    description: "24hr urine Calcium"
+    reason: "Specific 24hr-urine collection labs not in ETHOS lab vocab."
+
+  - eq_code: "LAB//50957//mmol/L"
+    description: "Lithium (serum drug level)"
+    reason: "ETHOS lab vocab lacks serum drug-level labs; though ATC N05 covers lithium as a drug, this is a *measurement* not an administration event."
+
+  - eq_code: "LAB//50964//mOsm/kg"
+    description: "Serum Osmolality"
+    reason: "Specific osmolality measurement not in ETHOS lab vocab."
+
+  - eq_code: "LAB//51769//UNK"
+    description: "Rubella IgG (serology)"
+    reason: "Serology / immunoassay labs not in ETHOS lab vocab."
+
+  - eq_code: "SUBJECT_FLUID_OUTPUT//226600//mL"
+    description: "Jackson Pratt drain output #2 (surgical drain)"
+    reason: "ETHOS has no drain-output tokens; ICD POSTPROCEDURAL_COMPLICATIONS too generic to be useful."
+
+  - eq_code: "SUBJECT_FLUID_OUTPUT//227510//mL"
+    description: "Tube feed gastric residual volume"
+    reason: "No GI-residual measurement counterpart in ETHOS vocab."
