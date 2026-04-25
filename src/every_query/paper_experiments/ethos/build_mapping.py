@@ -32,6 +32,7 @@ import polars as pl
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
+import yaml
 from google.cloud import storage
 
 BUCKET = "every-query-runs"
@@ -47,6 +48,10 @@ VALUE_BIN_RE = re.compile(r"//value_\[[^)]*\)$")
 
 CACHE_DIR = Path(os.environ.get("ETHOS_MAPPING_CACHE", "/tmp/eq_ethos_cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+CROSSWALK_DIR = Path(__file__).parent / "crosswalks"
+ICD_CROSSWALK_PATH = CROSSWALK_DIR / "icd.yaml"
+ATC_CROSSWALK_PATH = CROSSWALK_DIR / "atc.yaml"
 
 
 def _client() -> storage.Client:
@@ -283,6 +288,48 @@ def build_quantile(
     return pl.DataFrame(rows, schema=_schema())
 
 
+def _load_crosswalk(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    with path.open() as f:
+        data = yaml.safe_load(f)
+    return data.get("mappings", [])
+
+
+def build_crosswalk(
+    eq_codes: list[str],
+    ethos_vocab: set[str],
+    crosswalk_path: Path,
+    tier_name: str,
+) -> pl.DataFrame:
+    """Emit literal-match rows for each (eq_code, ethos_token) pair declared in the crosswalk YAML.
+
+    Skips token patterns that aren't actually in the ETHOS vocab (so a stale
+    crosswalk entry is silently dropped rather than producing predictions
+    that always miss).
+    """
+    eq_set = set(eq_codes)
+    rows: list[dict] = []
+    for entry in _load_crosswalk(crosswalk_path):
+        eq = entry["eq_code"]
+        if eq not in eq_set:
+            # Crosswalk references a code we don't have in EQ AUC results -- skip.
+            continue
+        for tok in entry.get("ethos_tokens", []):
+            if tok not in ethos_vocab:
+                continue
+            rows.append(
+                {
+                    "query": eq,
+                    "tier": tier_name,
+                    "token_pattern": tok,
+                    "match_kind": "literal",
+                    "provenance": f"{tier_name}/{crosswalk_path.name}",
+                }
+            )
+    return pl.DataFrame(rows, schema=_schema())
+
+
 def build_union(prior: pl.DataFrame) -> pl.DataFrame:
     if prior.is_empty():
         return pl.DataFrame(schema=_schema())
@@ -367,7 +414,9 @@ def main() -> None:
     exact = build_exact(eq_codes, ethos_vocab)
     drop_bin = build_drop_bin(eq_codes, ethos_vocab)
     quantile = build_quantile(eq_codes, ethos_vocab, meds_q)
-    primary = pl.concat([exact, drop_bin, quantile], how="vertical")
+    icd_xw = build_crosswalk(eq_codes, ethos_vocab, ICD_CROSSWALK_PATH, "icd_crosswalk")
+    atc_xw = build_crosswalk(eq_codes, ethos_vocab, ATC_CROSSWALK_PATH, "atc_crosswalk")
+    primary = pl.concat([exact, drop_bin, quantile, icd_xw, atc_xw], how="vertical")
     union = build_union(primary)
     mapping = pl.concat([primary, union], how="vertical")
 

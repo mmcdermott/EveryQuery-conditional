@@ -1,0 +1,47 @@
+# LLM-proposed crosswalk: EQ medication codes -> ETHOS ATC tokens.
+#
+# Each entry maps an EQ MEDICATION code to one or more ETHOS ATC class tokens.
+# Multiple tokens are OR-ed at match time. We map at ATC level 3 (e.g. N04 =
+# ANTI-PARKINSON_DRUGS) since ETHOS has one token per ATC3 class and rarely a
+# more specific token. EQ's MEDICATION//START//, MEDICATION//STOP//, and
+# administration-status forms (Administered, Delayed Administered) are mapped
+# to the same ATC class -- ETHOS does not distinguish administration events
+# from start/stop, which is a known semantic loss flagged in the README.
+#
+# Provenance: hand-curated by Claude using ATC reference knowledge against the
+# vocab seen in `gs://every-query-runs/baselines/ethos/ethos_vocab.parquet`.
+
+mappings:
+  - eq_code: "MEDICATION//Carbidopa-Levodopa (25-100)//Administered"
+    eq_meaning: "Carbidopa/Levodopa, anti-Parkinson combination drug"
+    ethos_tokens:
+      - "ATC//N04//ANTI-PARKINSON_DRUGS"
+    rationale: "Carbidopa-Levodopa is ATC N04BA02; rolling up to N04 class."
+
+  - eq_code: "MEDICATION//Gabapentin//Delayed Administered"
+    eq_meaning: "Gabapentin, antiepileptic / neuropathic pain"
+    ethos_tokens:
+      - "ATC//N03//ANTIEPILEPTICS"
+    rationale: "Gabapentin is ATC N03AX12; rolling up to N03 class."
+
+  - eq_code: "MEDICATION//START//Mupirocin Nasal Ointment 2%"
+    eq_meaning: "Mupirocin nasal ointment, topical antibiotic for nasal MRSA decolonisation"
+    ethos_tokens:
+      - "ATC//R01//NASAL_PREPARATIONS"
+      - "ATC//D06//ANTIBIOTICS_AND_CHEMOTHERAPEUTICS_FOR_DERMATOLOGICAL_USE"
+    rationale: >-
+      Mupirocin nasal is ATC R01AX06; the same active ingredient as topical
+      D06AX09. We OR both since either nasal or dermatological tokens could
+      reasonably reflect the medication being administered.
+
+  - eq_code: "MEDICATION//STOP//Captopril"
+    eq_meaning: "Captopril, ACE inhibitor"
+    ethos_tokens:
+      - "ATC//C09//AGENTS_ACTING_ON_THE_RENIN-ANGIOTENSIN_SYSTEM"
+    rationale: "Captopril is ATC C09AA01; rolling up to C09 class."
+
+  - eq_code: "MEDICATION//STOP//Doxycycline Hyclate"
+    eq_meaning: "Doxycycline, tetracycline-class systemic antibiotic"
+    ethos_tokens:
+      - "ATC//J01//ANTIBIOTICS_AND_ANTIBACTERIALS_FOR_SYSTEMIC_USE"
+    rationale: "Doxycycline is ATC J01AA02; rolling up to J01 class."

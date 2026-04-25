@@ -64,7 +64,8 @@ Excluded partial models `14-08-24` and `23-54-43` (only 41 rows, duration=30 onl
 
 ## Outcome
 
-- **Coverage:** 7/41 EQ codes mapped (1 `MEDS_DEATH` via exact, 6 LABs via drop_bin, 3 of those LABs additionally via quantile). 34 codes unmapped because ETHOS's vocabulary uses descriptive ICD labels rather than codes, ATC for medications, and lacks `INFUSION_*` / `SUBJECT_FLUID_OUTPUT` / `TIMELINE_START` prefixes. See `mapping_coverage.parquet` for the full report.
+- **Coverage:** **18/41 EQ codes mapped (44%)** — 1 `MEDS_DEATH` (exact), 6 LABs (drop_bin, 3 also quantile), 5 DIAGNOSIS + 1 PROCEDURE (icd_crosswalk), 5 MEDICATION (atc_crosswalk).
+- **23 codes still unmapped:** 13 LABs whose item-id isn't in ETHOS's 200-lab vocab; 3 INFUSION_START + 3 INFUSION_END; 3 SUBJECT_FLUID_OUTPUT; 1 TIMELINE//START. None have natural counterparts in ETHOS's vocabulary. See `mapping_coverage.parquet` for the full report.
 - **AUROC, paired Wilcoxon over (code, duration, bucket) cells (best EQ ckpt `23-43-54`, with `MEDS_DEATH` falling back to `14-08-24`):**
 
   | Tier | n | mean EQ | mean ETHOS | mean diff | p |
@@ -72,17 +73,25 @@ Excluded partial models `14-08-24` and `23-54-43` (only 41 rows, duration=30 onl
   | exact | 1 | 0.834 | 0.880 | +0.046 | NA |
   | drop_bin | 12 | 0.920 | 0.922 | +0.002 | 0.85 |
   | quantile | 6 | 0.904 | 0.901 | −0.003 | 1.00 |
-  | union | 13 | 0.913 | 0.918 | +0.005 | 0.84 |
+  | icd_crosswalk | 12 | 0.707 | 0.801 | **+0.094** | **0.012** |
+  | atc_crosswalk | 10 | 0.767 | 0.792 | +0.025 | 0.62 |
+  | **union** | **35** | **0.801** | **0.842** | **+0.041** | **0.040** |
 
-- **Headline:** on every code we could evaluate, ETHOS (used as a query engine via 20 sampled trajectories) is statistically indistinguishable from EQ; the dominant gap is mapping coverage, not prediction quality.
+- **Headline:** with the LLM-proposed ICD and ATC crosswalks, ETHOS (used as a query engine via 20 sampled trajectories) **significantly outperforms EQ overall** (union tier, +0.041 AUROC, p=0.040), driven by the diagnosis/procedure tier where ETHOS leads by +0.094 AUROC. On lab presence and value-decile prediction the two are statistically indistinguishable. Generative-trajectory inference is at least as good as the supervised classifier on the codes we can evaluate; mapping coverage is now the dominant remaining gap.
+
+## Crosswalk audit notes
+
+The crosswalk YAMLs in `crosswalks/` are LLM-proposed and committed for review. The most loose mappings:
+- `DIAGNOSIS//ICD//9//7295` (Pain in soft tissues of limb) → `OTHER_DISORDERS_OF_MUSCLE` + `PAIN_NOT_ELSEWHERE_CLASSIFIED` (no exact ETHOS token; semantic proxy).
+- `PROCEDURE//ICD//9//7936` (Open reduction of foot fracture) → mapped to the **fracture diagnosis** tokens since ETHOS's `ICD//PCS//*` chunks don't carry per-procedure semantics. We're predicting the indication, not the procedure.
+- `MEDICATION//START//*` and `MEDICATION//STOP//*` are both rolled up to ATC class — ETHOS has no start/stop semantics, so this is a known loss of fidelity for the comparison.
+
+Stricter mappings (Parkinson, paroxysmal tachycardia, ESRD→CKD, ATC class lookups for the other four medications) are direct semantic matches.
 
 ## Follow-up directions
 
-The unmapped count is dominated by three reasons:
-- 13 LAB codes whose `LAB//<id>//<UNITS>` token isn't in ETHOS's 200-lab vocab.
-- 6 INFUSION_START/END + 3 SUBJECT_FLUID_OUTPUT — no corresponding prefix in ETHOS vocab.
-- 5 DIAGNOSIS — would require an ICD-9/10 → ETHOS-descriptive-label crosswalk.
-- 5 MEDICATION — would require a drug-name → ATC crosswalk.
-- 1 PROCEDURE (ICD-PCS chunked form), 1 TIMELINE//START.
-
-Adding either crosswalk tier or a hierarchical-rollup tier (both explicitly excluded from this pass) would lift coverage from 17% toward ~50–80%.
+The 23 still-unmapped codes have no clean ETHOS counterpart in the current vocab:
+- **13 LABs** — item-IDs not in ETHOS's 200-lab vocab. Would need an ETHOS-vocab → lab-ontology rollup.
+- **6 INFUSION_*** — no `INFUSION_*` prefix in ETHOS at all. Could try mapping to the underlying drug ATC class (loose).
+- **3 SUBJECT_FLUID_OUTPUT** — no `OUTPUT` family in ETHOS.
+- **1 TIMELINE//START** — ETHOS has `TIMELINE_END` but not `START`; would need to map to `HOSPITAL_ADMISSION` or admission tokens.
