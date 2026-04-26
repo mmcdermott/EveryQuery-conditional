@@ -80,6 +80,28 @@ Excluded partial models `14-08-24` and `23-54-43` (only 41 rows, duration=30 onl
 
 - **Headline:** ETHOS as a query engine (20 sampled trajectories per prediction) is **comparable to or better than EQ on every tier where ETHOS has a direct vocabulary counterpart** — including the icd_crosswalk codes where it significantly wins (+0.094 AUROC, p=0.012). The one tier where ETHOS significantly underperforms is `mimic_item_crosswalk`, where many mappings are intentionally loose proxies (e.g. EQ predicts "CK-MB elevated value" while ETHOS predicts "AMI diagnosis" — different events) and the AUROC gap reflects that mismatch, not a model capability gap. The union-tier comparison shows no significant difference (p=0.27).
 
+## Mapping provenance (`mapping_source` column)
+
+Every row of `mapping_table.parquet` carries a `mapping_source` field
+documenting where the (eq_code, ethos_token) pair came from. Six distinct
+sources currently appear across the 29 active mapping rows (excluding the
+union tier, which inherits the underlying primary tier's source):
+
+| `mapping_source`                                        | Tier(s)                            | n  |
+|---------------------------------------------------------|------------------------------------|---:|
+| `code:string_equality`                                  | exact                              | 1  |
+| `code:strip_value_bin+upper_units`                      | drop_bin                           | 6  |
+| `meds-codes.parquet:values_quantiles_or_sibling_bins`   | quantile                           | 3  |
+| `llm:claude_clinical_knowledge`                         | icd_crosswalk, atc_crosswalk       | 16 |
+| `direct:event_alignment`                                | mimic_item_crosswalk               | 1  |
+| `physionet/mimic-iv-demo:icu/d_items.csv+llm`           | mimic_item_crosswalk               | 12 |
+
+Code-derived tiers (`exact`, `drop_bin`, `quantile`) hardcode their source
+in `build_mapping.py`. YAML-derived tiers read a per-entry `source:` field
+from the crosswalk file. `union` rows preserve the primary row's source so
+downstream consumers can trace any union match back to its origin without
+joining back to the YAML.
+
 ## Crosswalk audit notes
 
 Three crosswalk YAMLs in `crosswalks/`, all LLM-proposed and committed for review:
