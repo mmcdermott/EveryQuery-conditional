@@ -1,6 +1,6 @@
 # ETHOS mapping review
 
-Per-EQ-code review of the EQ -> ETHOS code mapping produced by `build_mapping.py`. Each section shows the authoritative EQ-side label resolved through the staged Athena ontology, the candidate ETHOS tokens (with vocab counts and constituent-code expansions), the verbatim LLM rationale where one was recorded, and a status block for the reviewer to mark approve / reject / modify.
+Per-EQ-code review of the EQ -> ETHOS code mapping produced by `build_mapping.py`. Each section shows the authoritative EQ-side label resolved through the staged Athena ontology, the verbatim LLM rationale (rendered once per EQ code where one was recorded), the candidate ETHOS tokens with vocab counts and constituent-code expansions, and a status block for the reviewer to mark approve / reject / modify.
 
 ## Table of contents
 
@@ -53,28 +53,13 @@ Per-EQ-code review of the EQ -> ETHOS code mapping produced by `build_mapping.py
 - **Family:** `DIAGNOSIS`
 - **Mapped tiers:** icd_crosswalk
 
-**ETHOS held-out AUC**
-
-| duration_days | bucket | occurs_auc |
-| ---: | :--- | ---: |
-| 30 | ood | 0.7157 |
-| 30 | ood | 0.7214 |
-| 30 | ood | 0.7398 |
-| 30 | ood | 0.7321 |
-| 30 | ood | 0.7370 |
-| 30 | ood | 0.7405 |
-| 30 | ood | 0.7490 |
-| 30 | ood | 0.7377 |
-| 180 | ood | 0.7335 |
-| 180 | ood | 0.7128 |
-| 180 | ood | 0.7282 |
-| 180 | ood | 0.7266 |
-| 180 | ood | 0.7371 |
-| 180 | ood | 0.7473 |
-
 **Authoritative EQ label:** ICD-10-CM `I25118` -- Atherosclerotic heart disease of native coronary artery with other forms of angina pectoris
 - 3-char parent: `I25` -- Chronic ischemic heart disease
 - SNOMED bridge: Angina co-occurrent and due to coronary arteriosclerosis (concept_id 36712983)
+
+**LLM rationale (verbatim):**
+
+> I25.118 is a 5-digit child of I25 (chronic ischemic heart disease) with angina pectoris. The three ETHOS tokens together capture the I25 family semantics; we OR them so any of the three counts as a hit.
 
 _Found under tier(s): icd_crosswalk_
 
@@ -86,10 +71,6 @@ _Found under tier(s): icd_crosswalk_
 - Inferred source: ICD-10-CM 3-char category `I20` -- Angina pectoris
 - Constituent ICD-10-CM codes (7): I20.0, I20.1, I20.2, I20.8, I20.81, I20.89, I20.9
 
-**LLM rationale (verbatim):**
-
-> I25.118 is a 5-digit child of I25 (chronic ischemic heart disease) with angina pectoris. The three ETHOS tokens together capture the I25 family semantics; we OR them so any of the three counts as a hit.
-
 _Found under tier(s): icd_crosswalk_
 
 #### Candidate ETHOS token: `ICD//CM//ATHEROSCLEROSIS`
@@ -100,10 +81,6 @@ _Found under tier(s): icd_crosswalk_
 - Inferred source: ICD-10-CM 3-char category `I70` -- Atherosclerosis
 - Constituent ICD-10-CM codes (295): I70.0, I70.1, I70.2, I70.20, I70.201, I70.202, I70.203, I70.208, I70.209, I70.21, I70.211, I70.212, I70.213, I70.218, I70.219, I70.22, I70.221, I70.222, I70.223, I70.228, I70.229, I70.23, I70.231, I70.232, I70.233, I70.234, I70.235, I70.238, I70.239, I70.24, ... +265 more
 
-**LLM rationale (verbatim):**
-
-> I25.118 is a 5-digit child of I25 (chronic ischemic heart disease) with angina pectoris. The three ETHOS tokens together capture the I25 family semantics; we OR them so any of the three counts as a hit.
-
 _Found under tier(s): icd_crosswalk_
 
 #### Candidate ETHOS token: `ICD//CM//CHRONIC_ISCHEMIC_HEART_DISEASE`
@@ -113,10 +90,6 @@ _Found under tier(s): icd_crosswalk_
 - Mapping source: `llm:claude_clinical_knowledge`
 - Inferred source: ICD-10-CM 3-char category `I25` -- Chronic ischemic heart disease
 - Constituent ICD-10-CM codes (69): I25.1, I25.10, I25.11, I25.110, I25.111, I25.112, I25.118, I25.119, I25.2, I25.3, I25.4, I25.41, I25.42, I25.5, I25.6, I25.7, I25.70, I25.700, I25.701, I25.702, I25.708, I25.709, I25.71, I25.710, I25.711, I25.712, I25.718, I25.719, I25.72, I25.720, ... +39 more
-
-**LLM rationale (verbatim):**
-
-> I25.118 is a 5-digit child of I25 (chronic ischemic heart disease) with angina pectoris. The three ETHOS tokens together capture the I25 family semantics; we OR them so any of the three counts as a hit.
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -134,28 +107,13 @@ _Found under tier(s): icd_crosswalk_
 - **Family:** `DIAGNOSIS`
 - **Mapped tiers:** icd_crosswalk
 
-**ETHOS held-out AUC**
-
-| duration_days | bucket | occurs_auc |
-| ---: | :--- | ---: |
-| 30 | id | 0.6344 |
-| 30 | id | 0.6121 |
-| 30 | id | 0.6531 |
-| 30 | id | 0.6135 |
-| 30 | id | 0.6457 |
-| 30 | id | 0.6665 |
-| 30 | id | 0.6407 |
-| 30 | id | 0.6413 |
-| 180 | id | 0.6189 |
-| 180 | id | 0.5815 |
-| 180 | id | 0.5787 |
-| 180 | id | 0.6005 |
-| 180 | id | 0.6124 |
-| 180 | id | 0.6293 |
-
 **Authoritative EQ label:** ICD-9-CM `3320` -- Paralysis agitans
 - SNOMED bridge: Parkinson's disease (concept_id 381270)
 - ICD-10-CM crosswalk (7 codes): G20, G20.A, G20.A1, G20.A2, G20.B, G20.B1, G20.B2
+
+**LLM rationale (verbatim):**
+
+> Direct semantic match to ICD-10 G20.
 
 _Found under tier(s): icd_crosswalk_
 
@@ -166,10 +124,6 @@ _Found under tier(s): icd_crosswalk_
 - Mapping source: `llm:claude_clinical_knowledge`
 - Inferred source: ICD-10-CM 3-char category `G20` -- Parkinson's disease
 - Constituent ICD-10-CM codes (7): G20.A, G20.A1, G20.A2, G20.B, G20.B1, G20.B2, G20.C
-
-**LLM rationale (verbatim):**
-
-> Direct semantic match to ICD-10 G20.
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -187,28 +141,13 @@ _Found under tier(s): icd_crosswalk_
 - **Family:** `DIAGNOSIS`
 - **Mapped tiers:** icd_crosswalk
 
-**ETHOS held-out AUC**
-
-| duration_days | bucket | occurs_auc |
-| ---: | :--- | ---: |
-| 30 | id | 0.7822 |
-| 30 | id | 0.7776 |
-| 30 | id | 0.7663 |
-| 30 | id | 0.7792 |
-| 30 | id | 0.7732 |
-| 30 | id | 0.7816 |
-| 30 | id | 0.7858 |
-| 30 | id | 0.7923 |
-| 180 | id | 0.7622 |
-| 180 | id | 0.7673 |
-| 180 | id | 0.7338 |
-| 180 | id | 0.7559 |
-| 180 | id | 0.7391 |
-| 180 | id | 0.7534 |
-
 **Authoritative EQ label:** ICD-9-CM `4271` -- Paroxysmal ventricular tachycardia
 - SNOMED bridge: Paroxysmal ventricular tachycardia (concept_id 437579)
 - ICD-10-CM crosswalk (0 codes): (none)
+
+**LLM rationale (verbatim):**
+
+> Direct match to ICD-10 I47.
 
 _Found under tier(s): icd_crosswalk_
 
@@ -219,10 +158,6 @@ _Found under tier(s): icd_crosswalk_
 - Mapping source: `llm:claude_clinical_knowledge`
 - Inferred source: ICD-10-CM 3-char category `I47` -- Paroxysmal tachycardia
 - Constituent ICD-10-CM codes (10): I47.0, I47.1, I47.10, I47.11, I47.19, I47.2, I47.20, I47.21, I47.29, I47.9
-
-**LLM rationale (verbatim):**
-
-> Direct match to ICD-10 I47.
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -240,28 +175,13 @@ _Found under tier(s): icd_crosswalk_
 - **Family:** `DIAGNOSIS`
 - **Mapped tiers:** icd_crosswalk
 
-**ETHOS held-out AUC**
-
-| duration_days | bucket | occurs_auc |
-| ---: | :--- | ---: |
-| 30 | id | 0.7907 |
-| 30 | id | 0.8041 |
-| 30 | id | 0.7893 |
-| 30 | id | 0.7768 |
-| 30 | id | 0.7999 |
-| 30 | id | 0.8100 |
-| 30 | id | 0.7965 |
-| 30 | id | 0.8127 |
-| 180 | id | 0.8265 |
-| 180 | id | 0.8094 |
-| 180 | id | 0.7923 |
-| 180 | id | 0.8036 |
-| 180 | id | 0.8185 |
-| 180 | id | 0.8284 |
-
 **Authoritative EQ label:** ICD-9-CM `5856` -- End stage renal disease
 - SNOMED bridge: End-stage renal disease (concept_id 193782)
 - ICD-10-CM crosswalk (1 code): N18.6
+
+**LLM rationale (verbatim):**
+
+> ICD-9 585.6 is ESRD; ICD-10 N18 is CKD with N18.6 specifically being ESRD. ETHOS's CKD label captures the N18 family. Alternative tokens (HCPCS UNSCHED_DIALYSIS_ESRD_PT_HOS, ENCOUNTER_FOR_CARE_INVOLVING_RENAL_DIALYSIS) are too rare to be useful as standalone matches.
 
 _Found under tier(s): icd_crosswalk_
 
@@ -272,10 +192,6 @@ _Found under tier(s): icd_crosswalk_
 - Mapping source: `llm:claude_clinical_knowledge`
 - Inferred source: ICD-10-CM 3-char category `N18` -- Chronic kidney disease (CKD)
 - Constituent ICD-10-CM codes (10): N18.1, N18.2, N18.3, N18.30, N18.31, N18.32, N18.4, N18.5, N18.6, N18.9
-
-**LLM rationale (verbatim):**
-
-> ICD-9 585.6 is ESRD; ICD-10 N18 is CKD with N18.6 specifically being ESRD. ETHOS's CKD label captures the N18 family. Alternative tokens (HCPCS UNSCHED_DIALYSIS_ESRD_PT_HOS, ENCOUNTER_FOR_CARE_INVOLVING_RENAL_DIALYSIS) are too rare to be useful as standalone matches.
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -293,28 +209,13 @@ _Found under tier(s): icd_crosswalk_
 - **Family:** `DIAGNOSIS`
 - **Mapped tiers:** icd_crosswalk
 
-**ETHOS held-out AUC**
-
-| duration_days | bucket | occurs_auc |
-| ---: | :--- | ---: |
-| 30 | id | 0.5593 |
-| 30 | id | 0.5132 |
-| 30 | id | 0.5387 |
-| 30 | id | 0.5263 |
-| 30 | id | 0.5635 |
-| 30 | id | 0.5771 |
-| 30 | id | 0.5224 |
-| 30 | id | 0.5416 |
-| 180 | id | 0.5748 |
-| 180 | id | 0.5531 |
-| 180 | id | 0.5533 |
-| 180 | id | 0.5589 |
-| 180 | id | 0.5876 |
-| 180 | id | 0.5866 |
-
 **Authoritative EQ label:** ICD-9-CM `7295` -- Pain in limb
 - SNOMED bridge: Pain in limb (concept_id 138525)
 - ICD-10-CM crosswalk (3 codes): M79.6, M79.60, M79.609
+
+**LLM rationale (verbatim):**
+
+> ETHOS has no exact "pain in limb" token. The two listed are the closest semantic proxies (other muscle disorders + general unclassified pain); mapping is loose so the AUC for this code should be interpreted carefully.
 
 _Found under tier(s): icd_crosswalk_
 
@@ -326,10 +227,6 @@ _Found under tier(s): icd_crosswalk_
 - Inferred source: ICD-10-CM 3-char category `M62` -- Other disorders of muscle
 - Constituent ICD-10-CM codes (174): M62.0, M62.00, M62.01, M62.011, M62.012, M62.019, M62.02, M62.021, M62.022, M62.029, M62.03, M62.031, M62.032, M62.039, M62.04, M62.041, M62.042, M62.049, M62.05, M62.051, M62.052, M62.059, M62.06, M62.061, M62.062, M62.069, M62.07, M62.071, M62.072, M62.079, ... +144 more
 
-**LLM rationale (verbatim):**
-
-> ETHOS has no exact "pain in limb" token. The two listed are the closest semantic proxies (other muscle disorders + general unclassified pain); mapping is loose so the AUC for this code should be interpreted carefully.
-
 _Found under tier(s): icd_crosswalk_
 
 #### Candidate ETHOS token: `ICD//CM//PAIN_NOT_ELSEWHERE_CLASSIFIED`
@@ -339,10 +236,6 @@ _Found under tier(s): icd_crosswalk_
 - Mapping source: `llm:claude_clinical_knowledge`
 - Inferred source: ICD-10-CM 3-char category `G89` -- Pain, not elsewhere classified
 - Constituent ICD-10-CM codes (12): G89.0, G89.1, G89.11, G89.12, G89.18, G89.2, G89.21, G89.22, G89.28, G89.29, G89.3, G89.4
-
-**LLM rationale (verbatim):**
-
-> ETHOS has no exact "pain in limb" token. The two listed are the closest semantic proxies (other muscle disorders + general unclassified pain); mapping is loose so the AUC for this code should be interpreted carefully.
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -360,31 +253,16 @@ _Found under tier(s): icd_crosswalk_
 - **Family:** `INFUSION_END`
 - **Mapped tiers:** mimic_item_crosswalk
 
-**ETHOS held-out AUC**
-
-| duration_days | bucket | occurs_auc |
-| ---: | :--- | ---: |
-| 30 | ood | 0.9674 |
-| 30 | ood | 0.9615 |
-| 30 | ood | 0.9588 |
-| 30 | ood | 0.9676 |
-| 30 | ood | 0.9590 |
-| 30 | ood | 0.9599 |
-| 30 | ood | 0.9654 |
-| 30 | ood | 0.9690 |
-| 180 | ood | 0.9765 |
-| 180 | ood | 0.9788 |
-| 180 | ood | 0.9806 |
-| 180 | ood | 0.9782 |
-| 180 | ood | 0.9811 |
-| 180 | ood | 0.9825 |
-
 **Authoritative EQ label:** MIMIC item-id `227536` -- KCl (CRRT) (source: `d_items`)
 - abbreviation: KCl (CRRT)
 - category: Medications
 - unitname: mEq.
 - linksto: inputevents
 - EQ-encoded units: `value_[6.05,8.071587)`
+
+**LLM rationale (verbatim):**
+
+> Potassium chloride is ATC A12BA01 (mineral supplement). When administered via CRRT it is an electrolyte solution (B05X). We OR both classes since the underlying drug is K+ supplement but the route is CRRT.
 
 _Found under tier(s): mimic_item_crosswalk_
 
@@ -396,10 +274,6 @@ _Found under tier(s): mimic_item_crosswalk_
 - Inferred source: ATC level 2 class `A12` -- MINERAL SUPPLEMENTS
 - Constituent RxNorm ingredients (127): 1,2-docosahexanoyl-sn-glycero-3-phosphoserine calcium, 1,2-icosapentoyl-sn-glycero-3-phosphoserine calcium, allantoin calcium pantothenate, aluminum magnesium hydroxide carbonate, aluminum magnesium silicate, calcium, calcium acetate, calcium alginate, calcium aluminosilicate, calcium aluminum borosilicate, calcium amino acid chelate, calcium arsenate, calcium ascorbate, calcium aspartate, calcium bicarbonate, calcium bromide, calcium carbimide, calcium carbonate, calcium carbonate, precipitated, calcium chlorate dihydrate, calcium chloride, calcium citrate, calcium citrate malate, calcium creosotate, calcium fluoride, calcium galactogluconate bromide, calcium glubionate, calcium glucarate, calcium gluceptate, calcium gluconate, ... +97 more
 
-**LLM rationale (verbatim):**
-
-> Potassium chloride is ATC A12BA01 (mineral supplement). When administered via CRRT it is an electrolyte solution (B05X). We OR both classes since the underlying drug is K+ supplement but the route is CRRT.
-
 _Found under tier(s): mimic_item_crosswalk_
 
 #### Candidate ETHOS token: `ATC//B05//BLOOD_SUBSTITUTES_AND_PERFUSION_SOLUTIONS`
@@ -409,10 +283,6 @@ _Found under tier(s): mimic_item_crosswalk_
 - Mapping source: `physionet/mimic-iv-demo:icu/d_items.csv+llm`
 - Inferred source: ATC level 2 class `B05` -- BLOOD SUBSTITUTES AND PERFUSION SOLUTIONS
 - Constituent RxNorm ingredients (375): 4-aminomethylbenzoic acid, 6-aminocaproic acid, acetate, acetic acid, acyclovir, alanylglutamine, alatrofloxacin, albendazole, albumin human, USP, alpha tocopherol, aluminum acetotartrate, amcinonide, amdinocillin, amdinocillin pivoxil, amikacin, aminocaproate, ammonium chloride, amoxicillin, amphotericin B, ampicillin, anidulafungin, arbekacin, arginine, artemether, ascorbic acid, atovaquone, azidocillin, azithromycin, azlocillin, aztreonam, ... +345 more
-
-**LLM rationale (verbatim):**
-
-> Potassium chloride is ATC A12BA01 (mineral supplement). When administered via CRRT it is an electrolyte solution (B05X). We OR both classes since the underlying drug is K+ supplement but the route is CRRT.
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -430,31 +300,16 @@ _Found under tier(s): mimic_item_crosswalk_
 - **Family:** `INFUSION_END`
 - **Mapped tiers:** mimic_item_crosswalk
 
-**ETHOS held-out AUC**
-
-| duration_days | bucket | occurs_auc |
-| ---: | :--- | ---: |
-| 30 | id | 0.9743 |
-| 30 | id | 0.9655 |
-| 30 | id | 0.9658 |
-| 30 | id | 0.9725 |
-| 30 | id | 0.9663 |
-| 30 | id | 0.9644 |
-| 30 | id | 0.9706 |
-| 30 | id | 0.9694 |
-| 180 | id | 0.9613 |
-| 180 | id | 0.9676 |
-| 180 | id | 0.9692 |
-| 180 | id | 0.9594 |
-| 180 | id | 0.9719 |
-| 180 | id | 0.9704 |
-
 **Authoritative EQ label:** MIMIC item-id `227536` -- KCl (CRRT) (source: `d_items`)
 - abbreviation: KCl (CRRT)
 - category: Medications
 - unitname: mEq.
 - linksto: inputevents
 - EQ-encoded units: `value_[8.071587,9.379999)`
+
+**LLM rationale (verbatim):**
+
+> Potassium chloride is ATC A12BA01 (mineral supplement). When administered via CRRT it is an electrolyte solution (B05X). We OR both classes since the underlying drug is K+ supplement but the route is CRRT.
 
 _Found under tier(s): mimic_item_crosswalk_
 
@@ -466,10 +321,6 @@ _Found under tier(s): mimic_item_crosswalk_
 - Inferred source: ATC level 2 class `A12` -- MINERAL SUPPLEMENTS
 - Constituent RxNorm ingredients (127): 1,2-docosahexanoyl-sn-glycero-3-phosphoserine calcium, 1,2-icosapentoyl-sn-glycero-3-phosphoserine calcium, allantoin calcium pantothenate, aluminum magnesium hydroxide carbonate, aluminum magnesium silicate, calcium, calcium acetate, calcium alginate, calcium aluminosilicate, calcium aluminum borosilicate, calcium amino acid chelate, calcium arsenate, calcium ascorbate, calcium aspartate, calcium bicarbonate, calcium bromide, calcium carbimide, calcium carbonate, calcium carbonate, precipitated, calcium chlorate dihydrate, calcium chloride, calcium citrate, calcium citrate malate, calcium creosotate, calcium fluoride, calcium galactogluconate bromide, calcium glubionate, calcium glucarate, calcium gluceptate, calcium gluconate, ... +97 more
 
-**LLM rationale (verbatim):**
-
-> Potassium chloride is ATC A12BA01 (mineral supplement). When administered via CRRT it is an electrolyte solution (B05X). We OR both classes since the underlying drug is K+ supplement but the route is CRRT.
-
 _Found under tier(s): mimic_item_crosswalk_
 
 #### Candidate ETHOS token: `ATC//B05//BLOOD_SUBSTITUTES_AND_PERFUSION_SOLUTIONS`
@@ -479,10 +330,6 @@ _Found under tier(s): mimic_item_crosswalk_
 - Mapping source: `physionet/mimic-iv-demo:icu/d_items.csv+llm`
 - Inferred source: ATC level 2 class `B05` -- BLOOD SUBSTITUTES AND PERFUSION SOLUTIONS
 - Constituent RxNorm ingredients (375): 4-aminomethylbenzoic acid, 6-aminocaproic acid, acetate, acetic acid, acyclovir, alanylglutamine, alatrofloxacin, albendazole, albumin human, USP, alpha tocopherol, aluminum acetotartrate, amcinonide, amdinocillin, amdinocillin pivoxil, amikacin, aminocaproate, ammonium chloride, amoxicillin, amphotericin B, ampicillin, anidulafungin, arbekacin, arginine, artemether, ascorbic acid, atovaquone, azidocillin, azithromycin, azlocillin, aztreonam, ... +345 more
-
-**LLM rationale (verbatim):**
-
-> Potassium chloride is ATC A12BA01 (mineral supplement). When administered via CRRT it is an electrolyte solution (B05X). We OR both classes since the underlying drug is K+ supplement but the route is CRRT.
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -500,31 +347,16 @@ _Found under tier(s): mimic_item_crosswalk_
 - **Family:** `INFUSION_END`
 - **Mapped tiers:** mimic_item_crosswalk
 
-**ETHOS held-out AUC**
-
-| duration_days | bucket | occurs_auc |
-| ---: | :--- | ---: |
-| 30 | id | 0.9554 |
-| 30 | id | 0.9570 |
-| 30 | id | 0.9595 |
-| 30 | id | 0.9593 |
-| 30 | id | 0.9521 |
-| 30 | id | 0.9517 |
-| 30 | id | 0.9640 |
-| 30 | id | 0.9603 |
-| 180 | id | 0.9509 |
-| 180 | id | 0.9531 |
-| 180 | id | 0.9501 |
-| 180 | id | 0.9515 |
-| 180 | id | 0.9434 |
-| 180 | id | 0.9432 |
-
 **Authoritative EQ label:** MIMIC item-id `229420` -- Dexmedetomidine (Precedex) (source: `d_items`)
 - abbreviation: Dexmedetomidine (Precedex)
 - category: Medications
 - unitname: mcg
 - linksto: inputevents
 - EQ-encoded units: `value_[10.687433,23.27545)`
+
+**LLM rationale (verbatim):**
+
+> Dexmedetomidine is ATC N05CM18 (other hypnotics/sedatives); rolled up to N05 (psycholeptics) which is the broadest sedative/anxiolytic class.
 
 _Found under tier(s): mimic_item_crosswalk_
 
@@ -535,10 +367,6 @@ _Found under tier(s): mimic_item_crosswalk_
 - Mapping source: `physionet/mimic-iv-demo:icu/d_items.csv+llm`
 - Inferred source: ATC level 2 class `N05` -- PSYCHOLEPTICS
 - Constituent RxNorm ingredients (143): Valeriana officinalis whole extract, acepromazine, acetophenazine, allobarbital, alprazolam, amisulpride, amobarbital, aprobarbital, aripiprazole, asenapine, barbital, benperidol, brexpiprazole, bromazepam, bromide ion, bromperidol, brotizolam, buspirone, butobarbital, butylvinal, captodiamine, carbromal, cariprazine, chloral betaine, chlordiazepoxide, chlormethiazole, chlorproethazine, chlorpromazine, chlorprothixene, clobazam, ... +113 more
-
-**LLM rationale (verbatim):**
-
-> Dexmedetomidine is ATC N05CM18 (other hypnotics/sedatives); rolled up to N05 (psycholeptics) which is the broadest sedative/anxiolytic class.
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -556,30 +384,15 @@ _Found under tier(s): mimic_item_crosswalk_
 - **Family:** `INFUSION_START`
 - **Mapped tiers:** mimic_item_crosswalk
 
-**ETHOS held-out AUC**
-
-| duration_days | bucket | occurs_auc |
-| ---: | :--- | ---: |
-| 30 | ood | 0.9424 |
-| 30 | ood | 0.9457 |
-| 30 | ood | 0.9461 |
-| 30 | ood | 0.9439 |
-| 30 | ood | 0.9469 |
-| 30 | ood | 0.9389 |
-| 30 | ood | 0.9458 |
-| 30 | ood | 0.9455 |
-| 180 | ood | 0.9324 |
-| 180 | ood | 0.9340 |
-| 180 | ood | 0.9323 |
-| 180 | ood | 0.9328 |
-| 180 | ood | 0.9331 |
-| 180 | ood | 0.9211 |
-
 **Authoritative EQ label:** MIMIC item-id `220949` -- Dextrose 5% (source: `d_items`)
 - abbreviation: Dextrose 5%
 - category: Fluids/Intake
 - unitname: mL
 - linksto: inputevents
+
+**LLM rationale (verbatim):**
+
+> Dextrose 5% is ATC B05BA03 -- IV solution; rolled up to B05.
 
 _Found under tier(s): mimic_item_crosswalk_
 
@@ -590,10 +403,6 @@ _Found under tier(s): mimic_item_crosswalk_
 - Mapping source: `physionet/mimic-iv-demo:icu/d_items.csv+llm`
 - Inferred source: ATC level 2 class `B05` -- BLOOD SUBSTITUTES AND PERFUSION SOLUTIONS
 - Constituent RxNorm ingredients (375): 4-aminomethylbenzoic acid, 6-aminocaproic acid, acetate, acetic acid, acyclovir, alanylglutamine, alatrofloxacin, albendazole, albumin human, USP, alpha tocopherol, aluminum acetotartrate, amcinonide, amdinocillin, amdinocillin pivoxil, amikacin, aminocaproate, ammonium chloride, amoxicillin, amphotericin B, ampicillin, anidulafungin, arbekacin, arginine, artemether, ascorbic acid, atovaquone, azidocillin, azithromycin, azlocillin, aztreonam, ... +345 more
-
-**LLM rationale (verbatim):**
-
-> Dextrose 5% is ATC B05BA03 -- IV solution; rolled up to B05.
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -611,31 +420,16 @@ _Found under tier(s): mimic_item_crosswalk_
 - **Family:** `INFUSION_START`
 - **Mapped tiers:** mimic_item_crosswalk
 
-**ETHOS held-out AUC**
-
-| duration_days | bucket | occurs_auc |
-| ---: | :--- | ---: |
-| 30 | id | 0.9799 |
-| 30 | id | 0.9733 |
-| 30 | id | 0.9749 |
-| 30 | id | 0.9764 |
-| 30 | id | 0.9660 |
-| 30 | id | 0.9684 |
-| 30 | id | 0.9730 |
-| 30 | id | 0.9710 |
-| 180 | id | 0.9825 |
-| 180 | id | 0.9773 |
-| 180 | id | 0.9778 |
-| 180 | id | 0.9729 |
-| 180 | id | 0.9757 |
-| 180 | id | 0.9752 |
-
 **Authoritative EQ label:** MIMIC item-id `221794` -- Furosemide (Lasix) (source: `d_items`)
 - abbreviation: Furosemide (Lasix)
 - category: Medications
 - unitname: mg
 - linksto: inputevents
 - EQ-encoded units: `value_[8.004926,10.000001)`
+
+**LLM rationale (verbatim):**
+
+> Furosemide is ATC C03CA01 (diuretic); rolled up to C03.
 
 _Found under tier(s): mimic_item_crosswalk_
 
@@ -646,10 +440,6 @@ _Found under tier(s): mimic_item_crosswalk_
 - Mapping source: `physionet/mimic-iv-demo:icu/d_items.csv+llm`
 - Inferred source: ATC level 2 class `C03` -- DIURETICS
 - Constituent RxNorm ingredients (35): althiazide, amiloride, bendroflumethiazide, bumetanide, buthiazide, canrenoate, canrenone, chlorothiazide, chlorthalidone, cicletanine, clopamide, conivaptan, cyclopenthiazide, cyclothiazide, eplerenone, ethacrynate, finerenone, furosemide, hydrochlorothiazide, hydroflumethiazide, indapamide, mefruside, mersalyl, methyclothiazide, metolazone, piretanide, polythiazide, quinethazone, spironolactone, theobromine, ... +5 more
-
-**LLM rationale (verbatim):**
-
-> Furosemide is ATC C03CA01 (diuretic); rolled up to C03.
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -667,31 +457,16 @@ _Found under tier(s): mimic_item_crosswalk_
 - **Family:** `INFUSION_START`
 - **Mapped tiers:** mimic_item_crosswalk
 
-**ETHOS held-out AUC**
-
-| duration_days | bucket | occurs_auc |
-| ---: | :--- | ---: |
-| 30 | id | 0.9143 |
-| 30 | id | 0.9002 |
-| 30 | id | 0.8831 |
-| 30 | id | 0.8955 |
-| 30 | id | 0.8921 |
-| 30 | id | 0.8976 |
-| 30 | id | 0.9145 |
-| 30 | id | 0.9051 |
-| 180 | id | 0.9004 |
-| 180 | id | 0.9228 |
-| 180 | id | 0.9089 |
-| 180 | id | 0.8788 |
-| 180 | id | 0.9085 |
-| 180 | id | 0.9168 |
-
 **Authoritative EQ label:** MIMIC item-id `225168` -- Packed Red Blood Cells (source: `d_items`)
 - abbreviation: PRBC's
 - category: Blood Products/Colloids
 - unitname: mL
 - linksto: inputevents
 - EQ-encoded units: `value_[284.02966,350.0)`
+
+**LLM rationale (verbatim):**
+
+> PRBC transfusion belongs to ATC B05A (blood substitutes); B05 class.
 
 _Found under tier(s): mimic_item_crosswalk_
 
@@ -702,10 +477,6 @@ _Found under tier(s): mimic_item_crosswalk_
 - Mapping source: `physionet/mimic-iv-demo:icu/d_items.csv+llm`
 - Inferred source: ATC level 2 class `B05` -- BLOOD SUBSTITUTES AND PERFUSION SOLUTIONS
 - Constituent RxNorm ingredients (375): 4-aminomethylbenzoic acid, 6-aminocaproic acid, acetate, acetic acid, acyclovir, alanylglutamine, alatrofloxacin, albendazole, albumin human, USP, alpha tocopherol, aluminum acetotartrate, amcinonide, amdinocillin, amdinocillin pivoxil, amikacin, aminocaproate, ammonium chloride, amoxicillin, amphotericin B, ampicillin, anidulafungin, arbekacin, arginine, artemether, ascorbic acid, atovaquone, azidocillin, azithromycin, azlocillin, aztreonam, ... +345 more
-
-**LLM rationale (verbatim):**
-
-> PRBC transfusion belongs to ATC B05A (blood substitutes); B05 class.
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -723,25 +494,6 @@ _Found under tier(s): mimic_item_crosswalk_
 - **Family:** `LAB`
 - **Mapped tiers:** drop_bin, quantile
 
-**ETHOS held-out AUC**
-
-| duration_days | bucket | occurs_auc |
-| ---: | :--- | ---: |
-| 30 | ood | 0.9422 |
-| 30 | ood | 0.9439 |
-| 30 | ood | 0.9461 |
-| 30 | ood | 0.9447 |
-| 30 | ood | 0.9444 |
-| 30 | ood | 0.9474 |
-| 30 | ood | 0.9461 |
-| 30 | ood | 0.9450 |
-| 180 | ood | 0.9344 |
-| 180 | ood | 0.9433 |
-| 180 | ood | 0.9452 |
-| 180 | ood | 0.9361 |
-| 180 | ood | 0.9394 |
-| 180 | ood | 0.9468 |
-
 **Authoritative EQ label:** MIMIC item-id `220224` -- Arterial O2 pressure (source: `d_items`)
 - abbreviation: PO2 (Arterial)
 - category: Labs
@@ -758,8 +510,6 @@ _Found under tier(s): drop_bin_
 - Mapping source: `code:strip_value_bin+upper_units`
 - Inferred source: ETHOS-internal token (no Athena ontology bridge).
 
-_No LLM rationale recorded; mapping derived from `code:strip_value_bin+upper_units`._
-
 _Found under tier(s): quantile_
 
 #### Candidate ETHOS token: `LAB//220224//MMHG|Q4`
@@ -768,8 +518,6 @@ _Found under tier(s): quantile_
 - Match kind: `lab+next_qk`
 - Mapping source: `meds-codes.parquet:values_quantiles_or_sibling_bins`
 - Inferred source: ETHOS-internal token (no Athena ontology bridge).
-
-_No LLM rationale recorded; mapping derived from `meds-codes.parquet:values_quantiles_or_sibling_bins`._
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -787,25 +535,6 @@ _No LLM rationale recorded; mapping derived from `meds-codes.parquet:values_quan
 - **Family:** `LAB`
 - **Mapped tiers:** drop_bin
 
-**ETHOS held-out AUC**
-
-| duration_days | bucket | occurs_auc |
-| ---: | :--- | ---: |
-| 30 | ood | 0.9397 |
-| 30 | ood | 0.9418 |
-| 30 | ood | 0.9413 |
-| 30 | ood | 0.9438 |
-| 30 | ood | 0.9451 |
-| 30 | ood | 0.9423 |
-| 30 | ood | 0.9477 |
-| 30 | ood | 0.9437 |
-| 180 | ood | 0.9384 |
-| 180 | ood | 0.9425 |
-| 180 | ood | 0.9452 |
-| 180 | ood | 0.9441 |
-| 180 | ood | 0.9432 |
-| 180 | ood | 0.9415 |
-
 **Authoritative EQ label:** MIMIC item-id `220339` -- PEEP set (source: `d_items`)
 - abbreviation: PEEP set
 - category: Respiratory
@@ -821,8 +550,6 @@ _Found under tier(s): drop_bin_
 - Match kind: `literal`
 - Mapping source: `code:strip_value_bin+upper_units`
 - Inferred source: ETHOS-internal token (no Athena ontology bridge).
-
-_No LLM rationale recorded; mapping derived from `code:strip_value_bin+upper_units`._
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -840,25 +567,6 @@ _No LLM rationale recorded; mapping derived from `code:strip_value_bin+upper_uni
 - **Family:** `LAB`
 - **Mapped tiers:** drop_bin
 
-**ETHOS held-out AUC**
-
-| duration_days | bucket | occurs_auc |
-| ---: | :--- | ---: |
-| 30 | ood | 0.9406 |
-| 30 | ood | 0.9433 |
-| 30 | ood | 0.9463 |
-| 30 | ood | 0.9411 |
-| 30 | ood | 0.9441 |
-| 30 | ood | 0.9461 |
-| 30 | ood | 0.9445 |
-| 30 | ood | 0.9450 |
-| 180 | ood | 0.9415 |
-| 180 | ood | 0.9426 |
-| 180 | ood | 0.9441 |
-| 180 | ood | 0.9416 |
-| 180 | ood | 0.9426 |
-| 180 | ood | 0.9439 |
-
 **Authoritative EQ label:** MIMIC item-id `224054` -- Braden Sensory Perception (source: `d_items`)
 - abbreviation: Braden Sensory Perception
 - category: Skin - Assessment
@@ -873,8 +581,6 @@ _Found under tier(s): drop_bin_
 - Match kind: `literal`
 - Mapping source: `code:strip_value_bin+upper_units`
 - Inferred source: ETHOS-internal token (no Athena ontology bridge).
-
-_No LLM rationale recorded; mapping derived from `code:strip_value_bin+upper_units`._
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -892,25 +598,6 @@ _No LLM rationale recorded; mapping derived from `code:strip_value_bin+upper_uni
 - **Family:** `LAB`
 - **Mapped tiers:** drop_bin, quantile
 
-**ETHOS held-out AUC**
-
-| duration_days | bucket | occurs_auc |
-| ---: | :--- | ---: |
-| 30 | ood | 0.9275 |
-| 30 | ood | 0.9318 |
-| 30 | ood | 0.9270 |
-| 30 | ood | 0.9316 |
-| 30 | ood | 0.9334 |
-| 30 | ood | 0.9346 |
-| 30 | ood | 0.9342 |
-| 30 | ood | 0.9361 |
-| 180 | ood | 0.9212 |
-| 180 | ood | 0.9259 |
-| 180 | ood | 0.9211 |
-| 180 | ood | 0.9238 |
-| 180 | ood | 0.9267 |
-| 180 | ood | 0.9315 |
-
 **Authoritative EQ label:** MIMIC item-id `224690` -- Respiratory Rate (Total) (source: `d_items`)
 - abbreviation: Respiratory Rate (Total)
 - category: Respiratory
@@ -927,8 +614,6 @@ _Found under tier(s): drop_bin_
 - Mapping source: `code:strip_value_bin+upper_units`
 - Inferred source: ETHOS-internal token (no Athena ontology bridge).
 
-_No LLM rationale recorded; mapping derived from `code:strip_value_bin+upper_units`._
-
 _Found under tier(s): quantile_
 
 #### Candidate ETHOS token: `LAB//224690//INSP/MIN|Q2`
@@ -937,8 +622,6 @@ _Found under tier(s): quantile_
 - Match kind: `lab+next_qk`
 - Mapping source: `meds-codes.parquet:values_quantiles_or_sibling_bins`
 - Inferred source: ETHOS-internal token (no Athena ontology bridge).
-
-_No LLM rationale recorded; mapping derived from `meds-codes.parquet:values_quantiles_or_sibling_bins`._
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -956,31 +639,16 @@ _No LLM rationale recorded; mapping derived from `meds-codes.parquet:values_quan
 - **Family:** `LAB`
 - **Mapped tiers:** mimic_item_crosswalk
 
-**ETHOS held-out AUC**
-
-| duration_days | bucket | occurs_auc |
-| ---: | :--- | ---: |
-| 30 | id | 0.9541 |
-| 30 | id | 0.9368 |
-| 30 | id | 0.9248 |
-| 30 | id | 0.9595 |
-| 30 | id | 0.9274 |
-| 30 | id | 0.9174 |
-| 30 | id | 0.9488 |
-| 30 | id | 0.9494 |
-| 180 | id | 0.9677 |
-| 180 | id | 0.9606 |
-| 180 | id | 0.9606 |
-| 180 | id | 1.0000 |
-| 180 | id | 0.9528 |
-| 180 | id | 0.9606 |
-
 **Authoritative EQ label:** MIMIC item-id `226499` -- Hemodialysis Output (source: `d_items`)
 - abbreviation: Hemodialysis Output
 - category: Dialysis
 - unitname: mL
 - linksto: chartevents
 - EQ-encoded units: `mL`
+
+**LLM rationale (verbatim):**
+
+> Hemodialysis-output measurement happens during dialysis encounters; we proxy via the dialysis encounter and underlying CKD diagnosis tokens. Loose mapping (predicting indication/encounter, not the measurement).
 
 _Found under tier(s): mimic_item_crosswalk_
 
@@ -992,10 +660,6 @@ _Found under tier(s): mimic_item_crosswalk_
 - Inferred source: ICD-10-CM 3-char category `N18` -- Chronic kidney disease (CKD)
 - Constituent ICD-10-CM codes (10): N18.1, N18.2, N18.3, N18.30, N18.31, N18.32, N18.4, N18.5, N18.6, N18.9
 
-**LLM rationale (verbatim):**
-
-> Hemodialysis-output measurement happens during dialysis encounters; we proxy via the dialysis encounter and underlying CKD diagnosis tokens. Loose mapping (predicting indication/encounter, not the measurement).
-
 _Found under tier(s): mimic_item_crosswalk_
 
 #### Candidate ETHOS token: `ICD//CM//ENCOUNTER_FOR_CARE_INVOLVING_RENAL_DIALYSIS`
@@ -1005,10 +669,6 @@ _Found under tier(s): mimic_item_crosswalk_
 - Mapping source: `physionet/mimic-iv-demo:icu/d_items.csv+llm`
 - Inferred source: ICD-10-CM 3-char category `Z49` -- Encounter for care involving renal dialysis
 - Constituent ICD-10-CM codes (6): Z49.0, Z49.01, Z49.02, Z49.3, Z49.31, Z49.32
-
-**LLM rationale (verbatim):**
-
-> Hemodialysis-output measurement happens during dialysis encounters; we proxy via the dialysis encounter and underlying CKD diagnosis tokens. Loose mapping (predicting indication/encounter, not the measurement).
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -1026,25 +686,6 @@ _Found under tier(s): mimic_item_crosswalk_
 - **Family:** `LAB`
 - **Mapped tiers:** drop_bin
 
-**ETHOS held-out AUC**
-
-| duration_days | bucket | occurs_auc |
-| ---: | :--- | ---: |
-| 30 | ood | 0.9081 |
-| 30 | ood | 0.9159 |
-| 30 | ood | 0.9187 |
-| 30 | ood | 0.9116 |
-| 30 | ood | 0.9182 |
-| 30 | ood | 0.9186 |
-| 30 | ood | 0.9150 |
-| 30 | ood | 0.9207 |
-| 180 | ood | 0.9047 |
-| 180 | ood | 0.9153 |
-| 180 | ood | 0.9172 |
-| 180 | ood | 0.9072 |
-| 180 | ood | 0.9168 |
-| 180 | ood | 0.9176 |
-
 **Authoritative EQ label:** MIMIC item-id `227073` -- Anion gap (source: `d_items`)
 - abbreviation: Anion gap
 - category: Labs
@@ -1060,8 +701,6 @@ _Found under tier(s): drop_bin_
 - Match kind: `literal`
 - Mapping source: `code:strip_value_bin+upper_units`
 - Inferred source: ETHOS-internal token (no Athena ontology bridge).
-
-_No LLM rationale recorded; mapping derived from `code:strip_value_bin+upper_units`._
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -1079,31 +718,16 @@ _No LLM rationale recorded; mapping derived from `code:strip_value_bin+upper_uni
 - **Family:** `LAB`
 - **Mapped tiers:** mimic_item_crosswalk
 
-**ETHOS held-out AUC**
-
-| duration_days | bucket | occurs_auc |
-| ---: | :--- | ---: |
-| 30 | id | 0.8962 |
-| 30 | id | 0.9117 |
-| 30 | id | 0.9138 |
-| 30 | id | 0.9027 |
-| 30 | id | 0.9094 |
-| 30 | id | 0.9101 |
-| 30 | id | 0.9048 |
-| 30 | id | 0.9153 |
-| 180 | id | 0.9070 |
-| 180 | id | 0.9154 |
-| 180 | id | 0.9033 |
-| 180 | id | 0.9106 |
-| 180 | id | 0.8859 |
-| 180 | id | 0.8937 |
-
 **Authoritative EQ label:** MIMIC item-id `227445` -- CK-MB (source: `d_items`)
 - abbreviation: CK-MB
 - category: Labs
 - unitname: None
 - linksto: chartevents
 - EQ-encoded units: `ng/mL`
+
+**LLM rationale (verbatim):**
+
+> CK-MB is ordered when myocardial infarction is suspected; elevated values (the [11, 20) ng/mL bin is clearly elevated -- normal CK-MB is <5 ng/mL) strongly correlate with AMI. Proxy via AMI ICD label.
 
 _Found under tier(s): mimic_item_crosswalk_
 
@@ -1114,10 +738,6 @@ _Found under tier(s): mimic_item_crosswalk_
 - Mapping source: `physionet/mimic-iv-demo:icu/d_items.csv+llm`
 - Inferred source: ICD-10-CM 3-char category `I21` -- Acute myocardial infarction
 - Constituent ICD-10-CM codes (17): I21.0, I21.01, I21.02, I21.09, I21.1, I21.11, I21.19, I21.2, I21.21, I21.29, I21.3, I21.4, I21.9, I21.A, I21.A1, I21.A9, I21.B
-
-**LLM rationale (verbatim):**
-
-> CK-MB is ordered when myocardial infarction is suspected; elevated values (the [11, 20) ng/mL bin is clearly elevated -- normal CK-MB is <5 ng/mL) strongly correlate with AMI. Proxy via AMI ICD label.
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -1135,31 +755,16 @@ _Found under tier(s): mimic_item_crosswalk_
 - **Family:** `LAB`
 - **Mapped tiers:** mimic_item_crosswalk
 
-**ETHOS held-out AUC**
-
-| duration_days | bucket | occurs_auc |
-| ---: | :--- | ---: |
-| 30 | id | 0.9642 |
-| 30 | id | 0.9872 |
-| 30 | id | 0.9871 |
-| 30 | id | 0.9703 |
-| 30 | id | 0.9799 |
-| 30 | id | 0.9855 |
-| 30 | id | 0.9832 |
-| 30 | id | 0.9847 |
-| 180 | id | 0.9613 |
-| 180 | id | 0.9597 |
-| 180 | id | 0.9501 |
-| 180 | id | 0.9613 |
-| 180 | id | 0.9308 |
-| 180 | id | 0.9672 |
-
 **Authoritative EQ label:** MIMIC item-id `228724` -- Pressure ulcer #2- Length (source: `d_items`)
 - abbreviation: Pressure ulcer #2- Length
 - category: Skin - Impairment
 - unitname: cm
 - linksto: chartevents
 - EQ-encoded units: `cm`
+
+**LLM rationale (verbatim):**
+
+> Pressure-ulcer length measurement is recorded for patients who already have a pressure ulcer; this is the underlying ICD diagnosis.
 
 _Found under tier(s): mimic_item_crosswalk_
 
@@ -1170,10 +775,6 @@ _Found under tier(s): mimic_item_crosswalk_
 - Mapping source: `physionet/mimic-iv-demo:icu/d_items.csv+llm`
 - Inferred source: ICD-10-CM 3-char category `L89` -- Pressure ulcer
 - Constituent ICD-10-CM codes (207): L89.0, L89.00, L89.000, L89.001, L89.002, L89.003, L89.004, L89.006, L89.009, L89.01, L89.010, L89.011, L89.012, L89.013, L89.014, L89.016, L89.019, L89.02, L89.020, L89.021, L89.022, L89.023, L89.024, L89.026, L89.029, L89.1, L89.10, L89.100, L89.101, L89.102, ... +177 more
-
-**LLM rationale (verbatim):**
-
-> Pressure-ulcer length measurement is recorded for patients who already have a pressure ulcer; this is the underlying ICD diagnosis.
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -1191,25 +792,6 @@ _Found under tier(s): mimic_item_crosswalk_
 - **Family:** `LAB`
 - **Mapped tiers:** drop_bin, quantile
 
-**ETHOS held-out AUC**
-
-| duration_days | bucket | occurs_auc |
-| ---: | :--- | ---: |
-| 30 | id | 0.8326 |
-| 30 | id | 0.8404 |
-| 30 | id | 0.8409 |
-| 30 | id | 0.8355 |
-| 30 | id | 0.8362 |
-| 30 | id | 0.8388 |
-| 30 | id | 0.8351 |
-| 30 | id | 0.8361 |
-| 180 | id | 0.8182 |
-| 180 | id | 0.8257 |
-| 180 | id | 0.8279 |
-| 180 | id | 0.8230 |
-| 180 | id | 0.8236 |
-| 180 | id | 0.8259 |
-
 **Authoritative EQ label:** MIMIC item-id `51274` -- PT (source: `d_labitems`)
 - category: Hematology
 - fluid: Blood
@@ -1224,8 +806,6 @@ _Found under tier(s): drop_bin_
 - Mapping source: `code:strip_value_bin+upper_units`
 - Inferred source: ETHOS-internal token (no Athena ontology bridge).
 
-_No LLM rationale recorded; mapping derived from `code:strip_value_bin+upper_units`._
-
 _Found under tier(s): quantile_
 
 #### Candidate ETHOS token: `LAB//51274//SEC|Q6`
@@ -1234,8 +814,6 @@ _Found under tier(s): quantile_
 - Match kind: `lab+next_qk`
 - Mapping source: `meds-codes.parquet:values_quantiles_or_sibling_bins`
 - Inferred source: ETHOS-internal token (no Athena ontology bridge).
-
-_No LLM rationale recorded; mapping derived from `meds-codes.parquet:values_quantiles_or_sibling_bins`._
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -1253,30 +831,15 @@ _No LLM rationale recorded; mapping derived from `meds-codes.parquet:values_quan
 - **Family:** `MEDICATION`
 - **Mapped tiers:** atc_crosswalk
 
-**ETHOS held-out AUC**
-
-| duration_days | bucket | occurs_auc |
-| ---: | :--- | ---: |
-| 30 | id | 0.6611 |
-| 30 | id | 0.6429 |
-| 30 | id | 0.6610 |
-| 30 | id | 0.6368 |
-| 30 | id | 0.6493 |
-| 30 | id | 0.6698 |
-| 30 | id | 0.6695 |
-| 30 | id | 0.6793 |
-| 180 | id | 0.7051 |
-| 180 | id | 0.6708 |
-| 180 | id | 0.6835 |
-| 180 | id | 0.6786 |
-| 180 | id | 0.6871 |
-| 180 | id | 0.6755 |
-
 **Authoritative EQ label:** MIMIC medication `Carbidopa-Levodopa (25-100)` (admin modes: Administered)
 - RxNorm match: levodopa (concept_class Ingredient)
 - Ingredient: levodopa (concept_id 789578)
 - ATC level 3: `N04B` -- DOPAMINERGIC AGENTS
 - ATC level 4: `N04BA` -- Dopa and dopa derivatives
+
+**LLM rationale (verbatim):**
+
+> Carbidopa-Levodopa is ATC N04BA02; rolling up to N04 class.
 
 _Found under tier(s): atc_crosswalk_
 
@@ -1287,10 +850,6 @@ _Found under tier(s): atc_crosswalk_
 - Mapping source: `llm:claude_clinical_knowledge`
 - Inferred source: ATC level 2 class `N04` -- ANTI-PARKINSON DRUGS
 - Constituent RxNorm ingredients (32): amantadine, apomorphine, benztropine, biperiden, bornaprine, bromocriptine, budipine, cabergoline, dexetimide, dihydroergocryptine, diphenhydramine, entacapone, ethybenztropine, etilevodopa, istradefylline, levodopa, methixene, opicapone, orphenadrine, pergolide, piribedil, pramipexole, procyclidine, profenamine, rasagiline, ropinirole, rotigotine, safinamide, selegiline, tolcapone, ... +2 more
-
-**LLM rationale (verbatim):**
-
-> Carbidopa-Levodopa is ATC N04BA02; rolling up to N04 class.
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -1308,30 +867,15 @@ _Found under tier(s): atc_crosswalk_
 - **Family:** `MEDICATION`
 - **Mapped tiers:** atc_crosswalk
 
-**ETHOS held-out AUC**
-
-| duration_days | bucket | occurs_auc |
-| ---: | :--- | ---: |
-| 30 | ood | 0.7458 |
-| 30 | ood | 0.7687 |
-| 30 | ood | 0.7658 |
-| 30 | ood | 0.7501 |
-| 30 | ood | 0.7600 |
-| 30 | ood | 0.7686 |
-| 30 | ood | 0.7355 |
-| 30 | ood | 0.7646 |
-| 180 | ood | 0.7645 |
-| 180 | ood | 0.7827 |
-| 180 | ood | 0.7774 |
-| 180 | ood | 0.7675 |
-| 180 | ood | 0.7759 |
-| 180 | ood | 0.7597 |
-
 **Authoritative EQ label:** MIMIC medication `Gabapentin` (admin modes: Delayed Administered)
 - RxNorm match: gabapentin (concept_class Ingredient)
 - Ingredient: gabapentin (concept_id 797399)
 - ATC level 3: `N02B` -- OTHER ANALGESICS AND ANTIPYRETICS
 - ATC level 4: `N03AX` -- Other antiepileptics
+
+**LLM rationale (verbatim):**
+
+> Gabapentin is ATC N03AX12; rolling up to N03 class.
 
 _Found under tier(s): atc_crosswalk_
 
@@ -1342,10 +886,6 @@ _Found under tier(s): atc_crosswalk_
 - Mapping source: `llm:claude_clinical_knowledge`
 - Inferred source: ATC level 2 class `N03` -- ANTIEPILEPTICS
 - Constituent RxNorm ingredients (45): aminobutyrate, barbexaclone, beclamide, brivaracetam, cannabidiol, carbamazepine, cenobamate, clonazepam, dipropylacetamide, eslicarbazepine, ethosuximide, ethotoin, ezogabine, felbamate, fenfluramine, fosphenytoin, gabapentin, ganaxolone, lacosamide, lamotrigine, levetiracetam, mephenytoin, mephobarbital, metharbital, methsuximide, oxcarbazepine, paramethadione, perampanel, phenacemide, phenobarbital, ... +15 more
-
-**LLM rationale (verbatim):**
-
-> Gabapentin is ATC N03AX12; rolling up to N03 class.
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -1363,30 +903,15 @@ _Found under tier(s): atc_crosswalk_
 - **Family:** `MEDICATION`
 - **Mapped tiers:** atc_crosswalk
 
-**ETHOS held-out AUC**
-
-| duration_days | bucket | occurs_auc |
-| ---: | :--- | ---: |
-| 30 | id | 0.8767 |
-| 30 | id | 0.8931 |
-| 30 | id | 0.8618 |
-| 30 | id | 0.8884 |
-| 30 | id | 0.8812 |
-| 30 | id | 0.8853 |
-| 30 | id | 0.8882 |
-| 30 | id | 0.9027 |
-| 180 | id | 0.8469 |
-| 180 | id | 0.8697 |
-| 180 | id | 0.8459 |
-| 180 | id | 0.8518 |
-| 180 | id | 0.8564 |
-| 180 | id | 0.8521 |
-
 **Authoritative EQ label:** MIMIC medication `Mupirocin Nasal Ointment 2%` (admin modes: START)
 - RxNorm match: mupirocin (concept_class Ingredient)
 - Ingredient: mupirocin (concept_id 951511)
 - ATC level 3: `B05C` -- IRRIGATING SOLUTIONS
 - ATC level 4: `B05CA` -- Antiinfectives
+
+**LLM rationale (verbatim):**
+
+> Mupirocin nasal is ATC R01AX06; the same active ingredient as topical D06AX09. We OR both since either nasal or dermatological tokens could reasonably reflect the medication being administered.
 
 _Found under tier(s): atc_crosswalk_
 
@@ -1398,10 +923,6 @@ _Found under tier(s): atc_crosswalk_
 - Inferred source: ATC level 2 class `D06` -- ANTIBIOTICS AND CHEMOTHERAPEUTICS FOR DERMATOLOGICAL USE
 - Constituent RxNorm ingredients (40): acyclovir, amikacin, bacitracin, bacitracin methylene disalicylate, berdazimer, chloramphenicol, chlortetracycline, demeclocycline, docosanol, edoxudine, fusidate, gentamicin, idoxuridine, imiquimod, ingenol mebutate, inosine, lysozyme, mafenide, metronidazole, mupirocin, neomycin, oxytetracycline, ozenoxacin, penciclovir, podofilox, retapamulin, rifamycin SV, rifamycins, rifaximin, silver sulfadiazine, ... +10 more
 
-**LLM rationale (verbatim):**
-
-> Mupirocin nasal is ATC R01AX06; the same active ingredient as topical D06AX09. We OR both since either nasal or dermatological tokens could reasonably reflect the medication being administered.
-
 _Found under tier(s): atc_crosswalk_
 
 #### Candidate ETHOS token: `ATC//R01//NASAL_PREPARATIONS`
@@ -1411,10 +932,6 @@ _Found under tier(s): atc_crosswalk_
 - Mapping source: `llm:claude_clinical_knowledge`
 - Inferred source: ATC level 2 class `R01` -- NASAL PREPARATIONS
 - Constituent RxNorm ingredients (43): all-trans-retinol, antazoline, azelastine, beclomethasone, betamethasone, budesonide, calcium, ciclesonide, cromoglycate, cromolyn, cyclopentamine, dexamethasone, ephedrine, epinephrine, fenoxazoline, flunisolide, fluticasone, framycetin, hexamidine, hyaluronate, hydrocortisone, indanazoline, ipratropium, isospaglumic acid, levocabastine, mometasone, mupirocin, naphazoline, nedocromil, olopatadine, ... +13 more
-
-**LLM rationale (verbatim):**
-
-> Mupirocin nasal is ATC R01AX06; the same active ingredient as topical D06AX09. We OR both since either nasal or dermatological tokens could reasonably reflect the medication being administered.
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -1432,30 +949,15 @@ _Found under tier(s): atc_crosswalk_
 - **Family:** `MEDICATION`
 - **Mapped tiers:** atc_crosswalk
 
-**ETHOS held-out AUC**
-
-| duration_days | bucket | occurs_auc |
-| ---: | :--- | ---: |
-| 30 | ood | 0.8047 |
-| 30 | ood | 0.8127 |
-| 30 | ood | 0.8063 |
-| 30 | ood | 0.8010 |
-| 30 | ood | 0.8167 |
-| 30 | ood | 0.8246 |
-| 30 | ood | 0.8156 |
-| 30 | ood | 0.8227 |
-| 180 | ood | 0.7955 |
-| 180 | ood | 0.8012 |
-| 180 | ood | 0.7816 |
-| 180 | ood | 0.7877 |
-| 180 | ood | 0.8070 |
-| 180 | ood | 0.8207 |
-
 **Authoritative EQ label:** MIMIC medication `Captopril` (admin modes: STOP)
 - RxNorm match: captopril (concept_class Ingredient)
 - Ingredient: captopril (concept_id 1340128)
 - ATC level 3: `C09A` -- ACE INHIBITORS, PLAIN
 - ATC level 4: `C03AX` -- Thiazides, combinations with other drugs
+
+**LLM rationale (verbatim):**
+
+> Captopril is ATC C09AA01; rolling up to C09 class.
 
 _Found under tier(s): atc_crosswalk_
 
@@ -1466,10 +968,6 @@ _Found under tier(s): atc_crosswalk_
 - Mapping source: `llm:claude_clinical_knowledge`
 - Inferred source: ATC level 2 class `C09` -- AGENTS ACTING ON THE RENIN-ANGIOTENSIN SYSTEM
 - Constituent RxNorm ingredients (25): aliskiren, azilsartan, benazepril, candesartan, captopril, cilazapril, enalapril, enalaprilat, eprosartan, fosinopril, imidapril, irbesartan, lisinopril, losartan, moexipril, olmesartan, perindopril, quinapril, ramipril, sparsentan, spirapril, telmisartan, trandolapril, valsartan, zofenopril
-
-**LLM rationale (verbatim):**
-
-> Captopril is ATC C09AA01; rolling up to C09 class.
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -1487,27 +985,12 @@ _Found under tier(s): atc_crosswalk_
 - **Family:** `MEDICATION`
 - **Mapped tiers:** atc_crosswalk
 
-**ETHOS held-out AUC**
-
-| duration_days | bucket | occurs_auc |
-| ---: | :--- | ---: |
-| 30 | id | 0.6704 |
-| 30 | id | 0.6925 |
-| 30 | id | 0.7018 |
-| 30 | id | 0.6660 |
-| 30 | id | 0.6967 |
-| 30 | id | 0.7046 |
-| 30 | id | 0.6793 |
-| 30 | id | 0.6823 |
-| 180 | id | 0.6918 |
-| 180 | id | 0.7043 |
-| 180 | id | 0.7073 |
-| 180 | id | 0.6859 |
-| 180 | id | 0.7013 |
-| 180 | id | 0.7106 |
-
 **Authoritative EQ label:** MIMIC medication `Doxycycline Hyclate` (admin modes: STOP)
 - RxNorm match: doxycycline hyclate (concept_class Precise Ingredient)
+
+**LLM rationale (verbatim):**
+
+> Doxycycline is ATC J01AA02; rolling up to J01 class.
 
 _Found under tier(s): atc_crosswalk_
 
@@ -1518,10 +1001,6 @@ _Found under tier(s): atc_crosswalk_
 - Mapping source: `llm:claude_clinical_knowledge`
 - Inferred source: ATC level 2 class `J01` -- ANTIBACTERIALS FOR SYSTEMIC USE
 - Constituent RxNorm ingredients (187): amdinocillin, amdinocillin pivoxil, amikacin, amoxicillin, ampicillin, arbekacin, avibactam, azidocillin, azithromycin, azlocillin, aztreonam, bacampicillin, bacitracin, bacitracin methylene disalicylate, brodimoprim, carbenicillin, cefaclor, cefadroxil, cefamandole, cefatrizine, cefazolin, cefdinir, cefditoren, cefepime, cefetamet, cefiderocol, cefixime, cefmetazole, cefodizime, cefonicid, ... +157 more
-
-**LLM rationale (verbatim):**
-
-> Doxycycline is ATC J01AA02; rolling up to J01 class.
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -1539,13 +1018,6 @@ _Found under tier(s): atc_crosswalk_
 - **Family:** `MEDS_DEATH`
 - **Mapped tiers:** exact
 
-**ETHOS held-out AUC**
-
-| duration_days | bucket | occurs_auc |
-| ---: | :--- | ---: |
-| 30 | id | 0.8341 |
-| 30 | id | 0.8140 |
-
 **Authoritative EQ label:** Patient death (MEDS-format mortality token)
 
 _Found under tier(s): exact_
@@ -1556,8 +1028,6 @@ _Found under tier(s): exact_
 - Match kind: `literal`
 - Mapping source: `code:string_equality`
 - Inferred source: ETHOS mortality token (passthrough, no ontology lookup).
-
-_No LLM rationale recorded; mapping derived from `code:string_equality`._
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -1575,27 +1045,12 @@ _No LLM rationale recorded; mapping derived from `code:string_equality`._
 - **Family:** `PROCEDURE`
 - **Mapped tiers:** icd_crosswalk
 
-**ETHOS held-out AUC**
-
-| duration_days | bucket | occurs_auc |
-| ---: | :--- | ---: |
-| 30 | id | 0.6225 |
-| 30 | id | 0.6629 |
-| 30 | id | 0.6394 |
-| 30 | id | 0.6201 |
-| 30 | id | 0.6874 |
-| 30 | id | 0.7112 |
-| 30 | id | 0.6468 |
-| 30 | id | 0.7152 |
-| 180 | id | 0.6263 |
-| 180 | id | 0.6131 |
-| 180 | id | 0.6557 |
-| 180 | id | 0.6299 |
-| 180 | id | 0.6538 |
-| 180 | id | 0.6549 |
-
 **Authoritative EQ label:** ICD-9-Proc `7936` -- Open reduction of fracture with internal fixation, tibia and fibula
 - ICD-10-PCS crosswalk (0 codes): (none)
+
+**LLM rationale (verbatim):**
+
+> ETHOS uses chunked ICD-PCS tokens that don't carry procedure semantics directly. We map this procedure to the underlying fracture diagnosis as a proxy: predicting the fracture diagnosis is a reasonable proxy for the reduction procedure. Mapping is loose; AUC interpretation should reflect that we're predicting the indication, not the procedure itself.
 
 _Found under tier(s): icd_crosswalk_
 
@@ -1607,10 +1062,6 @@ _Found under tier(s): icd_crosswalk_
 - Inferred source: ICD-10-CM 3-char category `S92` -- Fracture of foot and toe, except ankle
 - Constituent ICD-10-CM codes (1630): S92.0, S92.00, S92.001, S92.001A, S92.001B, S92.001D, S92.001G, S92.001K, S92.001P, S92.001S, S92.002, S92.002A, S92.002B, S92.002D, S92.002G, S92.002K, S92.002P, S92.002S, S92.009, S92.009A, S92.009B, S92.009D, S92.009G, S92.009K, S92.009P, S92.009S, S92.01, S92.011, S92.011A, S92.011B, ... +1600 more
 
-**LLM rationale (verbatim):**
-
-> ETHOS uses chunked ICD-PCS tokens that don't carry procedure semantics directly. We map this procedure to the underlying fracture diagnosis as a proxy: predicting the fracture diagnosis is a reasonable proxy for the reduction procedure. Mapping is loose; AUC interpretation should reflect that we're predicting the indication, not the procedure itself.
-
 _Found under tier(s): icd_crosswalk_
 
 #### Candidate ETHOS token: `ICD//CM//FRACTURE_OF_LOWER_LEG_INCLUDING_ANKLE`
@@ -1620,10 +1071,6 @@ _Found under tier(s): icd_crosswalk_
 - Mapping source: `llm:claude_clinical_knowledge`
 - Inferred source: ICD-10-CM 3-char category `S82` -- Fracture of lower leg, including ankle
 - Constituent ICD-10-CM codes (3345): S82.0, S82.00, S82.001, S82.001A, S82.001B, S82.001C, S82.001D, S82.001E, S82.001F, S82.001G, S82.001H, S82.001J, S82.001K, S82.001M, S82.001N, S82.001P, S82.001Q, S82.001R, S82.001S, S82.002, S82.002A, S82.002B, S82.002C, S82.002D, S82.002E, S82.002F, S82.002G, S82.002H, S82.002J, S82.002K, ... +3315 more
-
-**LLM rationale (verbatim):**
-
-> ETHOS uses chunked ICD-PCS tokens that don't carry procedure semantics directly. We map this procedure to the underlying fracture diagnosis as a proxy: predicting the fracture diagnosis is a reasonable proxy for the reduction procedure. Mapping is loose; AUC interpretation should reflect that we're predicting the indication, not the procedure itself.
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -1641,26 +1088,11 @@ _Found under tier(s): icd_crosswalk_
 - **Family:** `TIMELINE`
 - **Mapped tiers:** mimic_item_crosswalk
 
-**ETHOS held-out AUC**
-
-| duration_days | bucket | occurs_auc |
-| ---: | :--- | ---: |
-| 30 | ood |  |
-| 30 | ood |  |
-| 30 | ood |  |
-| 30 | ood |  |
-| 30 | ood |  |
-| 30 | ood |  |
-| 30 | ood |  |
-| 30 | ood |  |
-| 180 | ood |  |
-| 180 | ood |  |
-| 180 | ood |  |
-| 180 | ood |  |
-| 180 | ood |  |
-| 180 | ood |  |
-
 **Authoritative EQ label:** Start of patient record (first event marker)
+
+**LLM rationale (verbatim):**
+
+> EQ's TIMELINE//START fires at the first event of a patient's record. Token frequencies match closely (EQ n=200,773 / ETHOS n=297,949), and ETHOS uses HOSPITAL_ADMISSION as its admission marker.
 
 _Found under tier(s): mimic_item_crosswalk_
 
@@ -1670,10 +1102,6 @@ _Found under tier(s): mimic_item_crosswalk_
 - Match kind: `literal`
 - Mapping source: `direct:event_alignment`
 - Inferred source: ETHOS hospital-admission marker (synthetic event token).
-
-**LLM rationale (verbatim):**
-
-> EQ's TIMELINE//START fires at the first event of a patient's record. Token frequencies match closely (EQ n=200,773 / ETHOS n=297,949), and ETHOS uses HOSPITAL_ADMISSION as its admission marker.
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 

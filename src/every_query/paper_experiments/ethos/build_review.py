@@ -1,10 +1,14 @@
 """Build the per-EQ-code mapping review markdown (Phase 2).
 
-Reads the four mapping artifacts produced by ``build_mapping.py`` plus the
-ETHOS held-out evaluation, calls ``ontology.py`` to resolve authoritative
-labels and constituent-code expansions, and emits a single markdown file at
-``review/mapping_review.md`` (one section per EQ code, mapped families
-first then unmapped).
+Reads the mapping artifacts produced by ``build_mapping.py``, calls
+``ontology.py`` to resolve authoritative labels and constituent-code
+expansions, and emits a single markdown file at ``review/mapping_review.md``
+(one section per EQ code, mapped families first then unmapped).
+
+Held-out AUC numbers are intentionally NOT included in the doc -- they
+anchor reviewers toward post-hoc-correct decisions, but the review question
+is whether the mapping is a fair semantic bridge, which is independent of
+empirical performance.
 
 Public entry points:
 
@@ -50,10 +54,10 @@ _MEDICATION_ADMIN_MODES = {
 }
 
 
-def load_mapping_artifacts() -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFrame]:
-    """Download (with cache reuse via ``build_mapping._download``) the four
-    parquet artifacts the review depends on, and return them as a 4-tuple in
-    the order ``(mapping_table, mapping_coverage, ethos_vocab, eval_aucs)``.
+def load_mapping_artifacts() -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    """Download (with cache reuse via ``build_mapping._download``) the three
+    parquet artifacts the review depends on, and return them as a 3-tuple in
+    the order ``(mapping_table, mapping_coverage, ethos_vocab)``.
 
     Cache files live under ``build_mapping.CACHE_DIR`` (defaults to
     ``/tmp/eq_ethos_cache`` and overridable via the ``ETHOS_MAPPING_CACHE``
@@ -63,19 +67,16 @@ def load_mapping_artifacts() -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, 
     mapping_table_path = CACHE_DIR / "mapping_table.parquet"
     mapping_coverage_path = CACHE_DIR / "mapping_coverage.parquet"
     ethos_vocab_path = CACHE_DIR / "ethos_vocab.parquet"
-    eval_aucs_path = CACHE_DIR / "eval_aucs_held_out.parquet"
 
     _bm._download(_bm.MAPPING_TABLE_BLOB, mapping_table_path)
     _bm._download(_bm.MAPPING_COVERAGE_BLOB, mapping_coverage_path)
     _bm._download(_bm.ETHOS_VOCAB_BLOB, ethos_vocab_path)
-    _bm._download(_bm.EQ_AUCS_BLOB, eval_aucs_path)
 
     mapping_table = pl.read_parquet(mapping_table_path)
     mapping_coverage = pl.read_parquet(mapping_coverage_path)
     ethos_vocab = pl.read_parquet(ethos_vocab_path)
-    eval_aucs = pl.read_parquet(eval_aucs_path)
 
-    return mapping_table, mapping_coverage, ethos_vocab, eval_aucs
+    return mapping_table, mapping_coverage, ethos_vocab
 
 
 def _anchor(eq_code: str) -> str:
@@ -96,15 +97,11 @@ def _render_section_header(
     eq_code: str,
     family: str,
     coverage_row: dict,
-    eq_aucs_subset: pl.DataFrame,
 ) -> str:
     """Emit the per-section header: an H3 title anchored on the EQ code, the
-    family, the list of tiers it was mapped under, and a small AUC table
-    with columns ``duration_days``, ``bucket``, ``occurs_auc``.
+    family, and the list of tiers it was mapped under.
 
-    ``eq_aucs_subset`` is the rows of ``eval_aucs_held_out.parquet`` filtered
-    to ``code == eq_code``. It may be empty (e.g. for codes not in the held-
-    out set), in which case the AUC table is replaced by an italic note.
+    Held-out AUC numbers are intentionally omitted -- see module docstring.
     """
     tiers = coverage_row.get("mapped_under_tiers") or []
     tiers_no_union = [t for t in tiers if t != "union"]
@@ -115,29 +112,6 @@ def _render_section_header(
     lines.append("")
     lines.append(f"- **Family:** `{family}`")
     lines.append(f"- **Mapped tiers:** {tier_str}")
-    lines.append("")
-
-    if eq_aucs_subset is None or eq_aucs_subset.is_empty():
-        lines.append("_No held-out AUC rows for this code._")
-        lines.append("")
-        return "\n".join(lines)
-
-    auc_cols = ["duration_days", "bucket", "occurs_auc"]
-    auc_df = (
-        eq_aucs_subset.select(auc_cols)
-        .sort(["duration_days", "bucket"])
-    )
-
-    lines.append("**ETHOS held-out AUC**")
-    lines.append("")
-    lines.append("| duration_days | bucket | occurs_auc |")
-    lines.append("| ---: | :--- | ---: |")
-    for r in auc_df.iter_rows(named=True):
-        dur = r["duration_days"]
-        bucket = r["bucket"] if r["bucket"] is not None else ""
-        auc = r["occurs_auc"]
-        auc_str = f"{auc:.4f}" if auc is not None else ""
-        lines.append(f"| {dur} | {bucket} | {auc_str} |")
     lines.append("")
 
     return "\n".join(lines)
@@ -369,7 +343,6 @@ def _render_ethos_token(
     token: str,
     match_kind: str,
     mapping_source: str,
-    llm_rationale: str | None,
 ) -> str:
     """Emit a markdown block describing one candidate ETHOS token.
 
@@ -382,9 +355,10 @@ def _render_ethos_token(
        render as ``inferred source: ETHOS-internal token``).
     3. Constituent-code expansion (truncated at 30 entries with a
        ``... +N more`` suffix).
-    4. Verbatim LLM rationale (``llm_rationale``) when supplied; otherwise a
-       static "(no LLM rationale: derived from <tier>)" stub keyed off the
-       ``mapping_source`` string.
+
+    The LLM rationale is rendered once per EQ code by the orchestrator
+    (since the YAML stores one rationale per ``eq_code`` covering all
+    candidate tokens for that code), not per token.
     """
     count = _ont.ethos_token_count(token)
     lines: list[str] = []
@@ -437,15 +411,6 @@ def _render_ethos_token(
     else:
         lines.append("- Inferred source: ETHOS-internal token (no Athena ontology bridge).")
 
-    lines.append("")
-    if llm_rationale:
-        lines.append("**LLM rationale (verbatim):**")
-        lines.append("")
-        lines.append("> " + llm_rationale.replace("\n", "\n> "))
-    else:
-        lines.append(
-            f"_No LLM rationale recorded; mapping derived from `{mapping_source}`._"
-        )
     lines.append("")
 
     return "\n".join(lines)
@@ -632,7 +597,7 @@ def build_review_markdown() -> str:
        renderer.
     5. Prepend a table-of-contents linking to each EQ-code anchor.
     """
-    mapping_table, mapping_coverage, _ethos_vocab, eval_aucs = load_mapping_artifacts()
+    mapping_table, mapping_coverage, _ethos_vocab = load_mapping_artifacts()
     rationales = _load_llm_rationales()
     unmappable = _load_unmappable_rationales()
 
@@ -677,20 +642,33 @@ def build_review_markdown() -> str:
             sections.append(section)
             continue
 
-        eq_aucs_subset = eval_aucs.filter(pl.col("code") == eq_code)
         section_parts: list[str] = []
         section_parts.append(
             _render_section_header(
                 eq_code=eq_code,
                 family=family,
                 coverage_row=cov_row,
-                eq_aucs_subset=eq_aucs_subset,
             )
         )
         section_parts.append(_render_eq_label(eq_code))
         section_parts.append("")
 
         candidates = candidates_by_query.get(eq_code, [])
+
+        unique_rationales: list[str] = []
+        seen_rationales: set[str] = set()
+        for cand in candidates:
+            r = _resolve_rationale(rationales, eq_code, cand["token"])
+            if r and r not in seen_rationales:
+                unique_rationales.append(r)
+                seen_rationales.add(r)
+        if unique_rationales:
+            section_parts.append("**LLM rationale (verbatim):**")
+            section_parts.append("")
+            for r in unique_rationales:
+                section_parts.append("> " + r.replace("\n", "\n> "))
+                section_parts.append("")
+
         if not candidates:
             section_parts.append("_No candidate ETHOS tokens recorded outside the union tier._")
             section_parts.append("")
@@ -698,12 +676,10 @@ def build_review_markdown() -> str:
             for cand in candidates:
                 tiers = sorted(set(cand["tiers"]))
                 tiers_str = ", ".join(tiers)
-                rationale = _resolve_rationale(rationales, eq_code, cand["token"])
                 token_md = _render_ethos_token(
                     token=cand["token"],
                     match_kind=cand["match_kind"],
                     mapping_source=cand["mapping_source"],
-                    llm_rationale=rationale,
                 )
                 section_parts.append(
                     f"_Found under tier(s): {tiers_str}_"
@@ -720,10 +696,11 @@ def build_review_markdown() -> str:
         (
             "Per-EQ-code review of the EQ -> ETHOS code mapping produced by "
             "`build_mapping.py`. Each section shows the authoritative EQ-side "
-            "label resolved through the staged Athena ontology, the candidate "
-            "ETHOS tokens (with vocab counts and constituent-code expansions), "
-            "the verbatim LLM rationale where one was recorded, and a status "
-            "block for the reviewer to mark approve / reject / modify."
+            "label resolved through the staged Athena ontology, the verbatim "
+            "LLM rationale (rendered once per EQ code where one was recorded), "
+            "the candidate ETHOS tokens with vocab counts and constituent-code "
+            "expansions, and a status block for the reviewer to mark "
+            "approve / reject / modify."
         ),
         "",
     ]
