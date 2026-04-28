@@ -895,15 +895,3 @@ def show_scoreboard() -> None:
     display(demo_aucs[["label", "duration_days", "eq_auc", "ar_auc", "delta", "winner"]].round(3))
 
 
-def show_multi_task_costs() -> None:
-    """How AR's amortization advantage saturates as #tasks grows."""
-    ar_per_traj_real = _ReplayARModel.PER_SUBJ_TRAJ_SECONDS_MEASURED
-    ar_shared_s = ar_per_traj_real * 20      # 20 trajectories per patient
-    ar_per_task_s = 0.05                     # tally cost per additional task
-    eq_lat_per_call_s = 0.05                 # representative EQ wall-clock
-
-    print(f"{'#tasks':>7s}  {'AR total':>10s}  {'EQ total':>10s}  {'speedup':>8s}")
-    for n in [1, 2, 4, 8, 16, 32]:
-        ar_total = ar_shared_s + n * ar_per_task_s
-        eq_total = eq_lat_per_call_s * n
-        print(f"{n:>7d}  {ar_total:>9.1f}s  {eq_total:>9.3f}s  {ar_total / eq_total:>7.0f}×")

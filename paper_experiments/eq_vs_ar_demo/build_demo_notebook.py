@@ -114,17 +114,7 @@ demo_helpers.show_scoreboard()
 """))
 
 _CELLS.append(md(r"""
-## 4. Multi-task efficiency
-
-When the same patient is queried for multiple tasks at once, the AR model amortizes trajectory generation but EQ stays linear and fast. Numbers below use the measured AR per-(subject, trajectory) cost.
-"""))
-
-_CELLS.append(code("""
-demo_helpers.show_multi_task_costs()
-"""))
-
-_CELLS.append(md(r"""
-## 5. About this demo
+## 4. About this demo
 
 | Component | Source |
 | --- | --- |
