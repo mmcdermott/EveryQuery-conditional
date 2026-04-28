@@ -1,0 +1,31 @@
+# EQ_reprocess_ethos — collapse Ethos's split-token MEDS shards back to singleton tokens.
+#
+# Reads parquets at ``input_dir/data/{split}/*.parquet`` (Ethos's standard MEDS output
+# layout), rewrites each shard so multi-token (head, mid, sfx) triplets at the same
+# (subject_id, time) are recombined into one event, and writes the result under
+# ``output_dir/data/{split}/*.parquet`` plus a code-mapping parquet at
+# ``output_dir/metadata/ethos_code_mapping.parquet``.
+#
+# Downstream MTD_preprocess + EQ_train consume the output dir unchanged.
+#
+# Usage:
+#   EQ_reprocess_ethos input_dir=/path/to/ethos/output output_dir=/path/to/eq/input
+
+defaults:
+  - _self_
+
+# Required: directory containing Ethos-tokenized MEDS shards.  Expected layout:
+#   {input_dir}/data/{split}/{shard}.parquet
+#   {input_dir}/metadata/codes.parquet  (optional; copied through unchanged if present)
+input_dir: ???
+
+# Required: directory to write recombined MEDS shards into.  Mirrors input layout.
+output_dir: ???
+
+# Optional: overwrite ``output_dir`` if it already exists.  Default false.
+overwrite: false
+
+hydra:
+  output_subdir: null
+  job:
+    chdir: false
