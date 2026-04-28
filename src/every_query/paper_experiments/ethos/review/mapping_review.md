@@ -12,17 +12,13 @@ Default to the **tightest** mapping that still captures the EQ concept. When a c
 - [`DIAGNOSIS//ICD//9//3320`](#diagnosisicd93320)
 - [`DIAGNOSIS//ICD//9//4271`](#diagnosisicd94271)
 - [`DIAGNOSIS//ICD//9//5856`](#diagnosisicd95856)
-- [`INFUSION_END//227536//value_[6.05,8.071587)`](#infusion-end227536value-6058071587)
-- [`INFUSION_END//227536//value_[8.071587,9.379999)`](#infusion-end227536value-80715879379999)
+- [`DIAGNOSIS//ICD//9//7295`](#diagnosisicd97295)
 - [`INFUSION_END//229420//value_[10.687433,23.27545)`](#infusion-end229420value-106874332327545)
-- [`INFUSION_START//220949`](#infusion-start220949)
 - [`INFUSION_START//221794//value_[8.004926,10.000001)`](#infusion-start221794value-800492610000001)
-- [`INFUSION_START//225168//value_[284.02966,350.0)`](#infusion-start225168value-284029663500)
 - [`LAB//220224//mmHg//value_[89.0,98.0)`](#lab220224mmhgvalue-890980)
 - [`LAB//220339//cmH2O//value_[10.0,12.0)`](#lab220339cmh2ovalue-100120)
 - [`LAB//224054//UNK//value_[2.0,3.0)`](#lab224054unkvalue-2030)
 - [`LAB//224690//insp/min//value_[14.0,16.0)`](#lab224690inspminvalue-140160)
-- [`LAB//226499//mL//value_[3150.0,inf)`](#lab226499mlvalue-31500inf)
 - [`LAB//227073//mEq/L//value_[17.0,19.0)`](#lab227073meqlvalue-170190)
 - [`LAB//228724//cm//value_[1.5,2.0)`](#lab228724cmvalue-1520)
 - [`LAB//51274//sec//value_[14.1,15.3)`](#lab51274secvalue-141153)
@@ -34,11 +30,15 @@ Default to the **tightest** mapping that still captures the EQ concept. When a c
 - [`MEDS_DEATH`](#meds-death)
 - [`PROCEDURE//ICD//9//7936`](#procedureicd97936)
 - [`TIMELINE//START`](#timelinestart)
-- [`DIAGNOSIS//ICD//9//7295` _(unmapped)_](#diagnosisicd97295)
+- [`INFUSION_END//227536//value_[6.05,8.071587)` _(unmapped)_](#infusion-end227536value-6058071587)
+- [`INFUSION_END//227536//value_[8.071587,9.379999)` _(unmapped)_](#infusion-end227536value-80715879379999)
+- [`INFUSION_START//220949` _(unmapped)_](#infusion-start220949)
+- [`INFUSION_START//225168//value_[284.02966,350.0)` _(unmapped)_](#infusion-start225168value-284029663500)
 - [`LAB//220245//ml/min//value_[173.0,188.0)` _(unmapped)_](#lab220245mlminvalue-17301880)
 - [`LAB//224665//UNK//value_[-inf,0.12)` _(unmapped)_](#lab224665unkvalue-inf012)
 - [`LAB//225640//%//value_[0.3,0.6)` _(unmapped)_](#lab225640value-0306)
 - [`LAB//225672//IU/L//value_[30.0,42.0)` _(unmapped)_](#lab225672iulvalue-300420)
+- [`LAB//226499//mL//value_[3150.0,inf)` _(unmapped)_](#lab226499mlvalue-31500inf)
 - [`LAB//227445//ng/mL//value_[11.0,20.0)` _(unmapped)_](#lab227445ngmlvalue-110200)
 - [`LAB//229663//cmH2O//value_[-inf,5.0)` _(unmapped)_](#lab229663cmh2ovalue-inf50)
 - [`LAB//229694//UNK//value_[0.0,inf)` _(unmapped)_](#lab229694unkvalue-00inf)
@@ -63,7 +63,7 @@ Default to the **tightest** mapping that still captures the EQ concept. When a c
 
 **LLM rationale (verbatim):**
 
-> I25.118 is a 5-digit child of I25 (chronic ischemic heart disease). ICD//CM//CHRONIC_ISCHEMIC_HEART_DISEASE is the I25 3-char category and is the tightest ETHOS bridge that still covers the EQ concept. Earlier candidates ANGINA_PECTORIS (I20, angina without specified atherosclerosis) and ATHEROSCLEROSIS (I70, mostly peripheral and leg atherosclerosis, not coronary) were dropped during precision review since they overshoot the EQ concept.
+> ICD-10-CM 3-char parent I25 resolved to ETHOS token via ethos_icd_3char_index.
 
 _Found under tier(s): icd_crosswalk_
 
@@ -71,7 +71,7 @@ _Found under tier(s): icd_crosswalk_
 
 - ETHOS vocab count: 130,280
 - Match kind: `literal`
-- Mapping source: `llm:claude_clinical_knowledge`
+- Mapping source: `deterministic:icd_3char_walker`
 - Inferred source: ICD-10-CM 3-char category `I25` -- Chronic ischemic heart disease
 - Constituent ICD-10-CM codes (69):
   - `I25.1` -- Atherosclerotic heart disease of native coronary artery
@@ -135,7 +135,7 @@ _Found under tier(s): icd_crosswalk_
 
 **LLM rationale (verbatim):**
 
-> Direct semantic match to ICD-10 G20.
+> ICD-10-CM 3-char parent G20 resolved to ETHOS token via ethos_icd_3char_index.
 
 _Found under tier(s): icd_crosswalk_
 
@@ -143,7 +143,7 @@ _Found under tier(s): icd_crosswalk_
 
 - ETHOS vocab count: 5,606
 - Match kind: `literal`
-- Mapping source: `llm:claude_clinical_knowledge`
+- Mapping source: `deterministic:icd_3char_walker`
 - Inferred source: ICD-10-CM 3-char category `G20` -- Parkinson's disease
 - Constituent ICD-10-CM codes (7):
   - `G20.A` -- Parkinson's disease without dyskinesia
@@ -175,7 +175,7 @@ _Found under tier(s): icd_crosswalk_
 
 **LLM rationale (verbatim):**
 
-> Direct match to ICD-10 I47.
+> While the EQ code specifically refers to ventricular tachycardia and the ETHOS token represents the broader category of paroxysmal tachycardia (which includes both ventricular and supraventricular types), this is the only available candidate and paroxysmal ventricular tachycardia is a subset of paroxysmal tachycardia. The mapping loses some specificity but remains clinically valid.
 
 _Found under tier(s): icd_crosswalk_
 
@@ -183,7 +183,7 @@ _Found under tier(s): icd_crosswalk_
 
 - ETHOS vocab count: 9,342
 - Match kind: `literal`
-- Mapping source: `llm:claude_clinical_knowledge`
+- Mapping source: `llm:diagnosis_walker_unresolved`
 - Inferred source: ICD-10-CM 3-char category `I47` -- Paroxysmal tachycardia
 - Constituent ICD-10-CM codes (10):
   - `I47.0` -- Re-entry ventricular arrhythmia
@@ -220,7 +220,7 @@ _Found under tier(s): icd_crosswalk_
 
 **LLM rationale (verbatim):**
 
-> ICD-9 585.6 is ESRD; ICD-10 N18 is CKD with N18.6 specifically being ESRD. ETHOS's CKD label captures the N18 family. Alternative tokens (HCPCS UNSCHED_DIALYSIS_ESRD_PT_HOS, ENCOUNTER_FOR_CARE_INVOLVING_RENAL_DIALYSIS) are too rare to be useful as standalone matches.
+> ICD-10-CM 3-char parent N18 resolved to ETHOS token via ethos_icd_3char_index.
 
 _Found under tier(s): icd_crosswalk_
 
@@ -228,7 +228,7 @@ _Found under tier(s): icd_crosswalk_
 
 - ETHOS vocab count: 84,796
 - Match kind: `literal`
-- Mapping source: `llm:claude_clinical_knowledge`
+- Mapping source: `deterministic:icd_3char_walker`
 - Inferred source: ICD-10-CM 3-char category `N18` -- Chronic kidney disease (CKD)
 - Constituent ICD-10-CM codes (10):
   - `N18.1` -- Chronic kidney disease, stage 1
@@ -253,212 +253,62 @@ _Found under tier(s): icd_crosswalk_
 
 ---
 
-### <a id="infusion-end227536value-6058071587"></a>`INFUSION_END//227536//value_[6.05,8.071587)`
+### <a id="diagnosisicd97295"></a>`DIAGNOSIS//ICD//9//7295`
 
-- **Family:** `INFUSION_END`
-- **Mapped tiers:** mimic_item_crosswalk
+- **Family:** `DIAGNOSIS`
+- **Mapped tiers:** icd_crosswalk
 
-**Authoritative EQ label:** MIMIC item-id `227536` -- KCl (CRRT) (source: `d_items`)
-- abbreviation: KCl (CRRT)
-- category: Medications
-- unitname: mEq.
-- linksto: inputevents
-- EQ-encoded units: `value_[6.05,8.071587)`
-
-**LLM rationale (verbatim):**
-
-> Potassium chloride is ATC A12BA01 (mineral supplement). When administered via CRRT it is an electrolyte solution (B05X). We OR both classes since the underlying drug is K+ supplement but the route is CRRT.
-
-_Found under tier(s): mimic_item_crosswalk_
-
-#### Candidate ETHOS token: `ATC//A12//MINERAL_SUPPLEMENTS`
-
-- ETHOS vocab count: 890,010
-- Match kind: `literal`
-- Mapping source: `physionet/mimic-iv-demo:icu/d_items.csv+llm`
-- Inferred source: ATC level 2 class `A12` -- MINERAL SUPPLEMENTS
-- Constituent RxNorm ingredients (127):
-  - 1,2-docosahexanoyl-sn-glycero-3-phosphoserine calcium
-  - 1,2-icosapentoyl-sn-glycero-3-phosphoserine calcium
-  - allantoin calcium pantothenate
-  - aluminum magnesium hydroxide carbonate
-  - aluminum magnesium silicate
-  - calcium
-  - calcium acetate
-  - calcium alginate
-  - calcium aluminosilicate
-  - calcium aluminum borosilicate
-  - calcium amino acid chelate
-  - calcium arsenate
-  - calcium ascorbate
-  - calcium aspartate
-  - calcium bicarbonate
-  - calcium bromide
-  - calcium carbimide
-  - calcium carbonate
-  - calcium carbonate, precipitated
-  - calcium chlorate dihydrate
-  - calcium chloride
-  - calcium citrate
-  - calcium citrate malate
-  - calcium creosotate
-  - calcium fluoride
-  - calcium galactogluconate bromide
-  - calcium glubionate
-  - calcium glucarate
-  - calcium gluceptate
-  - calcium gluconate
-  - ... +97 more
-
-_Found under tier(s): mimic_item_crosswalk_
-
-#### Candidate ETHOS token: `ATC//B05//BLOOD_SUBSTITUTES_AND_PERFUSION_SOLUTIONS`
-
-- ETHOS vocab count: 540,854
-- Match kind: `literal`
-- Mapping source: `physionet/mimic-iv-demo:icu/d_items.csv+llm`
-- Inferred source: ATC level 2 class `B05` -- BLOOD SUBSTITUTES AND PERFUSION SOLUTIONS
-- Constituent RxNorm ingredients (375):
-  - 4-aminomethylbenzoic acid
-  - 6-aminocaproic acid
-  - acetate
-  - acetic acid
-  - acyclovir
-  - alanylglutamine
-  - alatrofloxacin
-  - albendazole
-  - albumin human, USP
-  - alpha tocopherol
-  - aluminum acetotartrate
-  - amcinonide
-  - amdinocillin
-  - amdinocillin pivoxil
-  - amikacin
-  - aminocaproate
-  - ammonium chloride
-  - amoxicillin
-  - amphotericin B
-  - ampicillin
-  - anidulafungin
-  - arbekacin
-  - arginine
-  - artemether
-  - ascorbic acid
-  - atovaquone
-  - azidocillin
-  - azithromycin
-  - azlocillin
-  - aztreonam
-  - ... +345 more
-
-**STATUS:** [ ] approve  [ ] reject  [ ] modify
-
-**NOTES:**
-
-```
-
-```
-
-
----
-
-### <a id="infusion-end227536value-80715879379999"></a>`INFUSION_END//227536//value_[8.071587,9.379999)`
-
-- **Family:** `INFUSION_END`
-- **Mapped tiers:** mimic_item_crosswalk
-
-**Authoritative EQ label:** MIMIC item-id `227536` -- KCl (CRRT) (source: `d_items`)
-- abbreviation: KCl (CRRT)
-- category: Medications
-- unitname: mEq.
-- linksto: inputevents
-- EQ-encoded units: `value_[8.071587,9.379999)`
+**Authoritative EQ label:** ICD-9-CM `7295` -- Pain in limb
+- SNOMED bridge: Pain in limb (concept_id 138525)
+- ICD-10-CM crosswalk (3 codes):
+  - `M79.6` -- Pain in limb, hand, foot, fingers and toes
+  - `M79.60` -- Pain in limb, unspecified
+  - `M79.609` -- Pain in unspecified limb
 
 **LLM rationale (verbatim):**
 
-> Potassium chloride is ATC A12BA01 (mineral supplement). When administered via CRRT it is an electrolyte solution (B05X). We OR both classes since the underlying drug is K+ supplement but the route is CRRT.
+> ICD-10-CM 3-char parent M79 resolved to ETHOS token via ethos_icd_3char_index.
 
-_Found under tier(s): mimic_item_crosswalk_
+_Found under tier(s): icd_crosswalk_
 
-#### Candidate ETHOS token: `ATC//A12//MINERAL_SUPPLEMENTS`
+#### Candidate ETHOS token: `ICD//CM//OTHER_AND_UNSPECIFIED_SOFT_TISSUE_DISORDERS_NOT_ELSEWHERE_CLASSIFIED`
 
-- ETHOS vocab count: 890,010
+- ETHOS vocab count: 12,667
 - Match kind: `literal`
-- Mapping source: `physionet/mimic-iv-demo:icu/d_items.csv+llm`
-- Inferred source: ATC level 2 class `A12` -- MINERAL SUPPLEMENTS
-- Constituent RxNorm ingredients (127):
-  - 1,2-docosahexanoyl-sn-glycero-3-phosphoserine calcium
-  - 1,2-icosapentoyl-sn-glycero-3-phosphoserine calcium
-  - allantoin calcium pantothenate
-  - aluminum magnesium hydroxide carbonate
-  - aluminum magnesium silicate
-  - calcium
-  - calcium acetate
-  - calcium alginate
-  - calcium aluminosilicate
-  - calcium aluminum borosilicate
-  - calcium amino acid chelate
-  - calcium arsenate
-  - calcium ascorbate
-  - calcium aspartate
-  - calcium bicarbonate
-  - calcium bromide
-  - calcium carbimide
-  - calcium carbonate
-  - calcium carbonate, precipitated
-  - calcium chlorate dihydrate
-  - calcium chloride
-  - calcium citrate
-  - calcium citrate malate
-  - calcium creosotate
-  - calcium fluoride
-  - calcium galactogluconate bromide
-  - calcium glubionate
-  - calcium glucarate
-  - calcium gluceptate
-  - calcium gluconate
-  - ... +97 more
-
-_Found under tier(s): mimic_item_crosswalk_
-
-#### Candidate ETHOS token: `ATC//B05//BLOOD_SUBSTITUTES_AND_PERFUSION_SOLUTIONS`
-
-- ETHOS vocab count: 540,854
-- Match kind: `literal`
-- Mapping source: `physionet/mimic-iv-demo:icu/d_items.csv+llm`
-- Inferred source: ATC level 2 class `B05` -- BLOOD SUBSTITUTES AND PERFUSION SOLUTIONS
-- Constituent RxNorm ingredients (375):
-  - 4-aminomethylbenzoic acid
-  - 6-aminocaproic acid
-  - acetate
-  - acetic acid
-  - acyclovir
-  - alanylglutamine
-  - alatrofloxacin
-  - albendazole
-  - albumin human, USP
-  - alpha tocopherol
-  - aluminum acetotartrate
-  - amcinonide
-  - amdinocillin
-  - amdinocillin pivoxil
-  - amikacin
-  - aminocaproate
-  - ammonium chloride
-  - amoxicillin
-  - amphotericin B
-  - ampicillin
-  - anidulafungin
-  - arbekacin
-  - arginine
-  - artemether
-  - ascorbic acid
-  - atovaquone
-  - azidocillin
-  - azithromycin
-  - azlocillin
-  - aztreonam
-  - ... +345 more
+- Mapping source: `deterministic:icd_3char_walker`
+- Inferred source: ICD-10-CM 3-char category `M79` -- Other and unspecified soft tissue disorders, not elsewhere classified
+- Constituent ICD-10-CM codes (65):
+  - `M79.0` -- Rheumatism, unspecified
+  - `M79.1` -- Myalgia
+  - `M79.10` -- Myalgia, unspecified site
+  - `M79.11` -- Myalgia of mastication muscle
+  - `M79.12` -- Myalgia of auxiliary muscles, head and neck
+  - `M79.18` -- Myalgia, other site
+  - `M79.2` -- Neuralgia and neuritis, unspecified
+  - `M79.3` -- Panniculitis, unspecified
+  - `M79.4` -- Hypertrophy of (infrapatellar) fat pad
+  - `M79.5` -- Residual foreign body in soft tissue
+  - `M79.6` -- Pain in limb, hand, foot, fingers and toes
+  - `M79.60` -- Pain in limb, unspecified
+  - `M79.601` -- Pain in right arm
+  - `M79.602` -- Pain in left arm
+  - `M79.603` -- Pain in arm, unspecified
+  - `M79.604` -- Pain in right leg
+  - `M79.605` -- Pain in left leg
+  - `M79.606` -- Pain in leg, unspecified
+  - `M79.609` -- Pain in unspecified limb
+  - `M79.62` -- Pain in upper arm
+  - `M79.621` -- Pain in right upper arm
+  - `M79.622` -- Pain in left upper arm
+  - `M79.629` -- Pain in unspecified upper arm
+  - `M79.63` -- Pain in forearm
+  - `M79.631` -- Pain in right forearm
+  - `M79.632` -- Pain in left forearm
+  - `M79.639` -- Pain in unspecified forearm
+  - `M79.64` -- Pain in hand and fingers
+  - `M79.641` -- Pain in right hand
+  - `M79.642` -- Pain in left hand
+  - ... +35 more
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -485,7 +335,7 @@ _Found under tier(s): mimic_item_crosswalk_
 
 **LLM rationale (verbatim):**
 
-> Dexmedetomidine is ATC N05CM18 (other hypnotics/sedatives); rolled up to N05 (psycholeptics) which is the broadest sedative/anxiolytic class.
+> Dexmedetomidine is a sedative agent used for procedural sedation and ICU sedation. It falls under ATC class N05 (psycholeptics/sedatives), which is the most semantically appropriate match in the ETHOS vocabulary for this alpha-2 agonist sedative medication.
 
 _Found under tier(s): mimic_item_crosswalk_
 
@@ -493,7 +343,7 @@ _Found under tier(s): mimic_item_crosswalk_
 
 - ETHOS vocab count: 908,963
 - Match kind: `literal`
-- Mapping source: `physionet/mimic-iv-demo:icu/d_items.csv+llm`
+- Mapping source: `llm:infusion_walker_unresolved`
 - Inferred source: ATC level 2 class `N05` -- PSYCHOLEPTICS
 - Constituent RxNorm ingredients (143):
   - Valeriana officinalis whole extract
@@ -539,73 +389,6 @@ _Found under tier(s): mimic_item_crosswalk_
 
 ---
 
-### <a id="infusion-start220949"></a>`INFUSION_START//220949`
-
-- **Family:** `INFUSION_START`
-- **Mapped tiers:** mimic_item_crosswalk
-
-**Authoritative EQ label:** MIMIC item-id `220949` -- Dextrose 5% (source: `d_items`)
-- abbreviation: Dextrose 5%
-- category: Fluids/Intake
-- unitname: mL
-- linksto: inputevents
-
-**LLM rationale (verbatim):**
-
-> Dextrose 5% is ATC B05BA03 -- IV solution; rolled up to B05.
-
-_Found under tier(s): mimic_item_crosswalk_
-
-#### Candidate ETHOS token: `ATC//B05//BLOOD_SUBSTITUTES_AND_PERFUSION_SOLUTIONS`
-
-- ETHOS vocab count: 540,854
-- Match kind: `literal`
-- Mapping source: `physionet/mimic-iv-demo:icu/d_items.csv+llm`
-- Inferred source: ATC level 2 class `B05` -- BLOOD SUBSTITUTES AND PERFUSION SOLUTIONS
-- Constituent RxNorm ingredients (375):
-  - 4-aminomethylbenzoic acid
-  - 6-aminocaproic acid
-  - acetate
-  - acetic acid
-  - acyclovir
-  - alanylglutamine
-  - alatrofloxacin
-  - albendazole
-  - albumin human, USP
-  - alpha tocopherol
-  - aluminum acetotartrate
-  - amcinonide
-  - amdinocillin
-  - amdinocillin pivoxil
-  - amikacin
-  - aminocaproate
-  - ammonium chloride
-  - amoxicillin
-  - amphotericin B
-  - ampicillin
-  - anidulafungin
-  - arbekacin
-  - arginine
-  - artemether
-  - ascorbic acid
-  - atovaquone
-  - azidocillin
-  - azithromycin
-  - azlocillin
-  - aztreonam
-  - ... +345 more
-
-**STATUS:** [ ] approve  [ ] reject  [ ] modify
-
-**NOTES:**
-
-```
-
-```
-
-
----
-
 ### <a id="infusion-start221794value-800492610000001"></a>`INFUSION_START//221794//value_[8.004926,10.000001)`
 
 - **Family:** `INFUSION_START`
@@ -620,7 +403,7 @@ _Found under tier(s): mimic_item_crosswalk_
 
 **LLM rationale (verbatim):**
 
-> Furosemide is ATC C03CA01 (diuretic); rolled up to C03.
+> RxNorm ingredient 'furosemide' walks to ATC C03 via OHDSI CONCEPT_ANCESTOR.
 
 _Found under tier(s): mimic_item_crosswalk_
 
@@ -628,7 +411,7 @@ _Found under tier(s): mimic_item_crosswalk_
 
 - ETHOS vocab count: 612,787
 - Match kind: `literal`
-- Mapping source: `physionet/mimic-iv-demo:icu/d_items.csv+llm`
+- Mapping source: `deterministic:atc_ancestor_walker`
 - Inferred source: ATC level 2 class `C03` -- DIURETICS
 - Constituent RxNorm ingredients (35):
   - althiazide
@@ -662,74 +445,6 @@ _Found under tier(s): mimic_item_crosswalk_
   - spironolactone
   - theobromine
   - ... +5 more
-
-**STATUS:** [ ] approve  [ ] reject  [ ] modify
-
-**NOTES:**
-
-```
-
-```
-
-
----
-
-### <a id="infusion-start225168value-284029663500"></a>`INFUSION_START//225168//value_[284.02966,350.0)`
-
-- **Family:** `INFUSION_START`
-- **Mapped tiers:** mimic_item_crosswalk
-
-**Authoritative EQ label:** MIMIC item-id `225168` -- Packed Red Blood Cells (source: `d_items`)
-- abbreviation: PRBC's
-- category: Blood Products/Colloids
-- unitname: mL
-- linksto: inputevents
-- EQ-encoded units: `value_[284.02966,350.0)`
-
-**LLM rationale (verbatim):**
-
-> PRBC transfusion belongs to ATC B05A (blood substitutes); B05 class.
-
-_Found under tier(s): mimic_item_crosswalk_
-
-#### Candidate ETHOS token: `ATC//B05//BLOOD_SUBSTITUTES_AND_PERFUSION_SOLUTIONS`
-
-- ETHOS vocab count: 540,854
-- Match kind: `literal`
-- Mapping source: `physionet/mimic-iv-demo:icu/d_items.csv+llm`
-- Inferred source: ATC level 2 class `B05` -- BLOOD SUBSTITUTES AND PERFUSION SOLUTIONS
-- Constituent RxNorm ingredients (375):
-  - 4-aminomethylbenzoic acid
-  - 6-aminocaproic acid
-  - acetate
-  - acetic acid
-  - acyclovir
-  - alanylglutamine
-  - alatrofloxacin
-  - albendazole
-  - albumin human, USP
-  - alpha tocopherol
-  - aluminum acetotartrate
-  - amcinonide
-  - amdinocillin
-  - amdinocillin pivoxil
-  - amikacin
-  - aminocaproate
-  - ammonium chloride
-  - amoxicillin
-  - amphotericin B
-  - ampicillin
-  - anidulafungin
-  - arbekacin
-  - arginine
-  - artemether
-  - ascorbic acid
-  - atovaquone
-  - azidocillin
-  - azithromycin
-  - azlocillin
-  - aztreonam
-  - ... +345 more
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -887,49 +602,6 @@ _Found under tier(s): quantile_
 
 ---
 
-### <a id="lab226499mlvalue-31500inf"></a>`LAB//226499//mL//value_[3150.0,inf)`
-
-- **Family:** `LAB`
-- **Mapped tiers:** mimic_item_crosswalk
-
-**Authoritative EQ label:** MIMIC item-id `226499` -- Hemodialysis Output (source: `d_items`)
-- abbreviation: Hemodialysis Output
-- category: Dialysis
-- unitname: mL
-- linksto: chartevents
-- EQ-encoded units: `mL`
-
-**LLM rationale (verbatim):**
-
-> Hemodialysis-output measurement happens during dialysis encounters; we proxy via the dialysis encounter (ICD-10-CM Z49). The previously-OR'd CHRONIC_KIDNEY_DISEASE_(CKD) was dropped during precision review -- it includes all CKD stages (1-5) so any patient with mild CKD triggers it, but the EQ measurement only happens during active dialysis.
-
-_Found under tier(s): mimic_item_crosswalk_
-
-#### Candidate ETHOS token: `ICD//CM//ENCOUNTER_FOR_CARE_INVOLVING_RENAL_DIALYSIS`
-
-- ETHOS vocab count: 70
-- Match kind: `literal`
-- Mapping source: `physionet/mimic-iv-demo:icu/d_items.csv+llm`
-- Inferred source: ICD-10-CM 3-char category `Z49` -- Encounter for care involving renal dialysis
-- Constituent ICD-10-CM codes (6):
-  - `Z49.0` -- Preparatory care for renal dialysis
-  - `Z49.01` -- Encounter for fitting and adjustment of extracorporeal dialysis catheter
-  - `Z49.02` -- Encounter for fitting and adjustment of peritoneal dialysis catheter
-  - `Z49.3` -- Encounter for adequacy testing for dialysis
-  - `Z49.31` -- Encounter for adequacy testing for hemodialysis
-  - `Z49.32` -- Encounter for adequacy testing for peritoneal dialysis
-
-**STATUS:** [ ] approve  [ ] reject  [ ] modify
-
-**NOTES:**
-
-```
-
-```
-
-
----
-
 ### <a id="lab227073meqlvalue-170190"></a>`LAB//227073//mEq/L//value_[17.0,19.0)`
 
 - **Family:** `LAB`
@@ -976,7 +648,7 @@ _Found under tier(s): drop_bin_
 
 **LLM rationale (verbatim):**
 
-> Pressure-ulcer length measurement is recorded for patients who already have a pressure ulcer; this is the underlying ICD diagnosis.
+> The EQ code explicitly measures the length of pressure ulcer #2, making it a direct measurement related to pressure ulcers. The ICD-10-CM code L89 for Pressure Ulcer is the most semantically specific and faithful match among the candidates.
 
 _Found under tier(s): mimic_item_crosswalk_
 
@@ -984,7 +656,7 @@ _Found under tier(s): mimic_item_crosswalk_
 
 - ETHOS vocab count: 11,617
 - Match kind: `literal`
-- Mapping source: `physionet/mimic-iv-demo:icu/d_items.csv+llm`
+- Mapping source: `llm:orphan_lab`
 - Inferred source: ICD-10-CM 3-char category `L89` -- Pressure ulcer
 - Constituent ICD-10-CM codes (207):
   - `L89.0` -- Pressure ulcer of elbow
@@ -1082,7 +754,7 @@ _Found under tier(s): quantile_
 
 **LLM rationale (verbatim):**
 
-> Carbidopa-Levodopa is ATC N04BA02; rolling up to N04 class.
+> RxNorm ingredient 'levodopa' walks to ATC N04 via OHDSI CONCEPT_ANCESTOR.
 
 _Found under tier(s): atc_crosswalk_
 
@@ -1090,7 +762,7 @@ _Found under tier(s): atc_crosswalk_
 
 - ETHOS vocab count: 162,103
 - Match kind: `literal`
-- Mapping source: `llm:claude_clinical_knowledge`
+- Mapping source: `deterministic:atc_ancestor_walker`
 - Inferred source: ATC level 2 class `N04` -- ANTI-PARKINSON DRUGS
 - Constituent RxNorm ingredients (32):
   - amantadine
@@ -1149,7 +821,48 @@ _Found under tier(s): atc_crosswalk_
 
 **LLM rationale (verbatim):**
 
-> Gabapentin is ATC N03AX12; rolling up to N03 class.
+> RxNorm ingredient 'gabapentin' (concept_id=797399) sits in two distinct ATC chains; both are committed since they reflect the same source concept.
+
+_Found under tier(s): atc_crosswalk_
+
+#### Candidate ETHOS token: `ATC//N02//ANALGESICS`
+
+- ETHOS vocab count: 5,128,410
+- Match kind: `literal`
+- Mapping source: `deterministic:atc_same_source_concept_tie`
+- Inferred source: ATC level 2 class `N02` -- ANALGESICS
+- Constituent RxNorm ingredients (81):
+  - acetaminophen
+  - almotriptan
+  - aloxiprin
+  - aminopyrine
+  - antipyrine
+  - aspirin
+  - atogepant
+  - benorilate
+  - buprenorphine
+  - butorphanol
+  - cannabidiol
+  - cannabigerol
+  - cannabigerolate
+  - cannabinol
+  - choline
+  - clonidine
+  - codeine
+  - dextromoramide
+  - dezocine
+  - diflunisal
+  - dihydrocodeine
+  - dihydroergotamine
+  - dipyrone
+  - dronabinol
+  - eletriptan
+  - eptinezumab
+  - erenumab
+  - ergotamine
+  - ethenzamide
+  - fentanyl
+  - ... +51 more
 
 _Found under tier(s): atc_crosswalk_
 
@@ -1157,7 +870,7 @@ _Found under tier(s): atc_crosswalk_
 
 - ETHOS vocab count: 1,322,698
 - Match kind: `literal`
-- Mapping source: `llm:claude_clinical_knowledge`
+- Mapping source: `deterministic:atc_same_source_concept_tie`
 - Inferred source: ATC level 2 class `N03` -- ANTIEPILEPTICS
 - Constituent RxNorm ingredients (45):
   - aminobutyrate
@@ -1216,48 +929,7 @@ _Found under tier(s): atc_crosswalk_
 
 **LLM rationale (verbatim):**
 
-> Mupirocin nasal is ATC R01AX06; the same active ingredient as topical D06AX09. We OR both since either nasal or dermatological tokens could reasonably reflect the medication being administered.
-
-_Found under tier(s): atc_crosswalk_
-
-#### Candidate ETHOS token: `ATC//D06//ANTIBIOTICS_AND_CHEMOTHERAPEUTICS_FOR_DERMATOLOGICAL_USE`
-
-- ETHOS vocab count: 294,768
-- Match kind: `literal`
-- Mapping source: `llm:claude_clinical_knowledge`
-- Inferred source: ATC level 2 class `D06` -- ANTIBIOTICS AND CHEMOTHERAPEUTICS FOR DERMATOLOGICAL USE
-- Constituent RxNorm ingredients (40):
-  - acyclovir
-  - amikacin
-  - bacitracin
-  - bacitracin methylene disalicylate
-  - berdazimer
-  - chloramphenicol
-  - chlortetracycline
-  - demeclocycline
-  - docosanol
-  - edoxudine
-  - fusidate
-  - gentamicin
-  - idoxuridine
-  - imiquimod
-  - ingenol mebutate
-  - inosine
-  - lysozyme
-  - mafenide
-  - metronidazole
-  - mupirocin
-  - neomycin
-  - oxytetracycline
-  - ozenoxacin
-  - penciclovir
-  - podofilox
-  - retapamulin
-  - rifamycin SV
-  - rifamycins
-  - rifaximin
-  - silver sulfadiazine
-  - ... +10 more
+> Mupirocin Nasal Ointment 2% is specifically formulated for nasal application, making R01 (Nasal Preparations) the most semantically specific match. While mupirocin is an antibiotic that could fall under D06 for dermatological use, the nasal formulation and route of administration makes R01 the most faithful representation of this specific product.
 
 _Found under tier(s): atc_crosswalk_
 
@@ -1265,7 +937,7 @@ _Found under tier(s): atc_crosswalk_
 
 - ETHOS vocab count: 125,895
 - Match kind: `literal`
-- Mapping source: `llm:claude_clinical_knowledge`
+- Mapping source: `llm:atc_multi_chain`
 - Inferred source: ATC level 2 class `R01` -- NASAL PREPARATIONS
 - Constituent RxNorm ingredients (43):
   - all-trans-retinol
@@ -1324,7 +996,7 @@ _Found under tier(s): atc_crosswalk_
 
 **LLM rationale (verbatim):**
 
-> Captopril is ATC C09AA01; rolling up to C09 class.
+> RxNorm ingredient 'captopril' walks to ATC C09 via OHDSI CONCEPT_ANCESTOR.
 
 _Found under tier(s): atc_crosswalk_
 
@@ -1332,7 +1004,7 @@ _Found under tier(s): atc_crosswalk_
 
 - ETHOS vocab count: 285,699
 - Match kind: `literal`
-- Mapping source: `llm:claude_clinical_knowledge`
+- Mapping source: `deterministic:atc_ancestor_walker`
 - Inferred source: ATC level 2 class `C09` -- AGENTS ACTING ON THE RENIN-ANGIOTENSIN SYSTEM
 - Constituent RxNorm ingredients (25):
   - aliskiren
@@ -1382,7 +1054,7 @@ _Found under tier(s): atc_crosswalk_
 
 **LLM rationale (verbatim):**
 
-> Doxycycline is ATC J01AA02; rolling up to J01 class.
+> LLM proposed 'ATC//J01//ANTIBACTERIALS_FOR_SYSTEMIC_USE'; salvaged to canonical ETHOS token 'ATC//J01//ANTIBIOTICS_AND_ANTIBACTERIALS_FOR_SYSTEMIC_USE' via unique namespace-prefix match. Original rationale: Doxycycline hyclate is a tetracycline antibiotic used systemically for bacterial infections. The ATC level-3 class J01 (Antibacterials for Systemic Use) is the most semantically appropriate match, as ETHOS tokens do not appear to include specific drug ingredients or brand formulations, only therapeutic drug classes.
 
 _Found under tier(s): atc_crosswalk_
 
@@ -1390,7 +1062,7 @@ _Found under tier(s): atc_crosswalk_
 
 - ETHOS vocab count: 2,103,569
 - Match kind: `literal`
-- Mapping source: `llm:claude_clinical_knowledge`
+- Mapping source: `llm:medication_walker_unresolved`
 - Inferred source: ATC level 2 class `J01` -- ANTIBACTERIALS FOR SYSTEMIC USE
 - Constituent RxNorm ingredients (187):
   - amdinocillin
@@ -1472,48 +1144,48 @@ _Found under tier(s): exact_
 
 **LLM rationale (verbatim):**
 
-> ETHOS uses chunked ICD-PCS tokens that don't carry procedure semantics directly. We map this procedure to the underlying fracture diagnosis as a proxy: predicting the fracture diagnosis is a reasonable proxy for the reduction procedure. The previously-OR'd FRACTURE_OF_LOWER_LEG_INCLUDING_ANKLE was dropped during precision review since it covers different anatomy than the foot-bone procedure. Mapping is still loose -- AUC interpretation should reflect that we're predicting the indication, not the procedure itself.
+> The EQ code describes a procedure for open reduction with internal fixation of tibia and fibula fractures. The tibia and fibula are the two bones of the lower leg, which directly corresponds to the ETHOS token for fractures of the lower leg including ankle (S82).
 
 _Found under tier(s): icd_crosswalk_
 
-#### Candidate ETHOS token: `ICD//CM//FRACTURE_OF_FOOT_AND_TOE_EXCEPT_ANKLE`
+#### Candidate ETHOS token: `ICD//CM//FRACTURE_OF_LOWER_LEG_INCLUDING_ANKLE`
 
-- ETHOS vocab count: 1,544
+- ETHOS vocab count: 4,413
 - Match kind: `literal`
-- Mapping source: `llm:claude_clinical_knowledge`
-- Inferred source: ICD-10-CM 3-char category `S92` -- Fracture of foot and toe, except ankle
-- Constituent ICD-10-CM codes (1630):
-  - `S92.0` -- Fracture of calcaneus
-  - `S92.00` -- Unspecified fracture of calcaneus
-  - `S92.001` -- Unspecified fracture of right calcaneus
-  - `S92.001A` -- Unspecified fracture of right calcaneus, initial encounter for closed fracture
-  - `S92.001B` -- Unspecified fracture of right calcaneus, initial encounter for open fracture
-  - `S92.001D` -- Unspecified fracture of right calcaneus, subsequent encounter for fracture with routine healing
-  - `S92.001G` -- Unspecified fracture of right calcaneus, subsequent encounter for fracture with delayed healing
-  - `S92.001K` -- Unspecified fracture of right calcaneus, subsequent encounter for fracture with nonunion
-  - `S92.001P` -- Unspecified fracture of right calcaneus, subsequent encounter for fracture with malunion
-  - `S92.001S` -- Unspecified fracture of right calcaneus, sequela
-  - `S92.002` -- Unspecified fracture of left calcaneus
-  - `S92.002A` -- Unspecified fracture of left calcaneus, initial encounter for closed fracture
-  - `S92.002B` -- Unspecified fracture of left calcaneus, initial encounter for open fracture
-  - `S92.002D` -- Unspecified fracture of left calcaneus, subsequent encounter for fracture with routine healing
-  - `S92.002G` -- Unspecified fracture of left calcaneus, subsequent encounter for fracture with delayed healing
-  - `S92.002K` -- Unspecified fracture of left calcaneus, subsequent encounter for fracture with nonunion
-  - `S92.002P` -- Unspecified fracture of left calcaneus, subsequent encounter for fracture with malunion
-  - `S92.002S` -- Unspecified fracture of left calcaneus, sequela
-  - `S92.009` -- Unspecified fracture of unspecified calcaneus
-  - `S92.009A` -- Unspecified fracture of unspecified calcaneus, initial encounter for closed fracture
-  - `S92.009B` -- Unspecified fracture of unspecified calcaneus, initial encounter for open fracture
-  - `S92.009D` -- Unspecified fracture of unspecified calcaneus, subsequent encounter for fracture with routine healing
-  - `S92.009G` -- Unspecified fracture of unspecified calcaneus, subsequent encounter for fracture with delayed healing
-  - `S92.009K` -- Unspecified fracture of unspecified calcaneus, subsequent encounter for fracture with nonunion
-  - `S92.009P` -- Unspecified fracture of unspecified calcaneus, subsequent encounter for fracture with malunion
-  - `S92.009S` -- Unspecified fracture of unspecified calcaneus, sequela
-  - `S92.01` -- Fracture of body of calcaneus
-  - `S92.011` -- Displaced fracture of body of right calcaneus
-  - `S92.011A` -- Displaced fracture of body of right calcaneus, initial encounter for closed fracture
-  - `S92.011B` -- Displaced fracture of body of right calcaneus, initial encounter for open fracture
-  - ... +1600 more
+- Mapping source: `llm:no_pcs_tokens_in_ethos`
+- Inferred source: ICD-10-CM 3-char category `S82` -- Fracture of lower leg, including ankle
+- Constituent ICD-10-CM codes (3345):
+  - `S82.0` -- Fracture of patella
+  - `S82.00` -- Unspecified fracture of patella
+  - `S82.001` -- Unspecified fracture of right patella
+  - `S82.001A` -- Unspecified fracture of right patella, initial encounter for closed fracture
+  - `S82.001B` -- Unspecified fracture of right patella, initial encounter for open fracture type I or II
+  - `S82.001C` -- Unspecified fracture of right patella, initial encounter for open fracture type IIIA, IIIB, or IIIC
+  - `S82.001D` -- Unspecified fracture of right patella, subsequent encounter for closed fracture with routine healing
+  - `S82.001E` -- Unspecified fracture of right patella, subsequent encounter for open fracture type I or II with routine healing
+  - `S82.001F` -- Unspecified fracture of right patella, subsequent encounter for open fracture type IIIA, IIIB, or IIIC with routine healing
+  - `S82.001G` -- Unspecified fracture of right patella, subsequent encounter for closed fracture with delayed healing
+  - `S82.001H` -- Unspecified fracture of right patella, subsequent encounter for open fracture type I or II with delayed healing
+  - `S82.001J` -- Unspecified fracture of right patella, subsequent encounter for open fracture type IIIA, IIIB, or IIIC with delayed healing
+  - `S82.001K` -- Unspecified fracture of right patella, subsequent encounter for closed fracture with nonunion
+  - `S82.001M` -- Unspecified fracture of right patella, subsequent encounter for open fracture type I or II with nonunion
+  - `S82.001N` -- Unspecified fracture of right patella, subsequent encounter for open fracture type IIIA, IIIB, or IIIC with nonunion
+  - `S82.001P` -- Unspecified fracture of right patella, subsequent encounter for closed fracture with malunion
+  - `S82.001Q` -- Unspecified fracture of right patella, subsequent encounter for open fracture type I or II with malunion
+  - `S82.001R` -- Unspecified fracture of right patella, subsequent encounter for open fracture type IIIA, IIIB, or IIIC with malunion
+  - `S82.001S` -- Unspecified fracture of right patella, sequela
+  - `S82.002` -- Unspecified fracture of left patella
+  - `S82.002A` -- Unspecified fracture of left patella, initial encounter for closed fracture
+  - `S82.002B` -- Unspecified fracture of left patella, initial encounter for open fracture type I or II
+  - `S82.002C` -- Unspecified fracture of left patella, initial encounter for open fracture type IIIA, IIIB, or IIIC
+  - `S82.002D` -- Unspecified fracture of left patella, subsequent encounter for closed fracture with routine healing
+  - `S82.002E` -- Unspecified fracture of left patella, subsequent encounter for open fracture type I or II with routine healing
+  - `S82.002F` -- Unspecified fracture of left patella, subsequent encounter for open fracture type IIIA, IIIB, or IIIC with routine healing
+  - `S82.002G` -- Unspecified fracture of left patella, subsequent encounter for closed fracture with delayed healing
+  - `S82.002H` -- Unspecified fracture of left patella, subsequent encounter for open fracture type I or II with delayed healing
+  - `S82.002J` -- Unspecified fracture of left patella, subsequent encounter for open fracture type IIIA, IIIB, or IIIC with delayed healing
+  - `S82.002K` -- Unspecified fracture of left patella, subsequent encounter for closed fracture with nonunion
+  - ... +3315 more
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -1535,7 +1207,7 @@ _Found under tier(s): icd_crosswalk_
 
 **LLM rationale (verbatim):**
 
-> EQ's TIMELINE//START fires at the first event of a patient's record. Token frequencies match closely (EQ n=200,773 / ETHOS n=297,949), and ETHOS uses HOSPITAL_ADMISSION as its admission marker.
+> EQ's TIMELINE//START fires at the first event of a patient's record; ETHOS uses HOSPITAL_ADMISSION as its admission marker.
 
 _Found under tier(s): mimic_item_crosswalk_
 
@@ -1557,24 +1229,113 @@ _Found under tier(s): mimic_item_crosswalk_
 
 ---
 
-### <a id="diagnosisicd97295"></a>`DIAGNOSIS//ICD//9//7295` _(unmapped)_
+### <a id="infusion-end227536value-6058071587"></a>`INFUSION_END//227536//value_[6.05,8.071587)` _(unmapped)_
 
-- **Family:** `DIAGNOSIS`
+- **Family:** `INFUSION_END`
 - **Mapped tiers:** (none)
 
-**Authoritative EQ label:** ICD-9-CM `7295` -- Pain in limb
-- SNOMED bridge: Pain in limb (concept_id 138525)
-- ICD-10-CM crosswalk (3 codes):
-  - `M79.6` -- Pain in limb, hand, foot, fingers and toes
-  - `M79.60` -- Pain in limb, unspecified
-  - `M79.609` -- Pain in unspecified limb
+**Authoritative EQ label:** MIMIC item-id `227536` -- KCl (CRRT) (source: `d_items`)
+- abbreviation: KCl (CRRT)
+- category: Medications
+- unitname: mEq.
+- linksto: inputevents
+- EQ-encoded units: `value_[6.05,8.071587)`
 
-**Unmapped reason (from mapping_coverage):** `ethos_token_missing/diagnosis_uses_descriptive_label_not_icd_code`
+**Unmapped reason (from mapping_coverage):** `ethos_token_missing/no_infusion_prefix_in_vocab`
 
 **YAML rationale (`crosswalks/mimic_items.yaml`):**
 
-- description: Pain in soft tissues of limb (ICD-9 729.5)
-- reason: ETHOS has no specific limb-pain or musculoskeletal-pain ICD-10-CM 3-char category. The previously-proposed proxies OTHER_DISORDERS_OF_MUSCLE (M62, generic muscle disorder grab-bag) and PAIN_NOT_ELSEWHERE_CLASSIFIED (R52, unspecified pain) were dropped during precision review -- both overshoot to unrelated conditions and neither captures the limb-specific clinical concept.
+- description: KCl (CRRT) (MIMIC item 227536)
+- reason: LLM proposed 'LAB//227536//mEq/L' which is not in the ETHOS vocab; original rationale: This represents a potassium chloride (KCl) measurement during continuous renal replacement therapy (CRRT), which is a laboratory value. The MIMIC item 227536 corresponds to a serum potassium lab result, typically measured in mEq/L, making it appropriately mapped to the LAB namespace with the same identifier.
+
+**STATUS:** [ ] confirm no ETHOS counterpart  [ ] propose a candidate (notes below)
+
+**NOTES:**
+
+```
+
+```
+
+
+---
+
+### <a id="infusion-end227536value-80715879379999"></a>`INFUSION_END//227536//value_[8.071587,9.379999)` _(unmapped)_
+
+- **Family:** `INFUSION_END`
+- **Mapped tiers:** (none)
+
+**Authoritative EQ label:** MIMIC item-id `227536` -- KCl (CRRT) (source: `d_items`)
+- abbreviation: KCl (CRRT)
+- category: Medications
+- unitname: mEq.
+- linksto: inputevents
+- EQ-encoded units: `value_[8.071587,9.379999)`
+
+**Unmapped reason (from mapping_coverage):** `ethos_token_missing/no_infusion_prefix_in_vocab`
+
+**YAML rationale (`crosswalks/mimic_items.yaml`):**
+
+- description: KCl (CRRT) (MIMIC item 227536)
+- reason: LLM proposed 'LAB//227536//mEq/L' which is not in the ETHOS vocab; original rationale: This represents a potassium chloride (KCl) infusion measurement during continuous renal replacement therapy (CRRT), which is a laboratory value tracking serum potassium levels. The value range [8.071587,9.379999) appears to represent potassium concentration in mEq/L, making this appropriately mapped to a LAB token with the MIMIC item ID and standard potassium units.
+
+**STATUS:** [ ] confirm no ETHOS counterpart  [ ] propose a candidate (notes below)
+
+**NOTES:**
+
+```
+
+```
+
+
+---
+
+### <a id="infusion-start220949"></a>`INFUSION_START//220949` _(unmapped)_
+
+- **Family:** `INFUSION_START`
+- **Mapped tiers:** (none)
+
+**Authoritative EQ label:** MIMIC item-id `220949` -- Dextrose 5% (source: `d_items`)
+- abbreviation: Dextrose 5%
+- category: Fluids/Intake
+- unitname: mL
+- linksto: inputevents
+
+**Unmapped reason (from mapping_coverage):** `ethos_token_missing/no_infusion_prefix_in_vocab`
+
+**YAML rationale (`crosswalks/mimic_items.yaml`):**
+
+- description: Dextrose 5% (MIMIC item 220949)
+- reason: Dextrose 5% is an intravenous fluid used for hydration and as a vehicle for medication delivery, not a therapeutic drug class. The ETHOS vocabulary includes ATC drug classes for pharmacologically active medications, but D5W is a basic crystalloid solution without a specific therapeutic indication that would map to ICD diagnosis categories, ATC drug classes, or procedure codes.
+
+**STATUS:** [ ] confirm no ETHOS counterpart  [ ] propose a candidate (notes below)
+
+**NOTES:**
+
+```
+
+```
+
+
+---
+
+### <a id="infusion-start225168value-284029663500"></a>`INFUSION_START//225168//value_[284.02966,350.0)` _(unmapped)_
+
+- **Family:** `INFUSION_START`
+- **Mapped tiers:** (none)
+
+**Authoritative EQ label:** MIMIC item-id `225168` -- Packed Red Blood Cells (source: `d_items`)
+- abbreviation: PRBC's
+- category: Blood Products/Colloids
+- unitname: mL
+- linksto: inputevents
+- EQ-encoded units: `value_[284.02966,350.0)`
+
+**Unmapped reason (from mapping_coverage):** `ethos_token_missing/no_infusion_prefix_in_vocab`
+
+**YAML rationale (`crosswalks/mimic_items.yaml`):**
+
+- description: Packed Red Blood Cells (MIMIC item 225168)
+- reason: Packed Red Blood Cells are actual blood products (whole blood components), not blood substitutes or perfusion solutions. The ATC B05 category explicitly covers substitutes and solutions used in place of blood, whereas PRBCs are the real biological product itself, making this mapping semantically incorrect.
 
 **STATUS:** [ ] confirm no ETHOS counterpart  [ ] propose a candidate (notes below)
 
@@ -1601,7 +1362,10 @@ _Found under tier(s): mimic_item_crosswalk_
 
 **Unmapped reason (from mapping_coverage):** `value_bin_or_units_unmatched`
 
-_No `unmappable_with_rationale` entry in `crosswalks/mimic_items.yaml`._
+**YAML rationale (`crosswalks/mimic_items.yaml`):**
+
+- description: CO2 production (MIMIC LAB 220245, units=ml/min)
+- reason: LLM proposed 'LAB//220245//ml/min' which is not in the ETHOS vocab; original rationale: CO2 production is a specific laboratory measurement from MIMIC (lab ID 220245) measured in ml/min, typically obtained during metabolic or respiratory monitoring. This maps directly to the LAB namespace using the MIMIC identifier and units structure.
 
 **STATUS:** [ ] confirm no ETHOS counterpart  [ ] propose a candidate (notes below)
 
@@ -1630,8 +1394,8 @@ _No `unmappable_with_rationale` entry in `crosswalks/mimic_items.yaml`._
 
 **YAML rationale (`crosswalks/mimic_items.yaml`):**
 
-- description: PCA total dose (patient-controlled analgesia), low-dose bin
-- reason: The specific bin [-inf, 0.12) represents very low / no PCA dose -- which is the OPPOSITE of an analgesic-administration event. Mapping to ATC//N02//ANALGESICS would invert the AUROC. No reliable ETHOS counterpart.
+- description: PCA total dose (MIMIC LAB 224665, units=UNK)
+- reason: PCA (Patient-Controlled Analgesia) total dose is a cumulative medication administration metric, not a laboratory measurement. This represents a nursing/pharmacy documentation value tracking opioid delivery rather than a biological specimen analysis, so it does not fit the LAB namespace which is reserved for actual laboratory test results.
 
 **STATUS:** [ ] confirm no ETHOS counterpart  [ ] propose a candidate (notes below)
 
@@ -1658,7 +1422,10 @@ _No `unmappable_with_rationale` entry in `crosswalks/mimic_items.yaml`._
 
 **Unmapped reason (from mapping_coverage):** `value_bin_or_units_unmatched`
 
-_No `unmappable_with_rationale` entry in `crosswalks/mimic_items.yaml`._
+**YAML rationale (`crosswalks/mimic_items.yaml`):**
+
+- description: Differential-Eos (MIMIC LAB 225640, units=%)
+- reason: LLM proposed 'LAB//225640//%' which is not in the ETHOS vocab; original rationale: This represents eosinophil percentage from a differential white blood cell count, a standard laboratory test. The ETHOS LAB namespace includes MIMIC lab IDs with units, and this matches the structure LAB//<MIMIC-id>//<UNITS> where 225640 is the MIMIC identifier and % is the unit of measurement.
 
 **STATUS:** [ ] confirm no ETHOS counterpart  [ ] propose a candidate (notes below)
 
@@ -1685,7 +1452,40 @@ _No `unmappable_with_rationale` entry in `crosswalks/mimic_items.yaml`._
 
 **Unmapped reason (from mapping_coverage):** `value_bin_or_units_unmatched`
 
-_No `unmappable_with_rationale` entry in `crosswalks/mimic_items.yaml`._
+**YAML rationale (`crosswalks/mimic_items.yaml`):**
+
+- description: Lipase (MIMIC LAB 225672, units=IU/L)
+- reason: LLM proposed 'LAB//225672//IU/L' which is not in the ETHOS vocab; original rationale: This is a lipase laboratory test result from MIMIC (code 225672) measured in IU/L. The ETHOS LAB namespace supports MIMIC lab identifiers with units, making this a direct structural match for the serum lipase measurement.
+
+**STATUS:** [ ] confirm no ETHOS counterpart  [ ] propose a candidate (notes below)
+
+**NOTES:**
+
+```
+
+```
+
+
+---
+
+### <a id="lab226499mlvalue-31500inf"></a>`LAB//226499//mL//value_[3150.0,inf)` _(unmapped)_
+
+- **Family:** `LAB`
+- **Mapped tiers:** (none)
+
+**Authoritative EQ label:** MIMIC item-id `226499` -- Hemodialysis Output (source: `d_items`)
+- abbreviation: Hemodialysis Output
+- category: Dialysis
+- unitname: mL
+- linksto: chartevents
+- EQ-encoded units: `mL`
+
+**Unmapped reason (from mapping_coverage):** `value_bin_or_units_unmatched`
+
+**YAML rationale (`crosswalks/mimic_items.yaml`):**
+
+- description: Hemodialysis Output (MIMIC LAB 226499, units=mL)
+- reason: This EQ code represents a specific numeric range (≥3150 mL) of hemodialysis output volume, which is a binned measurement value rather than the measurement itself. ETHOS LAB tokens represent laboratory or clinical measurements by their LOINC/MIMIC identifiers and units, but do not encode specific numeric thresholds or ranges within the token structure.
 
 **STATUS:** [ ] confirm no ETHOS counterpart  [ ] propose a candidate (notes below)
 
@@ -1714,8 +1514,8 @@ _No `unmappable_with_rationale` entry in `crosswalks/mimic_items.yaml`._
 
 **YAML rationale (`crosswalks/mimic_items.yaml`):**
 
-- description: CK-MB elevated bin (cardiac biomarker, MIMIC chartevents 227445)
-- reason: Removed during precision review. The previously-proposed bridge ACUTE_MYOCARDIAL_INFARCTION is a behavioral proxy (CK-MB elevation correlates with AMI but also with post-cardiac-surgery state, myocarditis, severe renal failure, rhabdomyolysis), not a vocabulary equivalence. Predicting "AMI Dx appears" when "elevated CK-MB measurement appears" yields asymmetric false positives and false negatives depending on cohort composition. No tighter ETHOS token is available; safer to mark unmappable than to score the loose proxy.
+- description: CK-MB (MIMIC LAB 227445, units=ng/mL)
+- reason: LLM proposed 'LAB//227445//ng/mL' which is not in the ETHOS vocab; original rationale: CK-MB (creatine kinase-MB) is a cardiac biomarker measured in ng/mL, commonly used to diagnose myocardial infarction. The ETHOS LAB namespace supports MIMIC lab identifiers with units, making LAB//227445//ng/mL the direct faithful match for this laboratory test.
 
 **STATUS:** [ ] confirm no ETHOS counterpart  [ ] propose a candidate (notes below)
 
@@ -1742,7 +1542,10 @@ _No `unmappable_with_rationale` entry in `crosswalks/mimic_items.yaml`._
 
 **Unmapped reason (from mapping_coverage):** `value_bin_or_units_unmatched`
 
-_No `unmappable_with_rationale` entry in `crosswalks/mimic_items.yaml`._
+**YAML rationale (`crosswalks/mimic_items.yaml`):**
+
+- description: Pinsp (Hamilton) (MIMIC LAB 229663, units=cmH2O)
+- reason: Pinsp (inspiratory pressure) from Hamilton ventilators is a ventilator setting/parameter rather than a traditional laboratory test result. ETHOS LAB tokens are designed for laboratory measurements (chemistry, hematology, etc.), not mechanical ventilation parameters or device settings.
 
 **STATUS:** [ ] confirm no ETHOS counterpart  [ ] propose a candidate (notes below)
 
@@ -1768,7 +1571,10 @@ _No `unmappable_with_rationale` entry in `crosswalks/mimic_items.yaml`._
 
 **Unmapped reason (from mapping_coverage):** `value_bin_or_units_unmatched`
 
-_No `unmappable_with_rationale` entry in `crosswalks/mimic_items.yaml`._
+**YAML rationale (`crosswalks/mimic_items.yaml`):**
+
+- description: CPOT-Vocalization (CPOTa) (MIMIC LAB 229694, units=UNK)
+- reason: CPOT (Critical-Care Pain Observation Tool) Vocalization is a behavioral pain assessment subscale score used in ICU settings, not a laboratory measurement. This is a clinical assessment score rather than a lab value, procedure, diagnosis, or medication, and therefore falls outside the ETHOS vocabulary's defined namespaces.
 
 **STATUS:** [ ] confirm no ETHOS counterpart  [ ] propose a candidate (notes below)
 
@@ -1793,7 +1599,10 @@ _No `unmappable_with_rationale` entry in `crosswalks/mimic_items.yaml`._
 
 **Unmapped reason (from mapping_coverage):** `value_bin_or_units_unmatched`
 
-_No `unmappable_with_rationale` entry in `crosswalks/mimic_items.yaml`._
+**YAML rationale (`crosswalks/mimic_items.yaml`):**
+
+- description: Lithium (MIMIC LAB 50957, units=mmol/L)
+- reason: LLM proposed 'LAB//50957//mmol/L' which is not in the ETHOS vocab; original rationale: This is a lithium level measurement from MIMIC lab code 50957 in mmol/L units. The ETHOS LAB namespace supports structured lab tokens with MIMIC identifiers and units, making this a direct match for the laboratory test regardless of the specific value range.
 
 **STATUS:** [ ] confirm no ETHOS counterpart  [ ] propose a candidate (notes below)
 
@@ -1818,7 +1627,10 @@ _No `unmappable_with_rationale` entry in `crosswalks/mimic_items.yaml`._
 
 **Unmapped reason (from mapping_coverage):** `value_bin_or_units_unmatched`
 
-_No `unmappable_with_rationale` entry in `crosswalks/mimic_items.yaml`._
+**YAML rationale (`crosswalks/mimic_items.yaml`):**
+
+- description: Osmolality, Measured (MIMIC LAB 50964, units=mOsm/kg)
+- reason: LLM proposed 'LAB//50964//mOsm/kg' which is not in the ETHOS vocab; original rationale: This is a direct match for serum/plasma osmolality measured in the laboratory (MIMIC LAB 50964) with units of mOsm/kg. The ETHOS LAB namespace supports MIMIC lab identifiers with their corresponding units, making this a faithful semantic match for the measured osmolality concept.
 
 **STATUS:** [ ] confirm no ETHOS counterpart  [ ] propose a candidate (notes below)
 
@@ -1843,7 +1655,10 @@ _No `unmappable_with_rationale` entry in `crosswalks/mimic_items.yaml`._
 
 **Unmapped reason (from mapping_coverage):** `value_bin_or_units_unmatched`
 
-_No `unmappable_with_rationale` entry in `crosswalks/mimic_items.yaml`._
+**YAML rationale (`crosswalks/mimic_items.yaml`):**
+
+- description: 24 hr Calcium (MIMIC LAB 51066, units=mg/24hr)
+- reason: The EQ code represents a laboratory measurement of 24-hour urinary calcium with values in the range 177.0-216.0 mg/24hr, which is typically within or near normal range. The candidate token refers to dietary calcium deficiency (a diagnosis), which is semantically distinct from a calcium measurement and does not faithfully represent the laboratory test result.
 
 **STATUS:** [ ] confirm no ETHOS counterpart  [ ] propose a candidate (notes below)
 
@@ -1868,7 +1683,10 @@ _No `unmappable_with_rationale` entry in `crosswalks/mimic_items.yaml`._
 
 **Unmapped reason (from mapping_coverage):** `value_bin_or_units_unmatched`
 
-_No `unmappable_with_rationale` entry in `crosswalks/mimic_items.yaml`._
+**YAML rationale (`crosswalks/mimic_items.yaml`):**
+
+- description: RUBIgGV (MIMIC LAB 51769, units=UNK)
+- reason: LLM proposed 'LAB//51769//UNK' which is not in the ETHOS vocab; original rationale: RUBIgGV refers to Rubella IgG antibody levels, a specific laboratory test (MIMIC LAB code 51769). The ETHOS LAB namespace can represent this test with the same MIMIC identifier and unknown units designation, making it a direct semantic match at the test level regardless of the specific value range.
 
 **STATUS:** [ ] confirm no ETHOS counterpart  [ ] propose a candidate (notes below)
 
@@ -1895,7 +1713,10 @@ _No `unmappable_with_rationale` entry in `crosswalks/mimic_items.yaml`._
 
 **Unmapped reason (from mapping_coverage):** `ethos_token_missing/no_fluid_output_prefix_in_vocab`
 
-_No `unmappable_with_rationale` entry in `crosswalks/mimic_items.yaml`._
+**YAML rationale (`crosswalks/mimic_items.yaml`):**
+
+- description: Jackson Pratt #2 (MIMIC SUBJECT_FLUID_OUTPUT 226600, units=mL)
+- reason: The EQ code represents a specific measurement of surgical drain output (Jackson Pratt drain #2, 20-30 mL), which is a procedural fluid output measurement. None of the candidate ETHOS tokens appropriately capture this concept - they refer to disorders of amniotic fluid, cerebrospinal fluid findings, electrolyte imbalances, or intake symptoms, rather than post-surgical drain output measurements.
 
 **STATUS:** [ ] confirm no ETHOS counterpart  [ ] propose a candidate (notes below)
 
@@ -1922,7 +1743,10 @@ _No `unmappable_with_rationale` entry in `crosswalks/mimic_items.yaml`._
 
 **Unmapped reason (from mapping_coverage):** `ethos_token_missing/no_fluid_output_prefix_in_vocab`
 
-_No `unmappable_with_rationale` entry in `crosswalks/mimic_items.yaml`._
+**YAML rationale (`crosswalks/mimic_items.yaml`):**
+
+- description: Jackson Pratt #2 (MIMIC SUBJECT_FLUID_OUTPUT 226600, units=mL)
+- reason: The EQ code represents a specific measurement of surgical drain output (Jackson Pratt drain #2), which is a procedural fluid output measurement. None of the candidate ETHOS tokens appropriately capture this concept - they refer to disorders of amniotic fluid, cerebrospinal fluid findings, electrolyte imbalances, or food/fluid intake symptoms, none of which semantically match a post-surgical drain output measurement.
 
 **STATUS:** [ ] confirm no ETHOS counterpart  [ ] propose a candidate (notes below)
 
@@ -1949,7 +1773,10 @@ _No `unmappable_with_rationale` entry in `crosswalks/mimic_items.yaml`._
 
 **Unmapped reason (from mapping_coverage):** `ethos_token_missing/no_fluid_output_prefix_in_vocab`
 
-_No `unmappable_with_rationale` entry in `crosswalks/mimic_items.yaml`._
+**YAML rationale (`crosswalks/mimic_items.yaml`):**
+
+- description: TF Residual (MIMIC SUBJECT_FLUID_OUTPUT 227510, units=mL)
+- reason: TF Residual refers to tube feeding residual volume, which is a measured output value from enteral feeding tubes used to assess gastric emptying. None of the candidates address enteral/tube feeding measurements; they cover amniotic fluid, cerebrospinal fluid, electrolyte disorders, and general food/fluid intake symptoms, none of which faithfully represent the specific clinical concept of gastric residual volume measurement.
 
 **STATUS:** [ ] confirm no ETHOS counterpart  [ ] propose a candidate (notes below)
 
