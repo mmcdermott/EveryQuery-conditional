@@ -37,6 +37,7 @@ _AR_TRAJ_DIR = "eic/trajectories/medium_seq_1024/7573f855c4b050a9d79d57fefd8a139
 _AR_TRAJ_SHARDS = list(range(20))
 _PREVALENCE_PATH = "held_out_prevalence_7573f855c4b050a9d79d57fefd8a139c.csv"
 _AR_AUC_PATH = "baselines/eic/temporal_auc_results_10000_ID__8db2be6fadf8.parquet"
+_CODES_META_PATH = "meds/MIMIC_MEDS/MEDS_cohort/intermediate/metadata/codes.parquet"
 
 _HERE = Path(__file__).resolve().parent
 _CACHE = Path("/tmp/eq_demo_cache")
@@ -49,8 +50,13 @@ def _pip(*pkgs: str) -> None:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", *pkgs])
 
 
-def setup() -> None:
-    """Install runtime deps, authenticate, and warm caches.
+def setup(subjects: Optional[list[tuple[int, int]]] = None) -> None:
+    """Install runtime deps, authenticate, and pre-fetch all assets.
+
+    If ``subjects`` is provided, the 20 AR trajectory shards are pre-fetched
+    here (filtered to those subject IDs) so ``run_demo()`` and the "Compare
+    models" button do only in-memory lookups + cosmetic sleeps. Otherwise,
+    AR shards are loaded lazily on first use.
 
     Safe to call repeatedly. In Colab it triggers ``google.colab`` interactive
     auth; otherwise it relies on ``gcloud auth application-default login``.
@@ -82,7 +88,63 @@ def setup() -> None:
     )
     _state["tasks"] = _load_tasks()
     _state["itemid_map"] = _load_itemid_map()
-    print(f"Ready. {len(_state['tasks'])} demo tasks loaded.")
+
+    # codes.parquet has authoritative ICD/LOINC descriptions for every code
+    # the model emits — far more complete than the MIMIC mapping CSVs alone.
+    codes_df = _gread_parquet(_CODES_META_PATH)
+    _state["code_desc"] = (
+        codes_df[codes_df["description"].notna()]
+        .set_index("code")["description"]
+        .to_dict()
+    )
+
+    # Pre-fetch and pre-build patient histories + AR trajectories so the
+    # interactive UI never blocks on network I/O.
+    if subjects:
+        _prefetch_for(subjects)
+
+    print(f"Ready. {len(_state['tasks'])} demo tasks, {len(_state['code_desc']):,} code descriptions"
+          f"{f', {len(subjects)} patients pre-fetched' if subjects else ''}.")
+
+
+def _prefetch_for(subjects: list[tuple[int, int]]) -> None:
+    """Eagerly load every patient-level asset so the UI never waits on GCS."""
+    import pyarrow.parquet as pq
+    import pandas as pd
+
+    sids = [s for s, _ in subjects]
+
+    # 1. MEDS held-out events (whole shards — used to be lazy, now eager).
+    print("Loading patient histories...", flush=True)
+    _ = _events_by_subject(sids)
+
+    # 2. Build DemoPatient objects up front.
+    print("Building patient narratives + ground truth...", flush=True)
+    patients = [build_demo_patient(sid, pt_us) for sid, pt_us in subjects]
+    _state["patients"] = patients
+
+    # 3. AR trajectories — 20 shards, predicate-pushdown filtered to demo subjects.
+    print(f"Pre-fetching {len(_AR_TRAJ_SHARDS)} AR trajectory shards (filtered to {len(sids)} subjects)...", flush=True)
+    ar_cache: dict[int, pd.DataFrame] = {}
+    fs = _state["fs"]
+    for shard_idx in _AR_TRAJ_SHARDS:
+        local = _CACHE / f"ar_shard_{shard_idx}.parquet"
+        local.parent.mkdir(parents=True, exist_ok=True)
+        if local.exists():
+            df = pd.read_parquet(local)
+        else:
+            try:
+                with fs.open(f"{_BUCKET}/{_AR_TRAJ_DIR}/{shard_idx}.parquet", "rb") as f:
+                    table = pq.read_table(f, filters=[("subject_id", "in", sids)])
+                df = table.to_pandas()
+            except Exception:
+                full = _gread_parquet(f"{_AR_TRAJ_DIR}/{shard_idx}.parquet")
+                df = full[full["subject_id"].isin(sids)].copy()
+            df.to_parquet(local, index=False)
+        ar_cache[shard_idx] = df
+        print(f"  shard {shard_idx + 1}/{len(_AR_TRAJ_SHARDS)} ({len(df):,} rows)", end="\r", flush=True)
+    print()
+    _state["ar_cache"] = ar_cache
 
 
 def _gread_parquet(path: str):
@@ -179,8 +241,25 @@ def _parse_bin(parts: list[str]) -> str:
     return ""
 
 
+def _strip_value_bin(code: str) -> str:
+    """Strip a trailing ``//value_[lo,hi)`` segment from a MEDS code."""
+    parts = code.split("//")
+    while parts and parts[-1].startswith("value_["):
+        parts.pop()
+    return "//".join(parts)
+
+
 def humanize(code: str) -> str:
-    """Return a clinician-readable rendering of a MEDS code."""
+    """Return a clinician-readable rendering of a MEDS code.
+
+    Lookup order:
+        1. ``codes.parquet``'s ``description`` column (most authoritative —
+           covers ICDs, LOINCs, and MIMIC item descriptions for whatever the
+           model actually emits).
+        2. MIMIC item-id → label map for the itemid in the code, if present.
+        3. Hand-coded ICD tables for the rare items not in #1 or #2.
+        4. Heuristic formatting of the raw MEDS code.
+    """
     if code == "MEDS_DEATH":
         return "Death (in-hospital or out-of-hospital)"
     if code == "MEDS_BIRTH":
@@ -192,35 +271,48 @@ def humanize(code: str) -> str:
     head = parts[0]
     bin_str = _parse_bin(parts)
     item_map: dict = _state.get("itemid_map", {})
+    code_desc: dict = _state.get("code_desc", {})
 
+    # 1. Primary source: full code description from codes.parquet.
+    desc = code_desc.get(code)
+    if desc is None:
+        desc = code_desc.get(_strip_value_bin(code))
+
+    # Nicely format by code family, using the description (if any) as the body.
     if head == "DIAGNOSIS" and len(parts) >= 4 and parts[1] == "ICD":
+        if desc:
+            return f"Diagnosis: {desc}"
         version, dxcode = parts[2], parts[3]
         table = _ICD9_DX if version == "9" else _ICD10_DX if version == "10" else {}
         return f"Diagnosis: {table.get(dxcode, f'ICD-{version} {dxcode}')}"
     if head == "PROCEDURE" and len(parts) >= 4 and parts[1] == "ICD":
+        if desc:
+            return f"Procedure: {desc}"
         version, pxcode = parts[2], parts[3]
         table = _ICD9_PROC if version == "9" else {}
         return f"Procedure: {table.get(pxcode, f'ICD-{version} procedure {pxcode}')}"
     if head in {"INFUSION_START", "INFUSION_END"} and len(parts) >= 2:
         item = parts[1]
-        name = item_map.get(item, f"itemid {item}")
+        name = desc or item_map.get(item, f"itemid {item}")
         verb = "started" if head == "INFUSION_START" else "ended"
         return f"{name} infusion {verb} {bin_str}".strip()
     if head == "LAB" and len(parts) >= 2:
         item = parts[1]
-        name = item_map.get(item, f"itemid {item}")
+        name = desc or item_map.get(item, f"itemid {item}")
         return f"Lab — {name} {bin_str}".strip()
     if head == "SUBJECT_FLUID_OUTPUT" and len(parts) >= 2:
         item = parts[1]
-        name = item_map.get(item, f"itemid {item}")
+        name = desc or item_map.get(item, f"itemid {item}")
         return f"Fluid output — {name} {bin_str}".strip()
     if head == "MEDICATION":
+        if desc:
+            return f"Medication: {desc}"
         return f"Medication: {' '.join(parts[1:]).strip()}"
     if head in {"HOSPITAL_ADMISSION", "HOSPITAL_DISCHARGE", "ICU_ADMISSION", "ICU_DISCHARGE"}:
         return head.replace("_", " ").title()
     if head in {"GENDER", "Weight", "Weight (Lbs)", "Height", "Blood Pressure"}:
         return head
-    return code
+    return desc or code
 
 
 def _kind_for(code: str) -> str:
@@ -380,7 +472,8 @@ class _ReplayARModel:
         self._subjects = list(subjects)
         self.per_traj_seconds_real = self.PER_SUBJ_TRAJ_SECONDS_MEASURED
         self.per_traj_seconds_replay = self.PER_SUBJ_TRAJ_SECONDS_MEASURED
-        self._cache: dict[int, Any] = {}
+        # Inherit pre-fetched cache from setup() if it's there, else lazy.
+        self._cache: dict[int, Any] = dict(_state.get("ar_cache", {}))
 
     def _load_shard(self, shard_idx: int):
         import pandas as pd
@@ -558,7 +651,11 @@ def run_demo(subjects: list[tuple[int, int]], ar_n_samples: int = 20) -> None:
     from IPython.display import display, clear_output, HTML
 
     sids = [s for s, _ in subjects]
-    patients = [build_demo_patient(s, pt) for s, pt in subjects]
+    # Reuse pre-built patients from setup() if available; else build now.
+    patients = _state.get("patients")
+    if not patients or [p.id for p in patients] != [f"H{s}" for s in sids]:
+        patients = [build_demo_patient(s, pt) for s, pt in subjects]
+        _state["patients"] = patients
 
     eq_model = _ReplayEQModel()
     ar_model = _ReplayARModel(sids)

@@ -81,10 +81,26 @@ A side-by-side demo of two ways to answer clinical prediction questions about IC
 The architectural difference is the demo. The latency difference is the headline. Per-task AUC over the full held-out cohort (shown in the scoreboard cell) is the supporting evidence.
 """))
 
-_CELLS.append(md("## 1. Setup"))
+_CELLS.append(md(r"""
+## 1. Demo subjects
+
+These are the patients the side-by-side UI will surface. The list is fixed for reproducibility — to add or remove patients, edit `select_demo_patients.py` in the GitHub folder, run it locally, and update this list.
+"""))
+
+_subj_lines = ",\n    ".join(f"({sid}, {pt})" for sid, pt in DEMO_SUBJECTS)
+_CELLS.append(code(f"""
+DEMO_SUBJECTS = [
+    {_subj_lines},
+]
+"""))
+
+_CELLS.append(md(r"""
+## 2. Setup
+
+Downloads the helper module and JSON inputs, then pre-fetches every patient asset (event histories, ground-truth labels, all 20 AR trajectory shards filtered to these subjects). After this cell finishes, the "Compare models" button does only in-memory lookups + cosmetic sleeps — there is no network I/O on the interactive path.
+"""))
 
 _CELLS.append(code(rf"""
-# Download helper module + JSON inputs from this folder on GitHub, then import.
 import os, sys, urllib.request
 
 _RAW_BASE = "https://raw.githubusercontent.com/{GH_USER}/{GH_REPO}/{GH_BRANCH}/{GH_FOLDER}"
@@ -98,20 +114,7 @@ if _LOCAL not in sys.path:
     sys.path.insert(0, _LOCAL)
 
 import demo_helpers
-demo_helpers.setup()
-"""))
-
-_CELLS.append(md(r"""
-## 2. Demo subjects
-
-These are the patients the side-by-side UI will surface. The list is fixed for reproducibility — to add or remove patients, edit `select_demo_patients.py` in the GitHub folder, run it locally, and update this list.
-"""))
-
-_subj_lines = ",\n    ".join(f"({sid}, {pt})" for sid, pt in DEMO_SUBJECTS)
-_CELLS.append(code(f"""
-DEMO_SUBJECTS = [
-    {_subj_lines},
-]
+demo_helpers.setup(subjects=DEMO_SUBJECTS)
 """))
 
 _CELLS.append(md(r"""
