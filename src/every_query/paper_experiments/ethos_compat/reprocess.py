@@ -1,36 +1,29 @@
 """``EQ_reprocess_ethos`` — make Ethos-tokenized MEDS shards ingestible by EQ training.
 
-The Ethos tokenizer (``ipolharvard/ethos-ares``) does two things that prevent EQ
-from training on its output directly:
+The Ethos tokenizer (``ipolharvard/ethos-ares``) splits codes across multiple events at
+the same ``(subject_id, time)``: each ICD10/CM diagnosis becomes three rows (chars 0-3 →
+``ICD//CM//<head>``, chars 3-6 → ``ICD//CM//3-6//<mid>``, chars 6+ →
+``ICD//CM//SFX//<sfx>``); each ATC drug code becomes three rows (``ATC//<head>``,
+``ATC//4//<mid>``, ``ATC//SFX//<sfx>``).  EQ's task grammar treats ``code`` as an atom,
+so querying "did ``I10`` occur" against the split corpus would require conjunctive
+reasoning that :func:`every_query.generate_tasks.sample_tasks.evaluate_index_df` cannot
+express.
 
-1. **Splits codes across multiple events at the same ``(subject_id, time)``.**  Each
-   ICD10/CM diagnosis becomes three rows (chars 0-3 → ``ICD//CM//<head>``, chars 3-6
-   → ``ICD//CM//3-6//<mid>``, chars 6+ → ``ICD//CM//SFX//<sfx>``); each ATC drug code
-   becomes three rows (``ATC//<head>``, ``ATC//4//<mid>``, ``ATC//SFX//<sfx>``).  EQ's
-   task grammar treats ``code`` as an atom, so querying "did ``I10`` occur" against
-   the split corpus would require conjunctive reasoning that
-   :func:`every_query.generate_tasks.sample_tasks.evaluate_index_df` cannot express.
-2. **Extracts statics to a side-channel pickle** (``MEDS_BIRTH``, ``GENDER``, ``RACE``,
-   ``MARITAL``, ``BMI``, ...), removing them from the timeline.  EQ via MTD expects
-   statics as MEDS rows with ``time=null``.
-
-This module fixes both:
-
-* For every split family at every shared timestamp, collapse the ``(head, optional
-  mid, optional sfx)`` rows into one row whose code is a deterministic opaque
-  identifier ``EQ_TOK//<hash>``.  The mapping file
-  (``metadata/ethos_code_mapping.parquet``) records ``(input_code, output_code)`` pairs
-  for every changed code so the reverse lookup is recoverable; we don't try to
-  preserve the original ICD/ATC string in the output code itself, because the user
-  doesn't need that — what matters is that the output is a single token per logical
-  event so EQ can run on it without any conjunctive-query support.
-* Optionally re-inject statics from a parquet or pickle as ``time=null`` MEDS rows,
-  routed into the shard their subject lives in.  Statics keep their original
-  Ethos-side code strings (no recombination) since they were never split.
+This module reverses the splits.  For every split family at every shared timestamp, the
+``(head, optional mid, optional sfx)`` rows collapse into one row whose code is a
+deterministic opaque identifier ``EQ_TOK//<hash>``.  The mapping file
+(``metadata/ethos_code_mapping.parquet``) records ``(input_code, output_code, family)``
+rows for every changed code so the reverse lookup is recoverable.
 
 Atomic event types Ethos emits without splitting (labs, vitals, BMI, SOFA quantile
-tokens, admissions, discharges, time-deltas, demographics that stay in the timeline)
-pass through unchanged.
+tokens, admissions, discharges, time-deltas) pass through unchanged.
+
+Optional static-data reinjection: when ``static_data_path`` points at a parquet of
+``(subject_id, code, [numeric_value])`` rows, every entry is written as a ``time=null``
+MEDS row into the shard its subject lives in.  Ethos's native ``StaticDataCollector``
+emits a pickle whose schema is not yet inspected — only parquet input is supported here
+for now (convert externally if you have a pickle).  ``scripts/setup_ethos_demo_data.py``
+documents how to reproduce a real Ethos run and surface the actual pickle layout.
 
 See #174 for the design discussion.
 """
@@ -39,7 +32,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import pickle as _pickle
 import shutil
 from dataclasses import dataclass
 from importlib.resources import files
@@ -48,8 +40,6 @@ from typing import TYPE_CHECKING
 
 import hydra
 import polars as pl
-
-from every_query.utils._env import ensure_env  # noqa: F401  (parity with other CLIs)
 
 if TYPE_CHECKING:
     from omegaconf import DictConfig
@@ -67,7 +57,7 @@ class _Family:
     """One code family Ethos splits.
 
     Attributes:
-        name: Short identifier for logging.
+        name: Short identifier for logging / mapping output.
         head_prefix: Codes starting with this prefix (and *not* the mid/sfx prefixes)
             are head tokens.
         mid_prefix: Codes starting with this prefix are mid tokens.
@@ -105,6 +95,7 @@ FAMILIES: tuple[_Family, ...] = (
 
 
 COMBINED_PREFIX = "EQ_TOK//"
+_HASH_DIGEST_BYTES = 8  # → 16 hex chars (64 bits) — collision-free at any reasonable EHR vocab size.
 
 
 def make_combined_code(input_codes: tuple[str, ...] | list[str]) -> str:
@@ -112,41 +103,27 @@ def make_combined_code(input_codes: tuple[str, ...] | list[str]) -> str:
 
     The output is ``EQ_TOK//<16-char-hex>`` where the hex is a blake2b digest of the
     sorted input-codes tuple.  Sorting makes the function commutative — identical
-    triplets in any row order produce the same identifier.  16 hex chars (64 bits) is
-    far more entropy than typical EHR vocab sizes (10K-100K codes) need; collision
-    probability is below 10⁻¹⁰ at vocab sizes this side of millions.
+    triplets in any row order produce the same identifier.
 
     The identifier is not reversible from the string alone — the
     ``ethos_code_mapping.parquet`` written by :func:`reprocess_directory` is the
-    canonical reverse lookup.  This is per the user's clarification on #174 that the
-    output code "doesn't matter what the name or string is for that one code, so
-    long as it is unique."
+    canonical reverse lookup.
 
     Examples:
-        Same triplet in any order → same hash:
-
         >>> a = make_combined_code(("ICD//CM//I10", "ICD//CM//3-6//00", "ICD//CM//SFX//A"))
         >>> b = make_combined_code(("ICD//CM//SFX//A", "ICD//CM//I10", "ICD//CM//3-6//00"))
         >>> a == b
         True
         >>> a.startswith("EQ_TOK//")
         True
-
-        Different triplets → different hashes:
-
         >>> make_combined_code(("ICD//CM//I10",)) != make_combined_code(("ICD//CM//I11",))
         True
-
-        Single-input "triplet" (head only): still gets a unique hash so the family's
-        vocabulary is uniformly opaque.
-
         >>> code = make_combined_code(("ICD//CM//I10",))
         >>> code.startswith("EQ_TOK//") and len(code) == len("EQ_TOK//") + 16
         True
     """
-    sorted_codes = sorted(input_codes)
-    h = hashlib.blake2b(digest_size=8)
-    for c in sorted_codes:
+    h = hashlib.blake2b(digest_size=_HASH_DIGEST_BYTES)
+    for c in sorted(input_codes):
         h.update(c.encode("utf-8"))
         h.update(b"\x1f")  # unit separator — avoid prefix collisions across components
     return COMBINED_PREFIX + h.hexdigest()
@@ -158,7 +135,12 @@ def make_combined_code(input_codes: tuple[str, ...] | list[str]) -> str:
 
 
 def _classify_role(events: pl.DataFrame, family: _Family) -> pl.DataFrame:
-    """Tag each row with its role in the family (``head`` / ``mid`` / ``sfx`` / null)."""
+    """Tag each row with its role in the family (``head`` / ``mid`` / ``sfx`` / null).
+
+    Mid- and sfx-prefix checks come first; whatever's left of the family's broad prefix is treated as a head.
+    Family prefixes are designed to be non-overlapping (asserted in tests) so first-match classification is
+    unambiguous.
+    """
     code = pl.col("code")
     is_mid = code.str.starts_with(family.mid_prefix)
     is_sfx = code.str.starts_with(family.sfx_prefix)
@@ -181,20 +163,20 @@ def _recombine_family(events: pl.DataFrame, family: _Family) -> tuple[pl.DataFra
     The recombination pairs ``head[k]`` with ``mid[k]`` and ``sfx[k]`` within each
     ``(subject_id, time)`` based on Ethos's row order.  This relies on Ethos's polars
     ``.explode()`` preserving the per-original-event grouping, which it does in the
-    current upstream implementation; deviations would surface as visibly garbled
-    mappings and the test suite covers the round-trip identity for canonical inputs.
+    current upstream implementation.
 
     Returns:
-        ``(rewritten_family_rows, mapping_records)`` where ``mapping_records`` is the
-        long-form ``(input_code, output_code)`` mapping for every changed code.
+        ``(rewritten_family_rows, mapping_records)`` — ``mapping_records`` has columns
+        ``(input_code, output_code, family)``, one row per input sub-token that
+        contributed to a recombination.
     """
     if events.height == 0:
-        return events.head(0), pl.DataFrame(schema={"input_code": pl.Utf8, "output_code": pl.Utf8})
+        return events.head(0), _empty_mapping()
 
     classified = _classify_role(events, family)
     family_rows = classified.filter(pl.col("_role").is_not_null())
     if family_rows.height == 0:
-        return events.head(0), pl.DataFrame(schema={"input_code": pl.Utf8, "output_code": pl.Utf8})
+        return events.head(0), _empty_mapping()
 
     # Per-(subject_id, time, role) rank — pair head[k] with mid[k] and sfx[k].
     family_rows = family_rows.with_columns(
@@ -203,13 +185,12 @@ def _recombine_family(events: pl.DataFrame, family: _Family) -> tuple[pl.DataFra
 
     head_rows = family_rows.filter(pl.col("_role") == "head").drop("_role")
     if head_rows.height == 0:
-        # No heads — every row is an orphan mid/sfx.  Log + drop the family entirely.
         logger.warning(
             "Family %s: %d row(s) but no head tokens — entire family dropped from output.",
             family.name,
             family_rows.height,
         )
-        return events.head(0), pl.DataFrame(schema={"input_code": pl.Utf8, "output_code": pl.Utf8})
+        return events.head(0), _empty_mapping()
 
     mid_rows = (
         family_rows.filter(pl.col("_role") == "mid")
@@ -240,27 +221,55 @@ def _recombine_family(events: pl.DataFrame, family: _Family) -> tuple[pl.DataFra
         .join(sfx_rows, on=["subject_id", "time", "_rank"], how="left")
     )
 
-    # Build the combined code: hash over the sorted (head, optional mid, optional sfx) tuple.
-    # Polars: collect the row's components, then map_elements to call make_combined_code.
-    combined_codes = joined.select(["_head", "_mid", "_sfx"]).map_rows(
-        lambda row: (make_combined_code(tuple(c for c in row if c is not None)),)
-    )["column_0"]
-    joined = joined.with_columns(combined_codes.alias("code"))
+    # Hash each unique (head, mid, sfx) triplet *once*, then join back — avoids a
+    # Python-per-row call for every event in the shard.  Hashing happens in plain Python
+    # on the small unique set rather than in a polars expression because polars'
+    # ``map_elements`` over structs is fiddly across versions and not worth the risk.
+    unique_triplets = joined.select(["_head", "_mid", "_sfx"]).unique()
+    triplet_codes = [
+        make_combined_code(tuple(c for c in (h, m, s) if c is not None))
+        for h, m, s in zip(
+            unique_triplets["_head"].to_list(),
+            unique_triplets["_mid"].to_list(),
+            unique_triplets["_sfx"].to_list(),
+            strict=True,
+        )
+    ]
+    hashed = unique_triplets.with_columns(pl.Series("code", triplet_codes, dtype=pl.Utf8))
+    # Polars join treats null != null by default, which would drop rows whose mid/sfx
+    # are null (the head-only and head+mid cases).  ``nulls_equal=True`` matches
+    # null-to-null so every row in ``joined`` finds its hashed counterpart.
+    joined = joined.join(hashed, on=["_head", "_mid", "_sfx"], how="left", nulls_equal=True)
 
-    # Mapping: emit (input_code, output_code) for every changed input row.
+    # Mapping rows — one per input sub-token that contributed to a recombination.
+    family_lit = pl.lit(family.name)
     mapping_parts: list[pl.DataFrame] = [
-        joined.select([pl.col("_head").alias("input_code"), pl.col("code").alias("output_code")]),
+        joined.select(
+            [
+                pl.col("_head").alias("input_code"),
+                pl.col("code").alias("output_code"),
+                family_lit.alias("family"),
+            ]
+        ),
     ]
     if "_mid" in joined.columns:
         mapping_parts.append(
             joined.filter(pl.col("_mid").is_not_null()).select(
-                [pl.col("_mid").alias("input_code"), pl.col("code").alias("output_code")]
+                [
+                    pl.col("_mid").alias("input_code"),
+                    pl.col("code").alias("output_code"),
+                    family_lit.alias("family"),
+                ]
             )
         )
     if "_sfx" in joined.columns:
         mapping_parts.append(
             joined.filter(pl.col("_sfx").is_not_null()).select(
-                [pl.col("_sfx").alias("input_code"), pl.col("code").alias("output_code")]
+                [
+                    pl.col("_sfx").alias("input_code"),
+                    pl.col("code").alias("output_code"),
+                    family_lit.alias("family"),
+                ]
             )
         )
     mapping = pl.concat(mapping_parts, how="vertical").unique()
@@ -269,18 +278,18 @@ def _recombine_family(events: pl.DataFrame, family: _Family) -> tuple[pl.DataFra
     return joined.select(out_cols), mapping
 
 
+def _empty_mapping() -> pl.DataFrame:
+    """Empty mapping frame with the canonical schema."""
+    return pl.DataFrame(schema={"input_code": pl.Utf8, "output_code": pl.Utf8, "family": pl.Utf8})
+
+
 def reprocess_shard(events: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Reprocess one MEDS shard: recombine all known split families.
 
     Atomic events (codes outside the known split families) pass through unchanged.
-
-    Returns:
-        ``(rewritten_events, mapping_records)`` with the same schema as ``events``
-        but with every ``(head, mid, sfx)`` triplet collapsed into a single
-        opaque-coded row.
     """
     if events.height == 0:
-        return events, pl.DataFrame(schema={"input_code": pl.Utf8, "output_code": pl.Utf8})
+        return events, _empty_mapping()
 
     in_any_family = pl.lit(False)
     for fam in FAMILIES:
@@ -308,7 +317,7 @@ def reprocess_shard(events: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
     if mapping_per_family:
         mapping = pl.concat(mapping_per_family, how="vertical").unique()
     else:
-        mapping = pl.DataFrame(schema={"input_code": pl.Utf8, "output_code": pl.Utf8})
+        mapping = _empty_mapping()
 
     return rewritten, mapping
 
@@ -319,49 +328,35 @@ def reprocess_shard(events: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
 
 
 def load_static_table(path: Path) -> pl.DataFrame:
-    """Load static-data side-channel into a ``(subject_id, code)`` table.
+    """Load a parquet-format static-data table.
 
-    Two formats supported:
+    Schema requirement: ``subject_id`` and ``code`` columns are required; ``numeric_value``
+    is optional.  Other columns pass through.
 
-    * **Parquet** (``.parquet``): ``(subject_id, code)`` columns, optionally with a
-      ``numeric_value`` column.  Pass through.
-    * **Pickle** (``.pkl`` / ``.pickle``): a Python dict ``{subject_id: list[code]}``
-      or ``{subject_id: list[(code, numeric_value)]}`` — both shapes are normalized
-      to the long-form table.
+    Ethos's native ``StaticDataCollector`` emits a pickle whose schema this PR has not
+    yet inspected — until that's resolved, only the parquet format is supported here.
+    Convert your Ethos pickle externally (see ``scripts/setup_ethos_demo_data.py``).
 
     Raises:
-        ValueError: if the file extension is not one of the above.
+        ValueError: if the file extension is not ``.parquet``, or required columns are
+            missing.
         FileNotFoundError: if the path doesn't exist.
     """
     if not path.exists():
         raise FileNotFoundError(f"Static-data file does not exist: {path!s}")
-
-    suffix = path.suffix.lower()
-    if suffix == ".parquet":
-        df = pl.read_parquet(path)
-        if "subject_id" not in df.columns or "code" not in df.columns:
-            raise ValueError(
-                f"Static parquet at {path!s} must have ``subject_id`` and ``code`` columns; "
-                f"got {df.columns!r}"
-            )
-        return df
-
-    if suffix in {".pkl", ".pickle"}:
-        with path.open("rb") as f:
-            data = _pickle.load(f)
-        rows = []
-        for sid, codes in data.items():
-            for entry in codes:
-                if isinstance(entry, tuple) and len(entry) == 2:
-                    rows.append({"subject_id": sid, "code": entry[0], "numeric_value": entry[1]})
-                else:
-                    rows.append({"subject_id": sid, "code": entry})
-        return pl.DataFrame(rows)
-
-    raise ValueError(
-        f"Static-data file at {path!s} has unrecognized extension {suffix!r}; "
-        f"expected one of .parquet, .pkl, .pickle"
-    )
+    if path.suffix.lower() != ".parquet":
+        raise ValueError(
+            f"Static-data file at {path!s} has unsupported extension {path.suffix!r}; "
+            f"only .parquet is supported.  Convert your Ethos pickle externally — see "
+            f"scripts/setup_ethos_demo_data.py for the recommended workflow."
+        )
+    df = pl.read_parquet(path)
+    missing = {"subject_id", "code"} - set(df.columns)
+    if missing:
+        raise ValueError(
+            f"Static parquet at {path!s} is missing required column(s): {sorted(missing)}; got {df.columns!r}"
+        )
+    return df
 
 
 def _route_statics_to_shards(
@@ -386,11 +381,12 @@ def _route_statics_to_shards(
         )
     table_with_shard = table_with_shard.filter(pl.col("_shard_path") != "")
 
-    return {
-        Path(shard_path): group.drop("_shard_path")
-        for shard_path, group in table_with_shard.group_by("_shard_path")
-        for shard_path in [group["_shard_path"][0]]
-    }
+    routed: dict[Path, pl.DataFrame] = {}
+    for key, group in table_with_shard.group_by("_shard_path"):
+        # Polars group_by yields ``(key_tuple, group_df)`` for both single- and multi-key groupings.
+        shard_path_str = key[0] if isinstance(key, tuple) else key
+        routed[Path(shard_path_str)] = group.drop("_shard_path")
+    return routed
 
 
 def _build_subject_shard_map(shard_paths: list[Path]) -> dict[int, Path]:
@@ -429,13 +425,12 @@ def reprocess_directory(
 
     Side effects:
         * Writes recombined shards to ``output_dir/data/{relative_path}``.
-        * Writes the cumulative code mapping to
+        * Writes the cumulative code mapping (sorted, deterministic) to
           ``output_dir/metadata/ethos_code_mapping.parquet``.
-        * Optionally appends ``time=null`` static rows from ``static_data_path``,
-          routed into each subject's home shard.
-        * Copies ``input_dir/metadata/codes.parquet`` to
-          ``output_dir/metadata/codes.parquet`` with codes rewritten via the same
-          mapping.  Other metadata files are copied through unchanged.
+        * Optionally appends ``time=null`` static rows from a parquet, routed into each
+          subject's home shard.
+        * Copies ``input_dir/metadata/codes.parquet`` to ``output_dir/metadata/codes.parquet``
+          with codes rewritten via the same mapping.  Other metadata files pass through.
 
     Returns:
         The output directory path.
@@ -456,7 +451,6 @@ def reprocess_directory(
 
     logger.info("Reprocessing %d shard(s) from %s → %s", len(shards), input_dir, output_dir)
 
-    # Static reinjection: load + route to shards (or empty map if no static path).
     statics_per_shard: dict[Path, pl.DataFrame] = {}
     if static_data_path is not None:
         static_table = load_static_table(static_data_path)
@@ -478,7 +472,6 @@ def reprocess_directory(
         n_in = events.height
         rewritten, mapping = reprocess_shard(events)
 
-        # Append static rows (time=null) for subjects in this shard.
         statics = statics_per_shard.get(src)
         if statics is not None and statics.height > 0:
             statics_for_shard = statics.with_columns(
@@ -511,9 +504,13 @@ def reprocess_directory(
     metadata_dir = output_dir / "metadata"
     metadata_dir.mkdir(parents=True, exist_ok=True)
     if cumulative_mapping:
-        full_mapping = pl.concat(cumulative_mapping, how="vertical").unique()
+        full_mapping = (
+            pl.concat(cumulative_mapping, how="vertical")
+            .unique()
+            .sort(["family", "input_code", "output_code"])
+        )
     else:
-        full_mapping = pl.DataFrame(schema={"input_code": pl.Utf8, "output_code": pl.Utf8})
+        full_mapping = _empty_mapping()
     mapping_path = metadata_dir / "ethos_code_mapping.parquet"
     full_mapping.write_parquet(mapping_path)
     logger.info("Wrote %d unique code mappings to %s", full_mapping.height, mapping_path)
@@ -551,7 +548,7 @@ def _rewrite_codes_metadata(src: Path, dst: Path, mapping: pl.DataFrame) -> None
         return
 
     rewritten = codes.join(
-        mapping.rename({"input_code": "code"}),
+        mapping.select(["input_code", "output_code"]).rename({"input_code": "code"}),
         on="code",
         how="left",
     ).with_columns(pl.coalesce(["output_code", "code"]).alias("code"))

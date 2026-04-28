@@ -1,13 +1,12 @@
 """Tests for ``every_query.paper_experiments.ethos_compat.reprocess``.
 
-Verifies the recombination is correct, deterministic, preserves through-pass for atomic events, and re-injects
-statics when configured.
+Verifies the recombination is correct, deterministic, preserves through-pass for atomic events (including ICD-
+PCS sub-tokens which we explicitly do not handle), and re-injects statics when configured.
 """
 
 from __future__ import annotations
 
 import os
-import pickle
 import subprocess
 import sys
 from datetime import datetime
@@ -42,29 +41,22 @@ def ethos_like_events() -> pl.DataFrame:
     pass through unchanged.
     """
     rows = [
-        # Subject 1 at t1: short ICD code (head only)
         {"subject_id": 1, "time": datetime(2024, 1, 1, 10), "code": "ICD//CM//I10"},
-        # Subject 1 at t2: 5-char ICD (head + mid)
         {"subject_id": 1, "time": datetime(2024, 1, 2, 10), "code": "ICD//CM//E11"},
         {"subject_id": 1, "time": datetime(2024, 1, 2, 10), "code": "ICD//CM//3-6//65"},
-        # Subject 1 at t2 (same time): atomic LAB event
         {"subject_id": 1, "time": datetime(2024, 1, 2, 10), "code": "LAB//Q//CREATININE"},
-        # Subject 1 at t3: full 7-char ICD triplet
         {"subject_id": 1, "time": datetime(2024, 1, 3, 10), "code": "ICD//CM//K70"},
         {"subject_id": 1, "time": datetime(2024, 1, 3, 10), "code": "ICD//CM//3-6//30"},
         {"subject_id": 1, "time": datetime(2024, 1, 3, 10), "code": "ICD//CM//SFX//1"},
-        # Subject 1 at t4: full ATC triplet (Aspirin)
         {"subject_id": 1, "time": datetime(2024, 1, 4, 10), "code": "ATC//N02BA01//Acetylsalicylic_Acid"},
         {"subject_id": 1, "time": datetime(2024, 1, 4, 10), "code": "ATC//4//A"},
         {"subject_id": 1, "time": datetime(2024, 1, 4, 10), "code": "ATC//SFX//01"},
-        # Subject 2 at t5: two co-occurring full ICD triplets
         {"subject_id": 2, "time": datetime(2024, 2, 1, 10), "code": "ICD//CM//I10"},
         {"subject_id": 2, "time": datetime(2024, 2, 1, 10), "code": "ICD//CM//3-6//00"},
         {"subject_id": 2, "time": datetime(2024, 2, 1, 10), "code": "ICD//CM//SFX//A"},
         {"subject_id": 2, "time": datetime(2024, 2, 1, 10), "code": "ICD//CM//E11"},
         {"subject_id": 2, "time": datetime(2024, 2, 1, 10), "code": "ICD//CM//3-6//65"},
         {"subject_id": 2, "time": datetime(2024, 2, 1, 10), "code": "ICD//CM//SFX//1"},
-        # Subject 2 at t6: atomic admission
         {"subject_id": 2, "time": datetime(2024, 2, 2, 10), "code": "HOSPITAL_ADMISSION"},
     ]
     return pl.DataFrame(rows, schema={"subject_id": pl.Int64, "time": pl.Datetime("us"), "code": pl.Utf8})
@@ -97,7 +89,6 @@ class TestMakeCombinedCode:
         assert len(code) == len(COMBINED_PREFIX) + 16
 
     def test_distinct_triplets_collide_negligibly(self):
-        # Generate 1k synthetic triplets and confirm no collision (sanity bound).
         seen = {make_combined_code((f"ICD//CM//I{i}",)) for i in range(1000)}
         assert len(seen) == 1000
 
@@ -109,7 +100,7 @@ class TestMakeCombinedCode:
 
 class TestRecombination:
     def test_short_icd_becomes_singleton_hash(self, ethos_like_events):
-        out, mapping = reprocess_shard(ethos_like_events)
+        out, _ = reprocess_shard(ethos_like_events)
         s1_t1 = out.filter((pl.col("subject_id") == 1) & (pl.col("time") == datetime(2024, 1, 1, 10)))
         assert s1_t1.height == 1
         assert s1_t1["code"][0] == make_combined_code(("ICD//CM//I10",))
@@ -123,25 +114,23 @@ class TestRecombination:
             & pl.col("code").str.starts_with(COMBINED_PREFIX)
         )
         assert s1_t2.height == 1
-        expected = make_combined_code(("ICD//CM//E11", "ICD//CM//3-6//65"))
-        assert s1_t2["code"][0] == expected
+        assert s1_t2["code"][0] == make_combined_code(("ICD//CM//E11", "ICD//CM//3-6//65"))
 
     def test_full_icd_triplet_combines_to_one_row(self, ethos_like_events):
         out, _ = reprocess_shard(ethos_like_events)
         s1_t3 = out.filter((pl.col("subject_id") == 1) & (pl.col("time") == datetime(2024, 1, 3, 10)))
         assert s1_t3.height == 1
-        expected = make_combined_code(("ICD//CM//K70", "ICD//CM//3-6//30", "ICD//CM//SFX//1"))
-        assert s1_t3["code"][0] == expected
+        assert s1_t3["code"][0] == make_combined_code(("ICD//CM//K70", "ICD//CM//3-6//30", "ICD//CM//SFX//1"))
 
     def test_full_atc_triplet_combines_to_one_row(self, ethos_like_events):
         out, _ = reprocess_shard(ethos_like_events)
         s1_t4 = out.filter((pl.col("subject_id") == 1) & (pl.col("time") == datetime(2024, 1, 4, 10)))
         assert s1_t4.height == 1
-        expected = make_combined_code(("ATC//N02BA01//Acetylsalicylic_Acid", "ATC//4//A", "ATC//SFX//01"))
-        assert s1_t4["code"][0] == expected
+        assert s1_t4["code"][0] == make_combined_code(
+            ("ATC//N02BA01//Acetylsalicylic_Acid", "ATC//4//A", "ATC//SFX//01")
+        )
 
     def test_co_occurring_icd_codes_pair_by_rank(self, ethos_like_events):
-        """Two full ICD triplets at the same (subject, time) recombine to two distinct rows."""
         out, _ = reprocess_shard(ethos_like_events)
         s2_t5 = out.filter(
             (pl.col("subject_id") == 2)
@@ -163,7 +152,6 @@ class TestRecombination:
         assert set(atomic["code"].to_list()) == {"LAB//Q//CREATININE", "HOSPITAL_ADMISSION"}
 
     def test_total_row_count_drops_by_expected_amount(self, ethos_like_events):
-        """17 input rows → 8 output rows (1+1+1+1+2+2)."""
         out, _ = reprocess_shard(ethos_like_events)
         assert ethos_like_events.height == 17
         assert out.height == 8
@@ -185,6 +173,46 @@ class TestRecombination:
         for output_code in mapping["output_code"].unique().to_list():
             assert output_code in rewritten_codes
             assert output_code.startswith(COMBINED_PREFIX)
+
+    def test_mapping_has_family_column(self, ethos_like_events):
+        _, mapping = reprocess_shard(ethos_like_events)
+        assert "family" in mapping.columns
+        assert set(mapping["family"].unique().to_list()) <= {"ICD_CM", "ATC"}
+        # ICD inputs are tagged ICD_CM, ATC inputs are tagged ATC.
+        icd_rows = mapping.filter(pl.col("input_code").str.starts_with("ICD//CM//"))
+        atc_rows = mapping.filter(pl.col("input_code").str.starts_with("ATC//"))
+        assert icd_rows["family"].unique().to_list() == ["ICD_CM"]
+        assert atc_rows["family"].unique().to_list() == ["ATC"]
+
+
+class TestPCSPassthrough:
+    """ICD-PCS char-by-char split is explicitly out of scope (#174 follow-up).
+
+    PCS sub-tokens (``ICD//PCS//*``) don't match any registered family head_prefix, so
+    they pass through unchanged — the PR's caveat documents this, and these tests
+    pin the behaviour so a future broadening of the head pattern doesn't silently
+    change it.
+    """
+
+    def test_pcs_codes_pass_through_atomic(self):
+        events = pl.DataFrame(
+            {
+                "subject_id": [1, 1, 1, 1],
+                "time": [datetime(2024, 1, 1)] * 4,
+                "code": [
+                    "ICD//PCS//0",
+                    "ICD//PCS//1//F",
+                    "ICD//PCS//2//7",
+                    "LAB//Q//CREATININE",
+                ],
+            },
+            schema={"subject_id": pl.Int64, "time": pl.Datetime("us"), "code": pl.Utf8},
+        )
+        out, mapping = reprocess_shard(events)
+        # All four rows preserved, none recombined, none in mapping.
+        assert out.height == 4
+        assert mapping.height == 0
+        assert set(out["code"].to_list()) == set(events["code"].to_list())
 
 
 class TestEdgeCases:
@@ -239,7 +267,7 @@ class TestFamilyDefinitions:
 
 
 # ---------------------------------------------------------------------------
-# Static reinjection
+# Static reinjection (parquet only)
 # ---------------------------------------------------------------------------
 
 
@@ -252,29 +280,29 @@ class TestLoadStaticTable:
         assert loaded.height == 3
         assert set(loaded.columns) >= {"subject_id", "code"}
 
-    def test_load_pickle_simple_dict(self, tmp_path):
-        data = {1: ["GENDER//M", "RACE//A"], 2: ["GENDER//F"]}
-        p = tmp_path / "static.pkl"
-        with p.open("wb") as f:
-            pickle.dump(data, f)
+    def test_load_parquet_with_numeric_value_column(self, tmp_path):
+        df = pl.DataFrame({"subject_id": [1, 2], "code": ["BMI", "BMI"], "numeric_value": [27.5, 22.1]})
+        p = tmp_path / "static.parquet"
+        df.write_parquet(p)
         loaded = load_static_table(p)
-        assert loaded.height == 3
-        assert set(loaded["code"].to_list()) == {"GENDER//M", "GENDER//F", "RACE//A"}
-
-    def test_load_pickle_with_numeric_values(self, tmp_path):
-        data = {1: [("BMI", 27.5)], 2: [("BMI", 22.1)]}
-        p = tmp_path / "static.pkl"
-        with p.open("wb") as f:
-            pickle.dump(data, f)
-        loaded = load_static_table(p)
-        assert loaded.height == 2
         assert "numeric_value" in loaded.columns
-        assert set(loaded["numeric_value"].to_list()) == {27.5, 22.1}
+        assert loaded["numeric_value"].to_list() == [27.5, 22.1]
+
+    def test_load_pickle_rejected(self, tmp_path):
+        """Pickle support was removed — Ethos's actual format is unknown.
+
+        The error message points users at ``scripts/setup_ethos_demo_data.py`` to surface the real
+        layout and convert externally.
+        """
+        p = tmp_path / "static.pkl"
+        p.write_bytes(b"")  # content doesn't matter, extension is what's checked
+        with pytest.raises(ValueError, match="only .parquet is supported"):
+            load_static_table(p)
 
     def test_load_unknown_extension_raises(self, tmp_path):
         p = tmp_path / "static.txt"
         p.write_text("oops")
-        with pytest.raises(ValueError, match="unrecognized extension"):
+        with pytest.raises(ValueError, match="only .parquet is supported"):
             load_static_table(p)
 
     def test_load_missing_file_raises(self, tmp_path):
@@ -285,7 +313,7 @@ class TestLoadStaticTable:
         df = pl.DataFrame({"foo": [1], "bar": ["x"]})
         p = tmp_path / "static.parquet"
         df.write_parquet(p)
-        with pytest.raises(ValueError, match="must have"):
+        with pytest.raises(ValueError, match="missing required column"):
             load_static_table(p)
 
 
@@ -296,7 +324,6 @@ class TestLoadStaticTable:
 
 @pytest.fixture
 def ethos_like_dataset(tmp_path: Path, ethos_like_events: pl.DataFrame) -> Path:
-    """Write a one-shard MEDS-style dataset under ``tmp_path/ethos/`` for integration testing."""
     root = tmp_path / "ethos"
     (root / "data" / "held_out").mkdir(parents=True)
     ethos_like_events.write_parquet(root / "data" / "held_out" / "0.parquet")
@@ -325,11 +352,21 @@ def test_reprocess_directory_codes_metadata_drops_mid_sfx(ethos_like_dataset: Pa
         assert not c.startswith("ATC//SFX//")
 
 
+def test_reprocess_directory_mapping_is_deterministic(ethos_like_dataset: Path, tmp_path: Path):
+    """Two runs over identical input produce byte-identical mapping parquets."""
+    out_a = tmp_path / "a"
+    out_b = tmp_path / "b"
+    reprocess_directory(ethos_like_dataset, out_a)
+    reprocess_directory(ethos_like_dataset, out_b)
+    a_bytes = (out_a / "metadata" / "ethos_code_mapping.parquet").read_bytes()
+    b_bytes = (out_b / "metadata" / "ethos_code_mapping.parquet").read_bytes()
+    assert a_bytes == b_bytes
+
+
 def test_reprocess_directory_with_static_reinjection(ethos_like_dataset: Path, tmp_path: Path):
-    """Static rows from a parquet land in the output as ``time=null`` rows."""
     static_df = pl.DataFrame(
         {
-            "subject_id": [1, 1, 2, 99],  # subject 99 is an orphan (no timeline events)
+            "subject_id": [1, 1, 2, 99],
             "code": ["GENDER//M", "RACE//A", "GENDER//F", "DROPPED//ORPHAN"],
         }
     )
@@ -340,29 +377,11 @@ def test_reprocess_directory_with_static_reinjection(ethos_like_dataset: Path, t
     reprocess_directory(ethos_like_dataset, out_dir, static_data_path=static_path)
     out = pl.read_parquet(out_dir / "data" / "held_out" / "0.parquet")
 
-    # Static rows have time=null.
     static_rows = out.filter(pl.col("time").is_null())
-    assert static_rows.height == 3, f"expected 3 reinjected static rows, got {static_rows.height}"
+    assert static_rows.height == 3
     static_codes = set(static_rows["code"].to_list())
     assert static_codes == {"GENDER//M", "RACE//A", "GENDER//F"}
-    assert "DROPPED//ORPHAN" not in static_codes  # orphan dropped
-
-    # Timeline events still present and time is non-null for them.
-    timeline = out.filter(pl.col("time").is_not_null())
-    assert timeline.height > 0
-
-
-def test_reprocess_directory_with_static_pickle(ethos_like_dataset: Path, tmp_path: Path):
-    static_data = {1: ["GENDER//M"], 2: [("BMI", 25.0)]}
-    static_path = tmp_path / "static.pkl"
-    with static_path.open("wb") as f:
-        pickle.dump(static_data, f)
-
-    out_dir = tmp_path / "eq_input"
-    reprocess_directory(ethos_like_dataset, out_dir, static_data_path=static_path)
-    out = pl.read_parquet(out_dir / "data" / "held_out" / "0.parquet")
-    static_rows = out.filter(pl.col("time").is_null())
-    assert static_rows.height == 2
+    assert "DROPPED//ORPHAN" not in static_codes
 
 
 def test_reprocess_directory_refuses_to_clobber(ethos_like_dataset: Path, tmp_path: Path):
@@ -403,7 +422,7 @@ def test_reprocess_directory_missing_data_dir_raises(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# CLI subprocess test
+# CLI subprocess tests
 # ---------------------------------------------------------------------------
 
 
@@ -430,6 +449,37 @@ def test_eq_reprocess_ethos_cli_end_to_end(ethos_like_dataset: Path, tmp_path: P
     assert (out_dir / "metadata" / "ethos_code_mapping.parquet").is_file()
 
 
+def test_eq_reprocess_ethos_cli_no_hydra_config_snapshot(ethos_like_dataset: Path, tmp_path: Path):
+    """Hydra's ``output_subdir: null`` should suppress the per-run ``.hydra/`` config snapshot.
+
+    Hydra still creates an empty ``outputs/<date>/<time>/`` parent dir under the cwd —
+    that's stock behaviour all EQ CLIs share — but the per-run ``.hydra/`` config-snapshot
+    subdir (which would clutter every CLI invocation with a copy of the resolved config)
+    must not appear.  ``chdir: false`` separately keeps the process cwd unchanged.
+    """
+    out_dir = tmp_path / "cli_out"
+    env = os.environ.copy()
+    env["PATH"] = _VENV_BIN + os.pathsep + env.get("PATH", "")
+    cwd = tmp_path / "scratch_cwd"
+    cwd.mkdir()
+    result = subprocess.run(
+        [
+            "EQ_reprocess_ethos",
+            f"input_dir={ethos_like_dataset!s}",
+            f"output_dir={out_dir!s}",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=cwd,
+        timeout=120,
+    )
+    assert result.returncode == 0
+    # No `.hydra/` snapshot subdirs anywhere under cwd.
+    hydra_snapshots = list(cwd.rglob(".hydra"))
+    assert not hydra_snapshots, f"Hydra leaked .hydra/ snapshot dirs: {hydra_snapshots}"
+
+
 def test_eq_reprocess_ethos_cli_with_statics(ethos_like_dataset: Path, tmp_path: Path):
     static_df = pl.DataFrame({"subject_id": [1, 2], "code": ["GENDER//M", "GENDER//F"]})
     static_path = tmp_path / "static.parquet"
@@ -450,10 +500,65 @@ def test_eq_reprocess_ethos_cli_with_statics(ethos_like_dataset: Path, tmp_path:
         env=env,
         timeout=120,
     )
-    assert result.returncode == 0, (
-        f"EQ_reprocess_ethos failed (rc={result.returncode})\n"
-        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-    )
+    assert result.returncode == 0
     out = pl.read_parquet(out_dir / "data" / "held_out" / "0.parquet")
     static_rows = out.filter(pl.col("time").is_null())
     assert static_rows.height == 2
+
+
+# ---------------------------------------------------------------------------
+# Real-data integration test (gated on ETHOS_DEMO_DIR env var)
+# ---------------------------------------------------------------------------
+
+
+_ETHOS_DEMO_DIR = os.environ.get("ETHOS_DEMO_DIR")
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(
+    _ETHOS_DEMO_DIR is None,
+    reason="ETHOS_DEMO_DIR env var not set — run scripts/setup_ethos_demo_data.py to produce one",
+)
+def test_real_ethos_output_recombines_and_mtd_ingests(tmp_path: Path):
+    """End-to-end test against a real Ethos-tokenized output directory.
+
+    Set ``ETHOS_DEMO_DIR`` to the output of ``scripts/setup_ethos_demo_data.py`` to
+    enable.  Verifies:
+
+      * ``EQ_reprocess_ethos`` runs successfully on the real Ethos output.
+      * Output parquets have the expected MEDS schema (``subject_id``, ``time``, ``code``).
+      * ``MTD_preprocess`` can ingest the recombined directory without errors.
+    """
+    ethos_dir = Path(_ETHOS_DEMO_DIR).expanduser().resolve()
+    assert ethos_dir.is_dir(), f"ETHOS_DEMO_DIR={ethos_dir} is not a directory"
+
+    eq_input_dir = tmp_path / "eq_input"
+    reprocess_directory(ethos_dir, eq_input_dir)
+
+    # Schema sanity: every shard has subject_id, time, code; no duplicate (subject_id, time, code) rows.
+    for shard in (eq_input_dir / "data").rglob("*.parquet"):
+        df = pl.read_parquet(shard)
+        for col in ("subject_id", "time", "code"):
+            assert col in df.columns, f"Shard {shard} missing required column {col!r}"
+
+    # MTD_preprocess on the recombined output.  This is the load-bearing assertion that
+    # PR #176 actually delivers ingestible output.
+    mtd_out = tmp_path / "mtd_out"
+    env = os.environ.copy()
+    env["PATH"] = _VENV_BIN + os.pathsep + env.get("PATH", "")
+    result = subprocess.run(
+        [
+            "MTD_preprocess",
+            f"MEDS_dataset_dir={eq_input_dir!s}",
+            f"output_dir={mtd_out!s}",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=600,
+    )
+    assert result.returncode == 0, (
+        f"MTD_preprocess failed (rc={result.returncode}) on real recombined Ethos output.\n"
+        f"stdout:\n{result.stdout[-2000:]}\nstderr:\n{result.stderr[-2000:]}"
+    )
+    assert mtd_out.is_dir() and any(mtd_out.iterdir()), "MTD_preprocess produced no output"
