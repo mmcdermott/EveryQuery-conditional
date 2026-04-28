@@ -57,19 +57,6 @@ def code(text: str) -> dict:
     }
 
 
-# Selected subjects + their prediction times (µs since epoch).
-# These were chosen offline by ``select_demo_patients.py`` — see that script
-# for the curation logic. The notebook does not redo curation at runtime.
-DEMO_SUBJECTS = [
-    (13336307, 6051391200000000),
-    (11495932, 6635161440000000),
-    (13999026, 5392922400000000),
-    (13753717, 6315084000000000),
-    (15605355, 5753333700000000),
-    (18242530, 6576321600000000),
-]
-
-
 _CELLS.append(md(r"""
 # EveryQuery vs. Autoregressive EHR FM — Demo
 
@@ -82,22 +69,9 @@ The architectural difference is the demo. The latency difference is the headline
 """))
 
 _CELLS.append(md(r"""
-## 1. Demo subjects
+## 1. Setup
 
-These are the patients the side-by-side UI will surface. The list is fixed for reproducibility — to add or remove patients, edit `select_demo_patients.py` in the GitHub folder, run it locally, and update this list.
-"""))
-
-_subj_lines = ",\n    ".join(f"({sid}, {pt})" for sid, pt in DEMO_SUBJECTS)
-_CELLS.append(code(f"""
-DEMO_SUBJECTS = [
-    {_subj_lines},
-]
-"""))
-
-_CELLS.append(md(r"""
-## 2. Setup
-
-Downloads the helper module and JSON inputs, then pre-fetches every patient asset (event histories, ground-truth labels, all 20 AR trajectory shards filtered to these subjects). After this cell finishes, the "Compare models" button does only in-memory lookups + cosmetic sleeps — there is no network I/O on the interactive path.
+Downloads the helper module and JSON inputs, then pre-fetches every patient asset (event histories, ground-truth labels, all 20 AR trajectory shards). After this cell finishes, the "Compare models" button does only in-memory lookups + cosmetic sleeps — there is no network I/O on the interactive path.
 """))
 
 _CELLS.append(code(rf"""
@@ -114,11 +88,11 @@ if _LOCAL not in sys.path:
     sys.path.insert(0, _LOCAL)
 
 import demo_helpers
-demo_helpers.setup(subjects=DEMO_SUBJECTS)
+demo_helpers.setup()
 """))
 
 _CELLS.append(md(r"""
-## 3. Side-by-side comparison
+## 2. Side-by-side comparison
 
 Pick a patient, pick a clinical question, and click **Compare models**. EQ resolves on the right almost instantly; the AR panel streams 20 sampled trajectories on the left, with the running event-occurrence tally and a scrollable list of every trajectory.
 
@@ -126,11 +100,11 @@ Use the *AR replay* toggle to feel real-time latency (~6 s per query) or to fast
 """))
 
 _CELLS.append(code("""
-demo_helpers.run_demo(DEMO_SUBJECTS)
+demo_helpers.run_demo()
 """))
 
 _CELLS.append(md(r"""
-## 4. Headline result — per-task AUC over the full held-out cohort
+## 3. Headline result — per-task AUC over the full held-out cohort
 
 The 6-patient slice above is too small to give a faithful AUC read on rare events. The cell below pulls the per-(code, duration) AUCs that were already computed during the original evaluations across thousands of held-out subjects per cell, and reports the EQ-vs-AR head-to-head.
 """))
@@ -140,7 +114,7 @@ demo_helpers.show_scoreboard()
 """))
 
 _CELLS.append(md(r"""
-## 5. Multi-task efficiency
+## 4. Multi-task efficiency
 
 When the same patient is queried for multiple tasks at once, the AR model amortizes trajectory generation but EQ stays linear and fast. Numbers below use the measured AR per-(subject, trajectory) cost.
 """))
@@ -150,7 +124,7 @@ demo_helpers.show_multi_task_costs()
 """))
 
 _CELLS.append(md(r"""
-## 6. About this demo
+## 5. About this demo
 
 | Component | Source |
 | --- | --- |

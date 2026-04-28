@@ -42,6 +42,19 @@ _CODES_META_PATH = "meds/MIMIC_MEDS/MEDS_cohort/intermediate/metadata/codes.parq
 _HERE = Path(__file__).resolve().parent
 _CACHE = Path("/tmp/eq_demo_cache")
 
+# The (subject_id, prediction_time_us) pairs the demo surfaces. Curated offline
+# by ``select_demo_patients.py`` for clinical heterogeneity + diverse outcomes.
+# Edit this list (and re-run select_demo_patients.py if you want to regenerate)
+# to swap demo patients without touching the notebook.
+DEMO_SUBJECTS: list[tuple[int, int]] = [
+    (13336307, 6051391200000000),
+    (11495932, 6635161440000000),
+    (13999026, 5392922400000000),
+    (13753717, 6315084000000000),
+    (15605355, 5753333700000000),
+    (18242530, 6576321600000000),
+]
+
 # Lazy-loaded module-globals populated by setup()
 _state: dict[str, Any] = {}
 
@@ -53,14 +66,15 @@ def _pip(*pkgs: str) -> None:
 def setup(subjects: Optional[list[tuple[int, int]]] = None) -> None:
     """Install runtime deps, authenticate, and pre-fetch all assets.
 
-    If ``subjects`` is provided, the 20 AR trajectory shards are pre-fetched
-    here (filtered to those subject IDs) so ``run_demo()`` and the "Compare
-    models" button do only in-memory lookups + cosmetic sleeps. Otherwise,
-    AR shards are loaded lazily on first use.
+    Defaults to the module-level ``DEMO_SUBJECTS`` list. Pass an explicit
+    ``subjects`` list to override. After this returns, ``run_demo()`` and the
+    "Compare models" button do only in-memory lookups + cosmetic sleeps.
 
     Safe to call repeatedly. In Colab it triggers ``google.colab`` interactive
     auth; otherwise it relies on ``gcloud auth application-default login``.
     """
+    if subjects is None:
+        subjects = DEMO_SUBJECTS
     try:
         import gcsfs, pandas, ipywidgets, numpy  # noqa: F401
     except ImportError:
@@ -640,16 +654,19 @@ def _render_speedup(eq_s: float, ar_s: float) -> str:
     )
 
 
-def run_demo(subjects: list[tuple[int, int]], ar_n_samples: int = 20) -> None:
+def run_demo(subjects: Optional[list[tuple[int, int]]] = None, ar_n_samples: int = 20) -> None:
     """Render the side-by-side EQ vs AR demo UI.
 
     Args:
         subjects: list of (subject_id, prediction_time_us) pairs to surface.
+            Defaults to ``DEMO_SUBJECTS`` defined at the top of this module.
         ar_n_samples: how many AR trajectories to stream (default 20 = full set).
     """
     import ipywidgets as widgets
     from IPython.display import display, clear_output, HTML
 
+    if subjects is None:
+        subjects = DEMO_SUBJECTS
     sids = [s for s, _ in subjects]
     # Reuse pre-built patients from setup() if available; else build now.
     patients = _state.get("patients")
