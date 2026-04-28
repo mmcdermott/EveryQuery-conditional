@@ -61,8 +61,8 @@ def compute_aucs(predictions: pl.DataFrame, mapping: pl.DataFrame) -> pl.DataFra
     Each row is annotated with the ``tier_quality`` (``primary`` or
     ``secondary``) inherited from the mapping table so downstream consumers
     can split the AUC table into primary-tier and secondary-tier views per
-    Phase 10. ``union`` rows propagate the underlying primary-tier
-    annotation when present, otherwise fall back to ``secondary``.
+    Phase 10. ``any`` rows propagate the underlying primary-tier annotation
+    when present, otherwise fall back to ``secondary``.
     """
     if "tier_quality" not in mapping.columns:
         mapping = mapping.with_columns(pl.lit("primary").alias("tier_quality"))
@@ -144,10 +144,10 @@ def main() -> None:
     )
 
     print()
-    print("Primary vs secondary tier split (excluding union):")
+    print("Primary vs secondary tier split (excluding any):")
     print(
         aucs.filter(
-            pl.col("occurs_auc").is_not_null() & (pl.col("tier") != "union")
+            pl.col("occurs_auc").is_not_null() & (pl.col("tier") != "any")
         )
         .group_by("tier_quality")
         .agg(
@@ -158,10 +158,10 @@ def main() -> None:
         .sort("tier_quality")
     )
     print()
-    print("Union tier (per-code OR; reported separately):")
+    print("Any tier (per-code OR; reported separately):")
     print(
         aucs.filter(
-            pl.col("occurs_auc").is_not_null() & (pl.col("tier") == "union")
+            pl.col("occurs_auc").is_not_null() & (pl.col("tier") == "any")
         )
         .group_by("tier_quality")
         .agg(

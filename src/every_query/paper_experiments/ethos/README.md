@@ -12,11 +12,11 @@ on the held-out MIMIC eval suite (`gs://every-query-runs/eval_tasks/7573f855…/
    for same-source-concept ATC ties) or lands in `unmappable_with_rationale`.
 2. `build_mapping.py`: emits `mapping_table.parquet` (with `tier`,
    `tier_quality`, and `mapping_source` columns) and
-   `mapping_coverage.parquet`. Adds the `icd_specific` and `quantile_approx`
-   primary tiers and runs the suppression cascade (`drop_bin` -> drop when
-   `quantile`/`quantile_approx` exists; `icd_crosswalk` -> drop when
-   `icd_specific` exists; `mimic_item_crosswalk` -> drop when `quantile`/
-   `quantile_approx` exists).
+   `mapping_coverage.parquet`. Adds the `dx_specific` and `lab_approx_value`
+   primary tiers and runs the suppression cascade (`lab_no_value` -> drop when
+   `lab_exact_value`/`lab_approx_value` exists; `dx_parent` -> drop when
+   `dx_specific` exists; `proxy` -> drop when `lab_exact_value`/
+   `lab_approx_value` exists).
 3. `predict.py`: streams ETHOS trajectories, emits `ethos_predictions.parquet`.
    Supports literal and `code+next_token` match kinds.
 4. `evaluate.py`: emits `ethos_aucs_held_out.parquet` with a `tier_quality`
@@ -25,7 +25,7 @@ on the held-out MIMIC eval suite (`gs://every-query-runs/eval_tasks/7573f855…/
 5. `comparison.ipynb`: figures (PDF+PNG to `analysis/figures/`) and tables
    (CSV to `analysis/tables/`) with paired Wilcoxon over per-(code, duration,
    bucket) cells. Headline number leads with the primary tier_quality split;
-   secondary and union are reported separately. Also emits three head-to-head
+   secondary and `any` are reported separately. Also emits three head-to-head
    win-rate CSVs at `eps=0.01`
    (`ethos_vs_eq_win_rate_per_tier.csv`,
    `ethos_vs_eq_win_rate_per_tier_duration_bucket.csv`,
@@ -79,17 +79,17 @@ Excluded partial models `14-08-24` and `23-54-43` (only 41 rows, duration=30 onl
 ### Mapping mechanics implied by the audit
 
 - **Exact tier:** verbatim string match between EQ `code` and an ETHOS token in the trajectory.
-- **Drop-bin tier:** for `LAB`, `INFUSION_START`, `INFUSION_END`, `SUBJECT_FLUID_OUTPUT` families — strip the trailing `//value_[..)` segment from EQ `code`, normalise units to upper-case, and match the lab/item ETHOS token (ignoring the following `Qk`). Suppressed by the cascade in `build_mapping.apply_suppression_cascade` whenever a `quantile` or `quantile_approx` row exists for the same query.
-- **Quantile tier:** for the same families — match the lab/item token AND require the next-token `Qk` to fall in the decile range corresponding to EQ's `value_[lo, hi)`. Decile boundaries come from MEDS metadata `values/quantiles`; for codes with null parent quantiles we fall back to the sibling-bin layout when there are exactly 10 contiguous bins.
-- **Quantile-approx tier:** identical 2-token shape as `quantile`, but for parents whose `meds_codes.parquet` has 2..9 sibling bins (so the strict decile alignment can't fire). The EQ bin's 1-based positional index `i` among `n` sorted siblings is mapped linearly to `Qk = round(i * 10 / n)`. This is an approximation, flagged in the provenance string `meds-codes.parquet:sibling_bins_positional`.
-- **ICD-specific tier:** for `DIAGNOSIS//ICD//(9|10)//*` queries — emit a strict 2-token sequence `<descriptive_label>|ICD//CM//3-6//<suffix>` whenever the EQ code's 5-char ICD-10-CM target has both an ETHOS descriptive label (3-char parent) and an ETHOS `ICD//CM//3-6//<suffix>` token. Suppresses the broader `icd_crosswalk` row for the same query.
-- **Set-union OR tier:** ETHOS predicts target if any pattern from the prior tiers fires within the duration window.
+- **`lab_no_value` tier:** for `LAB`, `INFUSION_START`, `INFUSION_END`, `SUBJECT_FLUID_OUTPUT` families — strip the trailing `//value_[..)` segment from EQ `code`, normalise units to upper-case, and match the lab/item ETHOS token (ignoring the following `Qk`). Suppressed by the cascade in `build_mapping.apply_suppression_cascade` whenever a `lab_exact_value` or `lab_approx_value` row exists for the same query.
+- **`lab_exact_value` tier:** for the same families — match the lab/item token AND require the next-token `Qk` to fall in the decile range corresponding to EQ's `value_[lo, hi)`. Decile boundaries come from MEDS metadata `values/quantiles`; for codes with null parent quantiles we fall back to the sibling-bin layout when there are exactly 10 contiguous bins. EQ bin maps 1-to-1 to a single ETHOS `Qk`.
+- **`lab_approx_value` tier:** identical 2-token shape as `lab_exact_value`, but for parents whose `meds_codes.parquet` has 2..9 sibling bins (so the strict decile alignment can't fire). The EQ bin's 1-based positional index `i` among `n` sorted siblings is mapped linearly to `Qk = round(i * 10 / n)`. This is an approximation, flagged in the provenance string `meds-codes.parquet:sibling_bins_positional`.
+- **`dx_specific` tier:** for `DIAGNOSIS//ICD//(9|10)//*` queries — emit a strict 2-token sequence `<descriptive_label>|ICD//CM//3-6//<suffix>` whenever the EQ code's 5-char ICD-10-CM target has both an ETHOS descriptive label (3-char parent) and an ETHOS `ICD//CM//3-6//<suffix>` token. Suppresses the broader `dx_parent` row for the same query.
+- **`any` tier:** ETHOS predicts target if any pattern from the prior tiers fires within the duration window.
 
 Each row of `mapping_table.parquet` carries a **`tier_quality`** of
 `primary` (most-specific encoding the vocabulary supports) or `secondary`
 (best-effort proxy: ATC level 2, procedure-as-diagnosis, indication-proxy
 labs, `HOSPITAL_ADMISSION` for `TIMELINE//START`). Downstream consumers
-split AUC tables by `tier_quality` and report `union` separately as the
+split AUC tables by `tier_quality` and report `any` separately as the
 per-code OR.
 
 ## Outcome
@@ -106,18 +106,18 @@ procedures, indication-proxy diagnosis tokens for orphan MIMIC labs,
 `HOSPITAL_ADMISSION` for `TIMELINE//START`).
 
 - **Coverage:** **22/41 EQ codes mapped (54%)**, split by tier_quality:
-  - **Primary (12 codes):** 1 `MEDS_DEATH` (exact), 3 LABs (quantile, deciles
-    via `meds_codes.parquet`), 3 LABs (`quantile_approx`, sibling-bin
+  - **Primary (12 codes):** 1 `MEDS_DEATH` (exact), 3 LABs (`lab_exact_value`, deciles
+    via `meds_codes.parquet`), 3 LABs (`lab_approx_value`, sibling-bin
     positional approximation when fewer than 10 deciles exist), 3 DIAGNOSIS
-    (`icd_specific`: 5-char ICD-10-CM target rendered as label + 3-6-suffix
+    (`dx_specific`: 5-char ICD-10-CM target rendered as label + 3-6-suffix
     2-token pattern) plus 2 DIAGNOSIS that fall back to the 3-char parent
-    (`icd_crosswalk` primary for DIAGNOSIS).
-  - **Secondary (10 codes):** 5 MEDICATION (`atc_crosswalk` at ATC level 2;
+    (`dx_parent` primary for DIAGNOSIS).
+  - **Secondary (10 codes):** 5 MEDICATION (`drug_class` at ATC level 2;
     Gabapentin commits two tokens for the N02/N03 same-source ATC tie),
-    1 PROCEDURE (`icd_crosswalk` proxy via fracture-of-lower-leg diagnosis),
+    1 PROCEDURE (`dx_parent` proxy via fracture-of-lower-leg diagnosis),
     1 TIMELINE + 2 INFUSION_* (named-drug -> ATC class) + 1 orphan LAB
     (pressure-ulcer length -> `PRESSURE_ULCER` indication proxy), all
-    `mimic_item_crosswalk`.
+    `proxy`.
 - **19 codes remain unmapped** in `crosswalks/mimic_items.yaml`'s
   `unmappable_with_rationale` block: 12 LABs (CO2 production, eosinophil
   differential, lipase, hemodialysis output volume, CK-MB, ventilator
@@ -134,7 +134,7 @@ procedures, indication-proxy diagnosis tokens for orphan MIMIC labs,
   |---|---:|---:|---:|---:|---:|
   | **primary**   | 23 | 0.826 | 0.816 | -0.010 | 0.43 |
   | secondary[^1] | 18 | 0.824 | 0.775 | -0.049 | 0.55 |
-  | union         | 41 | 0.825 | 0.798 | -0.027 | 0.40 |
+  | any           | 41 | 0.825 | 0.798 | -0.027 | 0.40 |
 
   [^1]: Secondary tiers are best-effort proxies under ETHOS-vocab
   limitations (ATC level 2 only for drugs; no PCS tokens for procedures;
@@ -149,29 +149,29 @@ procedures, indication-proxy diagnosis tokens for orphan MIMIC labs,
   | Tier | quality | n | mean EQ | mean ETHOS | mean diff | p | Comment |
   |---|---|---:|---:|---:|---:|---:|---|
   | exact                | primary   |  1 | 0.834 | 0.880 | +0.046 | NA   | MEDS_DEATH |
-  | quantile             | primary   |  6 | 0.904 | 0.901 | -0.003 | 1.00 | LAB value decile |
-  | quantile_approx      | primary   |  6 | 0.935 | 0.839 | -0.096 | 0.031 | LAB sibling-bin positional approx |
-  | icd_specific         | primary   |  6 | 0.715 | 0.765 | +0.050 | 0.44 | DIAGNOSIS 5-char (label + 3-6-suffix) |
-  | icd_crosswalk        | mixed     |  6 | 0.699 | 0.759 | +0.059 | 0.44 | 3-char parent (primary for DX, secondary for PROC) |
-  | atc_crosswalk        | secondary | 10 | 0.767 | 0.774 | +0.007 | 1.00 | MEDICATION at ATC level 2 |
-  | mimic_item_crosswalk | secondary |  6 | 0.965 | 0.751 | -0.214 | 0.063 | INFUSION + indication proxies |
-  | union                | -         | 41 | 0.825 | 0.798 | -0.027 | 0.40 | Per-code OR |
+  | lab_exact_value      | primary   |  6 | 0.904 | 0.901 | -0.003 | 1.00 | LAB value decile |
+  | lab_approx_value      | primary   |  6 | 0.935 | 0.839 | -0.096 | 0.031 | LAB sibling-bin positional approx |
+  | dx_specific         | primary   |  6 | 0.715 | 0.765 | +0.050 | 0.44 | DIAGNOSIS 5-char (label + 3-6-suffix) |
+  | dx_parent        | mixed     |  6 | 0.699 | 0.759 | +0.059 | 0.44 | 3-char parent (primary for DX, secondary for PROC) |
+  | drug_class        | secondary | 10 | 0.767 | 0.774 | +0.007 | 1.00 | MEDICATION at ATC level 2 |
+  | proxy | secondary |  6 | 0.965 | 0.751 | -0.214 | 0.063 | INFUSION + indication proxies |
+  | any                  | -         | 41 | 0.825 | 0.798 | -0.027 | 0.40 | Per-code OR |
 
 - **Headline:** within the **primary** tier set ETHOS reaches mean AUC
   0.816 vs EQ 0.826 (n=23 cells, p=0.43) -- a **statistically
   indistinguishable** difference once the comparison is restricted to tiers
   whose ETHOS encoding actually represents the EQ concept. The primary
-  picture remains close to parity for diagnoses (`icd_specific` and
-  `icd_crosswalk` both favour ETHOS by ~0.05) and lab presence/value
-  (`exact`, `quantile`). The companion scatter is at
+  picture remains close to parity for diagnoses (`dx_specific` and
+  `dx_parent` both favour ETHOS by ~0.05) and lab presence/value
+  (`exact`, `lab_exact_value`). The companion scatter is at
   `analysis/figures/ethos_vs_eq_auc_scatter.{pdf,png}`.
 - **Trade-offs (acknowledged):**
-  - **`quantile_approx` underperforms** (mean diff -0.096, p=0.031) because
+  - **`lab_approx_value` underperforms** (mean diff -0.096, p=0.031) because
     the EQ bin's positional index is mapped linearly to a Q1..Q10 decile
     when fewer than 10 sibling bins exist in `meds_codes.parquet`. This is
     flagged in the YAML provenance string and the per-row mapping_source
     (`meds-codes.parquet:sibling_bins_positional`).
-  - The `mimic_item_crosswalk` row is the noisiest because indication-proxy
+  - The `proxy` row is the noisiest because indication-proxy
     diagnosis tokens (`PRESSURE_ULCER` for ulcer length, `HOSPITAL_ADMISSION`
     for `TIMELINE//START`) predict different events than the underlying EQ
     queries; this is reflected in `tier_quality=secondary`.
@@ -189,13 +189,13 @@ absorbs noise-level differences. `EQ win rate` is EQ-centric:
 | Tier | n | EQ wins | ties | ETHOS wins | EQ win rate |
 |---|---:|---:|---:|---:|---:|
 | exact                |  1 |  0 | 0 |  1 | 0.000 |
-| quantile             |  6 |  4 | 0 |  2 | 0.667 |
-| quantile_approx      |  6 |  6 | 0 |  0 | 1.000 |
-| icd_specific         |  6 |  3 | 0 |  3 | 0.500 |
-| icd_crosswalk        |  6 |  1 | 2 |  3 | 0.167 |
-| atc_crosswalk        | 10 |  4 | 0 |  6 | 0.400 |
-| mimic_item_crosswalk |  6 |  5 | 1 |  0 | 0.833 |
-| union                | 41 | 23 | 3 | 15 | 0.561 |
+| lab_exact_value      |  6 |  4 | 0 |  2 | 0.667 |
+| lab_approx_value      |  6 |  6 | 0 |  0 | 1.000 |
+| dx_specific         |  6 |  3 | 0 |  3 | 0.500 |
+| dx_parent        |  6 |  1 | 2 |  3 | 0.167 |
+| drug_class        | 10 |  4 | 0 |  6 | 0.400 |
+| proxy |  6 |  5 | 1 |  0 | 0.833 |
+| any                  | 41 | 23 | 3 | 15 | 0.561 |
 
 Per-tier-x-duration-x-bucket and per-code splits are persisted to
 `analysis/tables/ethos_vs_eq_win_rate_per_tier_duration_bucket.csv` and
@@ -206,35 +206,35 @@ Per-tier-x-duration-x-bucket and per-code splits are persisted to
 Every row of `mapping_table.parquet` carries a `mapping_source` field
 documenting where the (eq_code, ethos_token) pair came from. Under the
 deterministic-first pipeline 13 distinct sources appear across the 26 active
-mapping rows (excluding the union tier, which inherits the underlying primary
+mapping rows (excluding the `any` tier, which inherits the underlying primary
 tier's source):
 
 | `mapping_source`                                        | Tier(s)                            | n  |
 |---------------------------------------------------------|------------------------------------|---:|
 | `code:string_equality`                                  | exact                              | 1  |
-| `code:strip_value_bin+upper_units`                      | drop_bin                           | 6  |
-| `meds-codes.parquet:values_quantiles_or_sibling_bins`   | quantile                           | 3  |
-| `deterministic:icd_3char_walker`                        | icd_crosswalk                      | 4  |
-| `deterministic:atc_ancestor_walker`                     | atc_crosswalk, mimic_item_crosswalk| 3  |
-| `deterministic:atc_same_source_concept_tie`             | atc_crosswalk                      | 2  |
-| `direct:event_alignment`                                | mimic_item_crosswalk               | 1  |
-| `llm:atc_multi_chain`                                   | atc_crosswalk                      | 1  |
-| `llm:diagnosis_walker_unresolved`                       | icd_crosswalk                      | 1  |
-| `llm:infusion_walker_unresolved`                        | mimic_item_crosswalk               | 1  |
-| `llm:medication_walker_unresolved`                      | atc_crosswalk                      | 1  |
-| `llm:no_pcs_tokens_in_ethos`                            | icd_crosswalk                      | 1  |
-| `llm:orphan_lab`                                        | mimic_item_crosswalk               | 1  |
+| `code:strip_value_bin+upper_units`                      | lab_no_value                           | 6  |
+| `meds-codes.parquet:values_quantiles_or_sibling_bins`   | lab_exact_value                    | 3  |
+| `deterministic:icd_3char_walker`                        | dx_parent                      | 4  |
+| `deterministic:atc_ancestor_walker`                     | drug_class, proxy| 3  |
+| `deterministic:atc_same_source_concept_tie`             | drug_class                      | 2  |
+| `direct:event_alignment`                                | proxy               | 1  |
+| `llm:atc_multi_chain`                                   | drug_class                      | 1  |
+| `llm:diagnosis_walker_unresolved`                       | dx_parent                      | 1  |
+| `llm:infusion_walker_unresolved`                        | proxy               | 1  |
+| `llm:medication_walker_unresolved`                      | drug_class                      | 1  |
+| `llm:no_pcs_tokens_in_ethos`                            | dx_parent                      | 1  |
+| `llm:orphan_lab`                                        | proxy               | 1  |
 
-Code-derived tiers (`exact`, `drop_bin`, `quantile`) hardcode their source
+Code-derived tiers (`exact`, `lab_no_value`, `lab_exact_value`) hardcode their source
 in `build_mapping.py`. The crosswalk YAMLs are produced by
 `build_crosswalks.py`: deterministic walker hits carry the
 `deterministic:*` prefix; LLM picker hits carry an `llm:<reason>` prefix
 where `<reason>` is the residual case the walker couldn't resolve. The
 prior `llm:claude_clinical_knowledge` source from the loose-mapping era is
 no longer produced; it has been replaced by deterministic walkers wherever
-possible and by tightly-scoped LLM picker calls otherwise. `union` rows
+possible and by tightly-scoped LLM picker calls otherwise. `any` rows
 preserve the primary row's source so downstream consumers can trace any
-union match back to its origin without joining back to the YAML.
+match back to its origin without joining back to the YAML.
 
 ## Crosswalk audit notes
 
@@ -282,7 +282,7 @@ allowed exception of a same-source-concept ATC tie).
   residual) have no fluid-output prefix in the ETHOS vocab.
   Indication-proxy mappings used in the prior loose-mapping run (CK-MB ->
   AMI, HD output -> CKD encounter) were intentionally **dropped** because
-  they predict different events than EQ; the `mimic_item_crosswalk` AUC
+  they predict different events than EQ; the `proxy` AUC
   drop in the table above is the explicit cost of that change.
 
 ## Follow-up directions
@@ -301,7 +301,7 @@ allowed exception of a same-source-concept ATC tie).
   `Doxycycline Hyclate -> J01` (loses tetracycline-class specificity), and
   the procedure-as-indication mapping `7936 -> S82`. Approve / reject /
   modify per EQ section drives the next iteration of the YAMLs.
-- **Honest precision vs OR-of-N hit-rate.** The `icd_crosswalk` advantage
+- **Honest precision vs OR-of-N hit-rate.** The `dx_parent` advantage
   shrank from +0.094 (p=0.012) to +0.086 (p=0.064) because each ICD code
   now commits to exactly one parent. Restoring statistical significance
   would require either deeper-than-3-char ETHOS tokens (not present in the

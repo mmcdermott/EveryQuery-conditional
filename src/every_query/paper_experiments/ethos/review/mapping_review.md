@@ -55,13 +55,13 @@ Default to the **tightest** mapping that still captures the EQ concept. When a c
 ### <a id="diagnosisicd10i25118"></a>`DIAGNOSIS//ICD//10//I25118`
 
 - **Family:** `DIAGNOSIS`
-- **Mapped tiers:** icd_specific
+- **Mapped tiers:** dx_specific
 
 **Authoritative EQ label:** ICD-10-CM `I25118` -- Atherosclerotic heart disease of native coronary artery with other forms of angina pectoris
 - 3-char parent: `I25` -- Chronic ischemic heart disease
 - SNOMED bridge: Angina co-occurrent and due to coronary arteriosclerosis (concept_id 36712983)
 
-_Found under tier(s): icd_specific_
+_Found under tier(s): dx_specific_
 
 #### Candidate ETHOS token: `ICD//CM//CHRONIC_ISCHEMIC_HEART_DISEASE|ICD//CM//3-6//118` _(primary)_
 
@@ -84,7 +84,7 @@ _Found under tier(s): icd_specific_
 ### <a id="diagnosisicd93320"></a>`DIAGNOSIS//ICD//9//3320`
 
 - **Family:** `DIAGNOSIS`
-- **Mapped tiers:** icd_crosswalk
+- **Mapped tiers:** dx_parent
 
 **Authoritative EQ label:** ICD-9-CM `3320` -- Paralysis agitans
 - SNOMED bridge: Parkinson's disease (concept_id 381270)
@@ -101,7 +101,7 @@ _Found under tier(s): icd_specific_
 
 > ICD-10-CM 3-char parent G20 resolved to ETHOS token via ethos_icd_3char_index.
 
-_Found under tier(s): icd_crosswalk_
+_Found under tier(s): dx_parent_
 
 #### Candidate ETHOS token: `ICD//CM//PARKINSON'S_DISEASE` _(primary)_
 
@@ -132,7 +132,7 @@ _Found under tier(s): icd_crosswalk_
 ### <a id="diagnosisicd94271"></a>`DIAGNOSIS//ICD//9//4271`
 
 - **Family:** `DIAGNOSIS`
-- **Mapped tiers:** icd_crosswalk
+- **Mapped tiers:** dx_parent
 
 **Authoritative EQ label:** ICD-9-CM `4271` -- Paroxysmal ventricular tachycardia
 - SNOMED bridge: Paroxysmal ventricular tachycardia (concept_id 437579)
@@ -141,7 +141,7 @@ _Found under tier(s): icd_crosswalk_
 
 > While the EQ code specifically refers to ventricular tachycardia and the ETHOS token represents the broader category of paroxysmal tachycardia (which includes both ventricular and supraventricular types), this is the only available candidate and paroxysmal ventricular tachycardia is a subset of paroxysmal tachycardia. The mapping loses some specificity but remains clinically valid.
 
-_Found under tier(s): icd_crosswalk_
+_Found under tier(s): dx_parent_
 
 #### Candidate ETHOS token: `ICD//CM//PAROXYSMAL_TACHYCARDIA` _(primary)_
 
@@ -175,14 +175,14 @@ _Found under tier(s): icd_crosswalk_
 ### <a id="diagnosisicd95856"></a>`DIAGNOSIS//ICD//9//5856`
 
 - **Family:** `DIAGNOSIS`
-- **Mapped tiers:** icd_specific
+- **Mapped tiers:** dx_specific
 
 **Authoritative EQ label:** ICD-9-CM `5856` -- End stage renal disease
 - SNOMED bridge: End-stage renal disease (concept_id 193782)
 - ICD-10-CM crosswalk (1 code):
   - `N18.6` -- End stage renal disease
 
-_Found under tier(s): icd_specific_
+_Found under tier(s): dx_specific_
 
 #### Candidate ETHOS token: `ICD//CM//CHRONIC_KIDNEY_DISEASE_(CKD)|ICD//CM//3-6//6` _(primary)_
 
@@ -205,7 +205,7 @@ _Found under tier(s): icd_specific_
 ### <a id="diagnosisicd97295"></a>`DIAGNOSIS//ICD//9//7295`
 
 - **Family:** `DIAGNOSIS`
-- **Mapped tiers:** icd_specific
+- **Mapped tiers:** dx_specific
 
 **Authoritative EQ label:** ICD-9-CM `7295` -- Pain in limb
 - SNOMED bridge: Pain in limb (concept_id 138525)
@@ -214,7 +214,7 @@ _Found under tier(s): icd_specific_
   - `M79.60` -- Pain in limb, unspecified
   - `M79.609` -- Pain in unspecified limb
 
-_Found under tier(s): icd_specific_
+_Found under tier(s): dx_specific_
 
 #### Candidate ETHOS token: `ICD//CM//OTHER_AND_UNSPECIFIED_SOFT_TISSUE_DISORDERS_NOT_ELSEWHERE_CLASSIFIED|ICD//CM//3-6//609` _(primary)_
 
@@ -237,7 +237,7 @@ _Found under tier(s): icd_specific_
 ### <a id="infusion-end229420value-106874332327545"></a>`INFUSION_END//229420//value_[10.687433,23.27545)`
 
 - **Family:** `INFUSION_END`
-- **Mapped tiers:** mimic_item_crosswalk
+- **Mapped tiers:** proxy
 
 **Authoritative EQ label:** MIMIC item-id `229420` -- Dexmedetomidine (Precedex) (source: `d_items`)
 - abbreviation: Dexmedetomidine (Precedex)
@@ -250,7 +250,7 @@ _Found under tier(s): icd_specific_
 
 > Dexmedetomidine is a sedative agent used for procedural sedation and ICU sedation. It falls under ATC class N05 (psycholeptics/sedatives), which is the most semantically appropriate match in the ETHOS vocabulary for this alpha-2 agonist sedative medication.
 
-_Found under tier(s): mimic_item_crosswalk_
+_Found under tier(s): proxy_
 
 #### Candidate ETHOS token: `ATC//N05//PSYCHOLEPTICS` _(secondary)_
 
@@ -305,7 +305,7 @@ _Found under tier(s): mimic_item_crosswalk_
 ### <a id="infusion-start221794value-800492610000001"></a>`INFUSION_START//221794//value_[8.004926,10.000001)`
 
 - **Family:** `INFUSION_START`
-- **Mapped tiers:** mimic_item_crosswalk
+- **Mapped tiers:** proxy
 
 **Authoritative EQ label:** MIMIC item-id `221794` -- Furosemide (Lasix) (source: `d_items`)
 - abbreviation: Furosemide (Lasix)
@@ -318,7 +318,7 @@ _Found under tier(s): mimic_item_crosswalk_
 
 > RxNorm ingredient 'furosemide' walks to ATC C03 via OHDSI CONCEPT_ANCESTOR.
 
-_Found under tier(s): mimic_item_crosswalk_
+_Found under tier(s): proxy_
 
 #### Candidate ETHOS token: `ATC//C03//DIURETICS` _(secondary)_
 
@@ -373,7 +373,7 @@ _Found under tier(s): mimic_item_crosswalk_
 ### <a id="lab220224mmhgvalue-890980"></a>`LAB//220224//mmHg//value_[89.0,98.0)`
 
 - **Family:** `LAB`
-- **Mapped tiers:** quantile
+- **Mapped tiers:** lab_exact_value
 
 **Authoritative EQ label:** MIMIC item-id `220224` -- Arterial O2 pressure (source: `d_items`)
 - abbreviation: PO2 (Arterial)
@@ -382,7 +382,7 @@ _Found under tier(s): mimic_item_crosswalk_
 - linksto: chartevents
 - EQ-encoded units: `mmHg`
 
-_Found under tier(s): quantile_
+_Found under tier(s): lab_exact_value_
 
 #### Candidate ETHOS token: `LAB//220224//MMHG|Q4` _(primary)_
 
@@ -405,7 +405,7 @@ _Found under tier(s): quantile_
 ### <a id="lab220339cmh2ovalue-100120"></a>`LAB//220339//cmH2O//value_[10.0,12.0)`
 
 - **Family:** `LAB`
-- **Mapped tiers:** quantile_approx
+- **Mapped tiers:** lab_approx_value
 
 **Authoritative EQ label:** MIMIC item-id `220339` -- PEEP set (source: `d_items`)
 - abbreviation: PEEP set
@@ -414,7 +414,7 @@ _Found under tier(s): quantile_
 - linksto: chartevents
 - EQ-encoded units: `cmH2O`
 
-_Found under tier(s): quantile_approx_
+_Found under tier(s): lab_approx_value_
 
 #### Candidate ETHOS token: `LAB//220339//CMH2O|Q8` _(primary)_
 
@@ -437,7 +437,7 @@ _Found under tier(s): quantile_approx_
 ### <a id="lab224054unkvalue-2030"></a>`LAB//224054//UNK//value_[2.0,3.0)`
 
 - **Family:** `LAB`
-- **Mapped tiers:** quantile_approx
+- **Mapped tiers:** lab_approx_value
 
 **Authoritative EQ label:** MIMIC item-id `224054` -- Braden Sensory Perception (source: `d_items`)
 - abbreviation: Braden Sensory Perception
@@ -445,7 +445,7 @@ _Found under tier(s): quantile_approx_
 - linksto: chartevents
 - EQ-encoded units: `UNK`
 
-_Found under tier(s): quantile_approx_
+_Found under tier(s): lab_approx_value_
 
 #### Candidate ETHOS token: `LAB//224054//UNK|Q5` _(primary)_
 
@@ -468,7 +468,7 @@ _Found under tier(s): quantile_approx_
 ### <a id="lab224690inspminvalue-140160"></a>`LAB//224690//insp/min//value_[14.0,16.0)`
 
 - **Family:** `LAB`
-- **Mapped tiers:** quantile
+- **Mapped tiers:** lab_exact_value
 
 **Authoritative EQ label:** MIMIC item-id `224690` -- Respiratory Rate (Total) (source: `d_items`)
 - abbreviation: Respiratory Rate (Total)
@@ -477,7 +477,7 @@ _Found under tier(s): quantile_approx_
 - linksto: chartevents
 - EQ-encoded units: `insp/min`
 
-_Found under tier(s): quantile_
+_Found under tier(s): lab_exact_value_
 
 #### Candidate ETHOS token: `LAB//224690//INSP/MIN|Q2` _(primary)_
 
@@ -500,7 +500,7 @@ _Found under tier(s): quantile_
 ### <a id="lab227073meqlvalue-170190"></a>`LAB//227073//mEq/L//value_[17.0,19.0)`
 
 - **Family:** `LAB`
-- **Mapped tiers:** quantile_approx
+- **Mapped tiers:** lab_approx_value
 
 **Authoritative EQ label:** MIMIC item-id `227073` -- Anion gap (source: `d_items`)
 - abbreviation: Anion gap
@@ -509,7 +509,7 @@ _Found under tier(s): quantile_
 - linksto: chartevents
 - EQ-encoded units: `mEq/L`
 
-_Found under tier(s): quantile_approx_
+_Found under tier(s): lab_approx_value_
 
 #### Candidate ETHOS token: `LAB//227073//MEQ/L|Q9` _(primary)_
 
@@ -532,7 +532,7 @@ _Found under tier(s): quantile_approx_
 ### <a id="lab228724cmvalue-1520"></a>`LAB//228724//cm//value_[1.5,2.0)`
 
 - **Family:** `LAB`
-- **Mapped tiers:** mimic_item_crosswalk
+- **Mapped tiers:** proxy
 
 **Authoritative EQ label:** MIMIC item-id `228724` -- Pressure ulcer #2- Length (source: `d_items`)
 - abbreviation: Pressure ulcer #2- Length
@@ -545,7 +545,7 @@ _Found under tier(s): quantile_approx_
 
 > The EQ code explicitly measures the length of pressure ulcer #2, making it a direct measurement related to pressure ulcers. The ICD-10-CM code L89 for Pressure Ulcer is the most semantically specific and faithful match among the candidates.
 
-_Found under tier(s): mimic_item_crosswalk_
+_Found under tier(s): proxy_
 
 #### Candidate ETHOS token: `ICD//CM//PRESSURE_ULCER` _(secondary)_
 
@@ -600,14 +600,14 @@ _Found under tier(s): mimic_item_crosswalk_
 ### <a id="lab51274secvalue-141153"></a>`LAB//51274//sec//value_[14.1,15.3)`
 
 - **Family:** `LAB`
-- **Mapped tiers:** quantile
+- **Mapped tiers:** lab_exact_value
 
 **Authoritative EQ label:** MIMIC item-id `51274` -- PT (source: `d_labitems`)
 - category: Hematology
 - fluid: Blood
 - EQ-encoded units: `sec`
 
-_Found under tier(s): quantile_
+_Found under tier(s): lab_exact_value_
 
 #### Candidate ETHOS token: `LAB//51274//SEC|Q6` _(primary)_
 
@@ -630,7 +630,7 @@ _Found under tier(s): quantile_
 ### <a id="medicationcarbidopa-levodopa-25-100administered"></a>`MEDICATION//Carbidopa-Levodopa (25-100)//Administered`
 
 - **Family:** `MEDICATION`
-- **Mapped tiers:** atc_crosswalk
+- **Mapped tiers:** drug_class
 
 **Authoritative EQ label:** MIMIC medication `Carbidopa-Levodopa (25-100)` (admin modes: Administered)
 - RxNorm match: levodopa (concept_class Ingredient)
@@ -642,7 +642,7 @@ _Found under tier(s): quantile_
 
 > RxNorm ingredient 'levodopa' walks to ATC N04 via OHDSI CONCEPT_ANCESTOR.
 
-_Found under tier(s): atc_crosswalk_
+_Found under tier(s): drug_class_
 
 #### Candidate ETHOS token: `ATC//N04//ANTI-PARKINSON_DRUGS` _(secondary)_
 
@@ -697,7 +697,7 @@ _Found under tier(s): atc_crosswalk_
 ### <a id="medicationgabapentindelayed-administered"></a>`MEDICATION//Gabapentin//Delayed Administered`
 
 - **Family:** `MEDICATION`
-- **Mapped tiers:** atc_crosswalk
+- **Mapped tiers:** drug_class
 
 **Authoritative EQ label:** MIMIC medication `Gabapentin` (admin modes: Delayed Administered)
 - RxNorm match: gabapentin (concept_class Ingredient)
@@ -709,7 +709,7 @@ _Found under tier(s): atc_crosswalk_
 
 > RxNorm ingredient 'gabapentin' (concept_id=797399) sits in two distinct ATC chains; both are committed since they reflect the same source concept.
 
-_Found under tier(s): atc_crosswalk_
+_Found under tier(s): drug_class_
 
 #### Candidate ETHOS token: `ATC//N02//ANALGESICS` _(secondary)_
 
@@ -750,7 +750,7 @@ _Found under tier(s): atc_crosswalk_
   - fentanyl
   - ... +51 more
 
-_Found under tier(s): atc_crosswalk_
+_Found under tier(s): drug_class_
 
 #### Candidate ETHOS token: `ATC//N03//ANTIEPILEPTICS` _(secondary)_
 
@@ -805,7 +805,7 @@ _Found under tier(s): atc_crosswalk_
 ### <a id="medicationstartmupirocin-nasal-ointment-2"></a>`MEDICATION//START//Mupirocin Nasal Ointment 2%`
 
 - **Family:** `MEDICATION`
-- **Mapped tiers:** atc_crosswalk
+- **Mapped tiers:** drug_class
 
 **Authoritative EQ label:** MIMIC medication `Mupirocin Nasal Ointment 2%` (admin modes: START)
 - RxNorm match: mupirocin (concept_class Ingredient)
@@ -817,7 +817,7 @@ _Found under tier(s): atc_crosswalk_
 
 > Mupirocin Nasal Ointment 2% is specifically formulated for nasal application, making R01 (Nasal Preparations) the most semantically specific match. While mupirocin is an antibiotic that could fall under D06 for dermatological use, the nasal formulation and route of administration makes R01 the most faithful representation of this specific product.
 
-_Found under tier(s): atc_crosswalk_
+_Found under tier(s): drug_class_
 
 #### Candidate ETHOS token: `ATC//R01//NASAL_PREPARATIONS` _(secondary)_
 
@@ -872,7 +872,7 @@ _Found under tier(s): atc_crosswalk_
 ### <a id="medicationstopcaptopril"></a>`MEDICATION//STOP//Captopril`
 
 - **Family:** `MEDICATION`
-- **Mapped tiers:** atc_crosswalk
+- **Mapped tiers:** drug_class
 
 **Authoritative EQ label:** MIMIC medication `Captopril` (admin modes: STOP)
 - RxNorm match: captopril (concept_class Ingredient)
@@ -884,7 +884,7 @@ _Found under tier(s): atc_crosswalk_
 
 > RxNorm ingredient 'captopril' walks to ATC C09 via OHDSI CONCEPT_ANCESTOR.
 
-_Found under tier(s): atc_crosswalk_
+_Found under tier(s): drug_class_
 
 #### Candidate ETHOS token: `ATC//C09//AGENTS_ACTING_ON_THE_RENIN-ANGIOTENSIN_SYSTEM` _(secondary)_
 
@@ -933,7 +933,7 @@ _Found under tier(s): atc_crosswalk_
 ### <a id="medicationstopdoxycycline-hyclate"></a>`MEDICATION//STOP//Doxycycline Hyclate`
 
 - **Family:** `MEDICATION`
-- **Mapped tiers:** atc_crosswalk
+- **Mapped tiers:** drug_class
 
 **Authoritative EQ label:** MIMIC medication `Doxycycline Hyclate` (admin modes: STOP)
 - RxNorm match: doxycycline hyclate (concept_class Precise Ingredient)
@@ -942,7 +942,7 @@ _Found under tier(s): atc_crosswalk_
 
 > LLM proposed 'ATC//J01//ANTIBACTERIALS_FOR_SYSTEMIC_USE'; salvaged to canonical ETHOS token 'ATC//J01//ANTIBIOTICS_AND_ANTIBACTERIALS_FOR_SYSTEMIC_USE' via unique namespace-prefix match. Original rationale: Doxycycline hyclate is a tetracycline antibiotic used systemically for bacterial infections. The ATC level-3 class J01 (Antibacterials for Systemic Use) is the most semantically appropriate match, as ETHOS tokens do not appear to include specific drug ingredients or brand formulations, only therapeutic drug classes.
 
-_Found under tier(s): atc_crosswalk_
+_Found under tier(s): drug_class_
 
 #### Candidate ETHOS token: `ATC//J01//ANTIBIOTICS_AND_ANTIBACTERIALS_FOR_SYSTEMIC_USE` _(secondary)_
 
@@ -1024,7 +1024,7 @@ _Found under tier(s): exact_
 ### <a id="procedureicd97936"></a>`PROCEDURE//ICD//9//7936`
 
 - **Family:** `PROCEDURE`
-- **Mapped tiers:** icd_crosswalk
+- **Mapped tiers:** dx_parent
 
 **Authoritative EQ label:** ICD-9-Proc `7936` -- Open reduction of fracture with internal fixation, tibia and fibula
 
@@ -1032,7 +1032,7 @@ _Found under tier(s): exact_
 
 > The EQ code describes a procedure for open reduction with internal fixation of tibia and fibula fractures. The tibia and fibula are the two bones of the lower leg, which directly corresponds to the ETHOS token for fractures of the lower leg including ankle (S82).
 
-_Found under tier(s): icd_crosswalk_
+_Found under tier(s): dx_parent_
 
 #### Candidate ETHOS token: `ICD//CM//FRACTURE_OF_LOWER_LEG_INCLUDING_ANKLE` _(secondary)_
 
@@ -1087,7 +1087,7 @@ _Found under tier(s): icd_crosswalk_
 ### <a id="timelinestart"></a>`TIMELINE//START`
 
 - **Family:** `TIMELINE`
-- **Mapped tiers:** mimic_item_crosswalk
+- **Mapped tiers:** proxy
 
 **Authoritative EQ label:** Start of patient record (first event marker)
 
@@ -1095,7 +1095,7 @@ _Found under tier(s): icd_crosswalk_
 
 > EQ's TIMELINE//START fires at the first event of a patient's record; ETHOS uses HOSPITAL_ADMISSION as its admission marker.
 
-_Found under tier(s): mimic_item_crosswalk_
+_Found under tier(s): proxy_
 
 #### Candidate ETHOS token: `HOSPITAL_ADMISSION` _(secondary)_
 

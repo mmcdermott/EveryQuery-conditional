@@ -5,16 +5,16 @@ more mapping rows, one per (tier, ETHOS token pattern) the query can be
 matched against:
 
 * ``exact`` -- EQ code string is a literal ETHOS token.
-* ``drop_bin`` -- for value-binned families (LAB / INFUSION_START / INFUSION_END
-  / SUBJECT_FLUID_OUTPUT) strip the trailing ``//value_[..)`` segment, upper-case
-  the units, match the resulting prefix as a literal ETHOS token (any value
-  decile counts as a hit).
-* ``quantile`` -- same prefix as ``drop_bin``, additionally constrained so the
-  next ETHOS token must be the ``Qk`` decile that EQ's value bin corresponds to.
-  Decile boundaries come from ``meds_codes.parquet`` ``values/quantiles``;
-  empirically EQ's bins ARE the deciles, so the mapping is the bin's positional
-  index 1..10 -> Q1..Q10.
-* ``union`` -- per-code OR of all patterns from prior tiers.
+* ``lab_no_value`` -- for value-binned families (LAB / INFUSION_START /
+  INFUSION_END / SUBJECT_FLUID_OUTPUT) strip the trailing ``//value_[..)``
+  segment, upper-case the units, match the resulting prefix as a literal ETHOS
+  token (any value decile counts as a hit).
+* ``lab_exact_value`` -- same prefix as ``lab_no_value``, additionally
+  constrained so the next ETHOS token must be the ``Qk`` decile that EQ's
+  value bin corresponds to. Decile boundaries come from ``meds_codes.parquet``
+  ``values/quantiles``; empirically EQ's bins ARE the deciles, so the mapping
+  is the bin's positional index 1..10 -> Q1..Q10.
+* ``any`` -- per-code OR of all patterns from prior tiers.
 
 Outputs ``mapping_table.parquet`` and ``mapping_coverage.parquet`` and uploads
 them to ``gs://every-query-runs/baselines/ethos/``.
@@ -123,9 +123,9 @@ def load_meds_sibling_bins() -> dict[str, list[tuple[float, float]]]:
     """Map non-binned base code (e.g. ``LAB//51274//sec``) -> sorted list of
     sibling ``(lo, hi)`` value bins observed in ``meds_codes.parquet``.
 
-    Used by :func:`build_quantile_approx` to map an EQ value bin's positional
+    Used by :func:`build_lab_approx_value` to map an EQ value bin's positional
     index to an approximate decile when a code has fewer than 10 sibling bins
-    (so the strict :func:`build_quantile` cannot fire).
+    (so the strict :func:`build_lab_exact_value` cannot fire).
     """
     p = _download(MEDS_CODES_BLOB, CACHE_DIR / "meds_codes.parquet")
     df = pl.read_parquet(p)
@@ -236,7 +236,7 @@ def build_exact(eq_codes: list[str], ethos_vocab: set[str]) -> pl.DataFrame:
     return pl.DataFrame(rows, schema=_schema())
 
 
-def build_drop_bin(eq_codes: list[str], ethos_vocab: set[str]) -> pl.DataFrame:
+def build_lab_no_value(eq_codes: list[str], ethos_vocab: set[str]) -> pl.DataFrame:
     rows: list[dict] = []
     for c in eq_codes:
         if family_of(c) not in VALUE_BIN_FAMILIES:
@@ -250,10 +250,10 @@ def build_drop_bin(eq_codes: list[str], ethos_vocab: set[str]) -> pl.DataFrame:
             rows.append(
                 {
                     "query": c,
-                    "tier": "drop_bin",
+                    "tier": "lab_no_value",
                     "token_pattern": token,
                     "match_kind": "literal",
-                    "provenance": "drop-bin/upper-units",
+                    "provenance": "lab-no-value/upper-units",
                     "mapping_source": "code:strip_value_bin+upper_units",
                 }
             )
@@ -278,7 +278,7 @@ def _decile_index(lo: float, hi: float, deciles: list[float]) -> int | None:
     return None
 
 
-def build_quantile(
+def build_lab_exact_value(
     eq_codes: list[str],
     ethos_vocab: set[str],
     meds_quantiles: dict[str, list[float]],
@@ -304,7 +304,7 @@ def build_quantile(
         rows.append(
             {
                 "query": c,
-                "tier": "quantile",
+                "tier": "lab_exact_value",
                 "token_pattern": f"{token_lab}|{token_q}",
                 "match_kind": "code+next_token",
                 "provenance": f"deciles/idx={idx}",
@@ -336,20 +336,20 @@ def _bin_positional_index(
     return None
 
 
-def build_quantile_approx(
+def build_lab_approx_value(
     eq_codes: list[str],
     ethos_vocab: set[str],
     sibling_bins: dict[str, list[tuple[float, float]]],
 ) -> pl.DataFrame:
     """Approximate-decile fallback for value-binned EQ codes whose base has
     ``1 < n < 10`` sibling bins in ``meds_codes.parquet`` (the strict
-    :func:`build_quantile` requires exactly 10 deciles).
+    :func:`build_lab_exact_value` requires exactly 10 deciles).
 
     For each candidate, find the EQ bin's 1-based positional index ``i``
     among the sorted siblings (length ``n``), compute
     ``Qk = max(1, min(10, round(i * 10 / n)))``, and emit a row with the
-    same ``code+next_token`` shape as the strict-quantile tier. Skips when
-    either token is absent from the ETHOS vocab.
+    same ``code+next_token`` shape as the ``lab_exact_value`` tier. Skips
+    when either token is absent from the ETHOS vocab.
     """
     rows: list[dict] = []
     for c in eq_codes:
@@ -374,7 +374,7 @@ def build_quantile_approx(
         rows.append(
             {
                 "query": c,
-                "tier": "quantile_approx",
+                "tier": "lab_approx_value",
                 "token_pattern": f"{token_lab}|{token_q}",
                 "match_kind": "code+next_token",
                 "provenance": f"approx_decile/i={i}/n={n}",
@@ -387,7 +387,7 @@ def build_quantile_approx(
 _EQ_DX_ICD_RE = re.compile(r"^DIAGNOSIS//ICD//(9|10)//(.+)$")
 
 
-def _icd_specific_target(eq_code: str) -> tuple[str, str, str] | None:
+def _dx_specific_target(eq_code: str) -> tuple[str, str, str] | None:
     """For a ``DIAGNOSIS//ICD//(9|10)//<code>`` EQ code, return
     ``(parent_3char_code, suffix_digits, source)`` where ``source`` is the
     deterministic provenance string for the chosen 5-char ICD-10-CM target.
@@ -442,7 +442,7 @@ def _icd_specific_target(eq_code: str) -> tuple[str, str, str] | None:
     return None
 
 
-def build_icd_specific(
+def build_dx_specific(
     eq_codes: list[str],
     ethos_vocab: set[str],
 ) -> pl.DataFrame:
@@ -454,8 +454,8 @@ def build_icd_specific(
     STRICT MATCHING: this tier matches only the 2-token sequence; an
     isolated emission of the descriptive label alone (no suffix follow-up)
     does not count as a hit. The tier is independent of and complementary
-    to ``icd_crosswalk`` (suppressed by the cascade in :func:`main` when
-    both fire for the same query).
+    to ``dx_parent`` (suppressed by the cascade in :func:`main` when both
+    fire for the same query).
     """
     from . import ontology as _ont
 
@@ -464,7 +464,7 @@ def build_icd_specific(
     for c in eq_codes:
         if family_of(c) != "DIAGNOSIS":
             continue
-        target = _icd_specific_target(c)
+        target = _dx_specific_target(c)
         if target is None:
             continue
         parent_3char_code, suffix, source = target
@@ -477,10 +477,10 @@ def build_icd_specific(
         rows.append(
             {
                 "query": c,
-                "tier": "icd_specific",
+                "tier": "dx_specific",
                 "token_pattern": f"{label_token}|{suffix_token}",
                 "match_kind": "code+next_token",
-                "provenance": f"icd_specific/{parent_3char_code}+{suffix}",
+                "provenance": f"dx_specific/{parent_3char_code}+{suffix}",
                 "mapping_source": source,
             }
         )
@@ -546,11 +546,11 @@ def build_crosswalk(
     return pl.DataFrame(rows, schema=_schema())
 
 
-def build_union(prior: pl.DataFrame) -> pl.DataFrame:
+def build_any(prior: pl.DataFrame) -> pl.DataFrame:
     if prior.is_empty():
         return pl.DataFrame(schema=_schema())
     return prior.with_columns(
-        pl.lit("union").alias("tier"),
+        pl.lit("any").alias("tier"),
         ("from-" + pl.col("tier")).alias("provenance"),
         # mapping_source is preserved from the underlying primary-tier row
     ).unique(subset=["query", "token_pattern", "match_kind"])
@@ -567,19 +567,19 @@ def _schema() -> dict[str, type]:
     }
 
 
-_PRIMARY_TIERS = ("exact", "drop_bin", "quantile", "quantile_approx", "icd_specific")
+_PRIMARY_TIERS = ("exact", "lab_no_value", "lab_exact_value", "lab_approx_value", "dx_specific")
 
 
 def apply_suppression_cascade(primary: pl.DataFrame) -> pl.DataFrame:
     """Apply the 'prefer the more specific tier' suppression rules:
 
-    (a) Drop ``drop_bin`` rows whose ``query`` also has a ``quantile`` or
-        ``quantile_approx`` row.
-    (b) Drop ``icd_crosswalk`` rows whose ``query`` also has an
-        ``icd_specific`` row.
-    (c) Drop ``mimic_item_crosswalk`` rows whose ``query`` also has a
-        ``quantile`` or ``quantile_approx`` row (suppress indication-proxy
-        when a precise lab quantile mapping exists).
+    (a) Drop ``lab_no_value`` rows whose ``query`` also has a
+        ``lab_exact_value`` or ``lab_approx_value`` row.
+    (b) Drop ``dx_parent`` rows whose ``query`` also has a ``dx_specific``
+        row.
+    (c) Drop ``proxy`` rows whose ``query`` also has a ``lab_exact_value``
+        or ``lab_approx_value`` row (suppress indication-proxy when a
+        precise lab value mapping exists).
 
     Suppressed tiers remain available for queries that have no upgraded
     coverage. Returns the filtered DataFrame.
@@ -588,22 +588,22 @@ def apply_suppression_cascade(primary: pl.DataFrame) -> pl.DataFrame:
         return primary
 
     queries_with_q = set(
-        primary.filter(pl.col("tier").is_in(["quantile", "quantile_approx"]))[
+        primary.filter(pl.col("tier").is_in(["lab_exact_value", "lab_approx_value"]))[
             "query"
         ].to_list()
     )
-    queries_with_icd_specific = set(
-        primary.filter(pl.col("tier") == "icd_specific")["query"].to_list()
+    queries_with_dx_specific = set(
+        primary.filter(pl.col("tier") == "dx_specific")["query"].to_list()
     )
 
     drop_mask = (
-        ((pl.col("tier") == "drop_bin") & pl.col("query").is_in(list(queries_with_q)))
+        ((pl.col("tier") == "lab_no_value") & pl.col("query").is_in(list(queries_with_q)))
         | (
-            (pl.col("tier") == "icd_crosswalk")
-            & pl.col("query").is_in(list(queries_with_icd_specific))
+            (pl.col("tier") == "dx_parent")
+            & pl.col("query").is_in(list(queries_with_dx_specific))
         )
         | (
-            (pl.col("tier") == "mimic_item_crosswalk")
+            (pl.col("tier") == "proxy")
             & pl.col("query").is_in(list(queries_with_q))
         )
     )
@@ -614,21 +614,21 @@ def add_tier_quality(mapping: pl.DataFrame) -> pl.DataFrame:
     """Attach a ``tier_quality`` column to the mapping table.
 
     ``primary`` iff one of:
-      (i)  ``tier`` in {exact, drop_bin, quantile, quantile_approx, icd_specific}, OR
-      (ii) ``tier == 'icd_crosswalk'`` AND ``family(query) == 'DIAGNOSIS'``
+      (i)  ``tier`` in {exact, lab_no_value, lab_exact_value, lab_approx_value, dx_specific}, OR
+      (ii) ``tier == 'dx_parent'`` AND ``family(query) == 'DIAGNOSIS'``
            (3-char parent IS the most specific ETHOS encoding for that
-           diagnosis when ``icd_specific`` cannot fire).
+           diagnosis when ``dx_specific`` cannot fire).
 
     ``secondary`` in all other cases:
-      (iii) ``tier == 'atc_crosswalk'`` (ETHOS encodes ATC at level 2 only,
+      (iii) ``tier == 'drug_class'`` (ETHOS encodes ATC at level 2 only,
             so every drug is a class-proxy);
-      (iv)  ``tier == 'icd_crosswalk'`` AND ``family(query) == 'PROCEDURE'``
+      (iv)  ``tier == 'dx_parent'`` AND ``family(query) == 'PROCEDURE'``
             (proxy via diagnosis token);
-      (v)   ``tier == 'mimic_item_crosswalk'`` (orphan-lab indication
-            proxies, ATC-class proxies for named-drug infusions,
+      (v)   ``tier == 'proxy'`` (orphan-lab indication proxies, ATC-class
+            proxies for named-drug infusions,
             ``TIMELINE//START -> HOSPITAL_ADMISSION``).
 
-    The ``union`` tier (a re-emission of primary rows under the OR-of-all
+    The ``any`` tier (a re-emission of primary rows under the OR-of-all
     semantics) falls into the secondary bucket by default; downstream
     consumers that care about quality use the underlying primary tier rows.
     """
@@ -636,7 +636,7 @@ def add_tier_quality(mapping: pl.DataFrame) -> pl.DataFrame:
     tier_quality = (
         pl.when(pl.col("tier").is_in(list(_PRIMARY_TIERS)))
         .then(pl.lit("primary"))
-        .when((pl.col("tier") == "icd_crosswalk") & (family_expr == "DIAGNOSIS"))
+        .when((pl.col("tier") == "dx_parent") & (family_expr == "DIAGNOSIS"))
         .then(pl.lit("primary"))
         .otherwise(pl.lit("secondary"))
         .alias("tier_quality")
@@ -717,17 +717,17 @@ def main(upload: bool = True) -> None:
 
     print("Building tiers ...")
     exact = build_exact(eq_codes, ethos_vocab)
-    drop_bin = build_drop_bin(eq_codes, ethos_vocab)
-    quantile = build_quantile(eq_codes, ethos_vocab, meds_q)
-    quantile_approx = build_quantile_approx(eq_codes, ethos_vocab, sibling_bins)
-    icd_specific = build_icd_specific(eq_codes, ethos_vocab)
-    icd_xw = build_crosswalk(eq_codes, ethos_vocab, ICD_CROSSWALK_PATH, "icd_crosswalk")
-    atc_xw = build_crosswalk(eq_codes, ethos_vocab, ATC_CROSSWALK_PATH, "atc_crosswalk")
-    mimic_xw = build_crosswalk(
-        eq_codes, ethos_vocab, MIMIC_ITEMS_CROSSWALK_PATH, "mimic_item_crosswalk"
+    lab_no_value = build_lab_no_value(eq_codes, ethos_vocab)
+    lab_exact_value = build_lab_exact_value(eq_codes, ethos_vocab, meds_q)
+    lab_approx_value = build_lab_approx_value(eq_codes, ethos_vocab, sibling_bins)
+    dx_specific = build_dx_specific(eq_codes, ethos_vocab)
+    dx_xw = build_crosswalk(eq_codes, ethos_vocab, ICD_CROSSWALK_PATH, "dx_parent")
+    drug_xw = build_crosswalk(eq_codes, ethos_vocab, ATC_CROSSWALK_PATH, "drug_class")
+    proxy_xw = build_crosswalk(
+        eq_codes, ethos_vocab, MIMIC_ITEMS_CROSSWALK_PATH, "proxy"
     )
     primary = pl.concat(
-        [exact, drop_bin, quantile, quantile_approx, icd_specific, icd_xw, atc_xw, mimic_xw],
+        [exact, lab_no_value, lab_exact_value, lab_approx_value, dx_specific, dx_xw, drug_xw, proxy_xw],
         how="vertical",
     )
 
@@ -736,8 +736,8 @@ def main(upload: bool = True) -> None:
     suppressed_n = len(pre_suppression) - len(primary)
     print(f"  suppression cascade dropped {suppressed_n} row(s)")
 
-    union = build_union(primary)
-    mapping = pl.concat([primary, union], how="vertical")
+    any_tier = build_any(primary)
+    mapping = pl.concat([primary, any_tier], how="vertical")
     mapping = add_tier_quality(mapping)
 
     coverage = build_coverage(eq_codes, mapping)

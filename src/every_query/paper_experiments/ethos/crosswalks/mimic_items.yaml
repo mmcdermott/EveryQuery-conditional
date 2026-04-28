@@ -3,7 +3,7 @@
 # INFUSION rows resolve the item-id to a drug-name label and walk to ATC
 # via ontology.atc_to_ethos_token. LAB and SUBJECT_FLUID_OUTPUT rows are
 # limited to orphan codes (base form not in the ETHOS vocab, so
-# build_mapping's drop_bin / quantile tiers cannot match) and are
+# build_mapping's lab_no_value / lab_exact_value tiers cannot match) and are
 # resolved by the LLM picker with diagnosis-token candidates seeded by
 # name overlap. TIMELINE//START is a direct mapping. Codes the LLM
 # declined are listed in unmappable_with_rationale at the bottom.

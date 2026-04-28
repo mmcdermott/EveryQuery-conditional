@@ -104,8 +104,8 @@ def _render_section_header(
     Held-out AUC numbers are intentionally omitted -- see module docstring.
     """
     tiers = coverage_row.get("mapped_under_tiers") or []
-    tiers_no_union = [t for t in tiers if t != "union"]
-    tier_str = ", ".join(tiers_no_union) if tiers_no_union else "(none)"
+    tiers_no_any = [t for t in tiers if t != "any"]
+    tier_str = ", ".join(tiers_no_any) if tiers_no_any else "(none)"
 
     lines: list[str] = []
     lines.append(f'### <a id="{_anchor(eq_code)}"></a>`{eq_code}`')
@@ -648,7 +648,7 @@ def build_review_markdown() -> str:
 
     1. Load the four mapping artifacts via ``load_mapping_artifacts``.
     2. Load LLM and unmappable rationales from the crosswalk YAMLs.
-    3. Filter ``mapping_table`` to drop the ``union`` tier (each unique
+    3. Filter ``mapping_table`` to drop the ``any`` tier (each unique
        candidate token appears once across primary tiers; the tiers each
        candidate appeared under are aggregated separately for display).
     4. Iterate over the 41 EQ codes in the order from
@@ -661,7 +661,7 @@ def build_review_markdown() -> str:
     rationales = _load_llm_rationales()
     unmappable = _load_unmappable_rationales()
 
-    primary = mapping_table.filter(pl.col("tier") != "union")
+    primary = mapping_table.filter(pl.col("tier") != "any")
 
     has_tier_quality = "tier_quality" in primary.columns
 
@@ -736,7 +736,7 @@ def build_review_markdown() -> str:
                 section_parts.append("")
 
         if not candidates:
-            section_parts.append("_No candidate ETHOS tokens recorded outside the union tier._")
+            section_parts.append("_No candidate ETHOS tokens recorded outside the any tier._")
             section_parts.append("")
         else:
             for cand in candidates:

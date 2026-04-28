@@ -25,7 +25,7 @@ Dispatch rules follow [`tighten_ethos_mappings_via_deterministic_walker_+_scoped
 * INFUSION_START / INFUSION_END -- resolve item-id via
   [`ontology.mimic_item_label`](ontology.py) -> drug-name -> ``atc_to_ethos_token``.
 * LAB / SUBJECT_FLUID_OUTPUT -- if ``build_mapping`` would have matched the
-  base via drop_bin/quantile (i.e., the upper-units base is in the ETHOS
+  base via lab_no_value/lab_exact_value (i.e., the upper-units base is in the ETHOS
   vocab), no crosswalk entry is needed and we skip; otherwise the code is an
   orphan and we escalate to ``pick.llm_pick_one`` with
   ``reason='orphan_lab'`` and candidates seeded by name-overlap against the
@@ -248,7 +248,7 @@ def _is_orphan_lab(code: str, ethos_vocab: set[str]) -> bool:
     """Return ``True`` if a LAB / SUBJECT_FLUID_OUTPUT code's base form
     (after stripping the value-bin and upper-casing units) is NOT in the
     ETHOS vocab and therefore would not be matched by ``build_mapping``'s
-    drop_bin or quantile tier.
+    lab_no_value or lab_exact_value tier.
     """
     parsed = bm.parse_value_bin(code)
     base = parsed[0] if parsed is not None else code
@@ -756,7 +756,7 @@ _MIMIC_HEADER = _yaml_header(
     "INFUSION rows resolve the item-id to a drug-name label and walk to ATC\n"
     "via ontology.atc_to_ethos_token. LAB and SUBJECT_FLUID_OUTPUT rows are\n"
     "limited to orphan codes (base form not in the ETHOS vocab, so\n"
-    "build_mapping's drop_bin / quantile tiers cannot match) and are\n"
+    "build_mapping's lab_no_value / lab_exact_value tiers cannot match) and are\n"
     "resolved by the LLM picker with diagnosis-token candidates seeded by\n"
     "name overlap. TIMELINE//START is a direct mapping. Codes the LLM\n"
     "declined are listed in unmappable_with_rationale at the bottom."

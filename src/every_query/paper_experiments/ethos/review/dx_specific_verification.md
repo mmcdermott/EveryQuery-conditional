@@ -53,9 +53,9 @@ Every pair reconstructs to a real, common ICD-10-CM code. There are 21,320 uniqu
 
 ## Implication for Phase 8
 
-Add the `icd_specific` tier as designed:
+Add the `dx_specific` tier as designed:
 
-- For DIAGNOSIS EQ codes that resolve to a specific 5-char ICD-10-CM code, derive the (3-char_label, suffix_digits) split, and if both `ICD//CM//<3char_label>` AND `ICD//CM//3-6//<suffix>` are in `ethos_vocab`, emit a row with `tier=icd_specific`, `match_kind=code+next_token`, `token_pattern=<label_token>|ICD//CM//3-6//<suffix>`.
+- For DIAGNOSIS EQ codes that resolve to a specific 5-char ICD-10-CM code, derive the (3-char_label, suffix_digits) split, and if both `ICD//CM//<3char_label>` AND `ICD//CM//3-6//<suffix>` are in `ethos_vocab`, emit a row with `tier=dx_specific`, `match_kind=code+next_token`, `token_pattern=<label_token>|ICD//CM//3-6//<suffix>`.
 
 The tier should match **only** the precise 2-token pair, not the 3-char-only emission, because the user explicitly asked for "1-1" mapping. ETHOS trajectories where the same patient has the I25-family diagnosis recorded only at 3-char level (no suffix) represent a genuinely different signal (subdivision not specified) and should not match a query for I25.118.
 
