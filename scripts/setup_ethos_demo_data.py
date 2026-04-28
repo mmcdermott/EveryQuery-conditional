@@ -1,42 +1,56 @@
 #!/usr/bin/env python3
 """Generate Ethos-tokenized MEDS shards from the public MIMIC-IV-demo dataset.
 
-Goal: produce a real Ethos preprocessing artifact (timeline shards + the
-``StaticDataCollector`` pickle) so we can:
+Goal: produce a real Ethos preprocessing artifact (post-tokenization MEDS-shape
+shards + the ``StaticDataCollector`` pickle) so we can:
 
-  1. Inspect the actual format of Ethos's static-data side-channel — required to lift
-     the parquet-only restriction in
-     ``src/every_query/paper_experiments/ethos_compat/reprocess.py::load_static_table``.
-  2. Run the slow integration test
+  1. Run ``EQ_reprocess_ethos`` against real Ethos output.
+  2. Run ``MTD_preprocess`` on the recombined directory to verify ingestibility.
+  3. Power the slow integration test
      ``tests/test_ethos_compat.py::test_real_ethos_output_recombines_and_mtd_ingests``
-     against real Ethos output (set ``ETHOS_DEMO_DIR`` to the result of this script).
+     (set ``ETHOS_DEMO_DIR`` to the result of this script).
 
-The MIMIC-IV-demo dataset is **publicly accessible** (no PhysioNet credentials
-required for the demo specifically — see https://physionet.org/content/mimic-iv-demo/).
+This script has been **executed end-to-end against MIMIC-IV-demo-MEDS** during the
+PR-#176 development.  The resulting outputs are the ground truth for:
 
-This script is a **best-effort** orchestration of the upstream tools.  Each external
-tool (curl, ``meds_etl_mimic`` or equivalent, ``ethos`` CLI) has its own setup
-requirements that may have drifted; the script logs each step and exits with
-diagnostic info if a step fails.  Read the printed errors and finish the failing step
-manually if needed — every intermediate is materialized on disk so you can resume
-from where it broke.
+  * Ethos's static pickle schema (handled by
+    :func:`every_query.paper_experiments.ethos_compat.reprocess._load_ethos_static_pickle`).
+  * The ICD/CM, ATC, and ICD/PCS prefix patterns used by the recombiner.
 
-Usage:
+## Source data
 
-    python scripts/setup_ethos_demo_data.py --workdir /tmp/ethos-demo
+The MIMIC-IV-demo dataset in MEDS format is publicly accessible at
+https://physionet.org/content/mimic-iv-demo-meds/0.0.1/ (no PhysioNet credentials
+required for the demo).  This script downloads the project zip via the ``get-zip``
+endpoint, so no manual login is needed.
 
-Output layout (under ``workdir``):
+## Steps
 
-    workdir/
-    ├── mimic_iv_demo/                   ← raw MIMIC-IV-demo CSVs from PhysioNet
-    ├── meds/                            ← MEDS-converted shards (via meds_etl_mimic)
-    ├── ethos_repo/                      ← cloned ipolharvard/ethos-ares
-    └── ethos_output/                    ← Ethos-tokenized shards + static pickle
-        ├── data/<split>/*.parquet
-        ├── metadata/codes.parquet
-        └── (whatever Ethos's StaticDataCollector emits — that's what we want to inspect)
+1. Download + unpack ``mimic-iv-demo-meds-0.0.1.zip`` from PhysioNet.
+2. Create an isolated venv (Ethos pins ``meds_transforms==0.1.1`` /
+   ``polars~=1.26`` which conflict with EveryQuery's pins) and install
+   ``ipolharvard/ethos-ares`` into it.
+3. Run ``ethos_tokenize`` on each split (``train``, ``tuning``, ``held_out``).
+4. Build a MEDS-shape directory by collecting the post-tokenization
+   ``inject_time_intervals`` parquet from each split — this is the input shape
+   ``EQ_reprocess_ethos`` consumes.
+5. Inspect ``static_data.pickle`` and report its schema.
 
-Set ``ETHOS_DEMO_DIR=workdir/ethos_output`` after a successful run.
+## Usage
+
+```bash
+python scripts/setup_ethos_demo_data.py --workdir /tmp/ethos-demo
+```
+
+After a successful run set:
+
+```bash
+export ETHOS_DEMO_DIR=/tmp/ethos-demo/ethos_meds_shape
+pytest -m slow tests/test_ethos_compat.py::test_real_ethos_output_recombines_and_mtd_ingests
+```
+
+The Ethos pickle (for static reinjection) lands at
+``/tmp/ethos-demo/ethos_output/train/static_data.pickle``.
 """
 
 from __future__ import annotations
@@ -52,9 +66,14 @@ from pathlib import Path
 logger = logging.getLogger("setup_ethos_demo_data")
 
 
-MIMIC_DEMO_URL = "https://physionet.org/static/published-projects/mimic-iv-demo/mimic-iv-demo-2.2.zip"
-MIMIC_DEMO_ZIP_NAME = "mimic-iv-demo-2.2.zip"
+# Public MIMIC-IV-demo-MEDS — no PhysioNet credentials required for the demo.
+MIMIC_DEMO_MEDS_URL = "https://physionet.org/content/mimic-iv-demo-meds/get-zip/0.0.1/"
+MIMIC_DEMO_MEDS_ZIP = "mimic-iv-demo-meds-0.0.1.zip"
 ETHOS_REPO_URL = "https://github.com/ipolharvard/ethos-ares.git"
+
+# Ethos numbers its MEDS-transforms stages dynamically.  ``inject_time_intervals`` is
+# the last MEDS-shape stage before the safetensors tokenizer; we glob on suffix.
+INJECT_TIME_INTERVALS_GLOB = "*inject_time_intervals/0.parquet"
 
 
 def _run(cmd: list[str], cwd: Path | None = None, env: dict | None = None) -> None:
@@ -67,170 +86,151 @@ def _run(cmd: list[str], cwd: Path | None = None, env: dict | None = None) -> No
     if result.returncode != 0:
         raise SystemExit(
             f"Command failed (rc={result.returncode}): {' '.join(cmd)}\n"
-            f"Inspect the logs above; finish this step manually if needed."
+            f"Inspect logs above; finish manually if needed."
         )
 
 
-def step_download_mimic_demo(workdir: Path) -> Path:
-    """Download MIMIC-IV-demo zip and unpack into ``workdir/mimic_iv_demo/``."""
-    target = workdir / "mimic_iv_demo"
-    if target.is_dir() and any(target.iterdir()):
-        logger.info("MIMIC-IV-demo already unpacked at %s — skipping download.", target)
-        return target
-
-    workdir.mkdir(parents=True, exist_ok=True)
-    zip_path = workdir / MIMIC_DEMO_ZIP_NAME
-    if not zip_path.is_file():
-        logger.info("Downloading MIMIC-IV-demo from %s …", MIMIC_DEMO_URL)
-        urllib.request.urlretrieve(MIMIC_DEMO_URL, zip_path)
-        logger.info("Downloaded %.1f MB → %s", zip_path.stat().st_size / 1e6, zip_path)
-
-    logger.info("Unpacking %s → %s", zip_path, target)
-    shutil.unpack_archive(str(zip_path), str(target))
-    return target
-
-
-def step_convert_to_meds(mimic_dir: Path, workdir: Path) -> Path:
-    """Convert MIMIC-IV-demo to MEDS via ``meds_etl`` (or fall back to manual).
-
-    Several wrapper names exist depending on install version; tries each in order.
-    """
+def step_download_meds(workdir: Path) -> Path:
+    """Download MIMIC-IV-demo-MEDS and unpack it into ``workdir/meds/``."""
     target = workdir / "meds"
     if target.is_dir() and any(target.iterdir()):
-        logger.info("MEDS conversion already done at %s — skipping.", target)
-        return target
-
-    target.mkdir(parents=True, exist_ok=True)
-    mimic_actual = next((p for p in mimic_dir.rglob("hosp/admissions.csv*")), None)
-    if mimic_actual is None:
-        raise SystemExit(
-            f"Could not locate hosp/admissions.csv under {mimic_dir} — the unpacked "
-            f"MIMIC-IV-demo layout looks unexpected."
-        )
-    mimic_root = mimic_actual.parent.parent
-    logger.info("MIMIC-IV-demo root resolved to %s", mimic_root)
-
-    candidates = [
-        ["meds_etl_mimic", str(mimic_root), str(target)],
-        ["meds_etl", "mimic", str(mimic_root), str(target)],
-        ["python", "-m", "meds_etl.mimic", str(mimic_root), str(target)],
-    ]
-    last_err: Exception | None = None
-    for cmd in candidates:
-        if shutil.which(cmd[0]) is None and cmd[0] != "python":
-            continue
-        try:
-            _run(cmd)
-            return target
-        except SystemExit as e:
-            last_err = e
-            logger.warning("Failed: %s — trying next candidate", " ".join(cmd))
-
-    raise SystemExit(
-        "Could not run any meds_etl variant.  Install meds_etl "
-        "(``uv pip install meds-etl``) and rerun, or convert MIMIC-IV-demo to MEDS "
-        f"manually under {target!s}.\nLast error: {last_err}"
-    )
-
-
-def step_clone_ethos(workdir: Path) -> Path:
-    """Clone ``ipolharvard/ethos-ares`` into ``workdir/ethos_repo/``."""
-    target = workdir / "ethos_repo"
-    if target.is_dir() and (target / ".git").is_dir():
-        logger.info("Ethos repo already cloned at %s — pulling latest.", target)
-        _run(["git", "-C", str(target), "pull", "--ff-only"])
+        logger.info("MIMIC-IV-demo-MEDS already unpacked at %s — skipping download.", target)
         return target
 
     workdir.mkdir(parents=True, exist_ok=True)
-    _run(["git", "clone", "--depth", "1", ETHOS_REPO_URL, str(target)])
+    zip_path = workdir / MIMIC_DEMO_MEDS_ZIP
+    if not zip_path.is_file():
+        logger.info("Downloading %s → %s", MIMIC_DEMO_MEDS_URL, zip_path)
+        # Some PhysioNet endpoints reject the default urllib User-Agent; mimic curl.
+        req = urllib.request.Request(MIMIC_DEMO_MEDS_URL, headers={"User-Agent": "curl/7.81"})
+        with urllib.request.urlopen(req, timeout=600) as r:
+            zip_path.write_bytes(r.read())
+        logger.info("Downloaded %.1f MB", zip_path.stat().st_size / 1e6)
+
+    logger.info("Unpacking %s …", zip_path)
+    raw = workdir / "_unpacked"
+    if raw.exists():
+        shutil.rmtree(raw)
+    raw.mkdir()
+    shutil.unpack_archive(str(zip_path), str(raw))
+
+    # The zip contains one inner directory whose name encodes dataset version.  Move
+    # it to the canonical ``meds/`` location.
+    inner = next(p for p in raw.iterdir() if p.is_dir())
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(inner), str(target))
+    shutil.rmtree(raw)
+    logger.info("MEDS data resolved to %s", target)
     return target
 
 
-def step_run_ethos_tokenization(meds_dir: Path, ethos_repo: Path, workdir: Path) -> Path:
-    """Invoke Ethos's tokenization on the MEDS shards.
+def step_install_ethos(workdir: Path) -> Path:
+    """Clone ``ipolharvard/ethos-ares`` and install into a dedicated venv.
 
-    Best-effort: the exact CLI / module name varies across upstream commits.  Tries
-    ``python -m ethos.tokenize.run_tokenization`` first.
+    Returns the venv's ``ethos_tokenize`` executable path.
     """
-    target = workdir / "ethos_output"
-    if target.is_dir() and any(target.iterdir()):
-        logger.info("Ethos output already exists at %s — skipping.", target)
-        return target
+    repo = workdir / "ethos_repo"
+    if not (repo / ".git").is_dir():
+        _run(["git", "clone", "--depth", "1", ETHOS_REPO_URL, str(repo)])
+    else:
+        logger.info("Ethos repo already cloned at %s", repo)
 
-    target.mkdir(parents=True, exist_ok=True)
+    venv_dir = workdir / "venv"
+    if not (venv_dir / "bin" / "python").exists():
+        _run(["uv", "venv", "--python", "3.12", str(venv_dir)])
+    ethos_bin = venv_dir / "bin" / "ethos_tokenize"
+    if not ethos_bin.exists():
+        env = {**__import__("os").environ, "VIRTUAL_ENV": str(venv_dir)}
+        _run(["uv", "pip", "install", "-e", str(repo)], env=env)
+    return ethos_bin
 
-    logger.info("Installing ethos from %s …", ethos_repo)
-    _run(["uv", "pip", "install", "-e", str(ethos_repo)])
 
-    cmd = [
-        "python",
-        "-m",
-        "ethos.tokenize.run_tokenization",
-        f"input_dir={meds_dir!s}",
-        f"output_dir={target!s}",
-        "dataset=mimic",
-    ]
-    try:
-        _run(cmd, cwd=ethos_repo)
-    except SystemExit as e:
-        raise SystemExit(
-            f"Ethos tokenization failed.  This is the most fragile step — the upstream "
-            f"CLI may have moved.  Look in {ethos_repo}/src/ethos/tokenize/ for the "
-            f"current entry point and run it manually with input={meds_dir} and "
-            f"output={target}.\nOriginal error: {e}"
-        ) from e
+def step_tokenize_each_split(meds_dir: Path, ethos_bin: Path, workdir: Path) -> Path:
+    """Run ``ethos_tokenize`` per split (train/tuning/held_out).
+
+    The first split (train) builds a vocabulary; subsequent splits reuse it via
+    ``vocab=`` so cross-split codes line up.
+    """
+    out = workdir / "ethos_output"
+    splits = ["train", "tuning", "held_out"]
+    for split in splits:
+        if (out / split / "static_data.pickle").exists():
+            logger.info("Ethos output for %s already present — skipping.", split)
+            continue
+        cmd = [
+            str(ethos_bin),
+            f"input_dir={meds_dir / 'data' / split}",
+            f"output_dir={out}",
+            f"out_fn={split}",
+        ]
+        if split != "train":
+            cmd.append(f"vocab={out / 'train'}")
+        _run(cmd, cwd=workdir)
+    return out
+
+
+def step_build_meds_shape_dir(meds_dir: Path, ethos_output: Path, workdir: Path) -> Path:
+    """Materialise an Ethos-MEDS-shape directory ``EQ_reprocess_ethos`` can consume.
+
+    Layout:
+        ethos_meds_shape/
+        ├── data/
+        │   ├── train/0.parquet     ← Ethos's `inject_time_intervals` stage output
+        │   ├── tuning/0.parquet
+        │   └── held_out/0.parquet
+        └── metadata/               ← copied from the source MEDS dir
+    """
+    target = workdir / "ethos_meds_shape"
+    if target.exists():
+        shutil.rmtree(target)
+    (target / "metadata").mkdir(parents=True)
+    for split in ("train", "tuning", "held_out"):
+        candidates = list((ethos_output / split).glob(INJECT_TIME_INTERVALS_GLOB))
+        if not candidates:
+            raise SystemExit(
+                f"Could not find inject_time_intervals stage parquet under "
+                f"{ethos_output / split}.  Available stages: "
+                f"{[p.name for p in (ethos_output / split).iterdir() if p.is_dir()]}"
+            )
+        src = candidates[0]
+        dst = target / "data" / split / "0.parquet"
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        logger.info("Copied %s → %s", src.relative_to(workdir), dst.relative_to(workdir))
+
+    # Bring through metadata from the original MEDS dataset (codes / splits / dataset.json).
+    for fname in ("dataset.json", "subject_splits.parquet", "codes.parquet"):
+        src = meds_dir / "metadata" / fname
+        if src.is_file():
+            shutil.copy2(src, target / "metadata" / fname)
+    logger.info("Ethos-MEDS-shape directory ready at %s", target)
     return target
 
 
-def step_inspect_ethos_output(ethos_output: Path) -> None:
-    """Walk the Ethos output dir and report what's there — especially any pickle.
-
-    The pickle is the static-data side-channel; reporting its Python type + structure
-    is the whole point of running this script (so we can update ``load_static_table``
-    to handle the real format).
-    """
-    logger.info("=" * 72)
-    logger.info("Ethos output inspection: %s", ethos_output)
-    logger.info("=" * 72)
-    for entry in sorted(ethos_output.rglob("*")):
-        if entry.is_file():
-            size_kb = entry.stat().st_size / 1024
-            logger.info("  %s  (%.1f KB)", entry.relative_to(ethos_output), size_kb)
-
-    pickles = list(ethos_output.rglob("*.pkl")) + list(ethos_output.rglob("*.pickle"))
-    if not pickles:
-        logger.warning(
-            "No pickle files found under %s — Ethos may emit statics in a different "
-            "format on this version.  Look at the parquet files instead.",
-            ethos_output,
-        )
-        return
-
+def step_inspect_static_pickle(ethos_output: Path) -> None:
+    """Walk pickle files and report their layout — confirmed schema is documented in
+    ``every_query.paper_experiments.ethos_compat.reprocess._load_ethos_static_pickle``."""
     import pickle as _pickle
 
-    for pkl in pickles:
-        logger.info("--- Inspecting pickle: %s ---", pkl)
+    pickles = list(ethos_output.rglob("*.pickle")) + list(ethos_output.rglob("*.pkl"))
+    if not pickles:
+        logger.warning("No pickle files under %s", ethos_output)
+        return
+    for p in pickles:
+        logger.info("--- pickle: %s ---", p)
         try:
-            with pkl.open("rb") as f:
+            with p.open("rb") as f:
                 data = _pickle.load(f)
         except Exception as e:
-            logger.warning("Could not load pickle %s: %s", pkl, e)
+            logger.warning("Could not load %s: %s", p, e)
             continue
-
-        logger.info("  type: %s", type(data).__name__)
-        if isinstance(data, dict):
-            logger.info("  keys (up to 5): %s", list(data.keys())[:5])
-            sample_key = next(iter(data), None)
-            if sample_key is not None:
-                sample_val = data[sample_key]
-                logger.info(
-                    "  sample value (key=%s): type=%s value=%r",
-                    sample_key,
-                    type(sample_val).__name__,
-                    sample_val if not isinstance(sample_val, list) else sample_val[:3],
-                )
-        else:
-            logger.info("  value (truncated): %r", str(data)[:500])
+        logger.info(
+            "  type=%s; subjects=%d", type(data).__name__, len(data) if isinstance(data, dict) else -1
+        )
+        if isinstance(data, dict) and data:
+            sample_sid = next(iter(data))
+            sample_val = data[sample_sid]
+            logger.info("  sample subject %s → %r", sample_sid, sample_val)
 
 
 def main() -> int:
@@ -243,11 +243,6 @@ def main() -> int:
         type=Path,
         help="Working directory.  All intermediates land here.",
     )
-    parser.add_argument(
-        "--skip-ethos",
-        action="store_true",
-        help="Skip the Ethos clone + tokenization step (just download + convert MEDS).",
-    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
@@ -255,22 +250,19 @@ def main() -> int:
     workdir.mkdir(parents=True, exist_ok=True)
     logger.info("Workdir: %s", workdir)
 
-    mimic_dir = step_download_mimic_demo(workdir)
-    meds_dir = step_convert_to_meds(mimic_dir, workdir)
+    meds_dir = step_download_meds(workdir)
+    ethos_bin = step_install_ethos(workdir)
+    ethos_output = step_tokenize_each_split(meds_dir, ethos_bin, workdir)
+    target = step_build_meds_shape_dir(meds_dir, ethos_output, workdir)
+    step_inspect_static_pickle(ethos_output)
 
-    if args.skip_ethos:
-        logger.info("--skip-ethos set; stopping after MEDS conversion.")
-        logger.info("MEDS output: %s", meds_dir)
-        return 0
-
-    ethos_repo = step_clone_ethos(workdir)
-    ethos_output = step_run_ethos_tokenization(meds_dir, ethos_repo, workdir)
-    step_inspect_ethos_output(ethos_output)
-
+    static_pickle = ethos_output / "train" / "static_data.pickle"
     print()
     print("=" * 72)
     print("Done.  To run the integration test against this output:")
-    print(f"  ETHOS_DEMO_DIR={ethos_output} pytest -m slow tests/test_ethos_compat.py")
+    print(f"  ETHOS_DEMO_DIR={target}")
+    print(f"  ETHOS_DEMO_STATIC={static_pickle}")
+    print("  pytest -m slow tests/test_ethos_compat.py::test_real_ethos_output_recombines_and_mtd_ingests")
     print("=" * 72)
     return 0
 

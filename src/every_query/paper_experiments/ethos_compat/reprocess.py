@@ -18,12 +18,12 @@ rows for every changed code so the reverse lookup is recoverable.
 Atomic event types Ethos emits without splitting (labs, vitals, BMI, SOFA quantile
 tokens, admissions, discharges, time-deltas) pass through unchanged.
 
-Optional static-data reinjection: when ``static_data_path`` points at a parquet of
-``(subject_id, code, [numeric_value])`` rows, every entry is written as a ``time=null``
-MEDS row into the shard its subject lives in.  Ethos's native ``StaticDataCollector``
-emits a pickle whose schema is not yet inspected — only parquet input is supported here
-for now (convert externally if you have a pickle).  ``scripts/setup_ethos_demo_data.py``
-documents how to reproduce a real Ethos run and surface the actual pickle layout.
+Optional static-data reinjection: ``static_data_path`` accepts either a parquet of
+``(subject_id, code, [numeric_value])`` rows or Ethos's native ``static_data.pickle``
+(schema confirmed against MIMIC-IV-demo; see :func:`_load_ethos_static_pickle`).
+Every entry is written as a ``time=null`` MEDS row routed into the shard its subject
+lives in.  ``scripts/setup_ethos_demo_data.py`` reproduces a real Ethos run for
+re-verification.
 
 See #174 for the design discussion.
 """
@@ -328,35 +328,98 @@ def reprocess_shard(events: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
 
 
 def load_static_table(path: Path) -> pl.DataFrame:
-    """Load a parquet-format static-data table.
+    """Load a static-data table — parquet or Ethos's native pickle.
 
-    Schema requirement: ``subject_id`` and ``code`` columns are required; ``numeric_value``
-    is optional.  Other columns pass through.
+    **Parquet** (``.parquet``): direct ``(subject_id, code [, numeric_value])`` table.
+    Useful when callers convert their static side-channel externally.
 
-    Ethos's native ``StaticDataCollector`` emits a pickle whose schema this PR has not
-    yet inspected — until that's resolved, only the parquet format is supported here.
-    Convert your Ethos pickle externally (see ``scripts/setup_ethos_demo_data.py``).
+    **Ethos pickle** (``.pkl`` / ``.pickle``): the format Ethos's ``StaticDataCollector``
+    emits.  Confirmed against MIMIC-IV-demo via ``scripts/setup_ethos_demo_data.py``::
+
+        {subject_id: int → {
+            "BMI":        {"code": ["BMI//UNKNOWN"],     "time": None | [int|None, ...]},
+            "GENDER":     {"code": ["GENDER//M"],        "time": [None]},
+            "MARITAL":    {"code": ["MARITAL//MARRIED"], "time": [microsec_int]},
+            "MEDS_BIRTH": {"code": ["MEDS_BIRTH"],       "time": [microsec_int]},
+            "RACE":       {"code": ["RACE//WHITE"],      "time": [microsec_int]},
+            ...
+        }}
+
+    Each ``code`` entry is a list of strings; ``time`` may be ``None``, a list with a
+    single ``None``, or a list of microsecond-since-epoch ``int``\\ s.  We unflatten
+    every ``(subject_id, code)`` tuple to one MEDS-shaped row.  ``time`` values are
+    dropped here — the reinjector emits all statics as ``time=null`` per the MEDS-static
+    convention.
 
     Raises:
-        ValueError: if the file extension is not ``.parquet``, or required columns are
-            missing.
+        ValueError: on unsupported extension or missing required columns.
         FileNotFoundError: if the path doesn't exist.
     """
     if not path.exists():
         raise FileNotFoundError(f"Static-data file does not exist: {path!s}")
-    if path.suffix.lower() != ".parquet":
-        raise ValueError(
-            f"Static-data file at {path!s} has unsupported extension {path.suffix!r}; "
-            f"only .parquet is supported.  Convert your Ethos pickle externally — see "
-            f"scripts/setup_ethos_demo_data.py for the recommended workflow."
-        )
-    df = pl.read_parquet(path)
-    missing = {"subject_id", "code"} - set(df.columns)
-    if missing:
-        raise ValueError(
-            f"Static parquet at {path!s} is missing required column(s): {sorted(missing)}; got {df.columns!r}"
-        )
-    return df
+    suffix = path.suffix.lower()
+    if suffix == ".parquet":
+        df = pl.read_parquet(path)
+        missing = {"subject_id", "code"} - set(df.columns)
+        if missing:
+            raise ValueError(
+                f"Static parquet at {path!s} is missing required column(s): "
+                f"{sorted(missing)}; got {df.columns!r}"
+            )
+        return df
+    if suffix in {".pkl", ".pickle"}:
+        return _load_ethos_static_pickle(path)
+    raise ValueError(
+        f"Static-data file at {path!s} has unsupported extension {suffix!r}; "
+        f"expected one of .parquet, .pkl, .pickle."
+    )
+
+
+def _load_ethos_static_pickle(path: Path) -> pl.DataFrame:
+    """Unflatten Ethos's ``StaticDataCollector`` pickle into a MEDS-shaped table.
+
+    See :func:`load_static_table` for the input schema.  Drops static event times —
+    statics are emitted downstream as ``time=null`` rows.
+    """
+    import pickle as _pickle
+
+    with path.open("rb") as f:
+        data = _pickle.load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"Ethos static pickle at {path!s} is a {type(data).__name__}, expected dict.")
+
+    rows: list[dict] = []
+    for sid, prefix_map in data.items():
+        if not isinstance(prefix_map, dict):
+            logger.warning(
+                "Static pickle subject %r has non-dict value (%s); skipping.",
+                sid,
+                type(prefix_map).__name__,
+            )
+            continue
+        for prefix, payload in prefix_map.items():
+            if not isinstance(payload, dict) or "code" not in payload:
+                logger.warning(
+                    "Static pickle subject %r prefix %r has unexpected payload; skipping.",
+                    sid,
+                    prefix,
+                )
+                continue
+            for code in payload.get("code") or []:
+                if isinstance(code, str):
+                    rows.append({"subject_id": int(sid), "code": code})
+                else:
+                    logger.warning(
+                        "Static pickle subject %r prefix %r non-string code %r; skipping.",
+                        sid,
+                        prefix,
+                        code,
+                    )
+
+    if not rows:
+        logger.warning("Static pickle at %s yielded zero rows after unflattening.", path)
+        return pl.DataFrame(schema={"subject_id": pl.Int64, "code": pl.Utf8})
+    return pl.DataFrame(rows, schema={"subject_id": pl.Int64, "code": pl.Utf8}, orient="row")
 
 
 def _route_statics_to_shards(

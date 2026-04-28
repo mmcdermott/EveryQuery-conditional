@@ -288,21 +288,51 @@ class TestLoadStaticTable:
         assert "numeric_value" in loaded.columns
         assert loaded["numeric_value"].to_list() == [27.5, 22.1]
 
-    def test_load_pickle_rejected(self, tmp_path):
-        """Pickle support was removed — Ethos's actual format is unknown.
+    def test_load_ethos_pickle(self, tmp_path):
+        """The native Ethos ``StaticDataCollector`` pickle layout — confirmed against MIMIC-IV-demo via
+        ``scripts/setup_ethos_demo_data.py``."""
+        import pickle
 
-        The error message points users at ``scripts/setup_ethos_demo_data.py`` to surface the real
-        layout and convert externally.
-        """
-        p = tmp_path / "static.pkl"
-        p.write_bytes(b"")  # content doesn't matter, extension is what's checked
-        with pytest.raises(ValueError, match="only .parquet is supported"):
-            load_static_table(p)
+        ethos_pickle = {
+            10018845: {
+                "BMI": {"code": ["BMI//UNKNOWN"], "time": None},
+                "GENDER": {"code": ["GENDER//M"], "time": [None]},
+                "MARITAL": {"code": ["MARITAL//MARRIED"], "time": [6777484080000000]},
+                "MEDS_BIRTH": {"code": ["MEDS_BIRTH"], "time": [3881606400000000]},
+                "RACE": {"code": ["RACE//WHITE"], "time": [6777484080000000]},
+            },
+            10003046: {
+                "BMI": {"code": ["BMI//Q3"], "time": None},
+                "GENDER": {"code": ["GENDER//M"], "time": [None]},
+            },
+        }
+        p = tmp_path / "static_data.pickle"
+        with p.open("wb") as f:
+            pickle.dump(ethos_pickle, f)
+        loaded = load_static_table(p)
+        # 5 entries for subject 10018845 + 2 for subject 10003046 = 7 rows.
+        assert loaded.height == 7
+        assert set(loaded.columns) == {"subject_id", "code"}
+        codes = set(loaded["code"].to_list())
+        assert "BMI//UNKNOWN" in codes
+        assert "MEDS_BIRTH" in codes
+        assert "GENDER//M" in codes
+        # Every code is a string; no `time` column leaked through.
+        assert "time" not in loaded.columns
 
     def test_load_unknown_extension_raises(self, tmp_path):
         p = tmp_path / "static.txt"
         p.write_text("oops")
-        with pytest.raises(ValueError, match="only .parquet is supported"):
+        with pytest.raises(ValueError, match="unsupported extension"):
+            load_static_table(p)
+
+    def test_load_pickle_non_dict_raises(self, tmp_path):
+        import pickle
+
+        p = tmp_path / "static.pkl"
+        with p.open("wb") as f:
+            pickle.dump([1, 2, 3], f)
+        with pytest.raises(ValueError, match="expected dict"):
             load_static_table(p)
 
     def test_load_missing_file_raises(self, tmp_path):
@@ -512,6 +542,7 @@ def test_eq_reprocess_ethos_cli_with_statics(ethos_like_dataset: Path, tmp_path:
 
 
 _ETHOS_DEMO_DIR = os.environ.get("ETHOS_DEMO_DIR")
+_ETHOS_DEMO_STATIC = os.environ.get("ETHOS_DEMO_STATIC")
 
 
 @pytest.mark.slow
@@ -522,27 +553,61 @@ _ETHOS_DEMO_DIR = os.environ.get("ETHOS_DEMO_DIR")
 def test_real_ethos_output_recombines_and_mtd_ingests(tmp_path: Path):
     """End-to-end test against a real Ethos-tokenized output directory.
 
-    Set ``ETHOS_DEMO_DIR`` to the output of ``scripts/setup_ethos_demo_data.py`` to
-    enable.  Verifies:
+    Set ``ETHOS_DEMO_DIR`` to the ``ethos_meds_shape/`` directory produced by
+    ``scripts/setup_ethos_demo_data.py``; optionally set ``ETHOS_DEMO_STATIC`` to the
+    accompanying ``static_data.pickle`` to also exercise pickle-format static
+    reinjection.  Verifies:
 
-      * ``EQ_reprocess_ethos`` runs successfully on the real Ethos output.
-      * Output parquets have the expected MEDS schema (``subject_id``, ``time``, ``code``).
-      * ``MTD_preprocess`` can ingest the recombined directory without errors.
+      * ``EQ_reprocess_ethos`` runs on the real Ethos output (with statics if provided).
+      * Recombined parquets have the expected MEDS schema and contain ``EQ_TOK//*`` codes.
+      * If statics are provided, ``time=null`` rows appear with the expected codes.
+      * ``MTD_preprocess`` ingests the recombined directory without errors.
+
+    Confirmed against MIMIC-IV-demo-MEDS during PR-#176 development; runs in ~18s.
     """
     ethos_dir = Path(_ETHOS_DEMO_DIR).expanduser().resolve()
     assert ethos_dir.is_dir(), f"ETHOS_DEMO_DIR={ethos_dir} is not a directory"
 
-    eq_input_dir = tmp_path / "eq_input"
-    reprocess_directory(ethos_dir, eq_input_dir)
+    static_path: Path | None = None
+    if _ETHOS_DEMO_STATIC:
+        static_path = Path(_ETHOS_DEMO_STATIC).expanduser().resolve()
+        assert static_path.is_file(), f"ETHOS_DEMO_STATIC={static_path} is not a file"
 
-    # Schema sanity: every shard has subject_id, time, code; no duplicate (subject_id, time, code) rows.
+    eq_input_dir = tmp_path / "eq_input"
+    reprocess_directory(ethos_dir, eq_input_dir, static_data_path=static_path)
+
+    # Recombined output must have at least one EQ_TOK//* code (confirms split codes in
+    # the input were actually collapsed, not just passed through).
+    train_shard = pl.read_parquet(eq_input_dir / "data" / "train" / "0.parquet")
+    eq_tok_rows = train_shard.filter(pl.col("code").str.starts_with(COMBINED_PREFIX))
+    assert eq_tok_rows.height > 0, "no recombined EQ_TOK//* codes — input may not be Ethos output"
+    # No leftover split-token tails — recombination is complete.
+    for fam in FAMILIES:
+        leftovers = train_shard.filter(
+            pl.col("code").str.starts_with(fam.mid_prefix) | pl.col("code").str.starts_with(fam.sfx_prefix)
+        )
+        assert leftovers.height == 0, (
+            f"family {fam.name}: {leftovers.height} mid/sfx tokens leaked through recombination"
+        )
+
+    # Statics: the pickle yielded a non-empty long-form table and we see time=null rows.
+    if static_path is not None:
+        all_data = pl.concat(
+            [pl.read_parquet(p) for p in (eq_input_dir / "data").rglob("*.parquet")],
+            how="diagonal_relaxed",
+        )
+        static_rows = all_data.filter(pl.col("time").is_null())
+        assert static_rows.height > 0, "static_data_path was set but no time=null rows appeared"
+        # Real Ethos statics include MEDS_BIRTH for every subject.
+        assert "MEDS_BIRTH" in set(static_rows["code"].to_list())
+
+    # Schema sanity for every shard.
     for shard in (eq_input_dir / "data").rglob("*.parquet"):
         df = pl.read_parquet(shard)
         for col in ("subject_id", "time", "code"):
             assert col in df.columns, f"Shard {shard} missing required column {col!r}"
 
-    # MTD_preprocess on the recombined output.  This is the load-bearing assertion that
-    # PR #176 actually delivers ingestible output.
+    # The load-bearing assertion: MTD_preprocess can ingest the recombined output.
     mtd_out = tmp_path / "mtd_out"
     env = os.environ.copy()
     env["PATH"] = _VENV_BIN + os.pathsep + env.get("PATH", "")
@@ -551,6 +616,7 @@ def test_real_ethos_output_recombines_and_mtd_ingests(tmp_path: Path):
             "MTD_preprocess",
             f"MEDS_dataset_dir={eq_input_dir!s}",
             f"output_dir={mtd_out!s}",
+            "do_overwrite=true",
         ],
         capture_output=True,
         text=True,
@@ -561,4 +627,6 @@ def test_real_ethos_output_recombines_and_mtd_ingests(tmp_path: Path):
         f"MTD_preprocess failed (rc={result.returncode}) on real recombined Ethos output.\n"
         f"stdout:\n{result.stdout[-2000:]}\nstderr:\n{result.stderr[-2000:]}"
     )
-    assert mtd_out.is_dir() and any(mtd_out.iterdir()), "MTD_preprocess produced no output"
+    # MTD's canonical post-tokenization artifacts.
+    for expected in ("metadata/codes.parquet", "tokenization/event_seqs", "tokenization/schemas"):
+        assert (mtd_out / expected).exists(), f"MTD output missing {expected}"

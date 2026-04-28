@@ -16,15 +16,30 @@ ICD10/PCS char-by-char split (up to 7 sub-tokens) is explicitly out of scope —
 
 ## Static reinjection
 
-Optional. `static_data_path=…` accepts a **parquet** with `subject_id`, `code` columns (and optional `numeric_value`). Each row is reinjected as a `time=null` MEDS row routed into its subject's home shard.
+Optional. `static_data_path=…` accepts either:
 
-The native Ethos `StaticDataCollector` emits a **pickle** whose schema this PR has not yet inspected — only parquet input is supported here for now. To produce a real Ethos pickle and inspect its layout, run:
+- **Parquet** (`.parquet`) with `subject_id`, `code` columns (and optional `numeric_value`).
+- **Ethos pickle** (`.pkl` / `.pickle`) — the format Ethos's `StaticDataCollector` emits. Schema confirmed against MIMIC-IV-demo:
+
+```python
+{subject_id: int → {
+    "BMI":        {"code": ["BMI//UNKNOWN"],     "time": None | [int|None, ...]},
+    "GENDER":     {"code": ["GENDER//M"],        "time": [None]},
+    "MARITAL":    {"code": ["MARITAL//MARRIED"], "time": [microsec_int]},
+    "MEDS_BIRTH": {"code": ["MEDS_BIRTH"],       "time": [microsec_int]},
+    "RACE":       {"code": ["RACE//WHITE"],      "time": [microsec_int]},
+}}
+```
+
+Each row is reinjected as a `time=null` MEDS row routed into its subject's home shard. Static event times in the pickle are dropped (statics are emitted as `time=null` per MEDS convention).
+
+To reproduce the real Ethos output and re-verify against it, run:
 
 ```bash
 python scripts/setup_ethos_demo_data.py --workdir /tmp/ethos-demo
 ```
 
-The script downloads the public MIMIC-IV-demo dataset (no PhysioNet credentials needed for the demo specifically), converts it to MEDS via `meds_etl`, runs Ethos's tokenization, and inspects the resulting pickle so we can extend `load_static_table` once we know the format.
+The script downloads the public MIMIC-IV-demo-MEDS dataset (no PhysioNet credentials needed), installs Ethos in an isolated venv, runs its tokenization across all splits, and assembles a MEDS-shape directory ready for `EQ_reprocess_ethos`.
 
 ## Code naming
 
@@ -67,7 +82,7 @@ Required:
 
 Optional:
 
-- `static_data_path` — parquet with `(subject_id, code[, numeric_value])` columns. Default `null` (no reinjection). Pickle support is intentionally absent until we inspect the real Ethos format — see [Static reinjection](#static-reinjection).
+- `static_data_path` — parquet `(subject_id, code[, numeric_value])` OR Ethos's native `static_data.pickle`. Default `null` (no reinjection). See [Static reinjection](#static-reinjection) for the supported layouts.
 - `overwrite=true` — clobber `output_dir` if it exists. Default `false`.
 
 ## Output layout
@@ -95,19 +110,23 @@ Pass-through codes are not in the mapping — only changed codes are recorded. T
 
 ## Real-data integration test
 
-The slow test `tests/test_ethos_compat.py::test_real_ethos_output_recombines_and_mtd_ingests` runs `EQ_reprocess_ethos` + `MTD_preprocess` end-to-end on real Ethos-tokenized MIMIC-IV-demo data. It's skipped by default — set `ETHOS_DEMO_DIR` to the output of the setup script:
+The slow test `tests/test_ethos_compat.py::test_real_ethos_output_recombines_and_mtd_ingests` runs `EQ_reprocess_ethos` + `MTD_preprocess` end-to-end on real Ethos-tokenized MIMIC-IV-demo data. **Confirmed passing against real Ethos output** during PR-#176 development (~18s). It's skipped by default — set:
 
 ```bash
 python scripts/setup_ethos_demo_data.py --workdir /tmp/ethos-demo
-ETHOS_DEMO_DIR=/tmp/ethos-demo/ethos_output pytest -m slow tests/test_ethos_compat.py
+ETHOS_DEMO_DIR=/tmp/ethos-demo/ethos_meds_shape \
+	ETHOS_DEMO_STATIC=/tmp/ethos-demo/ethos_output/train/static_data.pickle \
+	pytest -m slow tests/test_ethos_compat.py::test_real_ethos_output_recombines_and_mtd_ingests
 ```
+
+The test verifies: (1) recombined output contains `EQ_TOK//*` codes, (2) no split-token mid/sfx leftovers leaked through, (3) when `ETHOS_DEMO_STATIC` is set, the pickle-format reinjection produces `time=null` rows including `MEDS_BIRTH`, (4) `MTD_preprocess` ingests the recombined directory and produces `tokenization/event_seqs/`, `schemas/`, and a final `metadata/codes.parquet`.
 
 This is the load-bearing assertion that the recombined output is actually consumable by EQ's downstream pipeline.
 
 ## Caveats / follow-ups
 
 - **ICD10/PCS family** not handled — passes through atomically. Follow-up if needed.
-- **Ethos pickle format inspection** outstanding — `scripts/setup_ethos_demo_data.py` is the path forward.
+- **Ethos pickle format** confirmed against MIMIC-IV-demo and supported via `_load_ethos_static_pickle`; rerun `scripts/setup_ethos_demo_data.py` if upstream layout drifts.
 - **Other Ethos preprocessing decisions are preserved**: ICD9→ICD10 mapping, drug→ATC mapping, code filtering, per-code quantile binning. Properties of the input.
 - **Ordering assumption**: rank-based pairing of `head[k]` / `mid[k]` / `sfx[k]` relies on Ethos's polars `.explode()` preserving per-original-event grouping. Currently true upstream; would surface as visibly garbled mappings if it ever changes.
 
