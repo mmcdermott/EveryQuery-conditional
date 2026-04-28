@@ -1,0 +1,60 @@
+{
+  "tasks": [
+    {
+      "code": "MEDS_DEATH",
+      "duration_days": 30,
+      "label": "30-day mortality",
+      "question": "Will this patient die within the next 30 days?",
+      "valence": "adverse"
+    },
+    {
+      "code": "MEDS_DEATH",
+      "duration_days": 180,
+      "label": "6-month mortality",
+      "question": "Will this patient die within the next 6 months?",
+      "valence": "adverse"
+    },
+    {
+      "code": "DIAGNOSIS//ICD//9//4271",
+      "duration_days": 90,
+      "label": "PSVT 90d",
+      "question": "Will this patient be diagnosed with paroxysmal supraventricular tachycardia in the next 90 days?",
+      "valence": "adverse"
+    },
+    {
+      "code": "DIAGNOSIS//ICD//9//5856",
+      "duration_days": 365,
+      "label": "ESRD 1y",
+      "question": "Will this patient be diagnosed with end-stage renal disease in the next year?",
+      "valence": "adverse"
+    },
+    {
+      "code": "DIAGNOSIS//ICD//10//I25118",
+      "duration_days": 180,
+      "label": "Unstable angina 6m",
+      "question": "Will this patient be diagnosed with unstable angina in the next 6 months?",
+      "valence": "adverse"
+    },
+    {
+      "code": "INFUSION_START//221794//value_[8.004926,10.000001)",
+      "duration_days": 30,
+      "label": "High-dose Furosemide 30d",
+      "question": "Will this patient be started on a high-dose Furosemide (Lasix) infusion in the next 30 days?",
+      "valence": "adverse"
+    },
+    {
+      "code": "MEDICATION//Carbidopa-Levodopa (25-100)//Administered",
+      "duration_days": 90,
+      "label": "Levodopa 90d",
+      "question": "Will this patient receive Carbidopa-Levodopa in the next 90 days?",
+      "valence": "neutral"
+    },
+    {
+      "code": "LAB//51274//sec//value_[14.1,15.3)",
+      "duration_days": 30,
+      "label": "PT 14-15s 30d",
+      "question": "Will this patient have a borderline-high prothrombin time recorded in the next 30 days?",
+      "valence": "neutral"
+    }
+  ]
+}

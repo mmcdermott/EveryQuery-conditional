@@ -1,0 +1,134 @@
+{
+  "tasks": [
+    {
+      "code": "MEDS_DEATH",
+      "duration_days": 30
+    },
+    {
+      "code": "MEDS_DEATH",
+      "duration_days": 180
+    },
+    {
+      "code": "DIAGNOSIS//ICD//9//4271",
+      "duration_days": 90
+    },
+    {
+      "code": "DIAGNOSIS//ICD//9//5856",
+      "duration_days": 365
+    },
+    {
+      "code": "DIAGNOSIS//ICD//10//I25118",
+      "duration_days": 180
+    },
+    {
+      "code": "INFUSION_START//221794//value_[8.004926,10.000001)",
+      "duration_days": 30
+    },
+    {
+      "code": "MEDICATION//Carbidopa-Levodopa (25-100)//Administered",
+      "duration_days": 90
+    },
+    {
+      "code": "LAB//51274//sec//value_[14.1,15.3)",
+      "duration_days": 30
+    }
+  ],
+  "patients": [
+    {
+      "subject_id": 13336307,
+      "prediction_time_us": 6051391200000000,
+      "labels": [
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1
+      ],
+      "n_events": 12986
+    },
+    {
+      "subject_id": 11495932,
+      "prediction_time_us": 6635161440000000,
+      "labels": [
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        1
+      ],
+      "n_events": 9417
+    },
+    {
+      "subject_id": 13999026,
+      "prediction_time_us": 5392922400000000,
+      "labels": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1
+      ],
+      "n_events": 36279
+    },
+    {
+      "subject_id": 13753717,
+      "prediction_time_us": 6315084000000000,
+      "labels": [
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      "n_events": 6034
+    },
+    {
+      "subject_id": 15605355,
+      "prediction_time_us": 5753333700000000,
+      "labels": [
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "n_events": 4981
+    },
+    {
+      "subject_id": 18242530,
+      "prediction_time_us": 6576321600000000,
+      "labels": [
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "n_events": 3561
+    }
+  ],
+  "selection_seed": 20260428,
+  "shards_used": [
+    0,
+    1,
+    2
+  ]
+}
