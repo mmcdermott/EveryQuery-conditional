@@ -391,12 +391,15 @@ def _render_ethos_token(
     token: str,
     match_kind: str,
     mapping_source: str,
+    tier_quality: str | None = None,
 ) -> str:
     """Emit a markdown block describing one candidate ETHOS token.
 
     Block contents:
 
-    1. Token literal + ETHOS vocab count + match-kind + mapping-source.
+    1. Token literal (with ``_(primary)_`` / ``_(secondary)_`` tier-quality
+       annotation when known) + ETHOS vocab count + match-kind +
+       mapping-source.
     2. Inferred source-vocab concept (using ``ethos_descriptive_icd_to_codes``
        for ``ICD//CM//*``, ``atc_class`` for ``ATC//*``, direct passthrough
        for ``HOSPITAL_ADMISSION`` and ``MEDS_DEATH``; other token shapes
@@ -410,7 +413,8 @@ def _render_ethos_token(
     """
     count = _ont.ethos_token_count(token)
     lines: list[str] = []
-    lines.append(f"#### Candidate ETHOS token: `{token}`")
+    quality_suffix = f" _({tier_quality})_" if tier_quality else ""
+    lines.append(f"#### Candidate ETHOS token: `{token}`{quality_suffix}")
     lines.append("")
     lines.append(f"- ETHOS vocab count: {count:,}")
     lines.append(f"- Match kind: `{match_kind}`")
@@ -659,6 +663,8 @@ def build_review_markdown() -> str:
 
     primary = mapping_table.filter(pl.col("tier") != "union")
 
+    has_tier_quality = "tier_quality" in primary.columns
+
     candidates_by_query: dict[str, list[dict]] = {}
     for query, sub in primary.group_by("query", maintain_order=True):
         query_str = query[0] if isinstance(query, tuple) else query
@@ -666,14 +672,18 @@ def build_review_markdown() -> str:
         seen: dict[str, dict] = {}
         for row in sub_sorted.iter_rows(named=True):
             tok = row["token_pattern"]
+            row_tq = row.get("tier_quality") if has_tier_quality else None
             if tok in seen:
                 seen[tok]["tiers"].append(row["tier"])
+                if row_tq == "primary":
+                    seen[tok]["tier_quality"] = "primary"
                 continue
             seen[tok] = {
                 "token": tok,
                 "match_kind": row["match_kind"],
                 "mapping_source": row["mapping_source"],
                 "tiers": [row["tier"]],
+                "tier_quality": row_tq,
             }
         candidates_by_query[query_str] = list(seen.values())
 
@@ -736,6 +746,7 @@ def build_review_markdown() -> str:
                     token=cand["token"],
                     match_kind=cand["match_kind"],
                     mapping_source=cand["mapping_source"],
+                    tier_quality=cand.get("tier_quality"),
                 )
                 section_parts.append(
                     f"_Found under tier(s): {tiers_str}_"

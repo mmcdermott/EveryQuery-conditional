@@ -57,7 +57,28 @@ def compute_aucs(predictions: pl.DataFrame, mapping: pl.DataFrame) -> pl.DataFra
     the cross-join in :func:`predict.aggregate_predictions` yields
     ``occurs_prob=0`` for unmapped ``(query, tier)`` cells which would
     artificially inflate every tier's mean toward 0.5.
+
+    Each row is annotated with the ``tier_quality`` (``primary`` or
+    ``secondary``) inherited from the mapping table so downstream consumers
+    can split the AUC table into primary-tier and secondary-tier views per
+    Phase 10. ``union`` rows propagate the underlying primary-tier
+    annotation when present, otherwise fall back to ``secondary``.
     """
+    if "tier_quality" not in mapping.columns:
+        mapping = mapping.with_columns(pl.lit("primary").alias("tier_quality"))
+
+    quality = (
+        mapping.select("query", "tier", "tier_quality")
+        .unique()
+        .group_by(["query", "tier"])
+        .agg(
+            pl.when(pl.col("tier_quality").eq("primary").any())
+            .then(pl.lit("primary"))
+            .otherwise(pl.lit("secondary"))
+            .alias("tier_quality"),
+        )
+    )
+
     valid = mapping.select("query", "tier").unique()
     labeled = predictions.join(valid, on=["query", "tier"], how="inner").filter(
         pl.col("boolean_value").is_not_null()
@@ -81,7 +102,17 @@ def compute_aucs(predictions: pl.DataFrame, mapping: pl.DataFrame) -> pl.DataFra
                 "n_positive": int(sum(y)),
             }
         )
-    return pl.DataFrame(rows).sort(["tier", "bucket", "duration_days", "code"])
+    auc_df = pl.DataFrame(rows)
+    if auc_df.is_empty():
+        return auc_df.with_columns(pl.lit("primary").alias("tier_quality"))
+    auc_df = (
+        auc_df.join(
+            quality.rename({"query": "code"}), on=["code", "tier"], how="left"
+        )
+        .with_columns(pl.col("tier_quality").fill_null("secondary"))
+        .sort(["tier", "bucket", "duration_days", "code"])
+    )
+    return auc_df
 
 
 def main() -> None:
@@ -110,6 +141,35 @@ def main() -> None:
             pl.col("occurs_auc").median().alias("median_auc"),
         )
         .sort("tier")
+    )
+
+    print()
+    print("Primary vs secondary tier split (excluding union):")
+    print(
+        aucs.filter(
+            pl.col("occurs_auc").is_not_null() & (pl.col("tier") != "union")
+        )
+        .group_by("tier_quality")
+        .agg(
+            pl.len().alias("n"),
+            pl.col("occurs_auc").mean().alias("mean_auc"),
+            pl.col("occurs_auc").median().alias("median_auc"),
+        )
+        .sort("tier_quality")
+    )
+    print()
+    print("Union tier (per-code OR; reported separately):")
+    print(
+        aucs.filter(
+            pl.col("occurs_auc").is_not_null() & (pl.col("tier") == "union")
+        )
+        .group_by("tier_quality")
+        .agg(
+            pl.len().alias("n"),
+            pl.col("occurs_auc").mean().alias("mean_auc"),
+            pl.col("occurs_auc").median().alias("median_auc"),
+        )
+        .sort("tier_quality")
     )
 
     out = CACHE_DIR / "ethos_aucs_held_out.parquet"

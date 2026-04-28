@@ -119,6 +119,28 @@ def load_eq_codes() -> list[str]:
     return sorted(pl.read_parquet(p)["code"].unique().to_list())
 
 
+def load_meds_sibling_bins() -> dict[str, list[tuple[float, float]]]:
+    """Map non-binned base code (e.g. ``LAB//51274//sec``) -> sorted list of
+    sibling ``(lo, hi)`` value bins observed in ``meds_codes.parquet``.
+
+    Used by :func:`build_quantile_approx` to map an EQ value bin's positional
+    index to an approximate decile when a code has fewer than 10 sibling bins
+    (so the strict :func:`build_quantile` cannot fire).
+    """
+    p = _download(MEDS_CODES_BLOB, CACHE_DIR / "meds_codes.parquet")
+    df = pl.read_parquet(p)
+    out: dict[str, list[tuple[float, float]]] = {}
+    for row in df.iter_rows(named=True):
+        parsed = parse_value_bin(row["code"])
+        if parsed is None:
+            continue
+        base, lo, hi = parsed
+        out.setdefault(base, []).append((lo, hi))
+    for base in out:
+        out[base] = sorted(out[base])
+    return out
+
+
 def load_meds_quantiles() -> dict[str, list[float]]:
     """Map non-binned base code (e.g. ``LAB//51274//sec``) -> list of 9 decile boundaries.
 
@@ -284,9 +306,182 @@ def build_quantile(
                 "query": c,
                 "tier": "quantile",
                 "token_pattern": f"{token_lab}|{token_q}",
-                "match_kind": "lab+next_qk",
+                "match_kind": "code+next_token",
                 "provenance": f"deciles/idx={idx}",
                 "mapping_source": "meds-codes.parquet:values_quantiles_or_sibling_bins",
+            }
+        )
+    return pl.DataFrame(rows, schema=_schema())
+
+
+def _bin_positional_index(
+    lo: float, hi: float, bins: list[tuple[float, float]]
+) -> int | None:
+    """Return the 1-based positional index of ``(lo, hi)`` in the sorted
+    ``bins`` list, with tolerance against float drift.
+    """
+    for j, (b_lo, b_hi) in enumerate(bins):
+        lo_ok = (lo == b_lo) or (
+            lo != float("-inf")
+            and b_lo != float("-inf")
+            and abs(lo - b_lo) < 1e-3 * max(1.0, abs(b_lo))
+        )
+        hi_ok = (hi == b_hi) or (
+            hi != float("inf")
+            and b_hi != float("inf")
+            and abs(hi - b_hi) < 1e-3 * max(1.0, abs(b_hi))
+        )
+        if lo_ok and hi_ok:
+            return j + 1
+    return None
+
+
+def build_quantile_approx(
+    eq_codes: list[str],
+    ethos_vocab: set[str],
+    sibling_bins: dict[str, list[tuple[float, float]]],
+) -> pl.DataFrame:
+    """Approximate-decile fallback for value-binned EQ codes whose base has
+    ``1 < n < 10`` sibling bins in ``meds_codes.parquet`` (the strict
+    :func:`build_quantile` requires exactly 10 deciles).
+
+    For each candidate, find the EQ bin's 1-based positional index ``i``
+    among the sorted siblings (length ``n``), compute
+    ``Qk = max(1, min(10, round(i * 10 / n)))``, and emit a row with the
+    same ``code+next_token`` shape as the strict-quantile tier. Skips when
+    either token is absent from the ETHOS vocab.
+    """
+    rows: list[dict] = []
+    for c in eq_codes:
+        if family_of(c) not in VALUE_BIN_FAMILIES:
+            continue
+        parsed = parse_value_bin(c)
+        if parsed is None:
+            continue
+        base, lo, hi = parsed
+        bins = sibling_bins.get(base)
+        if bins is None or not (1 < len(bins) < 10):
+            continue
+        i = _bin_positional_index(lo, hi, bins)
+        if i is None:
+            continue
+        n = len(bins)
+        k = max(1, min(10, round(i * 10 / n)))
+        token_lab = upper_units(base)
+        token_q = f"Q{k}"
+        if token_lab not in ethos_vocab or token_q not in ethos_vocab:
+            continue
+        rows.append(
+            {
+                "query": c,
+                "tier": "quantile_approx",
+                "token_pattern": f"{token_lab}|{token_q}",
+                "match_kind": "code+next_token",
+                "provenance": f"approx_decile/i={i}/n={n}",
+                "mapping_source": "meds-codes.parquet:sibling_bins_positional",
+            }
+        )
+    return pl.DataFrame(rows, schema=_schema())
+
+
+_EQ_DX_ICD_RE = re.compile(r"^DIAGNOSIS//ICD//(9|10)//(.+)$")
+
+
+def _icd_specific_target(eq_code: str) -> tuple[str, str, str] | None:
+    """For a ``DIAGNOSIS//ICD//(9|10)//<code>`` EQ code, return
+    ``(parent_3char_code, suffix_digits, source)`` where ``source`` is the
+    deterministic provenance string for the chosen 5-char ICD-10-CM target.
+
+    For ICD-10 sources the EQ code is dotless; the parent is its first three
+    characters and the suffix is the remainder. ``icd10cm()`` is consulted
+    only to validate that the source code resolves in the Athena bundle.
+
+    For ICD-9 sources the code is bridged via ``icd9_dx`` to its ICD-10-CM
+    target list; the longest target (most-specific code, ties broken by
+    string sort for determinism) is taken.
+
+    Returns ``None`` when the source cannot be resolved or no suffix exists
+    (i.e. the source is itself a 3-char code with no 5-char specialization).
+    """
+    from . import ontology as _ont
+
+    m = _EQ_DX_ICD_RE.match(eq_code)
+    if m is None:
+        return None
+    edition, code = m.group(1), m.group(2)
+
+    if edition == "10":
+        hit = _ont.icd10cm(code)
+        if hit is None:
+            return None
+        parent = hit.get("parent_3char_code")
+        if not parent or len(parent) != 3 or not code.startswith(parent):
+            return None
+        suffix = code[3:]
+        if not suffix:
+            return None
+        return parent, suffix, "icd10cm:5char_to_label_plus_suffix"
+
+    if edition == "9":
+        hit = _ont.icd9_dx(code)
+        if hit is None:
+            return None
+        targets = hit.get("icd10_target_codes") or []
+        if not targets:
+            return None
+        longest = max(targets, key=lambda t: (len(t.replace(".", "")), t))
+        if "." in longest:
+            parent, _, suffix = longest.partition(".")
+            parent = parent[:3]
+        else:
+            parent, suffix = longest[:3], longest[3:]
+        if len(parent) != 3 or not suffix:
+            return None
+        return parent, suffix, "icd9_dx:longest_icd10_target"
+
+    return None
+
+
+def build_icd_specific(
+    eq_codes: list[str],
+    ethos_vocab: set[str],
+) -> pl.DataFrame:
+    """Emit a 2-token ``<label>|ICD//CM//3-6//<suffix>`` pattern for every
+    ``DIAGNOSIS//ICD//(9|10)//*`` EQ code whose 5-char ICD-10-CM target has
+    both a descriptive 3-char ETHOS label AND a matching ``ICD//CM//3-6//*``
+    suffix token in the ETHOS vocab.
+
+    STRICT MATCHING: this tier matches only the 2-token sequence; an
+    isolated emission of the descriptive label alone (no suffix follow-up)
+    does not count as a hit. The tier is independent of and complementary
+    to ``icd_crosswalk`` (suppressed by the cascade in :func:`main` when
+    both fire for the same query).
+    """
+    from . import ontology as _ont
+
+    icd_3char_index = _ont.ethos_icd_3char_index()
+    rows: list[dict] = []
+    for c in eq_codes:
+        if family_of(c) != "DIAGNOSIS":
+            continue
+        target = _icd_specific_target(c)
+        if target is None:
+            continue
+        parent_3char_code, suffix, source = target
+        label_token = icd_3char_index.get(parent_3char_code)
+        if label_token is None:
+            continue
+        suffix_token = f"ICD//CM//3-6//{suffix}"
+        if label_token not in ethos_vocab or suffix_token not in ethos_vocab:
+            continue
+        rows.append(
+            {
+                "query": c,
+                "tier": "icd_specific",
+                "token_pattern": f"{label_token}|{suffix_token}",
+                "match_kind": "code+next_token",
+                "provenance": f"icd_specific/{parent_3char_code}+{suffix}",
+                "mapping_source": source,
             }
         )
     return pl.DataFrame(rows, schema=_schema())
@@ -372,6 +567,83 @@ def _schema() -> dict[str, type]:
     }
 
 
+_PRIMARY_TIERS = ("exact", "drop_bin", "quantile", "quantile_approx", "icd_specific")
+
+
+def apply_suppression_cascade(primary: pl.DataFrame) -> pl.DataFrame:
+    """Apply the 'prefer the more specific tier' suppression rules:
+
+    (a) Drop ``drop_bin`` rows whose ``query`` also has a ``quantile`` or
+        ``quantile_approx`` row.
+    (b) Drop ``icd_crosswalk`` rows whose ``query`` also has an
+        ``icd_specific`` row.
+    (c) Drop ``mimic_item_crosswalk`` rows whose ``query`` also has a
+        ``quantile`` or ``quantile_approx`` row (suppress indication-proxy
+        when a precise lab quantile mapping exists).
+
+    Suppressed tiers remain available for queries that have no upgraded
+    coverage. Returns the filtered DataFrame.
+    """
+    if primary.is_empty():
+        return primary
+
+    queries_with_q = set(
+        primary.filter(pl.col("tier").is_in(["quantile", "quantile_approx"]))[
+            "query"
+        ].to_list()
+    )
+    queries_with_icd_specific = set(
+        primary.filter(pl.col("tier") == "icd_specific")["query"].to_list()
+    )
+
+    drop_mask = (
+        ((pl.col("tier") == "drop_bin") & pl.col("query").is_in(list(queries_with_q)))
+        | (
+            (pl.col("tier") == "icd_crosswalk")
+            & pl.col("query").is_in(list(queries_with_icd_specific))
+        )
+        | (
+            (pl.col("tier") == "mimic_item_crosswalk")
+            & pl.col("query").is_in(list(queries_with_q))
+        )
+    )
+    return primary.filter(~drop_mask)
+
+
+def add_tier_quality(mapping: pl.DataFrame) -> pl.DataFrame:
+    """Attach a ``tier_quality`` column to the mapping table.
+
+    ``primary`` iff one of:
+      (i)  ``tier`` in {exact, drop_bin, quantile, quantile_approx, icd_specific}, OR
+      (ii) ``tier == 'icd_crosswalk'`` AND ``family(query) == 'DIAGNOSIS'``
+           (3-char parent IS the most specific ETHOS encoding for that
+           diagnosis when ``icd_specific`` cannot fire).
+
+    ``secondary`` in all other cases:
+      (iii) ``tier == 'atc_crosswalk'`` (ETHOS encodes ATC at level 2 only,
+            so every drug is a class-proxy);
+      (iv)  ``tier == 'icd_crosswalk'`` AND ``family(query) == 'PROCEDURE'``
+            (proxy via diagnosis token);
+      (v)   ``tier == 'mimic_item_crosswalk'`` (orphan-lab indication
+            proxies, ATC-class proxies for named-drug infusions,
+            ``TIMELINE//START -> HOSPITAL_ADMISSION``).
+
+    The ``union`` tier (a re-emission of primary rows under the OR-of-all
+    semantics) falls into the secondary bucket by default; downstream
+    consumers that care about quality use the underlying primary tier rows.
+    """
+    family_expr = pl.col("query").str.split("//").list.get(0)
+    tier_quality = (
+        pl.when(pl.col("tier").is_in(list(_PRIMARY_TIERS)))
+        .then(pl.lit("primary"))
+        .when((pl.col("tier") == "icd_crosswalk") & (family_expr == "DIAGNOSIS"))
+        .then(pl.lit("primary"))
+        .otherwise(pl.lit("secondary"))
+        .alias("tier_quality")
+    )
+    return mapping.with_columns(tier_quality)
+
+
 def build_coverage(eq_codes: list[str], mapping: pl.DataFrame) -> pl.DataFrame:
     """Per-code coverage report with `unmapped_reason` annotations."""
 
@@ -434,6 +706,10 @@ def main(upload: bool = True) -> None:
     meds_q = load_meds_quantiles()
     print(f"  {len(meds_q)} codes have decile metadata")
 
+    print("Loading MEDS sibling bins ...")
+    sibling_bins = load_meds_sibling_bins()
+    print(f"  {len(sibling_bins)} value-binned base codes")
+
     print("Building / loading ETHOS vocab ...")
     vocab_df = build_ethos_vocab()
     ethos_vocab = set(vocab_df["token"].to_list())
@@ -443,14 +719,26 @@ def main(upload: bool = True) -> None:
     exact = build_exact(eq_codes, ethos_vocab)
     drop_bin = build_drop_bin(eq_codes, ethos_vocab)
     quantile = build_quantile(eq_codes, ethos_vocab, meds_q)
+    quantile_approx = build_quantile_approx(eq_codes, ethos_vocab, sibling_bins)
+    icd_specific = build_icd_specific(eq_codes, ethos_vocab)
     icd_xw = build_crosswalk(eq_codes, ethos_vocab, ICD_CROSSWALK_PATH, "icd_crosswalk")
     atc_xw = build_crosswalk(eq_codes, ethos_vocab, ATC_CROSSWALK_PATH, "atc_crosswalk")
     mimic_xw = build_crosswalk(
         eq_codes, ethos_vocab, MIMIC_ITEMS_CROSSWALK_PATH, "mimic_item_crosswalk"
     )
-    primary = pl.concat([exact, drop_bin, quantile, icd_xw, atc_xw, mimic_xw], how="vertical")
+    primary = pl.concat(
+        [exact, drop_bin, quantile, quantile_approx, icd_specific, icd_xw, atc_xw, mimic_xw],
+        how="vertical",
+    )
+
+    pre_suppression = primary
+    primary = apply_suppression_cascade(primary)
+    suppressed_n = len(pre_suppression) - len(primary)
+    print(f"  suppression cascade dropped {suppressed_n} row(s)")
+
     union = build_union(primary)
     mapping = pl.concat([primary, union], how="vertical")
+    mapping = add_tier_quality(mapping)
 
     coverage = build_coverage(eq_codes, mapping)
 

@@ -55,56 +55,20 @@ Default to the **tightest** mapping that still captures the EQ concept. When a c
 ### <a id="diagnosisicd10i25118"></a>`DIAGNOSIS//ICD//10//I25118`
 
 - **Family:** `DIAGNOSIS`
-- **Mapped tiers:** icd_crosswalk
+- **Mapped tiers:** icd_specific
 
 **Authoritative EQ label:** ICD-10-CM `I25118` -- Atherosclerotic heart disease of native coronary artery with other forms of angina pectoris
 - 3-char parent: `I25` -- Chronic ischemic heart disease
 - SNOMED bridge: Angina co-occurrent and due to coronary arteriosclerosis (concept_id 36712983)
 
-**LLM rationale (verbatim):**
+_Found under tier(s): icd_specific_
 
-> ICD-10-CM 3-char parent I25 resolved to ETHOS token via ethos_icd_3char_index.
+#### Candidate ETHOS token: `ICD//CM//CHRONIC_ISCHEMIC_HEART_DISEASE|ICD//CM//3-6//118` _(primary)_
 
-_Found under tier(s): icd_crosswalk_
-
-#### Candidate ETHOS token: `ICD//CM//CHRONIC_ISCHEMIC_HEART_DISEASE`
-
-- ETHOS vocab count: 130,280
-- Match kind: `literal`
-- Mapping source: `deterministic:icd_3char_walker`
-- Inferred source: ICD-10-CM 3-char category `I25` -- Chronic ischemic heart disease
-- Constituent ICD-10-CM codes (69):
-  - `I25.1` -- Atherosclerotic heart disease of native coronary artery
-  - `I25.10` -- Atherosclerotic heart disease of native coronary artery without angina pectoris
-  - `I25.11` -- Atherosclerotic heart disease of native coronary artery with angina pectoris
-  - `I25.110` -- Atherosclerotic heart disease of native coronary artery with unstable angina pectoris
-  - `I25.111` -- Atherosclerotic heart disease of native coronary artery with angina pectoris with documented spasm
-  - `I25.112` -- Atherosclerotic heart disease of native coronary artery with refractory angina pectoris
-  - `I25.118` -- Atherosclerotic heart disease of native coronary artery with other forms of angina pectoris
-  - `I25.119` -- Atherosclerotic heart disease of native coronary artery with unspecified angina pectoris
-  - `I25.2` -- Old myocardial infarction
-  - `I25.3` -- Aneurysm of heart
-  - `I25.4` -- Coronary artery aneurysm and dissection
-  - `I25.41` -- Coronary artery aneurysm
-  - `I25.42` -- Coronary artery dissection
-  - `I25.5` -- Ischemic cardiomyopathy
-  - `I25.6` -- Silent myocardial ischemia
-  - `I25.7` -- Atherosclerosis of coronary artery bypass graft(s) and coronary artery of transplanted heart with angina pectoris
-  - `I25.70` -- Atherosclerosis of coronary artery bypass graft(s), unspecified, with angina pectoris
-  - `I25.700` -- Atherosclerosis of coronary artery bypass graft(s), unspecified, with unstable angina pectoris
-  - `I25.701` -- Atherosclerosis of coronary artery bypass graft(s), unspecified, with angina pectoris with documented spasm
-  - `I25.702` -- Atherosclerosis of coronary artery bypass graft(s), unspecified, with refractory angina pectoris
-  - `I25.708` -- Atherosclerosis of coronary artery bypass graft(s), unspecified, with other forms of angina pectoris
-  - `I25.709` -- Atherosclerosis of coronary artery bypass graft(s), unspecified, with unspecified angina pectoris
-  - `I25.71` -- Atherosclerosis of autologous vein coronary artery bypass graft(s) with angina pectoris
-  - `I25.710` -- Atherosclerosis of autologous vein coronary artery bypass graft(s) with unstable angina pectoris
-  - `I25.711` -- Atherosclerosis of autologous vein coronary artery bypass graft(s) with angina pectoris with documented spasm
-  - `I25.712` -- Atherosclerosis of autologous vein coronary artery bypass graft(s) with refractory angina pectoris
-  - `I25.718` -- Atherosclerosis of autologous vein coronary artery bypass graft(s) with other forms of angina pectoris
-  - `I25.719` -- Atherosclerosis of autologous vein coronary artery bypass graft(s) with unspecified angina pectoris
-  - `I25.72` -- Atherosclerosis of autologous artery coronary artery bypass graft(s) with angina pectoris
-  - `I25.720` -- Atherosclerosis of autologous artery coronary artery bypass graft(s) with unstable angina pectoris
-  - ... +39 more
+- ETHOS vocab count: 0
+- Match kind: `code+next_token`
+- Mapping source: `icd10cm:5char_to_label_plus_suffix`
+- Inferred source: _no ICD-10-CM 3-char category match for label `CHRONIC_ISCHEMIC_HEART_DISEASE|ICD//CM//3-6//118`._
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -139,7 +103,7 @@ _Found under tier(s): icd_crosswalk_
 
 _Found under tier(s): icd_crosswalk_
 
-#### Candidate ETHOS token: `ICD//CM//PARKINSON'S_DISEASE`
+#### Candidate ETHOS token: `ICD//CM//PARKINSON'S_DISEASE` _(primary)_
 
 - ETHOS vocab count: 5,606
 - Match kind: `literal`
@@ -179,7 +143,7 @@ _Found under tier(s): icd_crosswalk_
 
 _Found under tier(s): icd_crosswalk_
 
-#### Candidate ETHOS token: `ICD//CM//PAROXYSMAL_TACHYCARDIA`
+#### Candidate ETHOS token: `ICD//CM//PAROXYSMAL_TACHYCARDIA` _(primary)_
 
 - ETHOS vocab count: 9,342
 - Match kind: `literal`
@@ -211,36 +175,21 @@ _Found under tier(s): icd_crosswalk_
 ### <a id="diagnosisicd95856"></a>`DIAGNOSIS//ICD//9//5856`
 
 - **Family:** `DIAGNOSIS`
-- **Mapped tiers:** icd_crosswalk
+- **Mapped tiers:** icd_specific
 
 **Authoritative EQ label:** ICD-9-CM `5856` -- End stage renal disease
 - SNOMED bridge: End-stage renal disease (concept_id 193782)
 - ICD-10-CM crosswalk (1 code):
   - `N18.6` -- End stage renal disease
 
-**LLM rationale (verbatim):**
+_Found under tier(s): icd_specific_
 
-> ICD-10-CM 3-char parent N18 resolved to ETHOS token via ethos_icd_3char_index.
+#### Candidate ETHOS token: `ICD//CM//CHRONIC_KIDNEY_DISEASE_(CKD)|ICD//CM//3-6//6` _(primary)_
 
-_Found under tier(s): icd_crosswalk_
-
-#### Candidate ETHOS token: `ICD//CM//CHRONIC_KIDNEY_DISEASE_(CKD)`
-
-- ETHOS vocab count: 84,796
-- Match kind: `literal`
-- Mapping source: `deterministic:icd_3char_walker`
-- Inferred source: ICD-10-CM 3-char category `N18` -- Chronic kidney disease (CKD)
-- Constituent ICD-10-CM codes (10):
-  - `N18.1` -- Chronic kidney disease, stage 1
-  - `N18.2` -- Chronic kidney disease, stage 2 (mild)
-  - `N18.3` -- Chronic kidney disease, stage 3 (moderate)
-  - `N18.30` -- Chronic kidney disease, stage 3 unspecified
-  - `N18.31` -- Chronic kidney disease, stage 3a
-  - `N18.32` -- Chronic kidney disease, stage 3b
-  - `N18.4` -- Chronic kidney disease, stage 4 (severe)
-  - `N18.5` -- Chronic kidney disease, stage 5
-  - `N18.6` -- End stage renal disease
-  - `N18.9` -- Chronic kidney disease, unspecified
+- ETHOS vocab count: 0
+- Match kind: `code+next_token`
+- Mapping source: `icd9_dx:longest_icd10_target`
+- Inferred source: _no ICD-10-CM 3-char category match for label `CHRONIC_KIDNEY_DISEASE_(CKD)|ICD//CM//3-6//6`._
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -256,7 +205,7 @@ _Found under tier(s): icd_crosswalk_
 ### <a id="diagnosisicd97295"></a>`DIAGNOSIS//ICD//9//7295`
 
 - **Family:** `DIAGNOSIS`
-- **Mapped tiers:** icd_crosswalk
+- **Mapped tiers:** icd_specific
 
 **Authoritative EQ label:** ICD-9-CM `7295` -- Pain in limb
 - SNOMED bridge: Pain in limb (concept_id 138525)
@@ -265,50 +214,14 @@ _Found under tier(s): icd_crosswalk_
   - `M79.60` -- Pain in limb, unspecified
   - `M79.609` -- Pain in unspecified limb
 
-**LLM rationale (verbatim):**
+_Found under tier(s): icd_specific_
 
-> ICD-10-CM 3-char parent M79 resolved to ETHOS token via ethos_icd_3char_index.
+#### Candidate ETHOS token: `ICD//CM//OTHER_AND_UNSPECIFIED_SOFT_TISSUE_DISORDERS_NOT_ELSEWHERE_CLASSIFIED|ICD//CM//3-6//609` _(primary)_
 
-_Found under tier(s): icd_crosswalk_
-
-#### Candidate ETHOS token: `ICD//CM//OTHER_AND_UNSPECIFIED_SOFT_TISSUE_DISORDERS_NOT_ELSEWHERE_CLASSIFIED`
-
-- ETHOS vocab count: 12,667
-- Match kind: `literal`
-- Mapping source: `deterministic:icd_3char_walker`
-- Inferred source: ICD-10-CM 3-char category `M79` -- Other and unspecified soft tissue disorders, not elsewhere classified
-- Constituent ICD-10-CM codes (65):
-  - `M79.0` -- Rheumatism, unspecified
-  - `M79.1` -- Myalgia
-  - `M79.10` -- Myalgia, unspecified site
-  - `M79.11` -- Myalgia of mastication muscle
-  - `M79.12` -- Myalgia of auxiliary muscles, head and neck
-  - `M79.18` -- Myalgia, other site
-  - `M79.2` -- Neuralgia and neuritis, unspecified
-  - `M79.3` -- Panniculitis, unspecified
-  - `M79.4` -- Hypertrophy of (infrapatellar) fat pad
-  - `M79.5` -- Residual foreign body in soft tissue
-  - `M79.6` -- Pain in limb, hand, foot, fingers and toes
-  - `M79.60` -- Pain in limb, unspecified
-  - `M79.601` -- Pain in right arm
-  - `M79.602` -- Pain in left arm
-  - `M79.603` -- Pain in arm, unspecified
-  - `M79.604` -- Pain in right leg
-  - `M79.605` -- Pain in left leg
-  - `M79.606` -- Pain in leg, unspecified
-  - `M79.609` -- Pain in unspecified limb
-  - `M79.62` -- Pain in upper arm
-  - `M79.621` -- Pain in right upper arm
-  - `M79.622` -- Pain in left upper arm
-  - `M79.629` -- Pain in unspecified upper arm
-  - `M79.63` -- Pain in forearm
-  - `M79.631` -- Pain in right forearm
-  - `M79.632` -- Pain in left forearm
-  - `M79.639` -- Pain in unspecified forearm
-  - `M79.64` -- Pain in hand and fingers
-  - `M79.641` -- Pain in right hand
-  - `M79.642` -- Pain in left hand
-  - ... +35 more
+- ETHOS vocab count: 0
+- Match kind: `code+next_token`
+- Mapping source: `icd9_dx:longest_icd10_target`
+- Inferred source: _no ICD-10-CM 3-char category match for label `OTHER_AND_UNSPECIFIED_SOFT_TISSUE_DISORDERS_NOT_ELSEWHERE_CLASSIFIED|ICD//CM//3-6//609`._
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -339,7 +252,7 @@ _Found under tier(s): icd_crosswalk_
 
 _Found under tier(s): mimic_item_crosswalk_
 
-#### Candidate ETHOS token: `ATC//N05//PSYCHOLEPTICS`
+#### Candidate ETHOS token: `ATC//N05//PSYCHOLEPTICS` _(secondary)_
 
 - ETHOS vocab count: 908,963
 - Match kind: `literal`
@@ -407,7 +320,7 @@ _Found under tier(s): mimic_item_crosswalk_
 
 _Found under tier(s): mimic_item_crosswalk_
 
-#### Candidate ETHOS token: `ATC//C03//DIURETICS`
+#### Candidate ETHOS token: `ATC//C03//DIURETICS` _(secondary)_
 
 - ETHOS vocab count: 612,787
 - Match kind: `literal`
@@ -460,7 +373,7 @@ _Found under tier(s): mimic_item_crosswalk_
 ### <a id="lab220224mmhgvalue-890980"></a>`LAB//220224//mmHg//value_[89.0,98.0)`
 
 - **Family:** `LAB`
-- **Mapped tiers:** drop_bin, quantile
+- **Mapped tiers:** quantile
 
 **Authoritative EQ label:** MIMIC item-id `220224` -- Arterial O2 pressure (source: `d_items`)
 - abbreviation: PO2 (Arterial)
@@ -469,21 +382,12 @@ _Found under tier(s): mimic_item_crosswalk_
 - linksto: chartevents
 - EQ-encoded units: `mmHg`
 
-_Found under tier(s): drop_bin_
-
-#### Candidate ETHOS token: `LAB//220224//MMHG`
-
-- ETHOS vocab count: 224,599
-- Match kind: `literal`
-- Mapping source: `code:strip_value_bin+upper_units`
-- Inferred source: ETHOS-internal token (no Athena ontology bridge).
-
 _Found under tier(s): quantile_
 
-#### Candidate ETHOS token: `LAB//220224//MMHG|Q4`
+#### Candidate ETHOS token: `LAB//220224//MMHG|Q4` _(primary)_
 
 - ETHOS vocab count: 0
-- Match kind: `lab+next_qk`
+- Match kind: `code+next_token`
 - Mapping source: `meds-codes.parquet:values_quantiles_or_sibling_bins`
 - Inferred source: ETHOS-internal token (no Athena ontology bridge).
 
@@ -501,7 +405,7 @@ _Found under tier(s): quantile_
 ### <a id="lab220339cmh2ovalue-100120"></a>`LAB//220339//cmH2O//value_[10.0,12.0)`
 
 - **Family:** `LAB`
-- **Mapped tiers:** drop_bin
+- **Mapped tiers:** quantile_approx
 
 **Authoritative EQ label:** MIMIC item-id `220339` -- PEEP set (source: `d_items`)
 - abbreviation: PEEP set
@@ -510,13 +414,13 @@ _Found under tier(s): quantile_
 - linksto: chartevents
 - EQ-encoded units: `cmH2O`
 
-_Found under tier(s): drop_bin_
+_Found under tier(s): quantile_approx_
 
-#### Candidate ETHOS token: `LAB//220339//CMH2O`
+#### Candidate ETHOS token: `LAB//220339//CMH2O|Q8` _(primary)_
 
-- ETHOS vocab count: 768,487
-- Match kind: `literal`
-- Mapping source: `code:strip_value_bin+upper_units`
+- ETHOS vocab count: 0
+- Match kind: `code+next_token`
+- Mapping source: `meds-codes.parquet:sibling_bins_positional`
 - Inferred source: ETHOS-internal token (no Athena ontology bridge).
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
@@ -533,7 +437,7 @@ _Found under tier(s): drop_bin_
 ### <a id="lab224054unkvalue-2030"></a>`LAB//224054//UNK//value_[2.0,3.0)`
 
 - **Family:** `LAB`
-- **Mapped tiers:** drop_bin
+- **Mapped tiers:** quantile_approx
 
 **Authoritative EQ label:** MIMIC item-id `224054` -- Braden Sensory Perception (source: `d_items`)
 - abbreviation: Braden Sensory Perception
@@ -541,13 +445,13 @@ _Found under tier(s): drop_bin_
 - linksto: chartevents
 - EQ-encoded units: `UNK`
 
-_Found under tier(s): drop_bin_
+_Found under tier(s): quantile_approx_
 
-#### Candidate ETHOS token: `LAB//224054//UNK`
+#### Candidate ETHOS token: `LAB//224054//UNK|Q5` _(primary)_
 
-- ETHOS vocab count: 808,972
-- Match kind: `literal`
-- Mapping source: `code:strip_value_bin+upper_units`
+- ETHOS vocab count: 0
+- Match kind: `code+next_token`
+- Mapping source: `meds-codes.parquet:sibling_bins_positional`
 - Inferred source: ETHOS-internal token (no Athena ontology bridge).
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
@@ -564,7 +468,7 @@ _Found under tier(s): drop_bin_
 ### <a id="lab224690inspminvalue-140160"></a>`LAB//224690//insp/min//value_[14.0,16.0)`
 
 - **Family:** `LAB`
-- **Mapped tiers:** drop_bin, quantile
+- **Mapped tiers:** quantile
 
 **Authoritative EQ label:** MIMIC item-id `224690` -- Respiratory Rate (Total) (source: `d_items`)
 - abbreviation: Respiratory Rate (Total)
@@ -573,21 +477,12 @@ _Found under tier(s): drop_bin_
 - linksto: chartevents
 - EQ-encoded units: `insp/min`
 
-_Found under tier(s): drop_bin_
-
-#### Candidate ETHOS token: `LAB//224690//INSP/MIN`
-
-- ETHOS vocab count: 710,225
-- Match kind: `literal`
-- Mapping source: `code:strip_value_bin+upper_units`
-- Inferred source: ETHOS-internal token (no Athena ontology bridge).
-
 _Found under tier(s): quantile_
 
-#### Candidate ETHOS token: `LAB//224690//INSP/MIN|Q2`
+#### Candidate ETHOS token: `LAB//224690//INSP/MIN|Q2` _(primary)_
 
 - ETHOS vocab count: 0
-- Match kind: `lab+next_qk`
+- Match kind: `code+next_token`
 - Mapping source: `meds-codes.parquet:values_quantiles_or_sibling_bins`
 - Inferred source: ETHOS-internal token (no Athena ontology bridge).
 
@@ -605,7 +500,7 @@ _Found under tier(s): quantile_
 ### <a id="lab227073meqlvalue-170190"></a>`LAB//227073//mEq/L//value_[17.0,19.0)`
 
 - **Family:** `LAB`
-- **Mapped tiers:** drop_bin
+- **Mapped tiers:** quantile_approx
 
 **Authoritative EQ label:** MIMIC item-id `227073` -- Anion gap (source: `d_items`)
 - abbreviation: Anion gap
@@ -614,13 +509,13 @@ _Found under tier(s): quantile_
 - linksto: chartevents
 - EQ-encoded units: `mEq/L`
 
-_Found under tier(s): drop_bin_
+_Found under tier(s): quantile_approx_
 
-#### Candidate ETHOS token: `LAB//227073//MEQ/L`
+#### Candidate ETHOS token: `LAB//227073//MEQ/L|Q9` _(primary)_
 
-- ETHOS vocab count: 405,801
-- Match kind: `literal`
-- Mapping source: `code:strip_value_bin+upper_units`
+- ETHOS vocab count: 0
+- Match kind: `code+next_token`
+- Mapping source: `meds-codes.parquet:sibling_bins_positional`
 - Inferred source: ETHOS-internal token (no Athena ontology bridge).
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
@@ -652,7 +547,7 @@ _Found under tier(s): drop_bin_
 
 _Found under tier(s): mimic_item_crosswalk_
 
-#### Candidate ETHOS token: `ICD//CM//PRESSURE_ULCER`
+#### Candidate ETHOS token: `ICD//CM//PRESSURE_ULCER` _(secondary)_
 
 - ETHOS vocab count: 11,617
 - Match kind: `literal`
@@ -705,28 +600,19 @@ _Found under tier(s): mimic_item_crosswalk_
 ### <a id="lab51274secvalue-141153"></a>`LAB//51274//sec//value_[14.1,15.3)`
 
 - **Family:** `LAB`
-- **Mapped tiers:** drop_bin, quantile
+- **Mapped tiers:** quantile
 
 **Authoritative EQ label:** MIMIC item-id `51274` -- PT (source: `d_labitems`)
 - category: Hematology
 - fluid: Blood
 - EQ-encoded units: `sec`
 
-_Found under tier(s): drop_bin_
-
-#### Candidate ETHOS token: `LAB//51274//SEC`
-
-- ETHOS vocab count: 1,316,289
-- Match kind: `literal`
-- Mapping source: `code:strip_value_bin+upper_units`
-- Inferred source: ETHOS-internal token (no Athena ontology bridge).
-
 _Found under tier(s): quantile_
 
-#### Candidate ETHOS token: `LAB//51274//SEC|Q6`
+#### Candidate ETHOS token: `LAB//51274//SEC|Q6` _(primary)_
 
 - ETHOS vocab count: 0
-- Match kind: `lab+next_qk`
+- Match kind: `code+next_token`
 - Mapping source: `meds-codes.parquet:values_quantiles_or_sibling_bins`
 - Inferred source: ETHOS-internal token (no Athena ontology bridge).
 
@@ -758,7 +644,7 @@ _Found under tier(s): quantile_
 
 _Found under tier(s): atc_crosswalk_
 
-#### Candidate ETHOS token: `ATC//N04//ANTI-PARKINSON_DRUGS`
+#### Candidate ETHOS token: `ATC//N04//ANTI-PARKINSON_DRUGS` _(secondary)_
 
 - ETHOS vocab count: 162,103
 - Match kind: `literal`
@@ -825,7 +711,7 @@ _Found under tier(s): atc_crosswalk_
 
 _Found under tier(s): atc_crosswalk_
 
-#### Candidate ETHOS token: `ATC//N02//ANALGESICS`
+#### Candidate ETHOS token: `ATC//N02//ANALGESICS` _(secondary)_
 
 - ETHOS vocab count: 5,128,410
 - Match kind: `literal`
@@ -866,7 +752,7 @@ _Found under tier(s): atc_crosswalk_
 
 _Found under tier(s): atc_crosswalk_
 
-#### Candidate ETHOS token: `ATC//N03//ANTIEPILEPTICS`
+#### Candidate ETHOS token: `ATC//N03//ANTIEPILEPTICS` _(secondary)_
 
 - ETHOS vocab count: 1,322,698
 - Match kind: `literal`
@@ -933,7 +819,7 @@ _Found under tier(s): atc_crosswalk_
 
 _Found under tier(s): atc_crosswalk_
 
-#### Candidate ETHOS token: `ATC//R01//NASAL_PREPARATIONS`
+#### Candidate ETHOS token: `ATC//R01//NASAL_PREPARATIONS` _(secondary)_
 
 - ETHOS vocab count: 125,895
 - Match kind: `literal`
@@ -1000,7 +886,7 @@ _Found under tier(s): atc_crosswalk_
 
 _Found under tier(s): atc_crosswalk_
 
-#### Candidate ETHOS token: `ATC//C09//AGENTS_ACTING_ON_THE_RENIN-ANGIOTENSIN_SYSTEM`
+#### Candidate ETHOS token: `ATC//C09//AGENTS_ACTING_ON_THE_RENIN-ANGIOTENSIN_SYSTEM` _(secondary)_
 
 - ETHOS vocab count: 285,699
 - Match kind: `literal`
@@ -1058,7 +944,7 @@ _Found under tier(s): atc_crosswalk_
 
 _Found under tier(s): atc_crosswalk_
 
-#### Candidate ETHOS token: `ATC//J01//ANTIBIOTICS_AND_ANTIBACTERIALS_FOR_SYSTEMIC_USE`
+#### Candidate ETHOS token: `ATC//J01//ANTIBIOTICS_AND_ANTIBACTERIALS_FOR_SYSTEMIC_USE` _(secondary)_
 
 - ETHOS vocab count: 2,103,569
 - Match kind: `literal`
@@ -1117,7 +1003,7 @@ _Found under tier(s): atc_crosswalk_
 
 _Found under tier(s): exact_
 
-#### Candidate ETHOS token: `MEDS_DEATH`
+#### Candidate ETHOS token: `MEDS_DEATH` _(primary)_
 
 - ETHOS vocab count: 34,014
 - Match kind: `literal`
@@ -1148,7 +1034,7 @@ _Found under tier(s): exact_
 
 _Found under tier(s): icd_crosswalk_
 
-#### Candidate ETHOS token: `ICD//CM//FRACTURE_OF_LOWER_LEG_INCLUDING_ANKLE`
+#### Candidate ETHOS token: `ICD//CM//FRACTURE_OF_LOWER_LEG_INCLUDING_ANKLE` _(secondary)_
 
 - ETHOS vocab count: 4,413
 - Match kind: `literal`
@@ -1211,7 +1097,7 @@ _Found under tier(s): icd_crosswalk_
 
 _Found under tier(s): mimic_item_crosswalk_
 
-#### Candidate ETHOS token: `HOSPITAL_ADMISSION`
+#### Candidate ETHOS token: `HOSPITAL_ADMISSION` _(secondary)_
 
 - ETHOS vocab count: 297,949
 - Match kind: `literal`

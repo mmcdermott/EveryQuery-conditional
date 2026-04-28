@@ -110,14 +110,15 @@ def _pattern_index(mapping: pl.DataFrame) -> pl.DataFrame:
 def _relevant_tokens(mapping: pl.DataFrame) -> set[str]:
     """All ETHOS tokens we need to keep when filtering trajectories.
 
-    For literal patterns: just the pattern itself. For lab+next_qk: both halves
-    (since both must be retained so the next-row check still finds a match).
+    For literal patterns: just the pattern itself. For code+next_token: both
+    halves (since both must be retained so the next-row check still finds a
+    match).
     """
     out: set[str] = set()
     for row in mapping.iter_rows(named=True):
         if row["match_kind"] == "literal":
             out.add(row["token_pattern"])
-        elif row["match_kind"] == "lab+next_qk":
+        elif row["match_kind"] == "code+next_token":
             lab, qk = row["token_pattern"].split("|", 1)
             out.add(lab)
             out.add(qk)
@@ -155,7 +156,7 @@ def _hits_for_sim(traj: pl.DataFrame, mapping: pl.DataFrame, sim_idx: int) -> pl
     for row in mapping.iter_rows(named=True):
         if row["match_kind"] == "literal":
             mask = pl.col("code") == row["token_pattern"]
-        elif row["match_kind"] == "lab+next_qk":
+        elif row["match_kind"] == "code+next_token":
             lab, qk = row["token_pattern"].split("|", 1)
             mask = (pl.col("code") == lab) & (pl.col("next_code") == qk)
         else:

@@ -10,12 +10,26 @@ on the held-out MIMIC eval suite (`gs://every-query-runs/eval_tasks/7573f855…/
    `anthropic/claude-sonnet-4.5`) emits the three crosswalk YAMLs in
    `crosswalks/`. Each EQ code gets exactly one ETHOS token (occasionally two
    for same-source-concept ATC ties) or lands in `unmappable_with_rationale`.
-2. `build_mapping.py`: emits `mapping_table.parquet` and `mapping_coverage.parquet`.
+2. `build_mapping.py`: emits `mapping_table.parquet` (with `tier`,
+   `tier_quality`, and `mapping_source` columns) and
+   `mapping_coverage.parquet`. Adds the `icd_specific` and `quantile_approx`
+   primary tiers and runs the suppression cascade (`drop_bin` -> drop when
+   `quantile`/`quantile_approx` exists; `icd_crosswalk` -> drop when
+   `icd_specific` exists; `mimic_item_crosswalk` -> drop when `quantile`/
+   `quantile_approx` exists).
 3. `predict.py`: streams ETHOS trajectories, emits `ethos_predictions.parquet`.
-4. `evaluate.py`: emits `ethos_aucs_held_out.parquet`.
+   Supports literal and `code+next_token` match kinds.
+4. `evaluate.py`: emits `ethos_aucs_held_out.parquet` with a `tier_quality`
+   column and prints a primary-vs-secondary aggregate alongside the
+   per-tier table.
 5. `comparison.ipynb`: figures (PDF+PNG to `analysis/figures/`) and tables
    (CSV to `analysis/tables/`) with paired Wilcoxon over per-(code, duration,
-   bucket) cells.
+   bucket) cells. Headline number leads with the primary tier_quality split;
+   secondary and union are reported separately. Also emits three head-to-head
+   win-rate CSVs at `eps=0.01`
+   (`ethos_vs_eq_win_rate_per_tier.csv`,
+   `ethos_vs_eq_win_rate_per_tier_duration_bucket.csv`,
+   `ethos_vs_eq_win_status_per_code.csv`).
 
 All artifacts upload to `gs://every-query-runs/baselines/ethos/`.
 
@@ -65,23 +79,45 @@ Excluded partial models `14-08-24` and `23-54-43` (only 41 rows, duration=30 onl
 ### Mapping mechanics implied by the audit
 
 - **Exact tier:** verbatim string match between EQ `code` and an ETHOS token in the trajectory.
-- **Drop-bin tier:** for `LAB`, `INFUSION_START`, `INFUSION_END`, `SUBJECT_FLUID_OUTPUT` families — strip the trailing `//value_[..)` segment from EQ `code`, normalise units to upper-case, and match the lab/item ETHOS token (ignoring the following `Qk`).
+- **Drop-bin tier:** for `LAB`, `INFUSION_START`, `INFUSION_END`, `SUBJECT_FLUID_OUTPUT` families — strip the trailing `//value_[..)` segment from EQ `code`, normalise units to upper-case, and match the lab/item ETHOS token (ignoring the following `Qk`). Suppressed by the cascade in `build_mapping.apply_suppression_cascade` whenever a `quantile` or `quantile_approx` row exists for the same query.
 - **Quantile tier:** for the same families — match the lab/item token AND require the next-token `Qk` to fall in the decile range corresponding to EQ's `value_[lo, hi)`. Decile boundaries come from MEDS metadata `values/quantiles`; for codes with null parent quantiles we fall back to the sibling-bin layout when there are exactly 10 contiguous bins.
+- **Quantile-approx tier:** identical 2-token shape as `quantile`, but for parents whose `meds_codes.parquet` has 2..9 sibling bins (so the strict decile alignment can't fire). The EQ bin's 1-based positional index `i` among `n` sorted siblings is mapped linearly to `Qk = round(i * 10 / n)`. This is an approximation, flagged in the provenance string `meds-codes.parquet:sibling_bins_positional`.
+- **ICD-specific tier:** for `DIAGNOSIS//ICD//(9|10)//*` queries — emit a strict 2-token sequence `<descriptive_label>|ICD//CM//3-6//<suffix>` whenever the EQ code's 5-char ICD-10-CM target has both an ETHOS descriptive label (3-char parent) and an ETHOS `ICD//CM//3-6//<suffix>` token. Suppresses the broader `icd_crosswalk` row for the same query.
 - **Set-union OR tier:** ETHOS predicts target if any pattern from the prior tiers fires within the duration window.
+
+Each row of `mapping_table.parquet` carries a **`tier_quality`** of
+`primary` (most-specific encoding the vocabulary supports) or `secondary`
+(best-effort proxy: ATC level 2, procedure-as-diagnosis, indication-proxy
+labs, `HOSPITAL_ADMISSION` for `TIMELINE//START`). Downstream consumers
+split AUC tables by `tier_quality` and report `union` separately as the
+per-code OR.
 
 ## Outcome
 
 Crosswalks were tightened so each EQ code resolves to the **single most-specific
-ETHOS token** (or a same-source-concept ATC tie that commits two tokens). The
-deterministic ICD-3char and ATC-ancestor walkers handle the 11 unambiguous
-codes outright; the LLM picker fires for 4 ICD/PROC and ~17 lab/infusion
-edge-cases that the walker cannot resolve.
+ETHOS token** (or a same-source-concept ATC tie that commits two tokens), and
+the mapping table now annotates every (query, tier) row with a
+**`tier_quality`** of `primary` or `secondary`. Primary tiers commit to the
+most-specific encoding the ETHOS vocabulary supports (literal token,
+lab-decile pair, ICD-10-CM 5-char label+suffix pair, ICD-10-CM 3-char parent
+for diagnoses); secondary tiers are best-effort proxies under ETHOS-vocab
+limitations (ATC level 2 for medications, procedure-as-diagnosis for ICD-9
+procedures, indication-proxy diagnosis tokens for orphan MIMIC labs,
+`HOSPITAL_ADMISSION` for `TIMELINE//START`).
 
-- **Coverage:** **22/41 EQ codes mapped (54%)**: 1 `MEDS_DEATH` (exact), 6
-  LABs (drop_bin, 3 also quantile), 5 DIAGNOSIS + 1 PROCEDURE (icd_crosswalk),
-  4+1 MEDICATION (atc_crosswalk; Gabapentin commits two tokens for the
-  N02/N03 same-source ATC tie), 1 TIMELINE + 2 INFUSION_* + 1 LAB
-  (mimic_item_crosswalk).
+- **Coverage:** **22/41 EQ codes mapped (54%)**, split by tier_quality:
+  - **Primary (12 codes):** 1 `MEDS_DEATH` (exact), 3 LABs (quantile, deciles
+    via `meds_codes.parquet`), 3 LABs (`quantile_approx`, sibling-bin
+    positional approximation when fewer than 10 deciles exist), 3 DIAGNOSIS
+    (`icd_specific`: 5-char ICD-10-CM target rendered as label + 3-6-suffix
+    2-token pattern) plus 2 DIAGNOSIS that fall back to the 3-char parent
+    (`icd_crosswalk` primary for DIAGNOSIS).
+  - **Secondary (10 codes):** 5 MEDICATION (`atc_crosswalk` at ATC level 2;
+    Gabapentin commits two tokens for the N02/N03 same-source ATC tie),
+    1 PROCEDURE (`icd_crosswalk` proxy via fracture-of-lower-leg diagnosis),
+    1 TIMELINE + 2 INFUSION_* (named-drug -> ATC class) + 1 orphan LAB
+    (pressure-ulcer length -> `PRESSURE_ULCER` indication proxy), all
+    `mimic_item_crosswalk`.
 - **19 codes remain unmapped** in `crosswalks/mimic_items.yaml`'s
   `unmappable_with_rationale` block: 12 LABs (CO2 production, eosinophil
   differential, lipase, hemodialysis output volume, CK-MB, ventilator
@@ -89,37 +125,81 @@ edge-cases that the walker cannot resolve.
   urine calcium, rubella serology, PCA total dose), 3 SUBJECT_FLUID_OUTPUT
   (Jackson-Pratt drain, tube-feed residual), and 4 INFUSION_* entries (KCl
   during CRRT in two bins, dextrose 5% IV fluid, packed RBCs).
-- **AUROC, paired Wilcoxon over (code, duration, bucket) cells (best EQ ckpt
-  `23-43-54`, with `MEDS_DEATH` falling back to a partial ckpt). Numbers are
-  the canonical output of `comparison.ipynb` and are persisted to
-  `analysis/tables/ethos_vs_eq_aggregated_per_tier.csv`:**
+- **Headline AUROC by tier_quality** (paired Wilcoxon over
+  `(code, duration, bucket)` cells, best EQ ckpt `23-43-54` with `MEDS_DEATH`
+  falling back to a partial ckpt; canonical output of `comparison.ipynb`,
+  persisted to `analysis/tables/ethos_vs_eq_aggregated_by_tier_quality.csv`):
 
-  | Tier | n | mean EQ | mean ETHOS | mean diff | p | Comment |
-  |---|---:|---:|---:|---:|---:|---|
-  | exact | 1 | 0.834 | 0.880 | +0.046 | NA | MEDS_DEATH |
-  | drop_bin | 12 | 0.920 | 0.922 | +0.002 | 0.85 | LAB presence |
-  | quantile | 6 | 0.904 | 0.901 | -0.003 | 1.00 | LAB value decile |
-  | icd_crosswalk | 12 | 0.707 | 0.793 | +0.086 | 0.064 | DIAGNOSIS+PROC |
-  | atc_crosswalk | 10 | 0.767 | 0.774 | +0.007 | 1.00 | MEDICATION |
-  | mimic_item_crosswalk | 6 | 0.965 | 0.751 | -0.214 | 0.0625 | INFUSION + 1 lab |
-  | union | 41 | 0.825 | 0.822 | -0.003 | 0.75 | Per-code OR |
+  | tier_quality | n | mean EQ | mean ETHOS | mean diff | p |
+  |---|---:|---:|---:|---:|---:|
+  | **primary**   | 23 | 0.826 | 0.816 | -0.010 | 0.43 |
+  | secondary[^1] | 18 | 0.824 | 0.775 | -0.049 | 0.55 |
+  | union         | 41 | 0.825 | 0.798 | -0.027 | 0.40 |
 
-- **Headline:** ETHOS as a query engine remains **comparable to EQ on every
-  tier where ETHOS has a direct vocabulary counterpart**, with the union-tier
-  comparison showing no significant difference (p=0.75). The companion
-  scatter is at `analysis/figures/ethos_vs_eq_auc_scatter.{pdf,png}`.
-- **Trade-off (acknowledged):** the `icd_crosswalk` advantage shrank from the
-  prior loose-mapping run (+0.094, p=0.012) to **+0.086, p=0.064** under the
-  tightened single-token mapping. This is the expected cost of the
-  honest-precision principle: previously an EQ ICD code was OR'd against up
-  to three ETHOS tokens (inflating the hit rate), whereas it now commits to
-  exactly one 3-char parent. The walker emits structurally-correct but
-  occasionally broad parents (e.g. `7295` -> `M79`); these are surfaced in
-  `review/mapping_review.md` for case-by-case audit. The
-  `mimic_item_crosswalk` row is also lower because most of the loose
-  indication-proxy mappings (CK-MB -> AMI, HD output -> CKD encounter) were
-  removed and now sit in `unmappable_with_rationale`; the remaining 6 cells
-  are honest mappings.
+  [^1]: Secondary tiers are best-effort proxies under ETHOS-vocab
+  limitations (ATC level 2 only for drugs; no PCS tokens for procedures;
+  indication-proxy diagnosis tokens for orphan MIMIC labs;
+  `HOSPITAL_ADMISSION` as a stand-in for `TIMELINE//START`). They are
+  reported separately so the primary-tier number reflects only the
+  vocabulary-supported encodings.
+
+- **Per-tier breakdown** (canonical output:
+  `analysis/tables/ethos_vs_eq_aggregated_per_tier.csv`):
+
+  | Tier | quality | n | mean EQ | mean ETHOS | mean diff | p | Comment |
+  |---|---|---:|---:|---:|---:|---:|---|
+  | exact                | primary   |  1 | 0.834 | 0.880 | +0.046 | NA   | MEDS_DEATH |
+  | quantile             | primary   |  6 | 0.904 | 0.901 | -0.003 | 1.00 | LAB value decile |
+  | quantile_approx      | primary   |  6 | 0.935 | 0.839 | -0.096 | 0.031 | LAB sibling-bin positional approx |
+  | icd_specific         | primary   |  6 | 0.715 | 0.765 | +0.050 | 0.44 | DIAGNOSIS 5-char (label + 3-6-suffix) |
+  | icd_crosswalk        | mixed     |  6 | 0.699 | 0.759 | +0.059 | 0.44 | 3-char parent (primary for DX, secondary for PROC) |
+  | atc_crosswalk        | secondary | 10 | 0.767 | 0.774 | +0.007 | 1.00 | MEDICATION at ATC level 2 |
+  | mimic_item_crosswalk | secondary |  6 | 0.965 | 0.751 | -0.214 | 0.063 | INFUSION + indication proxies |
+  | union                | -         | 41 | 0.825 | 0.798 | -0.027 | 0.40 | Per-code OR |
+
+- **Headline:** within the **primary** tier set ETHOS reaches mean AUC
+  0.816 vs EQ 0.826 (n=23 cells, p=0.43) -- a **statistically
+  indistinguishable** difference once the comparison is restricted to tiers
+  whose ETHOS encoding actually represents the EQ concept. The primary
+  picture remains close to parity for diagnoses (`icd_specific` and
+  `icd_crosswalk` both favour ETHOS by ~0.05) and lab presence/value
+  (`exact`, `quantile`). The companion scatter is at
+  `analysis/figures/ethos_vs_eq_auc_scatter.{pdf,png}`.
+- **Trade-offs (acknowledged):**
+  - **`quantile_approx` underperforms** (mean diff -0.096, p=0.031) because
+    the EQ bin's positional index is mapped linearly to a Q1..Q10 decile
+    when fewer than 10 sibling bins exist in `meds_codes.parquet`. This is
+    flagged in the YAML provenance string and the per-row mapping_source
+    (`meds-codes.parquet:sibling_bins_positional`).
+  - The `mimic_item_crosswalk` row is the noisiest because indication-proxy
+    diagnosis tokens (`PRESSURE_ULCER` for ulcer length, `HOSPITAL_ADMISSION`
+    for `TIMELINE//START`) predict different events than the underlying EQ
+    queries; this is reflected in `tier_quality=secondary`.
+
+## Win rate vs ETHOS
+
+Complementary view of the same `(code, duration, bucket)` cells used by the
+Wilcoxon table above, scoring each cell as a head-to-head outcome instead of
+a mean difference. EQ wins iff `eq_auc - ethos_auc > 0.01`; ETHOS wins iff
+`ethos_auc - eq_auc > 0.01`; otherwise the cell is a tie. The 0.01 tie band
+absorbs noise-level differences. `EQ win rate` is EQ-centric:
+`wins_eq / (wins_eq + ties + wins_ethos)`. Verbatim from
+`analysis/tables/ethos_vs_eq_win_rate_per_tier.csv`:
+
+| Tier | n | EQ wins | ties | ETHOS wins | EQ win rate |
+|---|---:|---:|---:|---:|---:|
+| exact                |  1 |  0 | 0 |  1 | 0.000 |
+| quantile             |  6 |  4 | 0 |  2 | 0.667 |
+| quantile_approx      |  6 |  6 | 0 |  0 | 1.000 |
+| icd_specific         |  6 |  3 | 0 |  3 | 0.500 |
+| icd_crosswalk        |  6 |  1 | 2 |  3 | 0.167 |
+| atc_crosswalk        | 10 |  4 | 0 |  6 | 0.400 |
+| mimic_item_crosswalk |  6 |  5 | 1 |  0 | 0.833 |
+| union                | 41 | 23 | 3 | 15 | 0.561 |
+
+Per-tier-x-duration-x-bucket and per-code splits are persisted to
+`analysis/tables/ethos_vs_eq_win_rate_per_tier_duration_bucket.csv` and
+`analysis/tables/ethos_vs_eq_win_status_per_code.csv` respectively.
 
 ## Mapping provenance (`mapping_source` column)
 
@@ -165,44 +245,45 @@ picker (`pick.py`) is invoked **only** for the residual cases listed below.
 Each EQ code commits **exactly one** ETHOS token (or two, in the single
 allowed exception of a same-source-concept ATC tie).
 
-- `icd.yaml` (6 mappings) — DIAGNOSIS rows resolved via the ICD-10-CM
-  3-char walker (`ontology.icd_to_ethos_token` → `ethos_icd_3char_index`);
-  4 rows are deterministic. The walker falls through to the LLM only for
-  ICD-9 codes with no ICD-10 bridge (`4271` paroxysmal vtach →
-  `PAROXYSMAL_TACHYCARDIA`, ICD-9 multi-parent path) and for procedures,
-  since ETHOS encodes no PCS tokens (`PROCEDURE//ICD//9//7936` open
-  reduction tibia/fibula → `FRACTURE_OF_LOWER_LEG_INCLUDING_ANKLE`,
-  scoped reason `no_pcs_tokens_in_ethos`). Broad-but-correct parents like
-  `7295 → M79 → OTHER_AND_UNSPECIFIED_SOFT_TISSUE_DISORDERS_NEC` are
+- `icd.yaml` (6 mappings): DIAGNOSIS rows resolved via the ICD-10-CM
+  3-char walker (`ontology.icd_to_ethos_token` plus
+  `ethos_icd_3char_index`); 4 rows are deterministic. The walker falls
+  through to the LLM only for ICD-9 codes with no ICD-10 bridge (`4271`
+  paroxysmal vtach -> `PAROXYSMAL_TACHYCARDIA`, ICD-9 multi-parent path)
+  and for procedures, since ETHOS encodes no PCS tokens
+  (`PROCEDURE//ICD//9//7936` open reduction tibia/fibula ->
+  `FRACTURE_OF_LOWER_LEG_INCLUDING_ANKLE`, scoped reason
+  `no_pcs_tokens_in_ethos`). Broad-but-correct parents like
+  `7295 -> M79 -> OTHER_AND_UNSPECIFIED_SOFT_TISSUE_DISORDERS_NEC` are
   surfaced in `review/mapping_review.md` for case-by-case approval.
-- `atc.yaml` (5 mappings) — MEDICATION rows resolved via the OHDSI ATC
-  ancestor walker (`ontology.atc_to_ethos_token` →
+- `atc.yaml` (5 mappings): MEDICATION rows resolved via the OHDSI ATC
+  ancestor walker (`ontology.atc_to_ethos_token` plus
   `rxnorm_drug_to_atc`); 2 rows are deterministic. Gabapentin is the only
-  same-source-concept tie and commits **two** tokens (N02 analgesics + N03
-  antiepileptics, scoped reason `atc_same_source_concept_tie`). The LLM
-  picker fires for one true multi-chain ambiguity (Mupirocin Nasal →
-  R01 vs D06; nasal formulation → R01) and one walker-unresolved
-  salt-form name (Doxycycline Hyclate → J01 antibiotics, salvaged from a
-  near-miss free-text proposal via the namespace-prefix salvage in
-  `pick._salvage_token_by_prefix`). `MEDICATION//START//*` and
-  `MEDICATION//STOP//*` both roll up to the same ATC class — ETHOS has no
-  start/stop semantics.
-- `mimic_items.yaml` (4 mappings + 19 unmappable) — INFUSION rows resolve
-  the MIMIC item-id to a drug name and walk to ATC; 1 row is
-  deterministic (Furosemide → C03 diuretics). LAB and SUBJECT_FLUID_OUTPUT
-  rows are limited to **orphan codes** (base form not in the ETHOS
-  vocab). `TIMELINE//START → HOSPITAL_ADMISSION` is a direct event
-  alignment. The remaining 19 entries are recorded in the
+  same-source-concept tie and commits **two** tokens (N02 analgesics plus
+  N03 antiepileptics, scoped reason `atc_same_source_concept_tie`). The
+  LLM picker fires for one true multi-chain ambiguity (Mupirocin Nasal:
+  R01 vs D06, with the nasal formulation resolving to R01) and one
+  walker-unresolved salt-form name (Doxycycline Hyclate -> J01
+  antibiotics, salvaged from a near-miss free-text proposal via the
+  namespace-prefix salvage in `pick._salvage_token_by_prefix`).
+  `MEDICATION//START//*` and `MEDICATION//STOP//*` both roll up to the
+  same ATC class since ETHOS has no start/stop semantics.
+- `mimic_items.yaml` (4 mappings plus 19 unmappable): INFUSION rows
+  resolve the MIMIC item-id to a drug name and walk to ATC; 1 row is
+  deterministic (Furosemide -> C03 diuretics). LAB and
+  SUBJECT_FLUID_OUTPUT rows are limited to **orphan codes** (base form
+  not in the ETHOS vocab). `TIMELINE//START -> HOSPITAL_ADMISSION` is a
+  direct event alignment. The remaining 19 entries are recorded in the
   `unmappable_with_rationale` block: most are MIMIC-only lab tokens whose
-  `LAB//<id>//<units>` form is absent from ETHOS's vocabulary (CK-MB, lipase,
-  osmolality, eosinophil percentage, lithium level, rubella IgG), one is
-  CO2 production (a respiratory parameter, not a chem panel), and the
-  SUBJECT_FLUID_OUTPUT codes (Jackson-Pratt drains, tube-feed residual)
-  have no fluid-output prefix in the ETHOS vocab. Indication-proxy
-  mappings used in the prior loose-mapping run (CK-MB → AMI,
-  HD output → CKD encounter) were intentionally **dropped** because they
-  predict different events than EQ; the `mimic_item_crosswalk` AUC drop
-  in the table above is the explicit cost of that change.
+  `LAB//<id>//<units>` form is absent from ETHOS's vocabulary (CK-MB,
+  lipase, osmolality, eosinophil percentage, lithium level, rubella IgG),
+  one is CO2 production (a respiratory parameter, not a chem panel), and
+  the SUBJECT_FLUID_OUTPUT codes (Jackson-Pratt drains, tube-feed
+  residual) have no fluid-output prefix in the ETHOS vocab.
+  Indication-proxy mappings used in the prior loose-mapping run (CK-MB ->
+  AMI, HD output -> CKD encounter) were intentionally **dropped** because
+  they predict different events than EQ; the `mimic_item_crosswalk` AUC
+  drop in the table above is the explicit cost of that change.
 
 ## Follow-up directions
 
@@ -215,10 +296,10 @@ allowed exception of a same-source-concept ATC tie).
   `mapping_coverage.parquet` together make this explicit for downstream
   consumers.
 - **Walker-emitted broad parents** flagged for human review in
-  `review/mapping_review.md`: `7295 → M79`,
-  `4271 → PAROXYSMAL_TACHYCARDIA` (loses VT-vs-SVT specificity),
-  `Doxycycline Hyclate → J01` (loses tetracycline-class specificity), and
-  the procedure-as-indication mapping `7936 → S82`. Approve / reject /
+  `review/mapping_review.md`: `7295 -> M79`,
+  `4271 -> PAROXYSMAL_TACHYCARDIA` (loses VT-vs-SVT specificity),
+  `Doxycycline Hyclate -> J01` (loses tetracycline-class specificity), and
+  the procedure-as-indication mapping `7936 -> S82`. Approve / reject /
   modify per EQ section drives the next iteration of the YAMLs.
 - **Honest precision vs OR-of-N hit-rate.** The `icd_crosswalk` advantage
   shrank from +0.094 (p=0.012) to +0.086 (p=0.064) because each ICD code
