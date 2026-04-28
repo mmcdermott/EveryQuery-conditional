@@ -138,6 +138,52 @@ def _propose_diagnosis_candidates(
     ]
 
 
+def _propose_atc_candidates(
+    text: str, ethos_vocab: set[str], top_k: int = 12
+) -> list[dict[str, str]]:
+    """Score named 3-char ETHOS ``ATC//<L3>//<NAME>`` tokens by jaccard
+    word-overlap between ``text`` and the L3 class name, returning the top
+    ``top_k`` as ``{"ethos_token", "atc_code", "atc_name"}`` dicts.
+
+    Used when the deterministic ATC ancestor walker fails (no RxNorm
+    ingredient match, walker returned a wrong ingredient, or the
+    ingredient has no ATC ancestors). Single-letter ``ATC//4//*`` tokens
+    and the ``ATC//SFX//*`` suffix tokens are skipped because their names
+    are not human-readable enough for the LLM to reason about.
+    """
+    target_words = _content_words(text)
+    if not target_words:
+        return []
+    scored: list[tuple[float, str, str, str]] = []
+    for token in ethos_vocab:
+        if not token.startswith("ATC//"):
+            continue
+        parts = token.split("//")
+        if len(parts) != 3:
+            continue
+        atc_code, name = parts[1], parts[2]
+        if atc_code == "4" or atc_code == "SFX":
+            continue
+        cand_words = _content_words(name.replace("_", " "))
+        if not cand_words:
+            continue
+        overlap = target_words & cand_words
+        if not overlap:
+            continue
+        union = target_words | cand_words
+        jaccard = len(overlap) / len(union)
+        scored.append((jaccard, atc_code, token, name))
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    return [
+        {
+            "ethos_token": tok,
+            "atc_code": atc_code,
+            "atc_name": name.replace("_", " ").title(),
+        }
+        for _, atc_code, tok, name in scored[:top_k]
+    ]
+
+
 def _icd9_diagnosis_meaning(eq_code: str) -> str:
     """Return a human-readable description for a DIAGNOSIS//ICD//*//* code,
     falling back to the EQ code if no source vocab description exists."""
@@ -249,59 +295,113 @@ def _atc_token_to_concept_id(token: str) -> int | None:
     return int(info["concept_id"])
 
 
-def handle_diagnosis(eq_code: str) -> dict | None:
-    """Resolve a DIAGNOSIS//ICD//* code to a single ETHOS ICD token entry."""
+def handle_diagnosis(
+    eq_code: str, ethos_vocab: set[str]
+) -> tuple[dict | None, dict | None]:
+    """Resolve a DIAGNOSIS//ICD//* code to a single ETHOS ICD token entry.
+
+    Returns ``(mapping_or_None, unmappable_or_None)``. Walker falls through
+    to the LLM picker on multi-parent ambiguity (``icd9_multi_parent``) and
+    on full failure (``diagnosis_walker_unresolved``); a null pick from the
+    LLM is recorded as ``unmappable_with_rationale`` so every EQ code lands
+    in one of the two buckets.
+    """
     walked = ontology.icd_to_ethos_token(eq_code)
-    if walked is None:
-        return None
     eq_label = _icd9_diagnosis_meaning(eq_code)
 
-    if walked.get("ethos_token"):
-        return {
-            "eq_code": eq_code,
-            "eq_meaning": eq_label,
-            "ethos_tokens": [walked["ethos_token"]],
-            "source": "deterministic:icd_3char_walker",
-            "rationale": (
-                f"ICD-10-CM 3-char parent {walked['source_3char_code']} "
-                f"resolved to ETHOS token via ethos_icd_3char_index."
-            ),
-        }
-
-    candidates = walked.get("candidates") or []
-    if len(candidates) < 2:
-        return None
-    index = ontology.ethos_icd_3char_index()
-    pick_candidates: list[dict[str, str]] = []
-    for three in candidates:
-        token = index.get(three)
-        if token is None:
-            continue
-        label = token[len("ICD//CM//") :].replace("_", " ").title()
-        pick_candidates.append(
+    if walked is not None and walked.get("ethos_token"):
+        return (
             {
-                "ethos_token": token,
-                "icd10cm_3char": three,
-                "icd10cm_3char_name": label,
-            }
+                "eq_code": eq_code,
+                "eq_meaning": eq_label,
+                "ethos_tokens": [walked["ethos_token"]],
+                "source": "deterministic:icd_3char_walker",
+                "rationale": (
+                    f"ICD-10-CM 3-char parent {walked['source_3char_code']} "
+                    f"resolved to ETHOS token via ethos_icd_3char_index."
+                ),
+            },
+            None,
         )
-    if not pick_candidates:
-        return None
+
+    candidates = walked.get("candidates") if walked is not None else []
+    candidates = candidates or []
+    if len(candidates) >= 2:
+        index = ontology.ethos_icd_3char_index()
+        pick_candidates: list[dict[str, str]] = []
+        for three in candidates:
+            token = index.get(three)
+            if token is None:
+                continue
+            label = token[len("ICD//CM//") :].replace("_", " ").title()
+            pick_candidates.append(
+                {
+                    "ethos_token": token,
+                    "icd10cm_3char": three,
+                    "icd10cm_3char_name": label,
+                }
+            )
+        if pick_candidates:
+            picked = pick.llm_pick_one(
+                eq_code=eq_code,
+                eq_label=eq_label,
+                candidates=pick_candidates,
+                reason="icd9_multi_parent",
+            )
+            return _diagnosis_pick_to_entry(
+                eq_code, eq_label, picked, "llm:icd9_multi_parent"
+            )
+
+    # Walker fully failed (no ICD-10 bridge, or ICD-9 bridge with no
+    # icd10_target_codes -- e.g. paroxysmal vtach 4271). Seed an
+    # ICD-3char heuristic candidate list from the source-vocab name so
+    # the LLM can pick a faithful diagnosis category, with vocab-validated
+    # free-text fallback if word overlap is empty.
+    heuristic = _propose_diagnosis_candidates(eq_label, top_k=12)
     picked = pick.llm_pick_one(
         eq_code=eq_code,
         eq_label=eq_label,
-        candidates=pick_candidates,
-        reason="icd9_multi_parent",
+        candidates=heuristic,
+        reason="diagnosis_walker_unresolved",
+        ethos_vocab=ethos_vocab,
     )
-    if not picked.get("ethos_token"):
-        return None
-    return {
-        "eq_code": eq_code,
-        "eq_meaning": eq_label,
-        "ethos_tokens": [picked["ethos_token"]],
-        "source": "llm:icd9_multi_parent",
-        "rationale": picked.get("rationale", ""),
-    }
+    return _diagnosis_pick_to_entry(
+        eq_code, eq_label, picked, "llm:diagnosis_walker_unresolved"
+    )
+
+
+def _diagnosis_pick_to_entry(
+    eq_code: str,
+    eq_label: str,
+    picked: dict,
+    source: str,
+) -> tuple[dict | None, dict | None]:
+    """Convert an ``llm_pick_one`` result for a diagnosis into either a
+    mapping entry or an ``unmappable_with_rationale`` entry, never both
+    None. Centralizes the null-token -> unmappable conversion shared by the
+    multi-parent and walker-unresolved paths.
+    """
+    token = picked.get("ethos_token")
+    rationale = picked.get("rationale", "")
+    if token:
+        return (
+            {
+                "eq_code": eq_code,
+                "eq_meaning": eq_label,
+                "ethos_tokens": [token],
+                "source": source,
+                "rationale": rationale,
+            },
+            None,
+        )
+    return (
+        None,
+        {
+            "eq_code": eq_code,
+            "description": eq_label,
+            "reason": rationale or "LLM declined to propose a faithful ETHOS token.",
+        },
+    )
 
 
 _PROCEDURE_ACTION_WORDS = frozenset(
@@ -345,10 +445,12 @@ def _strip_procedure_action_words(text: str) -> str:
     return " ".join(kept)
 
 
-def handle_procedure(eq_code: str) -> dict | None:
+def handle_procedure(
+    eq_code: str, ethos_vocab: set[str]
+) -> tuple[dict | None, dict | None]:
     """Resolve a PROCEDURE//ICD//* code via the LLM, with candidates seeded
     from the procedure source name's word overlap with ETHOS ICD 3-char
-    categories.
+    categories. Returns ``(mapping_or_None, unmappable_or_None)``.
     """
     eq_label, bridge = _icd9_procedure_meaning(eq_code)
     candidate_text = eq_label
@@ -364,46 +466,47 @@ def handle_procedure(eq_code: str) -> dict | None:
         eq_label=eq_label,
         candidates=candidates,
         reason="no_pcs_tokens_in_ethos",
+        ethos_vocab=ethos_vocab,
     )
-    if not picked.get("ethos_token"):
-        return None
-    return {
-        "eq_code": eq_code,
-        "eq_meaning": eq_label,
-        "ethos_tokens": [picked["ethos_token"]],
-        "source": "llm:no_pcs_tokens_in_ethos",
-        "rationale": picked.get("rationale", ""),
-    }
+    return _diagnosis_pick_to_entry(
+        eq_code, eq_label, picked, "llm:no_pcs_tokens_in_ethos"
+    )
 
 
 def _resolve_atc_for_drug(
-    eq_code: str, eq_label: str, drug_name: str
-) -> dict | None:
-    """Walk a drug name to an ATC token entry, with optional LLM
-    disambiguation when the ingredient sits in multiple ATC chains.
+    eq_code: str,
+    eq_label: str,
+    drug_name: str,
+    ethos_vocab: set[str],
+    fallback_reason: str,
+) -> tuple[dict | None, dict | None]:
+    """Walk a drug name to an ATC token entry, with LLM disambiguation when
+    the ingredient sits in multiple ATC chains and an LLM fallback when the
+    walker fails entirely.
 
-    Returns the YAML entry dict, or ``None`` if the drug name cannot be
-    resolved at all (no RxNorm ingredient match).
+    Returns ``(mapping_or_None, unmappable_or_None)`` -- exactly one is
+    non-None for any successful escalation. ``fallback_reason`` is used to
+    tag the LLM call when the walker can't produce a clean answer
+    (``medication_walker_unresolved`` or ``infusion_walker_unresolved``).
     """
     walked = ontology.atc_to_ethos_token(drug_name)
-    if walked is None:
-        return None
 
-    if walked.get("ethos_token"):
-        return {
-            "eq_code": eq_code,
-            "eq_meaning": eq_label,
-            "ethos_tokens": [walked["ethos_token"]],
-            "source": "deterministic:atc_ancestor_walker",
-            "rationale": (
-                f"RxNorm ingredient '{walked.get('ingredient_name')}' walks to "
-                f"ATC {walked['source_atc_code']} via OHDSI CONCEPT_ANCESTOR."
-            ),
-        }
+    if walked is not None and walked.get("ethos_token"):
+        return (
+            {
+                "eq_code": eq_code,
+                "eq_meaning": eq_label,
+                "ethos_tokens": [walked["ethos_token"]],
+                "source": "deterministic:atc_ancestor_walker",
+                "rationale": (
+                    f"RxNorm ingredient '{walked.get('ingredient_name')}' walks to "
+                    f"ATC {walked['source_atc_code']} via OHDSI CONCEPT_ANCESTOR."
+                ),
+            },
+            None,
+        )
 
-    candidate_tokens = walked.get("candidates") or []
-    if not candidate_tokens:
-        return None
+    candidate_tokens = (walked.get("candidates") if walked is not None else None) or []
 
     if len(candidate_tokens) == 2:
         # Same-source-concept tie: the RxNorm ingredient is shared across two
@@ -415,68 +518,144 @@ def _resolve_atc_for_drug(
         if (
             cid_a is not None
             and cid_b is not None
+            and walked is not None
             and walked.get("ingredient_concept_id") is not None
         ):
-            return {
-                "eq_code": eq_code,
-                "eq_meaning": eq_label,
-                "ethos_tokens": list(candidate_tokens),
-                "source": "deterministic:atc_same_source_concept_tie",
-                "rationale": (
-                    f"RxNorm ingredient '{walked.get('ingredient_name')}' "
-                    f"(concept_id={walked.get('ingredient_concept_id')}) sits "
-                    f"in two distinct ATC chains; both are committed since "
-                    f"they reflect the same source concept."
-                ),
-            }
+            return (
+                {
+                    "eq_code": eq_code,
+                    "eq_meaning": eq_label,
+                    "ethos_tokens": list(candidate_tokens),
+                    "source": "deterministic:atc_same_source_concept_tie",
+                    "rationale": (
+                        f"RxNorm ingredient '{walked.get('ingredient_name')}' "
+                        f"(concept_id={walked.get('ingredient_concept_id')}) sits "
+                        f"in two distinct ATC chains; both are committed since "
+                        f"they reflect the same source concept."
+                    ),
+                },
+                None,
+            )
 
-    pick_candidates = [
-        {"ethos_token": tok, "atc_code": tok.split("//")[1]}
-        for tok in candidate_tokens
-    ]
+    if candidate_tokens:
+        pick_candidates = [
+            {"ethos_token": tok, "atc_code": tok.split("//")[1]}
+            for tok in candidate_tokens
+        ]
+        picked = pick.llm_pick_one(
+            eq_code=eq_code,
+            eq_label=eq_label,
+            candidates=pick_candidates,
+            reason="atc_multi_chain",
+        )
+        return _atc_pick_to_entry(eq_code, eq_label, picked, "llm:atc_multi_chain")
+
+    # Walker yielded no candidates at all -- either no RxNorm ingredient
+    # match (e.g. salt-form suffixes like "Doxycycline Hyclate", or
+    # parenthetical product names like "KCl (CRRT)") or the matched
+    # ingredient has no ATC ancestors. Seed ATC candidates by name overlap
+    # against the ETHOS vocab and let the LLM pick (with vocab-validated
+    # free-text fallback if word overlap returns nothing).
+    heuristic = _propose_atc_candidates(drug_name, ethos_vocab, top_k=12)
     picked = pick.llm_pick_one(
         eq_code=eq_code,
         eq_label=eq_label,
-        candidates=pick_candidates,
-        reason="atc_multi_chain",
+        candidates=heuristic,
+        reason=fallback_reason,
+        ethos_vocab=ethos_vocab,
     )
-    if not picked.get("ethos_token"):
-        return None
-    return {
-        "eq_code": eq_code,
-        "eq_meaning": eq_label,
-        "ethos_tokens": [picked["ethos_token"]],
-        "source": "llm:atc_multi_chain",
-        "rationale": picked.get("rationale", ""),
-    }
+    return _atc_pick_to_entry(eq_code, eq_label, picked, f"llm:{fallback_reason}")
 
 
-def handle_medication(eq_code: str) -> dict | None:
+def _atc_pick_to_entry(
+    eq_code: str,
+    eq_label: str,
+    picked: dict,
+    source: str,
+) -> tuple[dict | None, dict | None]:
+    """Mirror of ``_diagnosis_pick_to_entry`` for ATC paths: convert an
+    ``llm_pick_one`` result into either a mapping entry or an
+    ``unmappable_with_rationale`` entry.
+    """
+    token = picked.get("ethos_token")
+    rationale = picked.get("rationale", "")
+    if token:
+        return (
+            {
+                "eq_code": eq_code,
+                "eq_meaning": eq_label,
+                "ethos_tokens": [token],
+                "source": source,
+                "rationale": rationale,
+            },
+            None,
+        )
+    return (
+        None,
+        {
+            "eq_code": eq_code,
+            "description": eq_label,
+            "reason": rationale or "LLM declined to propose a faithful ETHOS token.",
+        },
+    )
+
+
+def handle_medication(
+    eq_code: str, ethos_vocab: set[str]
+) -> tuple[dict | None, dict | None]:
+    """Resolve a MEDICATION//* code; returns ``(mapping_or_None,
+    unmappable_or_None)``."""
     drug_name = _drug_name_from_medication_code(eq_code)
     if not drug_name:
-        return None
-    return _resolve_atc_for_drug(eq_code, drug_name, drug_name)
+        return (None, None)
+    return _resolve_atc_for_drug(
+        eq_code,
+        drug_name,
+        drug_name,
+        ethos_vocab,
+        fallback_reason="medication_walker_unresolved",
+    )
 
 
-def handle_infusion(eq_code: str) -> dict | None:
+def handle_infusion(
+    eq_code: str, ethos_vocab: set[str]
+) -> tuple[dict | None, dict | None]:
+    """Resolve an INFUSION_(START|END)//* code; returns ``(mapping_or_None,
+    unmappable_or_None)``."""
     item_id = _infusion_item_id(eq_code)
     if item_id is None:
-        return None
+        return (None, None)
     info = ontology.mimic_item_label(item_id)
     if info is None or not info.get("label"):
-        return None
+        return (None, None)
     drug_name = info["label"]
     eq_label = f"{drug_name} (MIMIC item {item_id})"
-    return _resolve_atc_for_drug(eq_code, eq_label, drug_name)
+    return _resolve_atc_for_drug(
+        eq_code,
+        eq_label,
+        drug_name,
+        ethos_vocab,
+        fallback_reason="infusion_walker_unresolved",
+    )
 
 
-def handle_orphan_lab(eq_code: str) -> tuple[dict | None, dict | None]:
+def handle_orphan_lab(
+    eq_code: str, ethos_vocab: set[str]
+) -> tuple[dict | None, dict | None]:
     """Resolve an orphan LAB / SUBJECT_FLUID_OUTPUT code via the LLM.
 
     Returns ``(mapping_entry_or_None, unmappable_entry_or_None)`` -- exactly
-    one of the two is non-None for any successfully escalated orphan. If the
-    LLM picker returns ``ethos_token=null`` we emit the ``unmappable``
+    one of the two is non-None for any successfully escalated orphan. If
+    the LLM picker returns ``ethos_token=null`` we emit the ``unmappable``
     entry instead of a mapping.
+
+    When the heuristic candidate proposer returns ``[]`` (the lab label
+    shares no content words with any ICD-3char name, e.g. "CK-MB",
+    "RUBIgGV", "Pinsp (Hamilton)"), we still call the LLM but route through
+    the no-candidates prompt branch where the LLM may either propose a
+    free-text token from clinical knowledge (validated against
+    ``ethos_vocab``) or reply with a clinical rationale for why the lab
+    has no faithful ETHOS counterpart.
     """
     eq_label = _lab_meaning(eq_code)
     candidates = _propose_diagnosis_candidates(eq_label, top_k=12)
@@ -485,6 +664,7 @@ def handle_orphan_lab(eq_code: str) -> tuple[dict | None, dict | None]:
         eq_label=eq_label,
         candidates=candidates,
         reason="orphan_lab",
+        ethos_vocab=ethos_vocab,
     )
     token = picked.get("ethos_token")
     rationale = picked.get("rationale", "")
@@ -593,7 +773,9 @@ def main() -> None:
     print(f"  {len(ethos_vocab)} ETHOS tokens")
 
     icd_entries: list[dict] = []
+    icd_unmappable: list[dict] = []
     atc_entries: list[dict] = []
+    atc_unmappable: list[dict] = []
     mimic_entries: list[dict] = []
     mimic_unmappable: list[dict] = []
     skipped: list[tuple[str, str]] = []
@@ -602,33 +784,41 @@ def main() -> None:
         fam = bm.family_of(code)
         try:
             if fam == "DIAGNOSIS":
-                entry = handle_diagnosis(code)
-                if entry is not None:
-                    icd_entries.append(entry)
+                mapped, unmap = handle_diagnosis(code, ethos_vocab)
+                if mapped is not None:
+                    icd_entries.append(mapped)
+                elif unmap is not None:
+                    icd_unmappable.append(unmap)
                 else:
                     skipped.append((code, "diagnosis_unresolved"))
             elif fam == "PROCEDURE":
-                entry = handle_procedure(code)
-                if entry is not None:
-                    icd_entries.append(entry)
+                mapped, unmap = handle_procedure(code, ethos_vocab)
+                if mapped is not None:
+                    icd_entries.append(mapped)
+                elif unmap is not None:
+                    icd_unmappable.append(unmap)
                 else:
-                    skipped.append((code, "procedure_llm_declined"))
+                    skipped.append((code, "procedure_unresolved"))
             elif fam == "MEDICATION":
-                entry = handle_medication(code)
-                if entry is not None:
-                    atc_entries.append(entry)
+                mapped, unmap = handle_medication(code, ethos_vocab)
+                if mapped is not None:
+                    atc_entries.append(mapped)
+                elif unmap is not None:
+                    atc_unmappable.append(unmap)
                 else:
                     skipped.append((code, "medication_unresolved"))
             elif fam in ("INFUSION_START", "INFUSION_END"):
-                entry = handle_infusion(code)
-                if entry is not None:
-                    mimic_entries.append(entry)
+                mapped, unmap = handle_infusion(code, ethos_vocab)
+                if mapped is not None:
+                    mimic_entries.append(mapped)
+                elif unmap is not None:
+                    mimic_unmappable.append(unmap)
                 else:
                     skipped.append((code, "infusion_unresolved"))
             elif fam in ("LAB", "SUBJECT_FLUID_OUTPUT"):
                 if not _is_orphan_lab(code, ethos_vocab):
                     continue
-                mapped, unmap = handle_orphan_lab(code)
+                mapped, unmap = handle_orphan_lab(code, ethos_vocab)
                 if mapped is not None:
                     mimic_entries.append(mapped)
                 elif unmap is not None:
@@ -647,21 +837,35 @@ def main() -> None:
             skipped.append((code, f"error:{type(exc).__name__}:{exc}"))
 
     icd_entries.sort(key=lambda e: e["eq_code"])
+    icd_unmappable.sort(key=lambda e: e["eq_code"])
     atc_entries.sort(key=lambda e: e["eq_code"])
+    atc_unmappable.sort(key=lambda e: e["eq_code"])
     mimic_entries.sort(key=lambda e: e["eq_code"])
     mimic_unmappable.sort(key=lambda e: e["eq_code"])
 
     print()
-    print(f"icd.yaml entries:           {len(icd_entries)}")
-    print(f"atc.yaml entries:           {len(atc_entries)}")
-    print(f"mimic_items.yaml entries:   {len(mimic_entries)}")
-    print(f"mimic_items.yaml unmapped:  {len(mimic_unmappable)}")
+    print(f"icd.yaml mapped:            {len(icd_entries)}")
+    print(f"icd.yaml unmappable:        {len(icd_unmappable)}")
+    print(f"atc.yaml mapped:            {len(atc_entries)}")
+    print(f"atc.yaml unmappable:        {len(atc_unmappable)}")
+    print(f"mimic_items.yaml mapped:    {len(mimic_entries)}")
+    print(f"mimic_items.yaml unmappable: {len(mimic_unmappable)}")
     print(f"skipped:                    {len(skipped)}")
     for code, reason in skipped:
         print(f"  - {code}: {reason}")
 
-    _write_yaml(ICD_CROSSWALK_PATH, _ICD_HEADER, icd_entries)
-    _write_yaml(ATC_CROSSWALK_PATH, _ATC_HEADER, atc_entries)
+    _write_yaml(
+        ICD_CROSSWALK_PATH,
+        _ICD_HEADER,
+        icd_entries,
+        unmappable=icd_unmappable,
+    )
+    _write_yaml(
+        ATC_CROSSWALK_PATH,
+        _ATC_HEADER,
+        atc_entries,
+        unmappable=atc_unmappable,
+    )
     _write_yaml(
         MIMIC_ITEMS_CROSSWALK_PATH,
         _MIMIC_HEADER,
