@@ -281,6 +281,7 @@ def icd9_dx(code: str) -> dict | None:
         snomed_target_name = snomed_name_by_id[snomed_target_concept_id]
 
     icd10_codes: list[str] = []
+    icd10_targets: list[dict] = []
     if snomed_ids:
         icd10_concepts = load_concept(("ICD10CM",))
         icd10_id_set = set(
@@ -296,6 +297,10 @@ def icd9_dx(code: str) -> dict | None:
                 pl.col("concept_id").is_in(icd10_ids)
             ).sort("concept_code")
             icd10_codes = icd10_rows["concept_code"].to_list()
+            icd10_targets = [
+                {"code": r["concept_code"], "name": r["concept_name"]}
+                for r in icd10_rows.iter_rows(named=True)
+            ]
 
     return {
         "concept_id": src_id,
@@ -303,6 +308,7 @@ def icd9_dx(code: str) -> dict | None:
         "snomed_target_concept_id": snomed_target_concept_id,
         "snomed_target_name": snomed_target_name,
         "icd10_target_codes": icd10_codes,
+        "icd10_targets": icd10_targets,
     }
 
 
@@ -353,6 +359,7 @@ def icd9_proc(code: str) -> dict | None:
         snomed_target_name = snomed_name_by_id[snomed_target_concept_id]
 
     pcs_codes: list[str] = []
+    pcs_targets: list[dict] = []
     if snomed_ids:
         pcs_concepts = load_concept(("ICD10PCS",))
         pcs_id_set = set(int(c) for c in pcs_concepts["concept_id"].to_list())
@@ -366,6 +373,10 @@ def icd9_proc(code: str) -> dict | None:
                 pl.col("concept_id").is_in(pcs_ids)
             ).sort("concept_code")
             pcs_codes = pcs_rows["concept_code"].to_list()
+            pcs_targets = [
+                {"code": r["concept_code"], "name": r["concept_name"]}
+                for r in pcs_rows.iter_rows(named=True)
+            ]
 
     return {
         "concept_id": src_id,
@@ -373,6 +384,7 @@ def icd9_proc(code: str) -> dict | None:
         "snomed_target_concept_id": snomed_target_concept_id,
         "snomed_target_name": snomed_target_name,
         "icd10pcs_target_codes": pcs_codes,
+        "icd10pcs_targets": pcs_targets,
     }
 
 
@@ -506,6 +518,10 @@ def ethos_descriptive_icd_to_codes(label: str) -> dict | None:
         .filter(pl.col("concept_code") != src_code)
     )
     descendant_codes = descendants["concept_code"].to_list()
+    descendant_pairs = [
+        {"code": r["concept_code"], "name": r["concept_name"]}
+        for r in descendants.iter_rows(named=True)
+    ]
 
     return {
         "source_vocab": "ICD10CM",
@@ -513,6 +529,7 @@ def ethos_descriptive_icd_to_codes(label: str) -> dict | None:
         "source_concept_name": src_name,
         "source_concept_code": src_code,
         "descendant_codes": descendant_codes,
+        "descendants": descendant_pairs,
         "descendant_count": len(descendant_codes),
     }
 
@@ -917,6 +934,283 @@ def ethos_token_count(token: str) -> int:
     if token is None:
         return 0
     return _load_ethos_vocab_counts().get(token, 0)
+
+
+@lru_cache(maxsize=1)
+def ethos_icd_3char_index() -> dict[str, str]:
+    """Map ICD-10-CM 3-char category code -> descriptive ETHOS ICD token.
+
+    Enumerates every ``ICD//CM//<LABEL>`` token in the cached ETHOS vocab,
+    excluding the numeric ``ICD//CM//3-6//*`` and ``ICD//CM//SFX//*`` token
+    families, resolves each ``<LABEL>`` to its source ICD-10-CM 3-char
+    category via ``ethos_descriptive_icd_to_codes``, and returns a dict keyed
+    by that 3-char concept_code (e.g. ``G20``, ``I25``).
+
+    When two distinct labels collide on the same 3-char (should not happen
+    for the loose normalization used in ``ethos_descriptive_icd_to_codes``),
+    the first label encountered wins. Tokens whose label fails to resolve
+    are silently dropped.
+    """
+    counts = _load_ethos_vocab_counts()
+    out: dict[str, str] = {}
+    for token in counts:
+        if not token.startswith("ICD//CM//"):
+            continue
+        label = token[len("ICD//CM//") :]
+        if not label:
+            continue
+        if label.startswith("3-6//") or label.startswith("SFX//"):
+            continue
+        resolved = ethos_descriptive_icd_to_codes(label)
+        if resolved is None:
+            continue
+        code = resolved.get("source_concept_code")
+        if code and code not in out:
+            out[code] = token
+    return out
+
+
+@lru_cache(maxsize=1)
+def ethos_atc_index() -> dict[str, str]:
+    """Map ATC concept_code -> ETHOS ATC token.
+
+    Three observed token shapes in the cached ETHOS vocab:
+
+    * ``ATC//<level>//<NAME>``   -- e.g. ``ATC//4//A``. Second segment is a
+      level-number digit and the third segment is the ATC concept_code (a
+      level-1 single letter).
+    * ``ATC//<atc_code>//<NAME>`` -- e.g. ``ATC//A10//DRUGS_USED_IN_DIABETES``.
+      Second segment is the ATC concept_code (level >= 2), third segment is
+      the readable name.
+    * ``ATC//SFX//<atc_code>``   -- e.g. ``ATC//SFX//A01``. Third segment is
+      the ATC concept_code.
+
+    When the same ``atc_code`` is represented by multiple tokens, prefer the
+    descriptive ``CODE`` shape over ``LEVEL`` over ``SFX``.
+    """
+    counts = _load_ethos_vocab_counts()
+    priority = {"CODE": 0, "LEVEL": 1, "SFX": 2}
+    chosen: dict[str, tuple[int, str]] = {}
+    for token in counts:
+        if not token.startswith("ATC//"):
+            continue
+        parts = token.split("//")
+        if len(parts) != 3:
+            continue
+        _, p1, p2 = parts
+        if p1 == "SFX":
+            atc_code = p2
+            shape = "SFX"
+        elif p1.isdigit():
+            atc_code = p2
+            shape = "LEVEL"
+        else:
+            atc_code = p1
+            shape = "CODE"
+        if not atc_code:
+            continue
+        rank = priority[shape]
+        prev = chosen.get(atc_code)
+        if prev is None or rank < prev[0]:
+            chosen[atc_code] = (rank, token)
+    return {code: token for code, (_, token) in chosen.items()}
+
+
+_EQ_ICD_DX_RE = re.compile(r"^DIAGNOSIS//ICD//(9|10)//(.+)$")
+
+
+def icd_to_ethos_token(eq_code: str) -> dict | None:
+    """Walk an EQ ICD diagnosis code to its single most-specific ETHOS
+    descriptive ICD token via the ICD-10-CM 3-char parent.
+
+    Dispatches on the EQ ICD edition:
+
+    * ICD-9: bridges via ``icd9_dx`` (ICD-9-CM -> SNOMED -> ICD-10-CM
+      target list), then takes the unique 3-char prefixes of those targets.
+    * ICD-10: looks up via ``icd10cm`` and uses ``parent_3char_code``.
+
+    The 3-char code(s) are intersected with ``ethos_icd_3char_index``. When a
+    single 3-char parent is found the corresponding ETHOS token is returned.
+    When ICD-9 splits across multiple distinct 3-char parents the result is
+    ambiguous: ``ethos_token`` is ``None`` and ``candidates`` lists every
+    parent.
+
+    Returns ``None`` if ``eq_code`` is not a ``DIAGNOSIS//ICD//(9|10)//*``
+    code, or if the source code cannot be resolved at all. Otherwise::
+
+        {
+            "ethos_token": str | None,
+            "source_3char_code": str | None,
+            "descendant_count": int,
+            "candidates": list[str],   # of 3-char codes
+        }
+
+    ``candidates`` always has length >= 1 once the source resolves; length
+    >= 2 indicates the ambiguous ICD-9 multi-parent case that downstream
+    LLM-pick logic must disambiguate.
+    """
+    if not eq_code:
+        return None
+    m = _EQ_ICD_DX_RE.match(eq_code)
+    if m is None:
+        return None
+    edition, code = m.group(1), m.group(2)
+
+    parents: list[str] = []
+    if edition == "9":
+        bridged = icd9_dx(code)
+        if bridged is None:
+            return None
+        for target in bridged.get("icd10_target_codes") or []:
+            three = target.split(".")[0][:3]
+            if three and three not in parents:
+                parents.append(three)
+    else:
+        resolved = icd10cm(code)
+        if resolved is None:
+            return None
+        three = resolved.get("parent_3char_code")
+        if three:
+            parents.append(three)
+
+    if not parents:
+        return {
+            "ethos_token": None,
+            "source_3char_code": None,
+            "descendant_count": 0,
+            "candidates": [],
+        }
+
+    index = ethos_icd_3char_index()
+
+    if len(parents) == 1:
+        three = parents[0]
+        ethos_token = index.get(three)
+        descendant_count = 0
+        if ethos_token is not None:
+            label = ethos_token[len("ICD//CM//") :]
+            descendants = ethos_descriptive_icd_to_codes(label)
+            if descendants is not None:
+                descendant_count = descendants["descendant_count"]
+        return {
+            "ethos_token": ethos_token,
+            "source_3char_code": three,
+            "descendant_count": descendant_count,
+            "candidates": parents,
+        }
+
+    return {
+        "ethos_token": None,
+        "source_3char_code": None,
+        "descendant_count": 0,
+        "candidates": parents,
+    }
+
+
+def atc_to_ethos_token(drug_name: str) -> dict | None:
+    """Walk a free-text drug name to its single most-specific ETHOS ATC
+    token via the RxNorm ingredient and the OHDSI ATC ancestor table.
+
+    Strategy:
+
+    1. Resolve the drug name to a RxNorm ingredient via ``rxnorm_drug_to_atc``.
+    2. Read every ATC-vocabulary ancestor of that ingredient from
+       ``CONCEPT_ANCESTOR``.
+    3. Intersect each ATC ancestor's ``concept_code`` with ``ethos_atc_index``.
+    4. Reduce the hits to "leaves": atc_codes that are not the ATC-prefix of
+       any other hit. These are the deepest reachable ETHOS tokens per ATC
+       chain.
+
+    A single leaf is the unambiguous deterministic answer. Multiple leaves
+    indicate the ingredient sits in two or more distinct ATC chains (the
+    canonical example is Mupirocin -> ``R01`` (nasal) and ``D06``
+    (dermatological)); both are returned as ``candidates`` and the caller
+    decides whether to commit both or invoke the LLM picker.
+
+    Returns ``None`` when the drug cannot be resolved to a RxNorm
+    ingredient. Otherwise::
+
+        {
+            "ethos_token": str | None,
+            "source_atc_code": str | None,
+            "ingredient_concept_id": int | None,
+            "ingredient_name": str | None,
+            "candidates": list[str],   # of ETHOS tokens
+        }
+
+    ``candidates`` is empty when the ingredient resolves but no ATC ancestor
+    falls inside the ETHOS vocab; it has length >= 2 when multiple distinct
+    ATC chains are reachable from the ingredient.
+    """
+    if not drug_name:
+        return None
+    bridge = rxnorm_drug_to_atc(drug_name)
+    if bridge is None:
+        return None
+    ingredient_id = bridge.get("ingredient_concept_id")
+    ingredient_name = bridge.get("ingredient_name")
+    if ingredient_id is None:
+        return {
+            "ethos_token": None,
+            "source_atc_code": None,
+            "ingredient_concept_id": None,
+            "ingredient_name": None,
+            "candidates": [],
+        }
+
+    atc = load_concept(("ATC",))
+    atc_id_set = {int(c) for c in atc["concept_id"].to_list()}
+    atc_code_by_id = {
+        int(r["concept_id"]): r["concept_code"]
+        for r in atc.iter_rows(named=True)
+    }
+
+    ancestor = load_concept_ancestor([ingredient_id])
+    atc_ancestor_ids = [
+        int(x)
+        for x in ancestor["ancestor_concept_id"].unique().to_list()
+        if int(x) in atc_id_set
+    ]
+
+    index = ethos_atc_index()
+    hits: list[str] = []
+    for aid in atc_ancestor_ids:
+        code = atc_code_by_id.get(aid) or ""
+        if code and code in index and code not in hits:
+            hits.append(code)
+
+    if not hits:
+        return {
+            "ethos_token": None,
+            "source_atc_code": None,
+            "ingredient_concept_id": ingredient_id,
+            "ingredient_name": ingredient_name,
+            "candidates": [],
+        }
+
+    leaves = sorted(
+        ac
+        for ac in hits
+        if not any(other != ac and other.startswith(ac) for other in hits)
+    )
+    leaf_tokens = [index[ac] for ac in leaves]
+
+    if len(leaves) == 1:
+        return {
+            "ethos_token": leaf_tokens[0],
+            "source_atc_code": leaves[0],
+            "ingredient_concept_id": ingredient_id,
+            "ingredient_name": ingredient_name,
+            "candidates": leaf_tokens,
+        }
+
+    return {
+        "ethos_token": None,
+        "source_atc_code": None,
+        "ingredient_concept_id": ingredient_id,
+        "ingredient_name": ingredient_name,
+        "candidates": leaf_tokens,
+    }
 
 
 if __name__ == "__main__":

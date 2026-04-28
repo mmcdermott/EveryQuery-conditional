@@ -43,6 +43,7 @@ dependencies = [
   "ipykernel>=7.2,<8",
   "scikit-learn>=1.6,<2",
   "matplotlib>=3.9,<4",
+  "anthropic>=0.40,<1",
 ] # Add your runtime dependencies here
 
 [dependency-groups]

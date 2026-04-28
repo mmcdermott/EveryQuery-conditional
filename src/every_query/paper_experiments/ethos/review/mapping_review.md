@@ -2,6 +2,10 @@
 
 Per-EQ-code review of the EQ -> ETHOS code mapping produced by `build_mapping.py`. Each section shows the authoritative EQ-side label resolved through the staged Athena ontology, the verbatim LLM rationale (rendered once per EQ code where one was recorded), the candidate ETHOS tokens with vocab counts and constituent-code expansions, and a status block for the reviewer to mark approve / reject / modify.
 
+## Reviewing principle
+
+Default to the **tightest** mapping that still captures the EQ concept. When a candidate ETHOS token expands to constituent codes that include conditions clearly outside the EQ question (e.g. an ETHOS `ATHEROSCLEROSIS` bucket covering aortic, cerebrovascular, and peripheral vascular disease for an EQ question specifically about coronary artery atherosclerosis), lean toward `reject` or `modify`. The constituent-code lists below show every code (with its English description) the ETHOS token rolls up, so judge by reading those lines, not by the ETHOS token name in isolation.
+
 ## Table of contents
 
 - [`DIAGNOSIS//ICD//10//I25118`](#diagnosisicd10i25118)
@@ -69,7 +73,14 @@ _Found under tier(s): icd_crosswalk_
 - Match kind: `literal`
 - Mapping source: `llm:claude_clinical_knowledge`
 - Inferred source: ICD-10-CM 3-char category `I20` -- Angina pectoris
-- Constituent ICD-10-CM codes (7): I20.0, I20.1, I20.2, I20.8, I20.81, I20.89, I20.9
+- Constituent ICD-10-CM codes (7):
+  - `I20.0` -- Unstable angina
+  - `I20.1` -- Angina pectoris with documented spasm
+  - `I20.2` -- Refractory angina pectoris
+  - `I20.8` -- Other forms of angina pectoris
+  - `I20.81` -- Angina pectoris with coronary microvascular dysfunction
+  - `I20.89` -- Other forms of angina pectoris
+  - `I20.9` -- Angina pectoris, unspecified
 
 _Found under tier(s): icd_crosswalk_
 
@@ -79,7 +90,38 @@ _Found under tier(s): icd_crosswalk_
 - Match kind: `literal`
 - Mapping source: `llm:claude_clinical_knowledge`
 - Inferred source: ICD-10-CM 3-char category `I70` -- Atherosclerosis
-- Constituent ICD-10-CM codes (295): I70.0, I70.1, I70.2, I70.20, I70.201, I70.202, I70.203, I70.208, I70.209, I70.21, I70.211, I70.212, I70.213, I70.218, I70.219, I70.22, I70.221, I70.222, I70.223, I70.228, I70.229, I70.23, I70.231, I70.232, I70.233, I70.234, I70.235, I70.238, I70.239, I70.24, ... +265 more
+- Constituent ICD-10-CM codes (295):
+  - `I70.0` -- Atherosclerosis of aorta
+  - `I70.1` -- Atherosclerosis of renal artery
+  - `I70.2` -- Atherosclerosis of native arteries of the extremities
+  - `I70.20` -- Unspecified atherosclerosis of native arteries of extremities
+  - `I70.201` -- Unspecified atherosclerosis of native arteries of extremities, right leg
+  - `I70.202` -- Unspecified atherosclerosis of native arteries of extremities, left leg
+  - `I70.203` -- Unspecified atherosclerosis of native arteries of extremities, bilateral legs
+  - `I70.208` -- Unspecified atherosclerosis of native arteries of extremities, other extremity
+  - `I70.209` -- Unspecified atherosclerosis of native arteries of extremities, unspecified extremity
+  - `I70.21` -- Atherosclerosis of native arteries of extremities with intermittent claudication
+  - `I70.211` -- Atherosclerosis of native arteries of extremities with intermittent claudication, right leg
+  - `I70.212` -- Atherosclerosis of native arteries of extremities with intermittent claudication, left leg
+  - `I70.213` -- Atherosclerosis of native arteries of extremities with intermittent claudication, bilateral legs
+  - `I70.218` -- Atherosclerosis of native arteries of extremities with intermittent claudication, other extremity
+  - `I70.219` -- Atherosclerosis of native arteries of extremities with intermittent claudication, unspecified extremity
+  - `I70.22` -- Atherosclerosis of native arteries of extremities with rest pain
+  - `I70.221` -- Atherosclerosis of native arteries of extremities with rest pain, right leg
+  - `I70.222` -- Atherosclerosis of native arteries of extremities with rest pain, left leg
+  - `I70.223` -- Atherosclerosis of native arteries of extremities with rest pain, bilateral legs
+  - `I70.228` -- Atherosclerosis of native arteries of extremities with rest pain, other extremity
+  - `I70.229` -- Atherosclerosis of native arteries of extremities with rest pain, unspecified extremity
+  - `I70.23` -- Atherosclerosis of native arteries of right leg with ulceration
+  - `I70.231` -- Atherosclerosis of native arteries of right leg with ulceration of thigh
+  - `I70.232` -- Atherosclerosis of native arteries of right leg with ulceration of calf
+  - `I70.233` -- Atherosclerosis of native arteries of right leg with ulceration of ankle
+  - `I70.234` -- Atherosclerosis of native arteries of right leg with ulceration of heel and midfoot
+  - `I70.235` -- Atherosclerosis of native arteries of right leg with ulceration of other part of foot
+  - `I70.238` -- Atherosclerosis of native arteries of right leg with ulceration of other part of lower leg
+  - `I70.239` -- Atherosclerosis of native arteries of right leg with ulceration of unspecified site
+  - `I70.24` -- Atherosclerosis of native arteries of left leg with ulceration
+  - ... +265 more
 
 _Found under tier(s): icd_crosswalk_
 
@@ -89,7 +131,38 @@ _Found under tier(s): icd_crosswalk_
 - Match kind: `literal`
 - Mapping source: `llm:claude_clinical_knowledge`
 - Inferred source: ICD-10-CM 3-char category `I25` -- Chronic ischemic heart disease
-- Constituent ICD-10-CM codes (69): I25.1, I25.10, I25.11, I25.110, I25.111, I25.112, I25.118, I25.119, I25.2, I25.3, I25.4, I25.41, I25.42, I25.5, I25.6, I25.7, I25.70, I25.700, I25.701, I25.702, I25.708, I25.709, I25.71, I25.710, I25.711, I25.712, I25.718, I25.719, I25.72, I25.720, ... +39 more
+- Constituent ICD-10-CM codes (69):
+  - `I25.1` -- Atherosclerotic heart disease of native coronary artery
+  - `I25.10` -- Atherosclerotic heart disease of native coronary artery without angina pectoris
+  - `I25.11` -- Atherosclerotic heart disease of native coronary artery with angina pectoris
+  - `I25.110` -- Atherosclerotic heart disease of native coronary artery with unstable angina pectoris
+  - `I25.111` -- Atherosclerotic heart disease of native coronary artery with angina pectoris with documented spasm
+  - `I25.112` -- Atherosclerotic heart disease of native coronary artery with refractory angina pectoris
+  - `I25.118` -- Atherosclerotic heart disease of native coronary artery with other forms of angina pectoris
+  - `I25.119` -- Atherosclerotic heart disease of native coronary artery with unspecified angina pectoris
+  - `I25.2` -- Old myocardial infarction
+  - `I25.3` -- Aneurysm of heart
+  - `I25.4` -- Coronary artery aneurysm and dissection
+  - `I25.41` -- Coronary artery aneurysm
+  - `I25.42` -- Coronary artery dissection
+  - `I25.5` -- Ischemic cardiomyopathy
+  - `I25.6` -- Silent myocardial ischemia
+  - `I25.7` -- Atherosclerosis of coronary artery bypass graft(s) and coronary artery of transplanted heart with angina pectoris
+  - `I25.70` -- Atherosclerosis of coronary artery bypass graft(s), unspecified, with angina pectoris
+  - `I25.700` -- Atherosclerosis of coronary artery bypass graft(s), unspecified, with unstable angina pectoris
+  - `I25.701` -- Atherosclerosis of coronary artery bypass graft(s), unspecified, with angina pectoris with documented spasm
+  - `I25.702` -- Atherosclerosis of coronary artery bypass graft(s), unspecified, with refractory angina pectoris
+  - `I25.708` -- Atherosclerosis of coronary artery bypass graft(s), unspecified, with other forms of angina pectoris
+  - `I25.709` -- Atherosclerosis of coronary artery bypass graft(s), unspecified, with unspecified angina pectoris
+  - `I25.71` -- Atherosclerosis of autologous vein coronary artery bypass graft(s) with angina pectoris
+  - `I25.710` -- Atherosclerosis of autologous vein coronary artery bypass graft(s) with unstable angina pectoris
+  - `I25.711` -- Atherosclerosis of autologous vein coronary artery bypass graft(s) with angina pectoris with documented spasm
+  - `I25.712` -- Atherosclerosis of autologous vein coronary artery bypass graft(s) with refractory angina pectoris
+  - `I25.718` -- Atherosclerosis of autologous vein coronary artery bypass graft(s) with other forms of angina pectoris
+  - `I25.719` -- Atherosclerosis of autologous vein coronary artery bypass graft(s) with unspecified angina pectoris
+  - `I25.72` -- Atherosclerosis of autologous artery coronary artery bypass graft(s) with angina pectoris
+  - `I25.720` -- Atherosclerosis of autologous artery coronary artery bypass graft(s) with unstable angina pectoris
+  - ... +39 more
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -109,7 +182,14 @@ _Found under tier(s): icd_crosswalk_
 
 **Authoritative EQ label:** ICD-9-CM `3320` -- Paralysis agitans
 - SNOMED bridge: Parkinson's disease (concept_id 381270)
-- ICD-10-CM crosswalk (7 codes): G20, G20.A, G20.A1, G20.A2, G20.B, G20.B1, G20.B2
+- ICD-10-CM crosswalk (7 codes):
+  - `G20` -- Parkinson's disease
+  - `G20.A` -- Parkinson's disease without dyskinesia
+  - `G20.A1` -- Parkinson's disease without dyskinesia, without mention of fluctuations
+  - `G20.A2` -- Parkinson's disease without dyskinesia, with fluctuations
+  - `G20.B` -- Parkinson's disease with dyskinesia
+  - `G20.B1` -- Parkinson's disease with dyskinesia, without mention of fluctuations
+  - `G20.B2` -- Parkinson's disease with dyskinesia, with fluctuations
 
 **LLM rationale (verbatim):**
 
@@ -123,7 +203,14 @@ _Found under tier(s): icd_crosswalk_
 - Match kind: `literal`
 - Mapping source: `llm:claude_clinical_knowledge`
 - Inferred source: ICD-10-CM 3-char category `G20` -- Parkinson's disease
-- Constituent ICD-10-CM codes (7): G20.A, G20.A1, G20.A2, G20.B, G20.B1, G20.B2, G20.C
+- Constituent ICD-10-CM codes (7):
+  - `G20.A` -- Parkinson's disease without dyskinesia
+  - `G20.A1` -- Parkinson's disease without dyskinesia, without mention of fluctuations
+  - `G20.A2` -- Parkinson's disease without dyskinesia, with fluctuations
+  - `G20.B` -- Parkinson's disease with dyskinesia
+  - `G20.B1` -- Parkinson's disease with dyskinesia, without mention of fluctuations
+  - `G20.B2` -- Parkinson's disease with dyskinesia, with fluctuations
+  - `G20.C` -- Parkinsonism, unspecified
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -143,7 +230,6 @@ _Found under tier(s): icd_crosswalk_
 
 **Authoritative EQ label:** ICD-9-CM `4271` -- Paroxysmal ventricular tachycardia
 - SNOMED bridge: Paroxysmal ventricular tachycardia (concept_id 437579)
-- ICD-10-CM crosswalk (0 codes): (none)
 
 **LLM rationale (verbatim):**
 
@@ -157,7 +243,17 @@ _Found under tier(s): icd_crosswalk_
 - Match kind: `literal`
 - Mapping source: `llm:claude_clinical_knowledge`
 - Inferred source: ICD-10-CM 3-char category `I47` -- Paroxysmal tachycardia
-- Constituent ICD-10-CM codes (10): I47.0, I47.1, I47.10, I47.11, I47.19, I47.2, I47.20, I47.21, I47.29, I47.9
+- Constituent ICD-10-CM codes (10):
+  - `I47.0` -- Re-entry ventricular arrhythmia
+  - `I47.1` -- Supraventricular tachycardia
+  - `I47.10` -- Supraventricular tachycardia, unspecified
+  - `I47.11` -- Inappropriate sinus tachycardia, so stated
+  - `I47.19` -- Other supraventricular tachycardia
+  - `I47.2` -- Ventricular tachycardia
+  - `I47.20` -- Ventricular tachycardia, unspecified
+  - `I47.21` -- Torsades de pointes
+  - `I47.29` -- Other ventricular tachycardia
+  - `I47.9` -- Paroxysmal tachycardia, unspecified
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -177,7 +273,8 @@ _Found under tier(s): icd_crosswalk_
 
 **Authoritative EQ label:** ICD-9-CM `5856` -- End stage renal disease
 - SNOMED bridge: End-stage renal disease (concept_id 193782)
-- ICD-10-CM crosswalk (1 code): N18.6
+- ICD-10-CM crosswalk (1 code):
+  - `N18.6` -- End stage renal disease
 
 **LLM rationale (verbatim):**
 
@@ -191,7 +288,17 @@ _Found under tier(s): icd_crosswalk_
 - Match kind: `literal`
 - Mapping source: `llm:claude_clinical_knowledge`
 - Inferred source: ICD-10-CM 3-char category `N18` -- Chronic kidney disease (CKD)
-- Constituent ICD-10-CM codes (10): N18.1, N18.2, N18.3, N18.30, N18.31, N18.32, N18.4, N18.5, N18.6, N18.9
+- Constituent ICD-10-CM codes (10):
+  - `N18.1` -- Chronic kidney disease, stage 1
+  - `N18.2` -- Chronic kidney disease, stage 2 (mild)
+  - `N18.3` -- Chronic kidney disease, stage 3 (moderate)
+  - `N18.30` -- Chronic kidney disease, stage 3 unspecified
+  - `N18.31` -- Chronic kidney disease, stage 3a
+  - `N18.32` -- Chronic kidney disease, stage 3b
+  - `N18.4` -- Chronic kidney disease, stage 4 (severe)
+  - `N18.5` -- Chronic kidney disease, stage 5
+  - `N18.6` -- End stage renal disease
+  - `N18.9` -- Chronic kidney disease, unspecified
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -211,7 +318,10 @@ _Found under tier(s): icd_crosswalk_
 
 **Authoritative EQ label:** ICD-9-CM `7295` -- Pain in limb
 - SNOMED bridge: Pain in limb (concept_id 138525)
-- ICD-10-CM crosswalk (3 codes): M79.6, M79.60, M79.609
+- ICD-10-CM crosswalk (3 codes):
+  - `M79.6` -- Pain in limb, hand, foot, fingers and toes
+  - `M79.60` -- Pain in limb, unspecified
+  - `M79.609` -- Pain in unspecified limb
 
 **LLM rationale (verbatim):**
 
@@ -225,7 +335,38 @@ _Found under tier(s): icd_crosswalk_
 - Match kind: `literal`
 - Mapping source: `llm:claude_clinical_knowledge`
 - Inferred source: ICD-10-CM 3-char category `M62` -- Other disorders of muscle
-- Constituent ICD-10-CM codes (174): M62.0, M62.00, M62.01, M62.011, M62.012, M62.019, M62.02, M62.021, M62.022, M62.029, M62.03, M62.031, M62.032, M62.039, M62.04, M62.041, M62.042, M62.049, M62.05, M62.051, M62.052, M62.059, M62.06, M62.061, M62.062, M62.069, M62.07, M62.071, M62.072, M62.079, ... +144 more
+- Constituent ICD-10-CM codes (174):
+  - `M62.0` -- Separation of muscle (nontraumatic)
+  - `M62.00` -- Separation of muscle (nontraumatic), unspecified site
+  - `M62.01` -- Separation of muscle (nontraumatic), shoulder
+  - `M62.011` -- Separation of muscle (nontraumatic), right shoulder
+  - `M62.012` -- Separation of muscle (nontraumatic), left shoulder
+  - `M62.019` -- Separation of muscle (nontraumatic), unspecified shoulder
+  - `M62.02` -- Separation of muscle (nontraumatic), upper arm
+  - `M62.021` -- Separation of muscle (nontraumatic), right upper arm
+  - `M62.022` -- Separation of muscle (nontraumatic), left upper arm
+  - `M62.029` -- Separation of muscle (nontraumatic), unspecified upper arm
+  - `M62.03` -- Separation of muscle (nontraumatic), forearm
+  - `M62.031` -- Separation of muscle (nontraumatic), right forearm
+  - `M62.032` -- Separation of muscle (nontraumatic), left forearm
+  - `M62.039` -- Separation of muscle (nontraumatic), unspecified forearm
+  - `M62.04` -- Separation of muscle (nontraumatic), hand
+  - `M62.041` -- Separation of muscle (nontraumatic), right hand
+  - `M62.042` -- Separation of muscle (nontraumatic), left hand
+  - `M62.049` -- Separation of muscle (nontraumatic), unspecified hand
+  - `M62.05` -- Separation of muscle (nontraumatic), thigh
+  - `M62.051` -- Separation of muscle (nontraumatic), right thigh
+  - `M62.052` -- Separation of muscle (nontraumatic), left thigh
+  - `M62.059` -- Separation of muscle (nontraumatic), unspecified thigh
+  - `M62.06` -- Separation of muscle (nontraumatic), lower leg
+  - `M62.061` -- Separation of muscle (nontraumatic), right lower leg
+  - `M62.062` -- Separation of muscle (nontraumatic), left lower leg
+  - `M62.069` -- Separation of muscle (nontraumatic), unspecified lower leg
+  - `M62.07` -- Separation of muscle (nontraumatic), ankle and foot
+  - `M62.071` -- Separation of muscle (nontraumatic), right ankle and foot
+  - `M62.072` -- Separation of muscle (nontraumatic), left ankle and foot
+  - `M62.079` -- Separation of muscle (nontraumatic), unspecified ankle and foot
+  - ... +144 more
 
 _Found under tier(s): icd_crosswalk_
 
@@ -235,7 +376,19 @@ _Found under tier(s): icd_crosswalk_
 - Match kind: `literal`
 - Mapping source: `llm:claude_clinical_knowledge`
 - Inferred source: ICD-10-CM 3-char category `G89` -- Pain, not elsewhere classified
-- Constituent ICD-10-CM codes (12): G89.0, G89.1, G89.11, G89.12, G89.18, G89.2, G89.21, G89.22, G89.28, G89.29, G89.3, G89.4
+- Constituent ICD-10-CM codes (12):
+  - `G89.0` -- Central pain syndrome
+  - `G89.1` -- Acute pain, not elsewhere classified
+  - `G89.11` -- Acute pain due to trauma
+  - `G89.12` -- Acute post-thoracotomy pain
+  - `G89.18` -- Other acute postprocedural pain
+  - `G89.2` -- Chronic pain, not elsewhere classified
+  - `G89.21` -- Chronic pain due to trauma
+  - `G89.22` -- Chronic post-thoracotomy pain
+  - `G89.28` -- Other chronic postprocedural pain
+  - `G89.29` -- Other chronic pain
+  - `G89.3` -- Neoplasm related pain (acute) (chronic)
+  - `G89.4` -- Chronic pain syndrome
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -272,7 +425,38 @@ _Found under tier(s): mimic_item_crosswalk_
 - Match kind: `literal`
 - Mapping source: `physionet/mimic-iv-demo:icu/d_items.csv+llm`
 - Inferred source: ATC level 2 class `A12` -- MINERAL SUPPLEMENTS
-- Constituent RxNorm ingredients (127): 1,2-docosahexanoyl-sn-glycero-3-phosphoserine calcium, 1,2-icosapentoyl-sn-glycero-3-phosphoserine calcium, allantoin calcium pantothenate, aluminum magnesium hydroxide carbonate, aluminum magnesium silicate, calcium, calcium acetate, calcium alginate, calcium aluminosilicate, calcium aluminum borosilicate, calcium amino acid chelate, calcium arsenate, calcium ascorbate, calcium aspartate, calcium bicarbonate, calcium bromide, calcium carbimide, calcium carbonate, calcium carbonate, precipitated, calcium chlorate dihydrate, calcium chloride, calcium citrate, calcium citrate malate, calcium creosotate, calcium fluoride, calcium galactogluconate bromide, calcium glubionate, calcium glucarate, calcium gluceptate, calcium gluconate, ... +97 more
+- Constituent RxNorm ingredients (127):
+  - 1,2-docosahexanoyl-sn-glycero-3-phosphoserine calcium
+  - 1,2-icosapentoyl-sn-glycero-3-phosphoserine calcium
+  - allantoin calcium pantothenate
+  - aluminum magnesium hydroxide carbonate
+  - aluminum magnesium silicate
+  - calcium
+  - calcium acetate
+  - calcium alginate
+  - calcium aluminosilicate
+  - calcium aluminum borosilicate
+  - calcium amino acid chelate
+  - calcium arsenate
+  - calcium ascorbate
+  - calcium aspartate
+  - calcium bicarbonate
+  - calcium bromide
+  - calcium carbimide
+  - calcium carbonate
+  - calcium carbonate, precipitated
+  - calcium chlorate dihydrate
+  - calcium chloride
+  - calcium citrate
+  - calcium citrate malate
+  - calcium creosotate
+  - calcium fluoride
+  - calcium galactogluconate bromide
+  - calcium glubionate
+  - calcium glucarate
+  - calcium gluceptate
+  - calcium gluconate
+  - ... +97 more
 
 _Found under tier(s): mimic_item_crosswalk_
 
@@ -282,7 +466,38 @@ _Found under tier(s): mimic_item_crosswalk_
 - Match kind: `literal`
 - Mapping source: `physionet/mimic-iv-demo:icu/d_items.csv+llm`
 - Inferred source: ATC level 2 class `B05` -- BLOOD SUBSTITUTES AND PERFUSION SOLUTIONS
-- Constituent RxNorm ingredients (375): 4-aminomethylbenzoic acid, 6-aminocaproic acid, acetate, acetic acid, acyclovir, alanylglutamine, alatrofloxacin, albendazole, albumin human, USP, alpha tocopherol, aluminum acetotartrate, amcinonide, amdinocillin, amdinocillin pivoxil, amikacin, aminocaproate, ammonium chloride, amoxicillin, amphotericin B, ampicillin, anidulafungin, arbekacin, arginine, artemether, ascorbic acid, atovaquone, azidocillin, azithromycin, azlocillin, aztreonam, ... +345 more
+- Constituent RxNorm ingredients (375):
+  - 4-aminomethylbenzoic acid
+  - 6-aminocaproic acid
+  - acetate
+  - acetic acid
+  - acyclovir
+  - alanylglutamine
+  - alatrofloxacin
+  - albendazole
+  - albumin human, USP
+  - alpha tocopherol
+  - aluminum acetotartrate
+  - amcinonide
+  - amdinocillin
+  - amdinocillin pivoxil
+  - amikacin
+  - aminocaproate
+  - ammonium chloride
+  - amoxicillin
+  - amphotericin B
+  - ampicillin
+  - anidulafungin
+  - arbekacin
+  - arginine
+  - artemether
+  - ascorbic acid
+  - atovaquone
+  - azidocillin
+  - azithromycin
+  - azlocillin
+  - aztreonam
+  - ... +345 more
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -319,7 +534,38 @@ _Found under tier(s): mimic_item_crosswalk_
 - Match kind: `literal`
 - Mapping source: `physionet/mimic-iv-demo:icu/d_items.csv+llm`
 - Inferred source: ATC level 2 class `A12` -- MINERAL SUPPLEMENTS
-- Constituent RxNorm ingredients (127): 1,2-docosahexanoyl-sn-glycero-3-phosphoserine calcium, 1,2-icosapentoyl-sn-glycero-3-phosphoserine calcium, allantoin calcium pantothenate, aluminum magnesium hydroxide carbonate, aluminum magnesium silicate, calcium, calcium acetate, calcium alginate, calcium aluminosilicate, calcium aluminum borosilicate, calcium amino acid chelate, calcium arsenate, calcium ascorbate, calcium aspartate, calcium bicarbonate, calcium bromide, calcium carbimide, calcium carbonate, calcium carbonate, precipitated, calcium chlorate dihydrate, calcium chloride, calcium citrate, calcium citrate malate, calcium creosotate, calcium fluoride, calcium galactogluconate bromide, calcium glubionate, calcium glucarate, calcium gluceptate, calcium gluconate, ... +97 more
+- Constituent RxNorm ingredients (127):
+  - 1,2-docosahexanoyl-sn-glycero-3-phosphoserine calcium
+  - 1,2-icosapentoyl-sn-glycero-3-phosphoserine calcium
+  - allantoin calcium pantothenate
+  - aluminum magnesium hydroxide carbonate
+  - aluminum magnesium silicate
+  - calcium
+  - calcium acetate
+  - calcium alginate
+  - calcium aluminosilicate
+  - calcium aluminum borosilicate
+  - calcium amino acid chelate
+  - calcium arsenate
+  - calcium ascorbate
+  - calcium aspartate
+  - calcium bicarbonate
+  - calcium bromide
+  - calcium carbimide
+  - calcium carbonate
+  - calcium carbonate, precipitated
+  - calcium chlorate dihydrate
+  - calcium chloride
+  - calcium citrate
+  - calcium citrate malate
+  - calcium creosotate
+  - calcium fluoride
+  - calcium galactogluconate bromide
+  - calcium glubionate
+  - calcium glucarate
+  - calcium gluceptate
+  - calcium gluconate
+  - ... +97 more
 
 _Found under tier(s): mimic_item_crosswalk_
 
@@ -329,7 +575,38 @@ _Found under tier(s): mimic_item_crosswalk_
 - Match kind: `literal`
 - Mapping source: `physionet/mimic-iv-demo:icu/d_items.csv+llm`
 - Inferred source: ATC level 2 class `B05` -- BLOOD SUBSTITUTES AND PERFUSION SOLUTIONS
-- Constituent RxNorm ingredients (375): 4-aminomethylbenzoic acid, 6-aminocaproic acid, acetate, acetic acid, acyclovir, alanylglutamine, alatrofloxacin, albendazole, albumin human, USP, alpha tocopherol, aluminum acetotartrate, amcinonide, amdinocillin, amdinocillin pivoxil, amikacin, aminocaproate, ammonium chloride, amoxicillin, amphotericin B, ampicillin, anidulafungin, arbekacin, arginine, artemether, ascorbic acid, atovaquone, azidocillin, azithromycin, azlocillin, aztreonam, ... +345 more
+- Constituent RxNorm ingredients (375):
+  - 4-aminomethylbenzoic acid
+  - 6-aminocaproic acid
+  - acetate
+  - acetic acid
+  - acyclovir
+  - alanylglutamine
+  - alatrofloxacin
+  - albendazole
+  - albumin human, USP
+  - alpha tocopherol
+  - aluminum acetotartrate
+  - amcinonide
+  - amdinocillin
+  - amdinocillin pivoxil
+  - amikacin
+  - aminocaproate
+  - ammonium chloride
+  - amoxicillin
+  - amphotericin B
+  - ampicillin
+  - anidulafungin
+  - arbekacin
+  - arginine
+  - artemether
+  - ascorbic acid
+  - atovaquone
+  - azidocillin
+  - azithromycin
+  - azlocillin
+  - aztreonam
+  - ... +345 more
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -366,7 +643,38 @@ _Found under tier(s): mimic_item_crosswalk_
 - Match kind: `literal`
 - Mapping source: `physionet/mimic-iv-demo:icu/d_items.csv+llm`
 - Inferred source: ATC level 2 class `N05` -- PSYCHOLEPTICS
-- Constituent RxNorm ingredients (143): Valeriana officinalis whole extract, acepromazine, acetophenazine, allobarbital, alprazolam, amisulpride, amobarbital, aprobarbital, aripiprazole, asenapine, barbital, benperidol, brexpiprazole, bromazepam, bromide ion, bromperidol, brotizolam, buspirone, butobarbital, butylvinal, captodiamine, carbromal, cariprazine, chloral betaine, chlordiazepoxide, chlormethiazole, chlorproethazine, chlorpromazine, chlorprothixene, clobazam, ... +113 more
+- Constituent RxNorm ingredients (143):
+  - Valeriana officinalis whole extract
+  - acepromazine
+  - acetophenazine
+  - allobarbital
+  - alprazolam
+  - amisulpride
+  - amobarbital
+  - aprobarbital
+  - aripiprazole
+  - asenapine
+  - barbital
+  - benperidol
+  - brexpiprazole
+  - bromazepam
+  - bromide ion
+  - bromperidol
+  - brotizolam
+  - buspirone
+  - butobarbital
+  - butylvinal
+  - captodiamine
+  - carbromal
+  - cariprazine
+  - chloral betaine
+  - chlordiazepoxide
+  - chlormethiazole
+  - chlorproethazine
+  - chlorpromazine
+  - chlorprothixene
+  - clobazam
+  - ... +113 more
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -402,7 +710,38 @@ _Found under tier(s): mimic_item_crosswalk_
 - Match kind: `literal`
 - Mapping source: `physionet/mimic-iv-demo:icu/d_items.csv+llm`
 - Inferred source: ATC level 2 class `B05` -- BLOOD SUBSTITUTES AND PERFUSION SOLUTIONS
-- Constituent RxNorm ingredients (375): 4-aminomethylbenzoic acid, 6-aminocaproic acid, acetate, acetic acid, acyclovir, alanylglutamine, alatrofloxacin, albendazole, albumin human, USP, alpha tocopherol, aluminum acetotartrate, amcinonide, amdinocillin, amdinocillin pivoxil, amikacin, aminocaproate, ammonium chloride, amoxicillin, amphotericin B, ampicillin, anidulafungin, arbekacin, arginine, artemether, ascorbic acid, atovaquone, azidocillin, azithromycin, azlocillin, aztreonam, ... +345 more
+- Constituent RxNorm ingredients (375):
+  - 4-aminomethylbenzoic acid
+  - 6-aminocaproic acid
+  - acetate
+  - acetic acid
+  - acyclovir
+  - alanylglutamine
+  - alatrofloxacin
+  - albendazole
+  - albumin human, USP
+  - alpha tocopherol
+  - aluminum acetotartrate
+  - amcinonide
+  - amdinocillin
+  - amdinocillin pivoxil
+  - amikacin
+  - aminocaproate
+  - ammonium chloride
+  - amoxicillin
+  - amphotericin B
+  - ampicillin
+  - anidulafungin
+  - arbekacin
+  - arginine
+  - artemether
+  - ascorbic acid
+  - atovaquone
+  - azidocillin
+  - azithromycin
+  - azlocillin
+  - aztreonam
+  - ... +345 more
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -439,7 +778,38 @@ _Found under tier(s): mimic_item_crosswalk_
 - Match kind: `literal`
 - Mapping source: `physionet/mimic-iv-demo:icu/d_items.csv+llm`
 - Inferred source: ATC level 2 class `C03` -- DIURETICS
-- Constituent RxNorm ingredients (35): althiazide, amiloride, bendroflumethiazide, bumetanide, buthiazide, canrenoate, canrenone, chlorothiazide, chlorthalidone, cicletanine, clopamide, conivaptan, cyclopenthiazide, cyclothiazide, eplerenone, ethacrynate, finerenone, furosemide, hydrochlorothiazide, hydroflumethiazide, indapamide, mefruside, mersalyl, methyclothiazide, metolazone, piretanide, polythiazide, quinethazone, spironolactone, theobromine, ... +5 more
+- Constituent RxNorm ingredients (35):
+  - althiazide
+  - amiloride
+  - bendroflumethiazide
+  - bumetanide
+  - buthiazide
+  - canrenoate
+  - canrenone
+  - chlorothiazide
+  - chlorthalidone
+  - cicletanine
+  - clopamide
+  - conivaptan
+  - cyclopenthiazide
+  - cyclothiazide
+  - eplerenone
+  - ethacrynate
+  - finerenone
+  - furosemide
+  - hydrochlorothiazide
+  - hydroflumethiazide
+  - indapamide
+  - mefruside
+  - mersalyl
+  - methyclothiazide
+  - metolazone
+  - piretanide
+  - polythiazide
+  - quinethazone
+  - spironolactone
+  - theobromine
+  - ... +5 more
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -476,7 +846,38 @@ _Found under tier(s): mimic_item_crosswalk_
 - Match kind: `literal`
 - Mapping source: `physionet/mimic-iv-demo:icu/d_items.csv+llm`
 - Inferred source: ATC level 2 class `B05` -- BLOOD SUBSTITUTES AND PERFUSION SOLUTIONS
-- Constituent RxNorm ingredients (375): 4-aminomethylbenzoic acid, 6-aminocaproic acid, acetate, acetic acid, acyclovir, alanylglutamine, alatrofloxacin, albendazole, albumin human, USP, alpha tocopherol, aluminum acetotartrate, amcinonide, amdinocillin, amdinocillin pivoxil, amikacin, aminocaproate, ammonium chloride, amoxicillin, amphotericin B, ampicillin, anidulafungin, arbekacin, arginine, artemether, ascorbic acid, atovaquone, azidocillin, azithromycin, azlocillin, aztreonam, ... +345 more
+- Constituent RxNorm ingredients (375):
+  - 4-aminomethylbenzoic acid
+  - 6-aminocaproic acid
+  - acetate
+  - acetic acid
+  - acyclovir
+  - alanylglutamine
+  - alatrofloxacin
+  - albendazole
+  - albumin human, USP
+  - alpha tocopherol
+  - aluminum acetotartrate
+  - amcinonide
+  - amdinocillin
+  - amdinocillin pivoxil
+  - amikacin
+  - aminocaproate
+  - ammonium chloride
+  - amoxicillin
+  - amphotericin B
+  - ampicillin
+  - anidulafungin
+  - arbekacin
+  - arginine
+  - artemether
+  - ascorbic acid
+  - atovaquone
+  - azidocillin
+  - azithromycin
+  - azlocillin
+  - aztreonam
+  - ... +345 more
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -658,7 +1059,17 @@ _Found under tier(s): mimic_item_crosswalk_
 - Match kind: `literal`
 - Mapping source: `physionet/mimic-iv-demo:icu/d_items.csv+llm`
 - Inferred source: ICD-10-CM 3-char category `N18` -- Chronic kidney disease (CKD)
-- Constituent ICD-10-CM codes (10): N18.1, N18.2, N18.3, N18.30, N18.31, N18.32, N18.4, N18.5, N18.6, N18.9
+- Constituent ICD-10-CM codes (10):
+  - `N18.1` -- Chronic kidney disease, stage 1
+  - `N18.2` -- Chronic kidney disease, stage 2 (mild)
+  - `N18.3` -- Chronic kidney disease, stage 3 (moderate)
+  - `N18.30` -- Chronic kidney disease, stage 3 unspecified
+  - `N18.31` -- Chronic kidney disease, stage 3a
+  - `N18.32` -- Chronic kidney disease, stage 3b
+  - `N18.4` -- Chronic kidney disease, stage 4 (severe)
+  - `N18.5` -- Chronic kidney disease, stage 5
+  - `N18.6` -- End stage renal disease
+  - `N18.9` -- Chronic kidney disease, unspecified
 
 _Found under tier(s): mimic_item_crosswalk_
 
@@ -668,7 +1079,13 @@ _Found under tier(s): mimic_item_crosswalk_
 - Match kind: `literal`
 - Mapping source: `physionet/mimic-iv-demo:icu/d_items.csv+llm`
 - Inferred source: ICD-10-CM 3-char category `Z49` -- Encounter for care involving renal dialysis
-- Constituent ICD-10-CM codes (6): Z49.0, Z49.01, Z49.02, Z49.3, Z49.31, Z49.32
+- Constituent ICD-10-CM codes (6):
+  - `Z49.0` -- Preparatory care for renal dialysis
+  - `Z49.01` -- Encounter for fitting and adjustment of extracorporeal dialysis catheter
+  - `Z49.02` -- Encounter for fitting and adjustment of peritoneal dialysis catheter
+  - `Z49.3` -- Encounter for adequacy testing for dialysis
+  - `Z49.31` -- Encounter for adequacy testing for hemodialysis
+  - `Z49.32` -- Encounter for adequacy testing for peritoneal dialysis
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -737,7 +1154,24 @@ _Found under tier(s): mimic_item_crosswalk_
 - Match kind: `literal`
 - Mapping source: `physionet/mimic-iv-demo:icu/d_items.csv+llm`
 - Inferred source: ICD-10-CM 3-char category `I21` -- Acute myocardial infarction
-- Constituent ICD-10-CM codes (17): I21.0, I21.01, I21.02, I21.09, I21.1, I21.11, I21.19, I21.2, I21.21, I21.29, I21.3, I21.4, I21.9, I21.A, I21.A1, I21.A9, I21.B
+- Constituent ICD-10-CM codes (17):
+  - `I21.0` -- ST elevation (STEMI) myocardial infarction of anterior wall
+  - `I21.01` -- ST elevation (STEMI) myocardial infarction involving left main coronary artery
+  - `I21.02` -- ST elevation (STEMI) myocardial infarction involving left anterior descending coronary artery
+  - `I21.09` -- ST elevation (STEMI) myocardial infarction involving other coronary artery of anterior wall
+  - `I21.1` -- ST elevation (STEMI) myocardial infarction of inferior wall
+  - `I21.11` -- ST elevation (STEMI) myocardial infarction involving right coronary artery
+  - `I21.19` -- ST elevation (STEMI) myocardial infarction involving other coronary artery of inferior wall
+  - `I21.2` -- ST elevation (STEMI) myocardial infarction of other sites
+  - `I21.21` -- ST elevation (STEMI) myocardial infarction involving left circumflex coronary artery
+  - `I21.29` -- ST elevation (STEMI) myocardial infarction involving other sites
+  - `I21.3` -- ST elevation (STEMI) myocardial infarction of unspecified site
+  - `I21.4` -- Non-ST elevation (NSTEMI) myocardial infarction
+  - `I21.9` -- Acute myocardial infarction, unspecified
+  - `I21.A` -- Other type of myocardial infarction
+  - `I21.A1` -- Myocardial infarction type 2
+  - `I21.A9` -- Other myocardial infarction type
+  - `I21.B` -- Myocardial infarction with coronary microvascular dysfunction
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -774,7 +1208,38 @@ _Found under tier(s): mimic_item_crosswalk_
 - Match kind: `literal`
 - Mapping source: `physionet/mimic-iv-demo:icu/d_items.csv+llm`
 - Inferred source: ICD-10-CM 3-char category `L89` -- Pressure ulcer
-- Constituent ICD-10-CM codes (207): L89.0, L89.00, L89.000, L89.001, L89.002, L89.003, L89.004, L89.006, L89.009, L89.01, L89.010, L89.011, L89.012, L89.013, L89.014, L89.016, L89.019, L89.02, L89.020, L89.021, L89.022, L89.023, L89.024, L89.026, L89.029, L89.1, L89.10, L89.100, L89.101, L89.102, ... +177 more
+- Constituent ICD-10-CM codes (207):
+  - `L89.0` -- Pressure ulcer of elbow
+  - `L89.00` -- Pressure ulcer of unspecified elbow
+  - `L89.000` -- Pressure ulcer of unspecified elbow, unstageable
+  - `L89.001` -- Pressure ulcer of unspecified elbow, stage 1
+  - `L89.002` -- Pressure ulcer of unspecified elbow, stage 2
+  - `L89.003` -- Pressure ulcer of unspecified elbow, stage 3
+  - `L89.004` -- Pressure ulcer of unspecified elbow, stage 4
+  - `L89.006` -- Pressure-induced deep tissue damage of unspecified elbow
+  - `L89.009` -- Pressure ulcer of unspecified elbow, unspecified stage
+  - `L89.01` -- Pressure ulcer of right elbow
+  - `L89.010` -- Pressure ulcer of right elbow, unstageable
+  - `L89.011` -- Pressure ulcer of right elbow, stage 1
+  - `L89.012` -- Pressure ulcer of right elbow, stage 2
+  - `L89.013` -- Pressure ulcer of right elbow, stage 3
+  - `L89.014` -- Pressure ulcer of right elbow, stage 4
+  - `L89.016` -- Pressure-induced deep tissue damage of right elbow
+  - `L89.019` -- Pressure ulcer of right elbow, unspecified stage
+  - `L89.02` -- Pressure ulcer of left elbow
+  - `L89.020` -- Pressure ulcer of left elbow, unstageable
+  - `L89.021` -- Pressure ulcer of left elbow, stage 1
+  - `L89.022` -- Pressure ulcer of left elbow, stage 2
+  - `L89.023` -- Pressure ulcer of left elbow, stage 3
+  - `L89.024` -- Pressure ulcer of left elbow, stage 4
+  - `L89.026` -- Pressure-induced deep tissue damage of left elbow
+  - `L89.029` -- Pressure ulcer of left elbow, unspecified stage
+  - `L89.1` -- Pressure ulcer of back
+  - `L89.10` -- Pressure ulcer of unspecified part of back
+  - `L89.100` -- Pressure ulcer of unspecified part of back, unstageable
+  - `L89.101` -- Pressure ulcer of unspecified part of back, stage 1
+  - `L89.102` -- Pressure ulcer of unspecified part of back, stage 2
+  - ... +177 more
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -849,7 +1314,38 @@ _Found under tier(s): atc_crosswalk_
 - Match kind: `literal`
 - Mapping source: `llm:claude_clinical_knowledge`
 - Inferred source: ATC level 2 class `N04` -- ANTI-PARKINSON DRUGS
-- Constituent RxNorm ingredients (32): amantadine, apomorphine, benztropine, biperiden, bornaprine, bromocriptine, budipine, cabergoline, dexetimide, dihydroergocryptine, diphenhydramine, entacapone, ethybenztropine, etilevodopa, istradefylline, levodopa, methixene, opicapone, orphenadrine, pergolide, piribedil, pramipexole, procyclidine, profenamine, rasagiline, ropinirole, rotigotine, safinamide, selegiline, tolcapone, ... +2 more
+- Constituent RxNorm ingredients (32):
+  - amantadine
+  - apomorphine
+  - benztropine
+  - biperiden
+  - bornaprine
+  - bromocriptine
+  - budipine
+  - cabergoline
+  - dexetimide
+  - dihydroergocryptine
+  - diphenhydramine
+  - entacapone
+  - ethybenztropine
+  - etilevodopa
+  - istradefylline
+  - levodopa
+  - methixene
+  - opicapone
+  - orphenadrine
+  - pergolide
+  - piribedil
+  - pramipexole
+  - procyclidine
+  - profenamine
+  - rasagiline
+  - ropinirole
+  - rotigotine
+  - safinamide
+  - selegiline
+  - tolcapone
+  - ... +2 more
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -885,7 +1381,38 @@ _Found under tier(s): atc_crosswalk_
 - Match kind: `literal`
 - Mapping source: `llm:claude_clinical_knowledge`
 - Inferred source: ATC level 2 class `N03` -- ANTIEPILEPTICS
-- Constituent RxNorm ingredients (45): aminobutyrate, barbexaclone, beclamide, brivaracetam, cannabidiol, carbamazepine, cenobamate, clonazepam, dipropylacetamide, eslicarbazepine, ethosuximide, ethotoin, ezogabine, felbamate, fenfluramine, fosphenytoin, gabapentin, ganaxolone, lacosamide, lamotrigine, levetiracetam, mephenytoin, mephobarbital, metharbital, methsuximide, oxcarbazepine, paramethadione, perampanel, phenacemide, phenobarbital, ... +15 more
+- Constituent RxNorm ingredients (45):
+  - aminobutyrate
+  - barbexaclone
+  - beclamide
+  - brivaracetam
+  - cannabidiol
+  - carbamazepine
+  - cenobamate
+  - clonazepam
+  - dipropylacetamide
+  - eslicarbazepine
+  - ethosuximide
+  - ethotoin
+  - ezogabine
+  - felbamate
+  - fenfluramine
+  - fosphenytoin
+  - gabapentin
+  - ganaxolone
+  - lacosamide
+  - lamotrigine
+  - levetiracetam
+  - mephenytoin
+  - mephobarbital
+  - metharbital
+  - methsuximide
+  - oxcarbazepine
+  - paramethadione
+  - perampanel
+  - phenacemide
+  - phenobarbital
+  - ... +15 more
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -921,7 +1448,38 @@ _Found under tier(s): atc_crosswalk_
 - Match kind: `literal`
 - Mapping source: `llm:claude_clinical_knowledge`
 - Inferred source: ATC level 2 class `D06` -- ANTIBIOTICS AND CHEMOTHERAPEUTICS FOR DERMATOLOGICAL USE
-- Constituent RxNorm ingredients (40): acyclovir, amikacin, bacitracin, bacitracin methylene disalicylate, berdazimer, chloramphenicol, chlortetracycline, demeclocycline, docosanol, edoxudine, fusidate, gentamicin, idoxuridine, imiquimod, ingenol mebutate, inosine, lysozyme, mafenide, metronidazole, mupirocin, neomycin, oxytetracycline, ozenoxacin, penciclovir, podofilox, retapamulin, rifamycin SV, rifamycins, rifaximin, silver sulfadiazine, ... +10 more
+- Constituent RxNorm ingredients (40):
+  - acyclovir
+  - amikacin
+  - bacitracin
+  - bacitracin methylene disalicylate
+  - berdazimer
+  - chloramphenicol
+  - chlortetracycline
+  - demeclocycline
+  - docosanol
+  - edoxudine
+  - fusidate
+  - gentamicin
+  - idoxuridine
+  - imiquimod
+  - ingenol mebutate
+  - inosine
+  - lysozyme
+  - mafenide
+  - metronidazole
+  - mupirocin
+  - neomycin
+  - oxytetracycline
+  - ozenoxacin
+  - penciclovir
+  - podofilox
+  - retapamulin
+  - rifamycin SV
+  - rifamycins
+  - rifaximin
+  - silver sulfadiazine
+  - ... +10 more
 
 _Found under tier(s): atc_crosswalk_
 
@@ -931,7 +1489,38 @@ _Found under tier(s): atc_crosswalk_
 - Match kind: `literal`
 - Mapping source: `llm:claude_clinical_knowledge`
 - Inferred source: ATC level 2 class `R01` -- NASAL PREPARATIONS
-- Constituent RxNorm ingredients (43): all-trans-retinol, antazoline, azelastine, beclomethasone, betamethasone, budesonide, calcium, ciclesonide, cromoglycate, cromolyn, cyclopentamine, dexamethasone, ephedrine, epinephrine, fenoxazoline, flunisolide, fluticasone, framycetin, hexamidine, hyaluronate, hydrocortisone, indanazoline, ipratropium, isospaglumic acid, levocabastine, mometasone, mupirocin, naphazoline, nedocromil, olopatadine, ... +13 more
+- Constituent RxNorm ingredients (43):
+  - all-trans-retinol
+  - antazoline
+  - azelastine
+  - beclomethasone
+  - betamethasone
+  - budesonide
+  - calcium
+  - ciclesonide
+  - cromoglycate
+  - cromolyn
+  - cyclopentamine
+  - dexamethasone
+  - ephedrine
+  - epinephrine
+  - fenoxazoline
+  - flunisolide
+  - fluticasone
+  - framycetin
+  - hexamidine
+  - hyaluronate
+  - hydrocortisone
+  - indanazoline
+  - ipratropium
+  - isospaglumic acid
+  - levocabastine
+  - mometasone
+  - mupirocin
+  - naphazoline
+  - nedocromil
+  - olopatadine
+  - ... +13 more
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -967,7 +1556,32 @@ _Found under tier(s): atc_crosswalk_
 - Match kind: `literal`
 - Mapping source: `llm:claude_clinical_knowledge`
 - Inferred source: ATC level 2 class `C09` -- AGENTS ACTING ON THE RENIN-ANGIOTENSIN SYSTEM
-- Constituent RxNorm ingredients (25): aliskiren, azilsartan, benazepril, candesartan, captopril, cilazapril, enalapril, enalaprilat, eprosartan, fosinopril, imidapril, irbesartan, lisinopril, losartan, moexipril, olmesartan, perindopril, quinapril, ramipril, sparsentan, spirapril, telmisartan, trandolapril, valsartan, zofenopril
+- Constituent RxNorm ingredients (25):
+  - aliskiren
+  - azilsartan
+  - benazepril
+  - candesartan
+  - captopril
+  - cilazapril
+  - enalapril
+  - enalaprilat
+  - eprosartan
+  - fosinopril
+  - imidapril
+  - irbesartan
+  - lisinopril
+  - losartan
+  - moexipril
+  - olmesartan
+  - perindopril
+  - quinapril
+  - ramipril
+  - sparsentan
+  - spirapril
+  - telmisartan
+  - trandolapril
+  - valsartan
+  - zofenopril
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -1000,7 +1614,38 @@ _Found under tier(s): atc_crosswalk_
 - Match kind: `literal`
 - Mapping source: `llm:claude_clinical_knowledge`
 - Inferred source: ATC level 2 class `J01` -- ANTIBACTERIALS FOR SYSTEMIC USE
-- Constituent RxNorm ingredients (187): amdinocillin, amdinocillin pivoxil, amikacin, amoxicillin, ampicillin, arbekacin, avibactam, azidocillin, azithromycin, azlocillin, aztreonam, bacampicillin, bacitracin, bacitracin methylene disalicylate, brodimoprim, carbenicillin, cefaclor, cefadroxil, cefamandole, cefatrizine, cefazolin, cefdinir, cefditoren, cefepime, cefetamet, cefiderocol, cefixime, cefmetazole, cefodizime, cefonicid, ... +157 more
+- Constituent RxNorm ingredients (187):
+  - amdinocillin
+  - amdinocillin pivoxil
+  - amikacin
+  - amoxicillin
+  - ampicillin
+  - arbekacin
+  - avibactam
+  - azidocillin
+  - azithromycin
+  - azlocillin
+  - aztreonam
+  - bacampicillin
+  - bacitracin
+  - bacitracin methylene disalicylate
+  - brodimoprim
+  - carbenicillin
+  - cefaclor
+  - cefadroxil
+  - cefamandole
+  - cefatrizine
+  - cefazolin
+  - cefdinir
+  - cefditoren
+  - cefepime
+  - cefetamet
+  - cefiderocol
+  - cefixime
+  - cefmetazole
+  - cefodizime
+  - cefonicid
+  - ... +157 more
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -1046,7 +1691,6 @@ _Found under tier(s): exact_
 - **Mapped tiers:** icd_crosswalk
 
 **Authoritative EQ label:** ICD-9-Proc `7936` -- Open reduction of fracture with internal fixation, tibia and fibula
-- ICD-10-PCS crosswalk (0 codes): (none)
 
 **LLM rationale (verbatim):**
 
@@ -1060,7 +1704,38 @@ _Found under tier(s): icd_crosswalk_
 - Match kind: `literal`
 - Mapping source: `llm:claude_clinical_knowledge`
 - Inferred source: ICD-10-CM 3-char category `S92` -- Fracture of foot and toe, except ankle
-- Constituent ICD-10-CM codes (1630): S92.0, S92.00, S92.001, S92.001A, S92.001B, S92.001D, S92.001G, S92.001K, S92.001P, S92.001S, S92.002, S92.002A, S92.002B, S92.002D, S92.002G, S92.002K, S92.002P, S92.002S, S92.009, S92.009A, S92.009B, S92.009D, S92.009G, S92.009K, S92.009P, S92.009S, S92.01, S92.011, S92.011A, S92.011B, ... +1600 more
+- Constituent ICD-10-CM codes (1630):
+  - `S92.0` -- Fracture of calcaneus
+  - `S92.00` -- Unspecified fracture of calcaneus
+  - `S92.001` -- Unspecified fracture of right calcaneus
+  - `S92.001A` -- Unspecified fracture of right calcaneus, initial encounter for closed fracture
+  - `S92.001B` -- Unspecified fracture of right calcaneus, initial encounter for open fracture
+  - `S92.001D` -- Unspecified fracture of right calcaneus, subsequent encounter for fracture with routine healing
+  - `S92.001G` -- Unspecified fracture of right calcaneus, subsequent encounter for fracture with delayed healing
+  - `S92.001K` -- Unspecified fracture of right calcaneus, subsequent encounter for fracture with nonunion
+  - `S92.001P` -- Unspecified fracture of right calcaneus, subsequent encounter for fracture with malunion
+  - `S92.001S` -- Unspecified fracture of right calcaneus, sequela
+  - `S92.002` -- Unspecified fracture of left calcaneus
+  - `S92.002A` -- Unspecified fracture of left calcaneus, initial encounter for closed fracture
+  - `S92.002B` -- Unspecified fracture of left calcaneus, initial encounter for open fracture
+  - `S92.002D` -- Unspecified fracture of left calcaneus, subsequent encounter for fracture with routine healing
+  - `S92.002G` -- Unspecified fracture of left calcaneus, subsequent encounter for fracture with delayed healing
+  - `S92.002K` -- Unspecified fracture of left calcaneus, subsequent encounter for fracture with nonunion
+  - `S92.002P` -- Unspecified fracture of left calcaneus, subsequent encounter for fracture with malunion
+  - `S92.002S` -- Unspecified fracture of left calcaneus, sequela
+  - `S92.009` -- Unspecified fracture of unspecified calcaneus
+  - `S92.009A` -- Unspecified fracture of unspecified calcaneus, initial encounter for closed fracture
+  - `S92.009B` -- Unspecified fracture of unspecified calcaneus, initial encounter for open fracture
+  - `S92.009D` -- Unspecified fracture of unspecified calcaneus, subsequent encounter for fracture with routine healing
+  - `S92.009G` -- Unspecified fracture of unspecified calcaneus, subsequent encounter for fracture with delayed healing
+  - `S92.009K` -- Unspecified fracture of unspecified calcaneus, subsequent encounter for fracture with nonunion
+  - `S92.009P` -- Unspecified fracture of unspecified calcaneus, subsequent encounter for fracture with malunion
+  - `S92.009S` -- Unspecified fracture of unspecified calcaneus, sequela
+  - `S92.01` -- Fracture of body of calcaneus
+  - `S92.011` -- Displaced fracture of body of right calcaneus
+  - `S92.011A` -- Displaced fracture of body of right calcaneus, initial encounter for closed fracture
+  - `S92.011B` -- Displaced fracture of body of right calcaneus, initial encounter for open fracture
+  - ... +1600 more
 
 _Found under tier(s): icd_crosswalk_
 
@@ -1070,7 +1745,38 @@ _Found under tier(s): icd_crosswalk_
 - Match kind: `literal`
 - Mapping source: `llm:claude_clinical_knowledge`
 - Inferred source: ICD-10-CM 3-char category `S82` -- Fracture of lower leg, including ankle
-- Constituent ICD-10-CM codes (3345): S82.0, S82.00, S82.001, S82.001A, S82.001B, S82.001C, S82.001D, S82.001E, S82.001F, S82.001G, S82.001H, S82.001J, S82.001K, S82.001M, S82.001N, S82.001P, S82.001Q, S82.001R, S82.001S, S82.002, S82.002A, S82.002B, S82.002C, S82.002D, S82.002E, S82.002F, S82.002G, S82.002H, S82.002J, S82.002K, ... +3315 more
+- Constituent ICD-10-CM codes (3345):
+  - `S82.0` -- Fracture of patella
+  - `S82.00` -- Unspecified fracture of patella
+  - `S82.001` -- Unspecified fracture of right patella
+  - `S82.001A` -- Unspecified fracture of right patella, initial encounter for closed fracture
+  - `S82.001B` -- Unspecified fracture of right patella, initial encounter for open fracture type I or II
+  - `S82.001C` -- Unspecified fracture of right patella, initial encounter for open fracture type IIIA, IIIB, or IIIC
+  - `S82.001D` -- Unspecified fracture of right patella, subsequent encounter for closed fracture with routine healing
+  - `S82.001E` -- Unspecified fracture of right patella, subsequent encounter for open fracture type I or II with routine healing
+  - `S82.001F` -- Unspecified fracture of right patella, subsequent encounter for open fracture type IIIA, IIIB, or IIIC with routine healing
+  - `S82.001G` -- Unspecified fracture of right patella, subsequent encounter for closed fracture with delayed healing
+  - `S82.001H` -- Unspecified fracture of right patella, subsequent encounter for open fracture type I or II with delayed healing
+  - `S82.001J` -- Unspecified fracture of right patella, subsequent encounter for open fracture type IIIA, IIIB, or IIIC with delayed healing
+  - `S82.001K` -- Unspecified fracture of right patella, subsequent encounter for closed fracture with nonunion
+  - `S82.001M` -- Unspecified fracture of right patella, subsequent encounter for open fracture type I or II with nonunion
+  - `S82.001N` -- Unspecified fracture of right patella, subsequent encounter for open fracture type IIIA, IIIB, or IIIC with nonunion
+  - `S82.001P` -- Unspecified fracture of right patella, subsequent encounter for closed fracture with malunion
+  - `S82.001Q` -- Unspecified fracture of right patella, subsequent encounter for open fracture type I or II with malunion
+  - `S82.001R` -- Unspecified fracture of right patella, subsequent encounter for open fracture type IIIA, IIIB, or IIIC with malunion
+  - `S82.001S` -- Unspecified fracture of right patella, sequela
+  - `S82.002` -- Unspecified fracture of left patella
+  - `S82.002A` -- Unspecified fracture of left patella, initial encounter for closed fracture
+  - `S82.002B` -- Unspecified fracture of left patella, initial encounter for open fracture type I or II
+  - `S82.002C` -- Unspecified fracture of left patella, initial encounter for open fracture type IIIA, IIIB, or IIIC
+  - `S82.002D` -- Unspecified fracture of left patella, subsequent encounter for closed fracture with routine healing
+  - `S82.002E` -- Unspecified fracture of left patella, subsequent encounter for open fracture type I or II with routine healing
+  - `S82.002F` -- Unspecified fracture of left patella, subsequent encounter for open fracture type IIIA, IIIB, or IIIC with routine healing
+  - `S82.002G` -- Unspecified fracture of left patella, subsequent encounter for closed fracture with delayed healing
+  - `S82.002H` -- Unspecified fracture of left patella, subsequent encounter for open fracture type I or II with delayed healing
+  - `S82.002J` -- Unspecified fracture of left patella, subsequent encounter for open fracture type IIIA, IIIB, or IIIC with delayed healing
+  - `S82.002K` -- Unspecified fracture of left patella, subsequent encounter for closed fracture with nonunion
+  - ... +3315 more
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 

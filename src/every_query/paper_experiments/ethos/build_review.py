@@ -146,6 +146,52 @@ def _format_truncated_list(items: list[str], cap: int = _DESCENDANT_TRUNCATION) 
     return f"{head}, ... +{len(items) - cap} more"
 
 
+def _format_code_name_bullets(
+    pairs: list[dict],
+    cap: int = _DESCENDANT_TRUNCATION,
+    indent: str = "  ",
+) -> list[str]:
+    """Format a list of ``{"code": ..., "name": ...}`` dicts as bulleted
+    markdown sublines, truncated at ``cap`` entries with a ``+N more`` line.
+
+    Each bullet renders as ``  - `<code>` -- <name>`` so the reviewer can scan
+    the English description of every constituent code.
+    """
+    if not pairs:
+        return []
+    lines: list[str] = []
+    head = pairs[:cap]
+    for p in head:
+        code = p.get("code") or ""
+        name = p.get("name") or ""
+        if name:
+            lines.append(f"{indent}- `{code}` -- {name}")
+        else:
+            lines.append(f"{indent}- `{code}`")
+    if len(pairs) > cap:
+        lines.append(f"{indent}- ... +{len(pairs) - cap} more")
+    return lines
+
+
+def _format_name_bullets(
+    names: list[str],
+    cap: int = _DESCENDANT_TRUNCATION,
+    indent: str = "  ",
+) -> list[str]:
+    """Format a list of plain-name strings as bulleted markdown sublines,
+    truncated at ``cap`` entries with a ``+N more`` line.
+    """
+    if not names:
+        return []
+    lines: list[str] = []
+    head = names[:cap]
+    for n in head:
+        lines.append(f"{indent}- {n}")
+    if len(names) > cap:
+        lines.append(f"{indent}- ... +{len(names) - cap} more")
+    return lines
+
+
 def _render_eq_label(eq_code: str) -> str:
     """Resolve and render the authoritative EQ-side label for ``eq_code`` as
     a markdown subsection.
@@ -199,12 +245,13 @@ def _render_eq_label(eq_code: str) -> str:
                     f"- SNOMED bridge: {hit['snomed_target_name']} "
                     f"(concept_id {hit.get('snomed_target_concept_id')})"
                 )
-            icd10_codes = hit.get("icd10_target_codes") or []
-            lines.append(
-                f"- ICD-10-CM crosswalk ({len(icd10_codes)} code"
-                f"{'' if len(icd10_codes) == 1 else 's'}): "
-                f"{_format_truncated_list(icd10_codes)}"
-            )
+            icd10_targets = hit.get("icd10_targets") or []
+            if icd10_targets:
+                lines.append(
+                    f"- ICD-10-CM crosswalk ({len(icd10_targets)} code"
+                    f"{'' if len(icd10_targets) == 1 else 's'}):"
+                )
+                lines.extend(_format_code_name_bullets(icd10_targets))
             return "\n".join(lines)
 
         if edition == "10":
@@ -253,12 +300,13 @@ def _render_eq_label(eq_code: str) -> str:
                     f"- SNOMED bridge: {hit['snomed_target_name']} "
                     f"(concept_id {hit.get('snomed_target_concept_id')})"
                 )
-            pcs_codes = hit.get("icd10pcs_target_codes") or []
-            lines.append(
-                f"- ICD-10-PCS crosswalk ({len(pcs_codes)} code"
-                f"{'' if len(pcs_codes) == 1 else 's'}): "
-                f"{_format_truncated_list(pcs_codes)}"
-            )
+            pcs_targets = hit.get("icd10pcs_targets") or []
+            if pcs_targets:
+                lines.append(
+                    f"- ICD-10-PCS crosswalk ({len(pcs_targets)} code"
+                    f"{'' if len(pcs_targets) == 1 else 's'}):"
+                )
+                lines.extend(_format_code_name_bullets(pcs_targets))
             return "\n".join(lines)
 
         if edition == "10":
@@ -386,11 +434,16 @@ def _render_ethos_token(
                 f"- Inferred source: ICD-10-CM 3-char category "
                 f"`{hit['source_concept_code']}` -- {hit['source_concept_name']}"
             )
-            descendants = hit.get("descendant_codes") or []
-            lines.append(
-                f"- Constituent ICD-10-CM codes ({hit.get('descendant_count', len(descendants))}): "
-                f"{_format_truncated_list(descendants)}"
-            )
+            descendants = hit.get("descendants") or []
+            count = hit.get("descendant_count", len(descendants))
+            if descendants:
+                lines.append(f"- Constituent ICD-10-CM codes ({count}):")
+                lines.extend(_format_code_name_bullets(descendants))
+            else:
+                lines.append(
+                    "- Constituent ICD-10-CM codes (0): _3-char category has no "
+                    "child codes in this Athena release._"
+                )
     elif parts[0] == "ATC" and len(parts) >= 2:
         atc_code = parts[1]
         hit = _ont.atc_class(atc_code)
@@ -404,10 +457,11 @@ def _render_ethos_token(
                 f"`{atc_code}` -- {hit['concept_name']}"
             )
             ingredients = hit.get("ingredients") or []
-            lines.append(
-                f"- Constituent RxNorm ingredients ({len(ingredients)}): "
-                f"{_format_truncated_list(ingredients)}"
-            )
+            if ingredients:
+                lines.append(
+                    f"- Constituent RxNorm ingredients ({len(ingredients)}):"
+                )
+                lines.extend(_format_name_bullets(ingredients))
     else:
         lines.append("- Inferred source: ETHOS-internal token (no Athena ontology bridge).")
 
@@ -701,6 +755,21 @@ def build_review_markdown() -> str:
             "the candidate ETHOS tokens with vocab counts and constituent-code "
             "expansions, and a status block for the reviewer to mark "
             "approve / reject / modify."
+        ),
+        "",
+        "## Reviewing principle",
+        "",
+        (
+            "Default to the **tightest** mapping that still captures the EQ "
+            "concept. When a candidate ETHOS token expands to constituent "
+            "codes that include conditions clearly outside the EQ question "
+            "(e.g. an ETHOS `ATHEROSCLEROSIS` bucket covering aortic, "
+            "cerebrovascular, and peripheral vascular disease for an EQ "
+            "question specifically about coronary artery atherosclerosis), "
+            "lean toward `reject` or `modify`. The constituent-code lists "
+            "below show every code (with its English description) the ETHOS "
+            "token rolls up, so judge by reading those lines, not by the "
+            "ETHOS token name in isolation."
         ),
         "",
     ]
