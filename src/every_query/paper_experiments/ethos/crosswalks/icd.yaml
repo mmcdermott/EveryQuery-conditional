@@ -34,30 +34,21 @@ mappings:
       UNSCHED_DIALYSIS_ESRD_PT_HOS, ENCOUNTER_FOR_CARE_INVOLVING_RENAL_DIALYSIS)
       are too rare to be useful as standalone matches.
 
-  - eq_code: DIAGNOSIS//ICD//9//7295
-    eq_meaning: "Pain in soft tissues of limb"
-    ethos_tokens:
-      - "ICD//CM//OTHER_DISORDERS_OF_MUSCLE"
-      - "ICD//CM//PAIN_NOT_ELSEWHERE_CLASSIFIED"
-    source: "llm:claude_clinical_knowledge"
-    rationale: >-
-      ETHOS has no exact "pain in limb" token. The two listed are the closest
-      semantic proxies (other muscle disorders + general unclassified pain);
-      mapping is loose so the AUC for this code should be interpreted carefully.
-
   - eq_code: DIAGNOSIS//ICD//10//I25118
     eq_meaning: >-
       Atherosclerotic heart disease of native coronary artery
       with other forms of angina pectoris
     ethos_tokens:
       - "ICD//CM//CHRONIC_ISCHEMIC_HEART_DISEASE"
-      - "ICD//CM//ANGINA_PECTORIS"
-      - "ICD//CM//ATHEROSCLEROSIS"
     source: "llm:claude_clinical_knowledge"
     rationale: >-
-      I25.118 is a 5-digit child of I25 (chronic ischemic heart disease) with
-      angina pectoris. The three ETHOS tokens together capture the I25 family
-      semantics; we OR them so any of the three counts as a hit.
+      I25.118 is a 5-digit child of I25 (chronic ischemic heart disease).
+      ICD//CM//CHRONIC_ISCHEMIC_HEART_DISEASE is the I25 3-char category
+      and is the tightest ETHOS bridge that still covers the EQ concept.
+      Earlier candidates ANGINA_PECTORIS (I20, angina without specified
+      atherosclerosis) and ATHEROSCLEROSIS (I70, mostly peripheral and leg
+      atherosclerosis, not coronary) were dropped during precision review
+      since they overshoot the EQ concept.
 
   - eq_code: PROCEDURE//ICD//9//7936
     eq_meaning: >-
@@ -65,11 +56,27 @@ mappings:
       metatarsal and tarsal bones (foot)
     ethos_tokens:
       - "ICD//CM//FRACTURE_OF_FOOT_AND_TOE_EXCEPT_ANKLE"
-      - "ICD//CM//FRACTURE_OF_LOWER_LEG_INCLUDING_ANKLE"
     source: "llm:claude_clinical_knowledge"
     rationale: >-
       ETHOS uses chunked ICD-PCS tokens that don't carry procedure semantics
-      directly. We map this procedure to the underlying fracture diagnosis as
-      a proxy: predicting the fracture diagnosis is a reasonable proxy for the
-      reduction procedure. Mapping is loose; AUC interpretation should reflect
-      that we're predicting the indication, not the procedure itself.
+      directly. We map this procedure to the underlying fracture diagnosis
+      as a proxy: predicting the fracture diagnosis is a reasonable proxy
+      for the reduction procedure. The previously-OR'd
+      FRACTURE_OF_LOWER_LEG_INCLUDING_ANKLE was dropped during precision
+      review since it covers different anatomy than the foot-bone procedure.
+      Mapping is still loose -- AUC interpretation should reflect that we're
+      predicting the indication, not the procedure itself.
+
+# Codes intentionally omitted -- no ETHOS counterpart available under any
+# reasonable mapping in the current vocabulary. Documented for the audit
+# trail rather than mapped speculatively.
+unmappable_with_rationale:
+  - eq_code: DIAGNOSIS//ICD//9//7295
+    description: "Pain in soft tissues of limb (ICD-9 729.5)"
+    reason: >-
+      ETHOS has no specific limb-pain or musculoskeletal-pain ICD-10-CM
+      3-char category. The previously-proposed proxies
+      OTHER_DISORDERS_OF_MUSCLE (M62, generic muscle disorder grab-bag) and
+      PAIN_NOT_ELSEWHERE_CLASSIFIED (R52, unspecified pain) were dropped
+      during precision review -- both overshoot to unrelated conditions and
+      neither captures the limb-specific clinical concept.

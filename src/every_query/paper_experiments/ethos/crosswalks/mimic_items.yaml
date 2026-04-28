@@ -69,22 +69,13 @@ mappings:
     eq_meaning: "Hemodialysis output volume (MIMIC chartevents 226499)"
     ethos_tokens:
       - "ICD//CM//ENCOUNTER_FOR_CARE_INVOLVING_RENAL_DIALYSIS"
-      - "ICD//CM//CHRONIC_KIDNEY_DISEASE_(CKD)"
     source: "physionet/mimic-iv-demo:icu/d_items.csv+llm"
     rationale: >-
       Hemodialysis-output measurement happens during dialysis encounters; we
-      proxy via the dialysis encounter and underlying CKD diagnosis tokens.
-      Loose mapping (predicting indication/encounter, not the measurement).
-
-  - eq_code: "LAB//227445//ng/mL//value_[11.0,20.0)"
-    eq_meaning: "CK-MB (cardiac biomarker, MIMIC chartevents 227445)"
-    ethos_tokens:
-      - "ICD//CM//ACUTE_MYOCARDIAL_INFARCTION"
-    source: "physionet/mimic-iv-demo:icu/d_items.csv+llm"
-    rationale: >-
-      CK-MB is ordered when myocardial infarction is suspected; elevated
-      values (the [11, 20) ng/mL bin is clearly elevated -- normal CK-MB is
-      <5 ng/mL) strongly correlate with AMI. Proxy via AMI ICD label.
+      proxy via the dialysis encounter (ICD-10-CM Z49). The previously-OR'd
+      CHRONIC_KIDNEY_DISEASE_(CKD) was dropped during precision review -- it
+      includes all CKD stages (1-5) so any patient with mild CKD triggers
+      it, but the EQ measurement only happens during active dialysis.
 
   - eq_code: "LAB//228724//cm//value_[1.5,2.0)"
     eq_meaning: "Pressure ulcer #2 length (MIMIC chartevents 228724)"
@@ -99,6 +90,18 @@ mappings:
 # reasonable mapping in the current vocabulary. Documented for the audit
 # trail rather than mapped speculatively.
 unmappable_with_rationale:
+  - eq_code: "LAB//227445//ng/mL//value_[11.0,20.0)"
+    description: "CK-MB elevated bin (cardiac biomarker, MIMIC chartevents 227445)"
+    reason: >-
+      Removed during precision review. The previously-proposed bridge
+      ACUTE_MYOCARDIAL_INFARCTION is a behavioral proxy (CK-MB elevation
+      correlates with AMI but also with post-cardiac-surgery state,
+      myocarditis, severe renal failure, rhabdomyolysis), not a vocabulary
+      equivalence. Predicting "AMI Dx appears" when "elevated CK-MB
+      measurement appears" yields asymmetric false positives and false
+      negatives depending on cohort composition. No tighter ETHOS token is
+      available; safer to mark unmappable than to score the loose proxy.
+
   - eq_code: "LAB//224665//UNK//value_[-inf,0.12)"
     description: "PCA total dose (patient-controlled analgesia), low-dose bin"
     reason: >-

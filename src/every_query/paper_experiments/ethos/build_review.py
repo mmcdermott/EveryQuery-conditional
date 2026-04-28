@@ -582,27 +582,29 @@ def _load_llm_rationales() -> dict[tuple[str, str], str]:
 
 
 def _load_unmappable_rationales() -> dict[str, dict]:
-    """Read the ``unmappable_with_rationale`` block of
-    ``crosswalks/mimic_items.yaml`` and return
-    ``{eq_code: {"description": str | None, "reason": str | None}}``.
+    """Read the ``unmappable_with_rationale`` blocks of every crosswalk YAML
+    and return ``{eq_code: {"description": str | None, "reason": str | None}}``.
 
-    The block lists EQ codes that the LLM-curated crosswalk intentionally
+    Each crosswalk YAML may declare codes the LLM-curated mapping intentionally
     declined to map; the renderer attaches the description and reason to the
-    unmapped EQ-code section so a reviewer can see why it was skipped.
+    unmapped EQ-code section so a reviewer can see why it was skipped. When the
+    same eq_code appears in multiple YAML unmappable blocks, the first read
+    wins (deterministic ordering follows ``_CROSSWALK_PATHS``).
     """
     out: dict[str, dict] = {}
-    if not _MIMIC_ITEMS_YAML.exists():
-        return out
-    with _MIMIC_ITEMS_YAML.open() as f:
-        data = yaml.safe_load(f) or {}
-    for entry in data.get("unmappable_with_rationale") or []:
-        eq_code = entry.get("eq_code")
-        if not eq_code:
+    for path in _CROSSWALK_PATHS:
+        if not path.exists():
             continue
-        out[eq_code] = {
-            "description": entry.get("description"),
-            "reason": entry.get("reason"),
-        }
+        with path.open() as f:
+            data = yaml.safe_load(f) or {}
+        for entry in data.get("unmappable_with_rationale") or []:
+            eq_code = entry.get("eq_code")
+            if not eq_code or eq_code in out:
+                continue
+            out[eq_code] = {
+                "description": entry.get("description"),
+                "reason": entry.get("reason"),
+            }
     return out
 
 

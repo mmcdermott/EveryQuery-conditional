@@ -419,7 +419,13 @@ def build_coverage(eq_codes: list[str], mapping: pl.DataFrame) -> pl.DataFrame:
     return full
 
 
-def main() -> None:
+def main(upload: bool = True) -> None:
+    """Build the mapping artifacts and (by default) upload them to GCS.
+
+    Set ``upload=False`` to write the local parquet artifacts under
+    ``CACHE_DIR`` without pushing to ``gs://every-query-runs/baselines/ethos/``.
+    Useful when iterating on YAML crosswalks before locking the mapping in.
+    """
     print("Loading EQ codes ...")
     eq_codes = load_eq_codes()
     print(f"  {len(eq_codes)} unique EQ queries")
@@ -471,11 +477,16 @@ def main() -> None:
     print(coverage.filter(pl.col("is_unmapped")).select("family", "query", "unmapped_reason"))
 
     print()
-    print("Uploading to GCS ...")
-    _upload(out_table, MAPPING_TABLE_BLOB)
-    _upload(out_cov, MAPPING_COVERAGE_BLOB)
-    print(f"  gs://{BUCKET}/{MAPPING_TABLE_BLOB}")
-    print(f"  gs://{BUCKET}/{MAPPING_COVERAGE_BLOB}")
+    if upload:
+        print("Uploading to GCS ...")
+        _upload(out_table, MAPPING_TABLE_BLOB)
+        _upload(out_cov, MAPPING_COVERAGE_BLOB)
+        print(f"  gs://{BUCKET}/{MAPPING_TABLE_BLOB}")
+        print(f"  gs://{BUCKET}/{MAPPING_COVERAGE_BLOB}")
+    else:
+        print("Skipping GCS upload (upload=False).")
+        print(f"  local: {out_table}")
+        print(f"  local: {out_cov}")
 
 
 if __name__ == "__main__":
