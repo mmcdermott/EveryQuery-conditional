@@ -36,7 +36,7 @@ _MEDS_SHARDS = [0, 1, 2]
 _AR_TRAJ_DIR = "eic/trajectories/medium_seq_1024/7573f855c4b050a9d79d57fefd8a139c/held_out"
 _AR_TRAJ_SHARDS = list(range(20))
 _PREVALENCE_PATH = "held_out_prevalence_7573f855c4b050a9d79d57fefd8a139c.csv"
-_AR_AUC_PATH = "eic-vs-eq-april/eic/eic-temporal_auc_results_10000_ID__8db2be6fadf8.parquet"
+_AR_AUC_PATH = "baselines/eic/temporal_auc_results_10000_ID__8db2be6fadf8.parquet"
 
 _HERE = Path(__file__).resolve().parent
 _CACHE = Path("/tmp/eq_demo_cache")
