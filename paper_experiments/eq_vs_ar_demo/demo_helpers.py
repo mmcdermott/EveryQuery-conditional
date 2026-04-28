@@ -122,43 +122,61 @@ def setup(subjects: Optional[list[tuple[int, int]]] = None) -> None:
 
 
 def _prefetch_for(subjects: list[tuple[int, int]]) -> None:
-    """Eagerly load every patient-level asset so the UI never waits on GCS."""
-    import pyarrow.parquet as pq
+    """Eagerly load every patient-level asset so the UI never waits on GCS.
+
+    The two heavy steps run in parallel:
+
+    1. MEDS event histories: 3 shards, predicate-pushdown filtered + column-
+       subsetted (typically ~100 KB per shard after filtering vs ~10 MB raw).
+    2. AR trajectories: 20 shards, predicate-pushdown filtered + column-
+       subsetted (typically ~1 MB per shard after filtering vs ~40 MB raw),
+       fetched concurrently via a thread pool.
+    """
     import pandas as pd
+    import pyarrow.parquet as pq
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     sids = [s for s, _ in subjects]
-
-    # 1. MEDS held-out events (whole shards — used to be lazy, now eager).
-    print("Loading patient histories...", flush=True)
-    _ = _events_by_subject(sids)
-
-    # 2. Build DemoPatient objects up front.
-    print("Building patient narratives + ground truth...", flush=True)
-    patients = [build_demo_patient(sid, pt_us) for sid, pt_us in subjects]
-    _state["patients"] = patients
-
-    # 3. AR trajectories — 20 shards, predicate-pushdown filtered to demo subjects.
-    print(f"Pre-fetching {len(_AR_TRAJ_SHARDS)} AR trajectory shards (filtered to {len(sids)} subjects)...", flush=True)
-    ar_cache: dict[int, pd.DataFrame] = {}
     fs = _state["fs"]
-    for shard_idx in _AR_TRAJ_SHARDS:
+    ar_cols = ["subject_id", "time", "code", "numeric_value"]
+
+    def _fetch_ar_shard(shard_idx: int) -> tuple[int, pd.DataFrame]:
         local = _CACHE / f"ar_shard_{shard_idx}.parquet"
         local.parent.mkdir(parents=True, exist_ok=True)
         if local.exists():
-            df = pd.read_parquet(local)
-        else:
-            try:
-                with fs.open(f"{_BUCKET}/{_AR_TRAJ_DIR}/{shard_idx}.parquet", "rb") as f:
-                    table = pq.read_table(f, filters=[("subject_id", "in", sids)])
-                df = table.to_pandas()
-            except Exception:
-                full = _gread_parquet(f"{_AR_TRAJ_DIR}/{shard_idx}.parquet")
-                df = full[full["subject_id"].isin(sids)].copy()
-            df.to_parquet(local, index=False)
-        ar_cache[shard_idx] = df
-        print(f"  shard {shard_idx + 1}/{len(_AR_TRAJ_SHARDS)} ({len(df):,} rows)", end="\r", flush=True)
-    print()
+            return shard_idx, pd.read_parquet(local)
+        try:
+            with fs.open(f"{_BUCKET}/{_AR_TRAJ_DIR}/{shard_idx}.parquet", "rb") as f:
+                table = pq.read_table(f, columns=ar_cols, filters=[("subject_id", "in", sids)])
+            df = table.to_pandas()
+        except Exception:
+            full = _gread_parquet(f"{_AR_TRAJ_DIR}/{shard_idx}.parquet")
+            df = full[full["subject_id"].isin(sids)][ar_cols].copy()
+        df.to_parquet(local, index=False)
+        return shard_idx, df
+
+    # Kick off MEDS history fetch + AR shard fetches in parallel. AR shards
+    # are the bottleneck (20 of them); using a thread pool gets ~5-10x speedup
+    # on a typical Colab connection because GCS reads are I/O bound.
+    print(f"Pre-fetching patient histories + {len(_AR_TRAJ_SHARDS)} AR trajectory shards "
+          f"(filtered to {len(sids)} subjects)...", flush=True)
+    ar_cache: dict[int, pd.DataFrame] = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        meds_future = pool.submit(_shard_for_subjects, sids)
+        ar_futures = {pool.submit(_fetch_ar_shard, i): i for i in _AR_TRAJ_SHARDS}
+        completed = 0
+        for fut in as_completed(ar_futures):
+            shard_idx, df = fut.result()
+            ar_cache[shard_idx] = df
+            completed += 1
+            print(f"  AR shards: {completed}/{len(_AR_TRAJ_SHARDS)}", end="\r", flush=True)
+        print()
+        meds_future.result()  # propagate any errors
     _state["ar_cache"] = ar_cache
+
+    # Now build DemoPatient objects (cheap — pure pandas on tiny in-memory frames).
+    print("Building patient narratives + ground truth...", flush=True)
+    _state["patients"] = [build_demo_patient(sid, pt_us) for sid, pt_us in subjects]
 
 
 def _gread_parquet(path: str):
@@ -344,13 +362,33 @@ def _kind_for(code: str) -> str:
 # Patient assembly
 # ---------------------------------------------------------------------------
 def _shard_for_subjects(sids: list[int]):
-    """Concatenate the small set of MEDS held-out shards we need for these subjects."""
+    """Pull MEDS held-out events for these subjects with predicate pushdown.
+
+    Reads only ``[subject_id, time, code, numeric_value]`` and only the row
+    groups whose ``subject_id`` matches our demo subjects. Each ~10 MB shard
+    typically yields ~100 KB of in-memory rows under this filter.
+    """
     import pandas as pd
-    if "_meds_shards" not in _state:
-        frames = [_gread_parquet(_MEDS_HELDOUT_TEMPLATE.format(shard=i)) for i in _MEDS_SHARDS]
-        _state["_meds_shards"] = pd.concat(frames, ignore_index=True)
-    full = _state["_meds_shards"]
-    return full[full["subject_id"].isin(sids)].copy()
+    import pyarrow.parquet as pq
+
+    cache_key = ("_meds_shards", tuple(sorted(sids)))
+    if cache_key in _state:
+        return _state[cache_key]
+
+    cols = ["subject_id", "time", "code", "numeric_value"]
+    fs = _state["fs"]
+    frames = []
+    for i in _MEDS_SHARDS:
+        try:
+            with fs.open(f"{_BUCKET}/{_MEDS_HELDOUT_TEMPLATE.format(shard=i)}", "rb") as f:
+                table = pq.read_table(f, columns=cols, filters=[("subject_id", "in", sids)])
+            frames.append(table.to_pandas())
+        except Exception:
+            full = _gread_parquet(_MEDS_HELDOUT_TEMPLATE.format(shard=i))
+            frames.append(full[full["subject_id"].isin(sids)][cols].copy())
+    df = pd.concat(frames, ignore_index=True)
+    _state[cache_key] = df
+    return df
 
 
 def _events_by_subject(sids: list[int]):
@@ -496,16 +534,18 @@ class _ReplayARModel:
             return self._cache[shard_idx]
         local = _CACHE / f"ar_shard_{shard_idx}.parquet"
         local.parent.mkdir(parents=True, exist_ok=True)
+        cols = ["subject_id", "time", "code", "numeric_value"]
         if local.exists():
             df = pd.read_parquet(local)
         else:
             try:
                 with _state["fs"].open(f"{_BUCKET}/{_AR_TRAJ_DIR}/{shard_idx}.parquet", "rb") as f:
-                    table = pq.read_table(f, filters=[("subject_id", "in", self._subjects)])
+                    table = pq.read_table(f, columns=cols,
+                                          filters=[("subject_id", "in", self._subjects)])
                 df = table.to_pandas()
             except Exception:
                 full = _gread_parquet(f"{_AR_TRAJ_DIR}/{shard_idx}.parquet")
-                df = full[full["subject_id"].isin(self._subjects)].copy()
+                df = full[full["subject_id"].isin(self._subjects)][cols].copy()
             df.to_parquet(local, index=False)
         self._cache[shard_idx] = df
         return df
