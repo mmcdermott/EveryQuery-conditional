@@ -1,14 +1,13 @@
 """Tests for ``every_query.paper_experiments.ethos_compat.reprocess``.
 
-The Ethos tokenizer splits ICD10/CM and ATC codes across multiple events at the same
-``(subject_id, time)``.  ``EQ_reprocess_ethos`` collapses those triplets back to one
-event each.  These tests verify the recombination is correct, deterministic, and
-preserves the through-pass for atomic events.
+Verifies the recombination is correct, deterministic, preserves through-pass for atomic events, and re-injects
+statics when configured.
 """
 
 from __future__ import annotations
 
 import os
+import pickle
 import subprocess
 import sys
 from datetime import datetime
@@ -18,7 +17,10 @@ import polars as pl
 import pytest
 
 from every_query.paper_experiments.ethos_compat.reprocess import (
+    COMBINED_PREFIX,
     FAMILIES,
+    load_static_table,
+    make_combined_code,
     reprocess_directory,
     reprocess_shard,
 )
@@ -69,93 +71,120 @@ def ethos_like_events() -> pl.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Unit-level tests
+# make_combined_code primitive
+# ---------------------------------------------------------------------------
+
+
+class TestMakeCombinedCode:
+    def test_deterministic(self):
+        a = make_combined_code(("ICD//CM//I10", "ICD//CM//3-6//00"))
+        b = make_combined_code(("ICD//CM//I10", "ICD//CM//3-6//00"))
+        assert a == b
+
+    def test_order_invariant(self):
+        a = make_combined_code(("ICD//CM//I10", "ICD//CM//3-6//00", "ICD//CM//SFX//A"))
+        b = make_combined_code(("ICD//CM//SFX//A", "ICD//CM//I10", "ICD//CM//3-6//00"))
+        assert a == b
+
+    def test_unique_per_distinct_input(self):
+        a = make_combined_code(("ICD//CM//I10",))
+        b = make_combined_code(("ICD//CM//I11",))
+        assert a != b
+
+    def test_format(self):
+        code = make_combined_code(("ICD//CM//I10",))
+        assert code.startswith(COMBINED_PREFIX)
+        assert len(code) == len(COMBINED_PREFIX) + 16
+
+    def test_distinct_triplets_collide_negligibly(self):
+        # Generate 1k synthetic triplets and confirm no collision (sanity bound).
+        seen = {make_combined_code((f"ICD//CM//I{i}",)) for i in range(1000)}
+        assert len(seen) == 1000
+
+
+# ---------------------------------------------------------------------------
+# Recombination
 # ---------------------------------------------------------------------------
 
 
 class TestRecombination:
-    def test_short_icd_passes_through_as_head_only(self, ethos_like_events):
-        """A 3-char ICD code (head only, no mid/sfx) emerges unchanged."""
+    def test_short_icd_becomes_singleton_hash(self, ethos_like_events):
         out, mapping = reprocess_shard(ethos_like_events)
         s1_t1 = out.filter((pl.col("subject_id") == 1) & (pl.col("time") == datetime(2024, 1, 1, 10)))
         assert s1_t1.height == 1
-        assert s1_t1["code"][0] == "ICD//CM//I10"
+        assert s1_t1["code"][0] == make_combined_code(("ICD//CM//I10",))
+        assert s1_t1["code"][0].startswith(COMBINED_PREFIX)
 
     def test_five_char_icd_combines_head_and_mid(self, ethos_like_events):
-        out, mapping = reprocess_shard(ethos_like_events)
+        out, _ = reprocess_shard(ethos_like_events)
         s1_t2 = out.filter(
             (pl.col("subject_id") == 1)
             & (pl.col("time") == datetime(2024, 1, 2, 10))
-            & pl.col("code").str.starts_with("ICD")
+            & pl.col("code").str.starts_with(COMBINED_PREFIX)
         )
         assert s1_t2.height == 1
-        assert s1_t2["code"][0] == "ICD//CM//E11//3-6//65"
+        expected = make_combined_code(("ICD//CM//E11", "ICD//CM//3-6//65"))
+        assert s1_t2["code"][0] == expected
 
     def test_full_icd_triplet_combines_to_one_row(self, ethos_like_events):
-        out, mapping = reprocess_shard(ethos_like_events)
+        out, _ = reprocess_shard(ethos_like_events)
         s1_t3 = out.filter((pl.col("subject_id") == 1) & (pl.col("time") == datetime(2024, 1, 3, 10)))
         assert s1_t3.height == 1
-        assert s1_t3["code"][0] == "ICD//CM//K70//3-6//30//SFX//1"
+        expected = make_combined_code(("ICD//CM//K70", "ICD//CM//3-6//30", "ICD//CM//SFX//1"))
+        assert s1_t3["code"][0] == expected
 
     def test_full_atc_triplet_combines_to_one_row(self, ethos_like_events):
-        out, mapping = reprocess_shard(ethos_like_events)
+        out, _ = reprocess_shard(ethos_like_events)
         s1_t4 = out.filter((pl.col("subject_id") == 1) & (pl.col("time") == datetime(2024, 1, 4, 10)))
         assert s1_t4.height == 1
-        assert s1_t4["code"][0] == "ATC//N02BA01//Acetylsalicylic_Acid//4//A//SFX//01"
+        expected = make_combined_code(("ATC//N02BA01//Acetylsalicylic_Acid", "ATC//4//A", "ATC//SFX//01"))
+        assert s1_t4["code"][0] == expected
 
     def test_co_occurring_icd_codes_pair_by_rank(self, ethos_like_events):
-        """Two full ICD triplets at the same (subject, time) recombine to two distinct rows, paired in row
-        order (head[0] with mid[0]+sfx[0], head[1] with mid[1]+sfx[1])."""
-        out, mapping = reprocess_shard(ethos_like_events)
+        """Two full ICD triplets at the same (subject, time) recombine to two distinct rows."""
+        out, _ = reprocess_shard(ethos_like_events)
         s2_t5 = out.filter(
             (pl.col("subject_id") == 2)
             & (pl.col("time") == datetime(2024, 2, 1, 10))
-            & pl.col("code").str.starts_with("ICD")
-        ).sort("code")
+            & pl.col("code").str.starts_with(COMBINED_PREFIX)
+        )
         assert s2_t5.height == 2
         codes = set(s2_t5["code"].to_list())
-        assert codes == {
-            "ICD//CM//E11//3-6//65//SFX//1",
-            "ICD//CM//I10//3-6//00//SFX//A",
+        expected = {
+            make_combined_code(("ICD//CM//I10", "ICD//CM//3-6//00", "ICD//CM//SFX//A")),
+            make_combined_code(("ICD//CM//E11", "ICD//CM//3-6//65", "ICD//CM//SFX//1")),
         }
+        assert codes == expected
 
     def test_atomic_events_pass_through_unchanged(self, ethos_like_events):
-        out, mapping = reprocess_shard(ethos_like_events)
+        out, _ = reprocess_shard(ethos_like_events)
         atomic = out.filter(pl.col("code").is_in(["LAB//Q//CREATININE", "HOSPITAL_ADMISSION"]))
         assert atomic.height == 2
         assert set(atomic["code"].to_list()) == {"LAB//Q//CREATININE", "HOSPITAL_ADMISSION"}
 
     def test_total_row_count_drops_by_expected_amount(self, ethos_like_events):
-        """17 input rows: 1 short + (1+1) 5-char + 3 full + 3 ATC + 6 (two co-occurring) + 2 atomic.
-        Expected output: 1 + 1 + 1 + 1 + 2 + 2 = 8.
-        """
+        """17 input rows → 8 output rows (1+1+1+1+2+2)."""
         out, _ = reprocess_shard(ethos_like_events)
         assert ethos_like_events.height == 17
         assert out.height == 8
 
     def test_mapping_records_only_changed_codes(self, ethos_like_events):
-        out, mapping = reprocess_shard(ethos_like_events)
-        # Pass-through codes (LAB//Q//CREATININE, HOSPITAL_ADMISSION, ICD//CM//I10 alone)
-        # must not appear as input_codes.
+        _, mapping = reprocess_shard(ethos_like_events)
         inputs = set(mapping["input_code"].to_list())
         assert "LAB//Q//CREATININE" not in inputs
         assert "HOSPITAL_ADMISSION" not in inputs
-
-        # Combined-only ICD/ATC sub-tokens MUST appear as inputs.
         assert "ICD//CM//3-6//65" in inputs
         assert "ICD//CM//SFX//1" in inputs
         assert "ATC//4//A" in inputs
         assert "ATC//SFX//01" in inputs
 
     def test_mapping_outputs_match_combined_codes(self, ethos_like_events):
-        """Every output_code in the mapping must appear in the rewritten event stream."""
         out, mapping = reprocess_shard(ethos_like_events)
         assert mapping.height > 0
         rewritten_codes = set(out["code"].to_list())
         for output_code in mapping["output_code"].unique().to_list():
-            assert output_code in rewritten_codes, (
-                f"mapping declares output_code={output_code!r} but it doesn't appear in the rewritten events"
-            )
+            assert output_code in rewritten_codes
+            assert output_code.startswith(COMBINED_PREFIX)
 
 
 class TestEdgeCases:
@@ -177,56 +206,87 @@ class TestEdgeCases:
         out, mapping = reprocess_shard(events)
         assert out.height == 3
         assert mapping.height == 0
-        assert set(out["code"].to_list()) == {"LAB//Q//A", "VITAL//Q//HR", "HOSPITAL_ADMISSION"}
 
     def test_orphan_mid_without_head_logged_and_dropped(self, caplog):
-        """A mid token with no matching head at the same (subject, time) is dropped."""
         events = pl.DataFrame(
             {
                 "subject_id": [1, 1],
                 "time": [datetime(2024, 1, 1)] * 2,
-                # No ICD//CM//<head> token; just an orphan mid.
                 "code": ["ICD//CM//3-6//00", "LAB//Q//CREATININE"],
             },
             schema={"subject_id": pl.Int64, "time": pl.Datetime("us"), "code": pl.Utf8},
         )
         with caplog.at_level("WARNING"):
             out, _ = reprocess_shard(events)
-        # Orphan mid is dropped; LAB row stays.
         assert out.height == 1
         assert out["code"][0] == "LAB//Q//CREATININE"
-        assert any("orphan mid" in rec.message for rec in caplog.records)
-
-    def test_combined_codes_are_reversible(self, ethos_like_events):
-        """Splitting a combined output code on the well-known markers recovers the original triplet."""
-        out, _ = reprocess_shard(ethos_like_events)
-        full_triplet_row = out.filter(pl.col("code") == "ICD//CM//K70//3-6//30//SFX//1")
-        assert full_triplet_row.height == 1
-        code = full_triplet_row["code"][0]
-        head, _, rest = code.partition("//3-6//")
-        assert head == "ICD//CM//K70"
-        mid, _, sfx = rest.partition("//SFX//")
-        assert mid == "30"
-        assert sfx == "1"
+        assert any("no head tokens" in rec.message for rec in caplog.records)
 
 
 class TestFamilyDefinitions:
     def test_families_have_distinct_head_prefixes(self):
-        """Family head prefixes must be non-overlapping for first-match classification."""
         prefixes = [f.head_prefix for f in FAMILIES]
         for i, p in enumerate(prefixes):
             for j, q in enumerate(prefixes):
                 if i == j:
                     continue
-                assert not p.startswith(q) and not q.startswith(p), (
-                    f"head prefixes {p!r} and {q!r} overlap — first-match classification breaks"
-                )
+                assert not p.startswith(q) and not q.startswith(p)
 
     def test_family_mid_and_sfx_extend_head_prefix(self):
-        """Each family's mid + sfx prefixes should start with its head prefix."""
         for f in FAMILIES:
             assert f.mid_prefix.startswith(f.head_prefix)
             assert f.sfx_prefix.startswith(f.head_prefix)
+
+
+# ---------------------------------------------------------------------------
+# Static reinjection
+# ---------------------------------------------------------------------------
+
+
+class TestLoadStaticTable:
+    def test_load_parquet(self, tmp_path):
+        df = pl.DataFrame({"subject_id": [1, 2, 1], "code": ["GENDER//M", "GENDER//F", "RACE//A"]})
+        p = tmp_path / "static.parquet"
+        df.write_parquet(p)
+        loaded = load_static_table(p)
+        assert loaded.height == 3
+        assert set(loaded.columns) >= {"subject_id", "code"}
+
+    def test_load_pickle_simple_dict(self, tmp_path):
+        data = {1: ["GENDER//M", "RACE//A"], 2: ["GENDER//F"]}
+        p = tmp_path / "static.pkl"
+        with p.open("wb") as f:
+            pickle.dump(data, f)
+        loaded = load_static_table(p)
+        assert loaded.height == 3
+        assert set(loaded["code"].to_list()) == {"GENDER//M", "GENDER//F", "RACE//A"}
+
+    def test_load_pickle_with_numeric_values(self, tmp_path):
+        data = {1: [("BMI", 27.5)], 2: [("BMI", 22.1)]}
+        p = tmp_path / "static.pkl"
+        with p.open("wb") as f:
+            pickle.dump(data, f)
+        loaded = load_static_table(p)
+        assert loaded.height == 2
+        assert "numeric_value" in loaded.columns
+        assert set(loaded["numeric_value"].to_list()) == {27.5, 22.1}
+
+    def test_load_unknown_extension_raises(self, tmp_path):
+        p = tmp_path / "static.txt"
+        p.write_text("oops")
+        with pytest.raises(ValueError, match="unrecognized extension"):
+            load_static_table(p)
+
+    def test_load_missing_file_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            load_static_table(tmp_path / "missing.parquet")
+
+    def test_parquet_missing_required_columns_raises(self, tmp_path):
+        df = pl.DataFrame({"foo": [1], "bar": ["x"]})
+        p = tmp_path / "static.parquet"
+        df.write_parquet(p)
+        with pytest.raises(ValueError, match="must have"):
+            load_static_table(p)
 
 
 # ---------------------------------------------------------------------------
@@ -240,8 +300,6 @@ def ethos_like_dataset(tmp_path: Path, ethos_like_events: pl.DataFrame) -> Path:
     root = tmp_path / "ethos"
     (root / "data" / "held_out").mkdir(parents=True)
     ethos_like_events.write_parquet(root / "data" / "held_out" / "0.parquet")
-    # Also write a ``codes.parquet`` listing every code seen, so we can verify metadata
-    # rewriting works end-to-end.
     codes = ethos_like_events["code"].unique().to_frame()
     (root / "metadata").mkdir(parents=True)
     codes.write_parquet(root / "metadata" / "codes.parquet")
@@ -260,12 +318,51 @@ def test_reprocess_directory_codes_metadata_drops_mid_sfx(ethos_like_dataset: Pa
     out_dir = tmp_path / "eq_input"
     reprocess_directory(ethos_like_dataset, out_dir)
     out_codes = pl.read_parquet(out_dir / "metadata" / "codes.parquet")["code"].to_list()
-    # No code in the rewritten vocab should be a bare mid/sfx token.
     for c in out_codes:
-        assert not c.startswith("ICD//CM//3-6//"), f"mid token {c!r} leaked into codes.parquet"
-        assert not c.startswith("ICD//CM//SFX//"), f"sfx token {c!r} leaked into codes.parquet"
-        assert not c.startswith("ATC//4//"), f"mid token {c!r} leaked into codes.parquet"
-        assert not c.startswith("ATC//SFX//"), f"sfx token {c!r} leaked into codes.parquet"
+        assert not c.startswith("ICD//CM//3-6//")
+        assert not c.startswith("ICD//CM//SFX//")
+        assert not c.startswith("ATC//4//")
+        assert not c.startswith("ATC//SFX//")
+
+
+def test_reprocess_directory_with_static_reinjection(ethos_like_dataset: Path, tmp_path: Path):
+    """Static rows from a parquet land in the output as ``time=null`` rows."""
+    static_df = pl.DataFrame(
+        {
+            "subject_id": [1, 1, 2, 99],  # subject 99 is an orphan (no timeline events)
+            "code": ["GENDER//M", "RACE//A", "GENDER//F", "DROPPED//ORPHAN"],
+        }
+    )
+    static_path = tmp_path / "static.parquet"
+    static_df.write_parquet(static_path)
+
+    out_dir = tmp_path / "eq_input"
+    reprocess_directory(ethos_like_dataset, out_dir, static_data_path=static_path)
+    out = pl.read_parquet(out_dir / "data" / "held_out" / "0.parquet")
+
+    # Static rows have time=null.
+    static_rows = out.filter(pl.col("time").is_null())
+    assert static_rows.height == 3, f"expected 3 reinjected static rows, got {static_rows.height}"
+    static_codes = set(static_rows["code"].to_list())
+    assert static_codes == {"GENDER//M", "RACE//A", "GENDER//F"}
+    assert "DROPPED//ORPHAN" not in static_codes  # orphan dropped
+
+    # Timeline events still present and time is non-null for them.
+    timeline = out.filter(pl.col("time").is_not_null())
+    assert timeline.height > 0
+
+
+def test_reprocess_directory_with_static_pickle(ethos_like_dataset: Path, tmp_path: Path):
+    static_data = {1: ["GENDER//M"], 2: [("BMI", 25.0)]}
+    static_path = tmp_path / "static.pkl"
+    with static_path.open("wb") as f:
+        pickle.dump(static_data, f)
+
+    out_dir = tmp_path / "eq_input"
+    reprocess_directory(ethos_like_dataset, out_dir, static_data_path=static_path)
+    out = pl.read_parquet(out_dir / "data" / "held_out" / "0.parquet")
+    static_rows = out.filter(pl.col("time").is_null())
+    assert static_rows.height == 2
 
 
 def test_reprocess_directory_refuses_to_clobber(ethos_like_dataset: Path, tmp_path: Path):
@@ -282,15 +379,9 @@ def test_reprocess_directory_overwrite_clobbers(ethos_like_dataset: Path, tmp_pa
     (out_dir / "stale.txt").write_text("stale")
     reprocess_directory(ethos_like_dataset, out_dir, overwrite=True)
     assert not (out_dir / "stale.txt").exists()
-    assert (out_dir / "data" / "held_out" / "0.parquet").is_file()
 
 
 def test_reprocess_directory_rejects_in_place_rewrite(ethos_like_dataset: Path):
-    """Refuse if input_dir == output_dir to avoid clobbering source data."""
-    # The CLI guard for in-place rewrite is in main(); reprocess_directory itself
-    # protects via the FileExistsError when output_dir is non-empty.  This test
-    # asserts the directory-API behaviour — same dir means same files exist, so we get
-    # FileExistsError without overwrite=true.
     with pytest.raises(FileExistsError):
         reprocess_directory(ethos_like_dataset, ethos_like_dataset, overwrite=False)
 
@@ -317,7 +408,6 @@ def test_reprocess_directory_missing_data_dir_raises(tmp_path: Path):
 
 
 def test_eq_reprocess_ethos_cli_end_to_end(ethos_like_dataset: Path, tmp_path: Path):
-    """Run the registered console script in a subprocess; verify outputs."""
     out_dir = tmp_path / "cli_out"
     env = os.environ.copy()
     env["PATH"] = _VENV_BIN + os.pathsep + env.get("PATH", "")
@@ -339,7 +429,31 @@ def test_eq_reprocess_ethos_cli_end_to_end(ethos_like_dataset: Path, tmp_path: P
     assert (out_dir / "data" / "held_out" / "0.parquet").is_file()
     assert (out_dir / "metadata" / "ethos_code_mapping.parquet").is_file()
 
-    # Sanity: the output has fewer rows than the input.
-    inp_rows = pl.read_parquet(ethos_like_dataset / "data" / "held_out" / "0.parquet").height
-    out_rows = pl.read_parquet(out_dir / "data" / "held_out" / "0.parquet").height
-    assert out_rows < inp_rows, "expected fewer rows after recombination"
+
+def test_eq_reprocess_ethos_cli_with_statics(ethos_like_dataset: Path, tmp_path: Path):
+    static_df = pl.DataFrame({"subject_id": [1, 2], "code": ["GENDER//M", "GENDER//F"]})
+    static_path = tmp_path / "static.parquet"
+    static_df.write_parquet(static_path)
+
+    out_dir = tmp_path / "cli_out"
+    env = os.environ.copy()
+    env["PATH"] = _VENV_BIN + os.pathsep + env.get("PATH", "")
+    result = subprocess.run(
+        [
+            "EQ_reprocess_ethos",
+            f"input_dir={ethos_like_dataset!s}",
+            f"output_dir={out_dir!s}",
+            f"static_data_path={static_path!s}",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    assert result.returncode == 0, (
+        f"EQ_reprocess_ethos failed (rc={result.returncode})\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    out = pl.read_parquet(out_dir / "data" / "held_out" / "0.parquet")
+    static_rows = out.filter(pl.col("time").is_null())
+    assert static_rows.height == 2

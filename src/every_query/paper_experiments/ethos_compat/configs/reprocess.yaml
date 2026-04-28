@@ -22,6 +22,15 @@ input_dir: ???
 # Required: directory to write recombined MEDS shards into.  Mirrors input layout.
 output_dir: ???
 
+# Optional: path to a static-data side-channel emitted by Ethos's ``StaticDataCollector``.
+# Two formats supported:
+#   - Parquet: ``(subject_id, code)`` columns, optionally ``numeric_value``.
+#   - Pickle:  ``{subject_id: [code, ...]}`` or ``{subject_id: [(code, value), ...]}``.
+# When set, every static row is reinjected into the output as a ``time=null`` MEDS row,
+# routed into the shard its subject lives in.  Subjects without timeline shards are
+# dropped with a warning.
+static_data_path: null
+
 # Optional: overwrite ``output_dir`` if it already exists.  Default false.
 overwrite: false
 

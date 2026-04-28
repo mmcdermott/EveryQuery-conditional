@@ -1,63 +1,63 @@
 # `paper_experiments/ethos_compat/`
 
-`EQ_reprocess_ethos` — collapse Ethos's split-token MEDS shards back into singleton-code shards so EQ_train and EQ_evaluate run unchanged on Ethos-tokenized data.
+`EQ_reprocess_ethos` — make Ethos-tokenized MEDS shards ingestible by EQ training infra (MTD → EQ_train → EQ_predict → EQ_evaluate).
 
-Filed under `paper_experiments/` because the matched-tokenization comparison between EQ's training objective and Ethos's autoregressive objective is a paper-only question — it's not part of the normal EveryQuery user pipeline.
+Filed under `paper_experiments/` because the matched-tokenization comparison between EQ's training objective and Ethos's autoregressive objective is a paper-only question.
 
 See [#174](https://github.com/payalchandak/EveryQuery/issues/174) for the design discussion.
 
 ## What it does
 
-The Ethos tokenizer (`ipolharvard/ethos-ares`) splits two code families across multiple events at the same `(subject_id, time)`:
+Two things:
 
-- **ICD10/CM diagnoses** → 3 events: `ICD//CM//<head>` (chars 0–3) + `ICD//CM//3-6//<mid>` (chars 3–6) + `ICD//CM//SFX//<sfx>` (chars 6+).
-- **ATC drug codes** → 3 events: `ATC//<head>` (chars 0–3) + `ATC//4//<mid>` (char 3) + `ATC//SFX//<sfx>` (chars 4+).
+1. **Collapses split codes** — Ethos's tokenizer splits each ICD10/CM diagnosis and each ATC drug code across multiple events at the same `(subject_id, time)`. EQ's task grammar is single-code, so we collapse each split family back to one event with an opaque deterministic identifier (`EQ_TOK//<16-char-hex>`). The mapping file (`metadata/ethos_code_mapping.parquet`) is the canonical reverse lookup.
+2. **Re-injects statics** — Ethos extracts demographics + birth + race + marital + BMI to a side-channel pickle. We optionally read that pickle (or a parquet) and inject the rows back as `time=null` MEDS rows, routed into the shard their subject lives in.
 
-EQ's task grammar (`TaskQuerySchema`) treats `code` as an atom: a query for "did `I10` occur" against Ethos's split-token corpus would require conjunctive reasoning over the triplet, which the load-bearing `evaluate_index_df` cannot express.
+The output is a standard MEDS directory that downstream `MTD_preprocess` + `EQ_train` consume unchanged.
 
-This module reverses the splits. For each family, every `(head, optional mid, optional sfx)` triplet at a shared timestamp collapses into a single combined code:
+## Code naming
 
-```
-ICD//CM//I10                  ← head only (3-char ICD)         → ICD//CM//I10
-ICD//CM//I10
-ICD//CM//3-6//00              ← head + mid (5-char ICD)       → ICD//CM//I10//3-6//00
-ICD//CM//I10
-ICD//CM//3-6//65
-ICD//CM//SFX//1               ← full triplet (7-char ICD)     → ICD//CM//I10//3-6//65//SFX//1
-```
+The combined-code identifier is `EQ_TOK//<hash>` where the hash is a blake2b digest (16 hex chars / 64 bits) of the sorted input-codes tuple. This is opaque by design — the user clarification on #174 said any unique string suffices, and reversibility is provided by the mapping file rather than the string structure.
 
-The combined code is deterministic and reversible — splitting on `//3-6//` and `//SFX//` recovers the original triplet.
+| Input rows at same `(subject_id, time)`                           | Output             |
+| ----------------------------------------------------------------- | ------------------ |
+| `ICD//CM//I10`                                                    | `EQ_TOK//<hash_a>` |
+| `ICD//CM//E11`, `ICD//CM//3-6//65`                                | `EQ_TOK//<hash_b>` |
+| `ICD//CM//K70`, `ICD//CM//3-6//30`, `ICD//CM//SFX//1`             | `EQ_TOK//<hash_c>` |
+| `ATC//N02BA01//Acetylsalicylic_Acid`, `ATC//4//A`, `ATC//SFX//01` | `EQ_TOK//<hash_d>` |
+
+Atomic events outside the split families (labs, vitals, BMI, SOFA quantile tokens, admissions, discharges, time-deltas) **pass through unchanged**.
 
 ## Pipeline position
 
 ```
 Raw MEDS
-  → Ethos tokenizer (drops + remaps + splits + quantizes)
-  → Ethos-style parquets (multi-token timeline)
-  → EQ_reprocess_ethos                                    ← THIS MODULE
-  → flat-code parquets (Ethos's filtering + remapping + quantization, but singleton codes)
+  → Ethos tokenizer (drops + remaps + splits + quantizes; statics → pickle)
+  → Ethos parquets (multi-token timeline)  +  static_data.pkl
+  → EQ_reprocess_ethos                                             ← THIS MODULE
+  → singleton-code MEDS shards (with optional time=null statics)
   → MTD_preprocess (existing EQ path)
   → EQ_train / EQ_predict / EQ_evaluate
 ```
-
-The output code vocabulary is **not** the raw ICD10/ATC strings — tokenization is a property of the preprocessing run, and EQ's tasks are scoped to whatever vocab their corpus has. This is fine; the goal is matched-data comparison of the two training objectives, not vocabulary parity across runs.
 
 ## CLI
 
 ```bash
 EQ_reprocess_ethos \
 	input_dir=/path/to/ethos/output \
-	output_dir=/path/to/eq/input
+	output_dir=/path/to/eq/input \
+	static_data_path=/path/to/ethos/static_data.pkl
 ```
 
 Required:
 
-- `input_dir` — directory containing Ethos's tokenized MEDS shards (expects `{input_dir}/data/{split}/*.parquet`).
-- `output_dir` — directory to write the recombined shards into (mirrors the input layout).
+- `input_dir` — directory of Ethos-tokenized MEDS shards (`{input_dir}/data/{split}/*.parquet`).
+- `output_dir` — directory to write recombined shards (mirrors input layout).
 
 Optional:
 
-- `overwrite=true` — clobber `output_dir` if it already exists. Default `false`.
+- `static_data_path` — parquet with `(subject_id, code[, numeric_value])` columns OR pickle with `{subject_id: [code, ...]}` or `{subject_id: [(code, value), ...]}`. Default `null` (no reinjection).
+- `overwrite=true` — clobber `output_dir` if it exists. Default `false`.
 
 ## Output layout
 
@@ -65,26 +65,28 @@ Optional:
 {output_dir}/
 ├── data/
 │   └── {split}/
-│       └── {shard}.parquet              ← singleton-code MEDS shards (same schema as input)
+│       └── {shard}.parquet              ← singleton-code shards + optional time=null statics
 └── metadata/
-    ├── codes.parquet                    ← rewritten code vocabulary (mid/sfx codes dropped, heads remapped)
+    ├── codes.parquet                    ← rewritten vocab; mid/sfx tokens dropped, heads remapped
     ├── ethos_code_mapping.parquet       ← (input_code, output_code) for every changed code
     └── *                                ← other metadata files passed through unchanged
 ```
 
-The `ethos_code_mapping.parquet` contains exactly one row per `(input_code, output_code)` pair the run produced. Pass-through codes (atomic events that didn't change) are not included. Schema:
+`ethos_code_mapping.parquet` schema:
 
 | column        | type     | meaning                                           |
 | ------------- | -------- | ------------------------------------------------- |
 | `input_code`  | `string` | The Ethos code (head, mid, or sfx)                |
 | `output_code` | `string` | The combined singleton code it now contributes to |
 
-## Caveats
+Pass-through codes are not in the mapping — only changed codes are recorded.
 
-- **Only ICD10/CM and ATC families are recombined.** Ethos splits ICD10/PCS character-by-character (up to 7 sub-tokens); that's a separate family with a different structure. If your run includes PCS codes, file a follow-up — the same recombination shape applies but the prefix scheme differs.
-- **Ethos's static-pickle extraction is not undone here.** Demographics + birth + race + marital that Ethos pulls out of the timeline into a side-channel pickle remain absent from the output. For matched-data EQ training you may want to re-inject them via a separate stage; out of scope for this module.
+## Caveats / follow-ups
+
+- **Only ICD10/CM and ATC families are recombined.** Ethos splits ICD10/PCS character-by-character (up to 7 sub-tokens); that's a separate family with a different prefix scheme. File a follow-up if your runs include PCS codes.
 - **Other Ethos preprocessing decisions are preserved**: ICD9→ICD10 mapping, drug→ATC mapping, code filtering (infusions / weights / heights / eGFR / etc.), per-code quantile binning. Those are properties of the input, not of this module.
-- **Ordering assumption**: the recombination pairs `head[k]` with `mid[k]` and `sfx[k]` based on Ethos's row order. Ethos uses a polars-native `.explode()` which preserves per-original-event grouping, so this is correct in practice. Misalignment would surface as visibly garbled output codes; the test suite covers the round-trip identity for canonical inputs.
+- **Ordering assumption**: rank-based pairing of `head[k]` with `mid[k]` and `sfx[k]` relies on Ethos's polars `.explode()` preserving per-original-event grouping. Currently true upstream; would surface as visibly garbled mappings if it ever changes.
+- **Static format flexibility**: parquet (`subject_id`, `code`, optional `numeric_value`) or pickle (`{sid: [code, ...]}` or `{sid: [(code, value), ...]}`). Other shapes need a small extension to `load_static_table`.
 
 ## Related
 
