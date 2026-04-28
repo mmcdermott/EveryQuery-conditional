@@ -12,7 +12,6 @@ Default to the **tightest** mapping that still captures the EQ concept. When a c
 - [`DIAGNOSIS//ICD//9//3320`](#diagnosisicd93320)
 - [`DIAGNOSIS//ICD//9//4271`](#diagnosisicd94271)
 - [`DIAGNOSIS//ICD//9//5856`](#diagnosisicd95856)
-- [`DIAGNOSIS//ICD//9//7295`](#diagnosisicd97295)
 - [`INFUSION_END//227536//value_[6.05,8.071587)`](#infusion-end227536value-6058071587)
 - [`INFUSION_END//227536//value_[8.071587,9.379999)`](#infusion-end227536value-80715879379999)
 - [`INFUSION_END//229420//value_[10.687433,23.27545)`](#infusion-end229420value-106874332327545)
@@ -25,7 +24,6 @@ Default to the **tightest** mapping that still captures the EQ concept. When a c
 - [`LAB//224690//insp/min//value_[14.0,16.0)`](#lab224690inspminvalue-140160)
 - [`LAB//226499//mL//value_[3150.0,inf)`](#lab226499mlvalue-31500inf)
 - [`LAB//227073//mEq/L//value_[17.0,19.0)`](#lab227073meqlvalue-170190)
-- [`LAB//227445//ng/mL//value_[11.0,20.0)`](#lab227445ngmlvalue-110200)
 - [`LAB//228724//cm//value_[1.5,2.0)`](#lab228724cmvalue-1520)
 - [`LAB//51274//sec//value_[14.1,15.3)`](#lab51274secvalue-141153)
 - [`MEDICATION//Carbidopa-Levodopa (25-100)//Administered`](#medicationcarbidopa-levodopa-25-100administered)
@@ -36,10 +34,12 @@ Default to the **tightest** mapping that still captures the EQ concept. When a c
 - [`MEDS_DEATH`](#meds-death)
 - [`PROCEDURE//ICD//9//7936`](#procedureicd97936)
 - [`TIMELINE//START`](#timelinestart)
+- [`DIAGNOSIS//ICD//9//7295` _(unmapped)_](#diagnosisicd97295)
 - [`LAB//220245//ml/min//value_[173.0,188.0)` _(unmapped)_](#lab220245mlminvalue-17301880)
 - [`LAB//224665//UNK//value_[-inf,0.12)` _(unmapped)_](#lab224665unkvalue-inf012)
 - [`LAB//225640//%//value_[0.3,0.6)` _(unmapped)_](#lab225640value-0306)
 - [`LAB//225672//IU/L//value_[30.0,42.0)` _(unmapped)_](#lab225672iulvalue-300420)
+- [`LAB//227445//ng/mL//value_[11.0,20.0)` _(unmapped)_](#lab227445ngmlvalue-110200)
 - [`LAB//229663//cmH2O//value_[-inf,5.0)` _(unmapped)_](#lab229663cmh2ovalue-inf50)
 - [`LAB//229694//UNK//value_[0.0,inf)` _(unmapped)_](#lab229694unkvalue-00inf)
 - [`LAB//50957//mmol/L//value_[0.5,0.6)` _(unmapped)_](#lab50957mmollvalue-0506)
@@ -63,65 +63,7 @@ Default to the **tightest** mapping that still captures the EQ concept. When a c
 
 **LLM rationale (verbatim):**
 
-> I25.118 is a 5-digit child of I25 (chronic ischemic heart disease) with angina pectoris. The three ETHOS tokens together capture the I25 family semantics; we OR them so any of the three counts as a hit.
-
-_Found under tier(s): icd_crosswalk_
-
-#### Candidate ETHOS token: `ICD//CM//ANGINA_PECTORIS`
-
-- ETHOS vocab count: 4,650
-- Match kind: `literal`
-- Mapping source: `llm:claude_clinical_knowledge`
-- Inferred source: ICD-10-CM 3-char category `I20` -- Angina pectoris
-- Constituent ICD-10-CM codes (7):
-  - `I20.0` -- Unstable angina
-  - `I20.1` -- Angina pectoris with documented spasm
-  - `I20.2` -- Refractory angina pectoris
-  - `I20.8` -- Other forms of angina pectoris
-  - `I20.81` -- Angina pectoris with coronary microvascular dysfunction
-  - `I20.89` -- Other forms of angina pectoris
-  - `I20.9` -- Angina pectoris, unspecified
-
-_Found under tier(s): icd_crosswalk_
-
-#### Candidate ETHOS token: `ICD//CM//ATHEROSCLEROSIS`
-
-- ETHOS vocab count: 12,922
-- Match kind: `literal`
-- Mapping source: `llm:claude_clinical_knowledge`
-- Inferred source: ICD-10-CM 3-char category `I70` -- Atherosclerosis
-- Constituent ICD-10-CM codes (295):
-  - `I70.0` -- Atherosclerosis of aorta
-  - `I70.1` -- Atherosclerosis of renal artery
-  - `I70.2` -- Atherosclerosis of native arteries of the extremities
-  - `I70.20` -- Unspecified atherosclerosis of native arteries of extremities
-  - `I70.201` -- Unspecified atherosclerosis of native arteries of extremities, right leg
-  - `I70.202` -- Unspecified atherosclerosis of native arteries of extremities, left leg
-  - `I70.203` -- Unspecified atherosclerosis of native arteries of extremities, bilateral legs
-  - `I70.208` -- Unspecified atherosclerosis of native arteries of extremities, other extremity
-  - `I70.209` -- Unspecified atherosclerosis of native arteries of extremities, unspecified extremity
-  - `I70.21` -- Atherosclerosis of native arteries of extremities with intermittent claudication
-  - `I70.211` -- Atherosclerosis of native arteries of extremities with intermittent claudication, right leg
-  - `I70.212` -- Atherosclerosis of native arteries of extremities with intermittent claudication, left leg
-  - `I70.213` -- Atherosclerosis of native arteries of extremities with intermittent claudication, bilateral legs
-  - `I70.218` -- Atherosclerosis of native arteries of extremities with intermittent claudication, other extremity
-  - `I70.219` -- Atherosclerosis of native arteries of extremities with intermittent claudication, unspecified extremity
-  - `I70.22` -- Atherosclerosis of native arteries of extremities with rest pain
-  - `I70.221` -- Atherosclerosis of native arteries of extremities with rest pain, right leg
-  - `I70.222` -- Atherosclerosis of native arteries of extremities with rest pain, left leg
-  - `I70.223` -- Atherosclerosis of native arteries of extremities with rest pain, bilateral legs
-  - `I70.228` -- Atherosclerosis of native arteries of extremities with rest pain, other extremity
-  - `I70.229` -- Atherosclerosis of native arteries of extremities with rest pain, unspecified extremity
-  - `I70.23` -- Atherosclerosis of native arteries of right leg with ulceration
-  - `I70.231` -- Atherosclerosis of native arteries of right leg with ulceration of thigh
-  - `I70.232` -- Atherosclerosis of native arteries of right leg with ulceration of calf
-  - `I70.233` -- Atherosclerosis of native arteries of right leg with ulceration of ankle
-  - `I70.234` -- Atherosclerosis of native arteries of right leg with ulceration of heel and midfoot
-  - `I70.235` -- Atherosclerosis of native arteries of right leg with ulceration of other part of foot
-  - `I70.238` -- Atherosclerosis of native arteries of right leg with ulceration of other part of lower leg
-  - `I70.239` -- Atherosclerosis of native arteries of right leg with ulceration of unspecified site
-  - `I70.24` -- Atherosclerosis of native arteries of left leg with ulceration
-  - ... +265 more
+> I25.118 is a 5-digit child of I25 (chronic ischemic heart disease). ICD//CM//CHRONIC_ISCHEMIC_HEART_DISEASE is the I25 3-char category and is the tightest ETHOS bridge that still covers the EQ concept. Earlier candidates ANGINA_PECTORIS (I20, angina without specified atherosclerosis) and ATHEROSCLEROSIS (I70, mostly peripheral and leg atherosclerosis, not coronary) were dropped during precision review since they overshoot the EQ concept.
 
 _Found under tier(s): icd_crosswalk_
 
@@ -299,96 +241,6 @@ _Found under tier(s): icd_crosswalk_
   - `N18.5` -- Chronic kidney disease, stage 5
   - `N18.6` -- End stage renal disease
   - `N18.9` -- Chronic kidney disease, unspecified
-
-**STATUS:** [ ] approve  [ ] reject  [ ] modify
-
-**NOTES:**
-
-```
-
-```
-
-
----
-
-### <a id="diagnosisicd97295"></a>`DIAGNOSIS//ICD//9//7295`
-
-- **Family:** `DIAGNOSIS`
-- **Mapped tiers:** icd_crosswalk
-
-**Authoritative EQ label:** ICD-9-CM `7295` -- Pain in limb
-- SNOMED bridge: Pain in limb (concept_id 138525)
-- ICD-10-CM crosswalk (3 codes):
-  - `M79.6` -- Pain in limb, hand, foot, fingers and toes
-  - `M79.60` -- Pain in limb, unspecified
-  - `M79.609` -- Pain in unspecified limb
-
-**LLM rationale (verbatim):**
-
-> ETHOS has no exact "pain in limb" token. The two listed are the closest semantic proxies (other muscle disorders + general unclassified pain); mapping is loose so the AUC for this code should be interpreted carefully.
-
-_Found under tier(s): icd_crosswalk_
-
-#### Candidate ETHOS token: `ICD//CM//OTHER_DISORDERS_OF_MUSCLE`
-
-- ETHOS vocab count: 4,479
-- Match kind: `literal`
-- Mapping source: `llm:claude_clinical_knowledge`
-- Inferred source: ICD-10-CM 3-char category `M62` -- Other disorders of muscle
-- Constituent ICD-10-CM codes (174):
-  - `M62.0` -- Separation of muscle (nontraumatic)
-  - `M62.00` -- Separation of muscle (nontraumatic), unspecified site
-  - `M62.01` -- Separation of muscle (nontraumatic), shoulder
-  - `M62.011` -- Separation of muscle (nontraumatic), right shoulder
-  - `M62.012` -- Separation of muscle (nontraumatic), left shoulder
-  - `M62.019` -- Separation of muscle (nontraumatic), unspecified shoulder
-  - `M62.02` -- Separation of muscle (nontraumatic), upper arm
-  - `M62.021` -- Separation of muscle (nontraumatic), right upper arm
-  - `M62.022` -- Separation of muscle (nontraumatic), left upper arm
-  - `M62.029` -- Separation of muscle (nontraumatic), unspecified upper arm
-  - `M62.03` -- Separation of muscle (nontraumatic), forearm
-  - `M62.031` -- Separation of muscle (nontraumatic), right forearm
-  - `M62.032` -- Separation of muscle (nontraumatic), left forearm
-  - `M62.039` -- Separation of muscle (nontraumatic), unspecified forearm
-  - `M62.04` -- Separation of muscle (nontraumatic), hand
-  - `M62.041` -- Separation of muscle (nontraumatic), right hand
-  - `M62.042` -- Separation of muscle (nontraumatic), left hand
-  - `M62.049` -- Separation of muscle (nontraumatic), unspecified hand
-  - `M62.05` -- Separation of muscle (nontraumatic), thigh
-  - `M62.051` -- Separation of muscle (nontraumatic), right thigh
-  - `M62.052` -- Separation of muscle (nontraumatic), left thigh
-  - `M62.059` -- Separation of muscle (nontraumatic), unspecified thigh
-  - `M62.06` -- Separation of muscle (nontraumatic), lower leg
-  - `M62.061` -- Separation of muscle (nontraumatic), right lower leg
-  - `M62.062` -- Separation of muscle (nontraumatic), left lower leg
-  - `M62.069` -- Separation of muscle (nontraumatic), unspecified lower leg
-  - `M62.07` -- Separation of muscle (nontraumatic), ankle and foot
-  - `M62.071` -- Separation of muscle (nontraumatic), right ankle and foot
-  - `M62.072` -- Separation of muscle (nontraumatic), left ankle and foot
-  - `M62.079` -- Separation of muscle (nontraumatic), unspecified ankle and foot
-  - ... +144 more
-
-_Found under tier(s): icd_crosswalk_
-
-#### Candidate ETHOS token: `ICD//CM//PAIN_NOT_ELSEWHERE_CLASSIFIED`
-
-- ETHOS vocab count: 35,199
-- Match kind: `literal`
-- Mapping source: `llm:claude_clinical_knowledge`
-- Inferred source: ICD-10-CM 3-char category `G89` -- Pain, not elsewhere classified
-- Constituent ICD-10-CM codes (12):
-  - `G89.0` -- Central pain syndrome
-  - `G89.1` -- Acute pain, not elsewhere classified
-  - `G89.11` -- Acute pain due to trauma
-  - `G89.12` -- Acute post-thoracotomy pain
-  - `G89.18` -- Other acute postprocedural pain
-  - `G89.2` -- Chronic pain, not elsewhere classified
-  - `G89.21` -- Chronic pain due to trauma
-  - `G89.22` -- Chronic post-thoracotomy pain
-  - `G89.28` -- Other chronic postprocedural pain
-  - `G89.29` -- Other chronic pain
-  - `G89.3` -- Neoplasm related pain (acute) (chronic)
-  - `G89.4` -- Chronic pain syndrome
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -1049,27 +901,7 @@ _Found under tier(s): quantile_
 
 **LLM rationale (verbatim):**
 
-> Hemodialysis-output measurement happens during dialysis encounters; we proxy via the dialysis encounter and underlying CKD diagnosis tokens. Loose mapping (predicting indication/encounter, not the measurement).
-
-_Found under tier(s): mimic_item_crosswalk_
-
-#### Candidate ETHOS token: `ICD//CM//CHRONIC_KIDNEY_DISEASE_(CKD)`
-
-- ETHOS vocab count: 84,796
-- Match kind: `literal`
-- Mapping source: `physionet/mimic-iv-demo:icu/d_items.csv+llm`
-- Inferred source: ICD-10-CM 3-char category `N18` -- Chronic kidney disease (CKD)
-- Constituent ICD-10-CM codes (10):
-  - `N18.1` -- Chronic kidney disease, stage 1
-  - `N18.2` -- Chronic kidney disease, stage 2 (mild)
-  - `N18.3` -- Chronic kidney disease, stage 3 (moderate)
-  - `N18.30` -- Chronic kidney disease, stage 3 unspecified
-  - `N18.31` -- Chronic kidney disease, stage 3a
-  - `N18.32` -- Chronic kidney disease, stage 3b
-  - `N18.4` -- Chronic kidney disease, stage 4 (severe)
-  - `N18.5` -- Chronic kidney disease, stage 5
-  - `N18.6` -- End stage renal disease
-  - `N18.9` -- Chronic kidney disease, unspecified
+> Hemodialysis-output measurement happens during dialysis encounters; we proxy via the dialysis encounter (ICD-10-CM Z49). The previously-OR'd CHRONIC_KIDNEY_DISEASE_(CKD) was dropped during precision review -- it includes all CKD stages (1-5) so any patient with mild CKD triggers it, but the EQ measurement only happens during active dialysis.
 
 _Found under tier(s): mimic_item_crosswalk_
 
@@ -1118,60 +950,6 @@ _Found under tier(s): drop_bin_
 - Match kind: `literal`
 - Mapping source: `code:strip_value_bin+upper_units`
 - Inferred source: ETHOS-internal token (no Athena ontology bridge).
-
-**STATUS:** [ ] approve  [ ] reject  [ ] modify
-
-**NOTES:**
-
-```
-
-```
-
-
----
-
-### <a id="lab227445ngmlvalue-110200"></a>`LAB//227445//ng/mL//value_[11.0,20.0)`
-
-- **Family:** `LAB`
-- **Mapped tiers:** mimic_item_crosswalk
-
-**Authoritative EQ label:** MIMIC item-id `227445` -- CK-MB (source: `d_items`)
-- abbreviation: CK-MB
-- category: Labs
-- unitname: None
-- linksto: chartevents
-- EQ-encoded units: `ng/mL`
-
-**LLM rationale (verbatim):**
-
-> CK-MB is ordered when myocardial infarction is suspected; elevated values (the [11, 20) ng/mL bin is clearly elevated -- normal CK-MB is <5 ng/mL) strongly correlate with AMI. Proxy via AMI ICD label.
-
-_Found under tier(s): mimic_item_crosswalk_
-
-#### Candidate ETHOS token: `ICD//CM//ACUTE_MYOCARDIAL_INFARCTION`
-
-- ETHOS vocab count: 13,427
-- Match kind: `literal`
-- Mapping source: `physionet/mimic-iv-demo:icu/d_items.csv+llm`
-- Inferred source: ICD-10-CM 3-char category `I21` -- Acute myocardial infarction
-- Constituent ICD-10-CM codes (17):
-  - `I21.0` -- ST elevation (STEMI) myocardial infarction of anterior wall
-  - `I21.01` -- ST elevation (STEMI) myocardial infarction involving left main coronary artery
-  - `I21.02` -- ST elevation (STEMI) myocardial infarction involving left anterior descending coronary artery
-  - `I21.09` -- ST elevation (STEMI) myocardial infarction involving other coronary artery of anterior wall
-  - `I21.1` -- ST elevation (STEMI) myocardial infarction of inferior wall
-  - `I21.11` -- ST elevation (STEMI) myocardial infarction involving right coronary artery
-  - `I21.19` -- ST elevation (STEMI) myocardial infarction involving other coronary artery of inferior wall
-  - `I21.2` -- ST elevation (STEMI) myocardial infarction of other sites
-  - `I21.21` -- ST elevation (STEMI) myocardial infarction involving left circumflex coronary artery
-  - `I21.29` -- ST elevation (STEMI) myocardial infarction involving other sites
-  - `I21.3` -- ST elevation (STEMI) myocardial infarction of unspecified site
-  - `I21.4` -- Non-ST elevation (NSTEMI) myocardial infarction
-  - `I21.9` -- Acute myocardial infarction, unspecified
-  - `I21.A` -- Other type of myocardial infarction
-  - `I21.A1` -- Myocardial infarction type 2
-  - `I21.A9` -- Other myocardial infarction type
-  - `I21.B` -- Myocardial infarction with coronary microvascular dysfunction
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
@@ -1694,7 +1472,7 @@ _Found under tier(s): exact_
 
 **LLM rationale (verbatim):**
 
-> ETHOS uses chunked ICD-PCS tokens that don't carry procedure semantics directly. We map this procedure to the underlying fracture diagnosis as a proxy: predicting the fracture diagnosis is a reasonable proxy for the reduction procedure. Mapping is loose; AUC interpretation should reflect that we're predicting the indication, not the procedure itself.
+> ETHOS uses chunked ICD-PCS tokens that don't carry procedure semantics directly. We map this procedure to the underlying fracture diagnosis as a proxy: predicting the fracture diagnosis is a reasonable proxy for the reduction procedure. The previously-OR'd FRACTURE_OF_LOWER_LEG_INCLUDING_ANKLE was dropped during precision review since it covers different anatomy than the foot-bone procedure. Mapping is still loose -- AUC interpretation should reflect that we're predicting the indication, not the procedure itself.
 
 _Found under tier(s): icd_crosswalk_
 
@@ -1737,47 +1515,6 @@ _Found under tier(s): icd_crosswalk_
   - `S92.011B` -- Displaced fracture of body of right calcaneus, initial encounter for open fracture
   - ... +1600 more
 
-_Found under tier(s): icd_crosswalk_
-
-#### Candidate ETHOS token: `ICD//CM//FRACTURE_OF_LOWER_LEG_INCLUDING_ANKLE`
-
-- ETHOS vocab count: 4,413
-- Match kind: `literal`
-- Mapping source: `llm:claude_clinical_knowledge`
-- Inferred source: ICD-10-CM 3-char category `S82` -- Fracture of lower leg, including ankle
-- Constituent ICD-10-CM codes (3345):
-  - `S82.0` -- Fracture of patella
-  - `S82.00` -- Unspecified fracture of patella
-  - `S82.001` -- Unspecified fracture of right patella
-  - `S82.001A` -- Unspecified fracture of right patella, initial encounter for closed fracture
-  - `S82.001B` -- Unspecified fracture of right patella, initial encounter for open fracture type I or II
-  - `S82.001C` -- Unspecified fracture of right patella, initial encounter for open fracture type IIIA, IIIB, or IIIC
-  - `S82.001D` -- Unspecified fracture of right patella, subsequent encounter for closed fracture with routine healing
-  - `S82.001E` -- Unspecified fracture of right patella, subsequent encounter for open fracture type I or II with routine healing
-  - `S82.001F` -- Unspecified fracture of right patella, subsequent encounter for open fracture type IIIA, IIIB, or IIIC with routine healing
-  - `S82.001G` -- Unspecified fracture of right patella, subsequent encounter for closed fracture with delayed healing
-  - `S82.001H` -- Unspecified fracture of right patella, subsequent encounter for open fracture type I or II with delayed healing
-  - `S82.001J` -- Unspecified fracture of right patella, subsequent encounter for open fracture type IIIA, IIIB, or IIIC with delayed healing
-  - `S82.001K` -- Unspecified fracture of right patella, subsequent encounter for closed fracture with nonunion
-  - `S82.001M` -- Unspecified fracture of right patella, subsequent encounter for open fracture type I or II with nonunion
-  - `S82.001N` -- Unspecified fracture of right patella, subsequent encounter for open fracture type IIIA, IIIB, or IIIC with nonunion
-  - `S82.001P` -- Unspecified fracture of right patella, subsequent encounter for closed fracture with malunion
-  - `S82.001Q` -- Unspecified fracture of right patella, subsequent encounter for open fracture type I or II with malunion
-  - `S82.001R` -- Unspecified fracture of right patella, subsequent encounter for open fracture type IIIA, IIIB, or IIIC with malunion
-  - `S82.001S` -- Unspecified fracture of right patella, sequela
-  - `S82.002` -- Unspecified fracture of left patella
-  - `S82.002A` -- Unspecified fracture of left patella, initial encounter for closed fracture
-  - `S82.002B` -- Unspecified fracture of left patella, initial encounter for open fracture type I or II
-  - `S82.002C` -- Unspecified fracture of left patella, initial encounter for open fracture type IIIA, IIIB, or IIIC
-  - `S82.002D` -- Unspecified fracture of left patella, subsequent encounter for closed fracture with routine healing
-  - `S82.002E` -- Unspecified fracture of left patella, subsequent encounter for open fracture type I or II with routine healing
-  - `S82.002F` -- Unspecified fracture of left patella, subsequent encounter for open fracture type IIIA, IIIB, or IIIC with routine healing
-  - `S82.002G` -- Unspecified fracture of left patella, subsequent encounter for closed fracture with delayed healing
-  - `S82.002H` -- Unspecified fracture of left patella, subsequent encounter for open fracture type I or II with delayed healing
-  - `S82.002J` -- Unspecified fracture of left patella, subsequent encounter for open fracture type IIIA, IIIB, or IIIC with delayed healing
-  - `S82.002K` -- Unspecified fracture of left patella, subsequent encounter for closed fracture with nonunion
-  - ... +3315 more
-
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
 
 **NOTES:**
@@ -1810,6 +1547,36 @@ _Found under tier(s): mimic_item_crosswalk_
 - Inferred source: ETHOS hospital-admission marker (synthetic event token).
 
 **STATUS:** [ ] approve  [ ] reject  [ ] modify
+
+**NOTES:**
+
+```
+
+```
+
+
+---
+
+### <a id="diagnosisicd97295"></a>`DIAGNOSIS//ICD//9//7295` _(unmapped)_
+
+- **Family:** `DIAGNOSIS`
+- **Mapped tiers:** (none)
+
+**Authoritative EQ label:** ICD-9-CM `7295` -- Pain in limb
+- SNOMED bridge: Pain in limb (concept_id 138525)
+- ICD-10-CM crosswalk (3 codes):
+  - `M79.6` -- Pain in limb, hand, foot, fingers and toes
+  - `M79.60` -- Pain in limb, unspecified
+  - `M79.609` -- Pain in unspecified limb
+
+**Unmapped reason (from mapping_coverage):** `ethos_token_missing/diagnosis_uses_descriptive_label_not_icd_code`
+
+**YAML rationale (`crosswalks/mimic_items.yaml`):**
+
+- description: Pain in soft tissues of limb (ICD-9 729.5)
+- reason: ETHOS has no specific limb-pain or musculoskeletal-pain ICD-10-CM 3-char category. The previously-proposed proxies OTHER_DISORDERS_OF_MUSCLE (M62, generic muscle disorder grab-bag) and PAIN_NOT_ELSEWHERE_CLASSIFIED (R52, unspecified pain) were dropped during precision review -- both overshoot to unrelated conditions and neither captures the limb-specific clinical concept.
+
+**STATUS:** [ ] confirm no ETHOS counterpart  [ ] propose a candidate (notes below)
 
 **NOTES:**
 
@@ -1919,6 +1686,36 @@ _No `unmappable_with_rationale` entry in `crosswalks/mimic_items.yaml`._
 **Unmapped reason (from mapping_coverage):** `value_bin_or_units_unmatched`
 
 _No `unmappable_with_rationale` entry in `crosswalks/mimic_items.yaml`._
+
+**STATUS:** [ ] confirm no ETHOS counterpart  [ ] propose a candidate (notes below)
+
+**NOTES:**
+
+```
+
+```
+
+
+---
+
+### <a id="lab227445ngmlvalue-110200"></a>`LAB//227445//ng/mL//value_[11.0,20.0)` _(unmapped)_
+
+- **Family:** `LAB`
+- **Mapped tiers:** (none)
+
+**Authoritative EQ label:** MIMIC item-id `227445` -- CK-MB (source: `d_items`)
+- abbreviation: CK-MB
+- category: Labs
+- unitname: None
+- linksto: chartevents
+- EQ-encoded units: `ng/mL`
+
+**Unmapped reason (from mapping_coverage):** `value_bin_or_units_unmatched`
+
+**YAML rationale (`crosswalks/mimic_items.yaml`):**
+
+- description: CK-MB elevated bin (cardiac biomarker, MIMIC chartevents 227445)
+- reason: Removed during precision review. The previously-proposed bridge ACUTE_MYOCARDIAL_INFARCTION is a behavioral proxy (CK-MB elevation correlates with AMI but also with post-cardiac-surgery state, myocarditis, severe renal failure, rhabdomyolysis), not a vocabulary equivalence. Predicting "AMI Dx appears" when "elevated CK-MB measurement appears" yields asymmetric false positives and false negatives depending on cohort composition. No tighter ETHOS token is available; safer to mark unmappable than to score the loose proxy.
 
 **STATUS:** [ ] confirm no ETHOS counterpart  [ ] propose a candidate (notes below)
 
