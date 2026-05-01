@@ -43,6 +43,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 from hydra.utils import instantiate
+from lightning.pytorch.callbacks import BasePredictionWriter
 from meds import held_out_split, tuning_split
 from omegaconf import DictConfig
 
@@ -196,86 +197,30 @@ def _check_vocab(task_codes: set[str], train_cfg: DictConfig) -> None:
         )
 
 
-def _gather_probabilities(pred_batches: list[dict[str, torch.Tensor]]) -> pl.DataFrame:
-    """Flatten Lightning's per-batch ``predict_step`` dicts into a two-column probabilities frame.
-
-    Returns ``(censor_prob, occurs_prob)`` in dataset iteration order.  Column names
-    come from :class:`PredictionSchema` so a rename on the schema flows through.
-
-    ``logits_to_probs`` does a trailing ``.squeeze()``, so a single-item batch emits a
-    0-d scalar tensor that ``torch.cat`` refuses to stack — ``reshape(-1)`` on every
-    per-batch tensor makes the concat well-defined regardless of batch size.
-    """
-    if not pred_batches:
-        return pl.DataFrame(
-            schema={
-                PredictionSchema.censor_prob_name: pl.Float32,
-                PredictionSchema.occurs_prob_name: pl.Float32,
-            }
-        )
-
-    def cat(key: str) -> pl.Series:
-        # ``PredictionSchema.{censor,occurs}_prob`` are ``pa.float32()`` — cast here
-        # so the final ``PredictionSchema.align`` doesn't have to coerce f64 → f32.
-        return pl.Series(torch.cat([b[key].reshape(-1) for b in pred_batches]).numpy()).cast(pl.Float32)
-
-    return pl.DataFrame(
-        {
-            PredictionSchema.censor_prob_name: cat("censor_probs"),
-            PredictionSchema.occurs_prob_name: cat("occurs_probs"),
-        }
-    )
-
-
 _EMBEDDING_COLUMN = "embedding"
 
 
-def _gather_embeddings(pred_batches: list[dict[str, torch.Tensor]], hidden_size: int) -> pl.DataFrame:
-    """Flatten Lightning's per-batch ``predict_step`` ``query_embed`` tensors into a one-column frame.
+def _embedding_batch_to_arrow(query_embed: torch.Tensor, hidden_size: int) -> pa.FixedSizeListArray:
+    """Build a single-batch ``fixed_size_list<float32>[hidden_size]`` array from ``query_embed``.
 
-    Mirrors :func:`_gather_probabilities`: concatenates each batch's
-    ``query_embed`` along dim 0 and returns a single-column polars frame whose
-    ``embedding`` column is backed by an arrow ``fixed_size_list<float32>[hidden_size]``.
-    Going through ``pa.FixedSizeListArray.from_arrays`` and ``pl.from_arrow``
-    preserves the fixed-width invariant onto the eventual parquet write.
-
-    ``hidden_size`` is required so the empty-batch case (degenerate cohort that
-    produces zero predictions) still emits a fixed-size-list-typed column on
-    disk — falling back to a variable-length ``list<float32>`` would silently
-    diverge from the documented sidecar schema.
+    The streaming writer calls this once per ``write_on_batch_end`` to produce the
+    per-batch embedding column.  Pre-building a fixed-size-list arrow array (rather
+    than letting polars infer a variable-length list) preserves the documented
+    sidecar schema across every row group of the streamed parquet — including the
+    empty-cohort case, where the writer's pre-built schema in :meth:`setup`
+    pins the same fixed-size-list type with no rows.
 
     Examples:
-        Two batches of three rows each with hidden_size=4:
+        Three rows with hidden_size=4:
 
-        >>> b1 = {"query_embed": torch.arange(12, dtype=torch.float32).reshape(3, 4)}
-        >>> b2 = {"query_embed": torch.arange(12, 20, dtype=torch.float32).reshape(2, 4)}
-        >>> df = _gather_embeddings([b1, b2], hidden_size=4)
-        >>> df.height
-        5
-        >>> df.columns
-        ['embedding']
-        >>> df.to_arrow().schema.field("embedding").type
+        >>> arr = _embedding_batch_to_arrow(torch.arange(12, dtype=torch.float32).reshape(3, 4), 4)
+        >>> arr.type
         FixedSizeListType(fixed_size_list<item: float>[4])
-
-        Empty input still produces a fixed-size-list-typed frame so the
-        on-disk sidecar schema matches the documented contract regardless of
-        cohort size:
-
-        >>> empty = _gather_embeddings([], hidden_size=4)
-        >>> empty.height
-        0
-        >>> empty.columns
-        ['embedding']
-        >>> empty.to_arrow().schema.field("embedding").type
-        FixedSizeListType(fixed_size_list<item: float>[4])
+        >>> len(arr)
+        3
     """
-    if pred_batches:
-        embeddings = torch.cat([b["query_embed"] for b in pred_batches], dim=0)
-        flat = pa.array(embeddings.reshape(-1).numpy().astype("float32"), type=pa.float32())
-    else:
-        flat = pa.array([], type=pa.float32())
-    fixed = pa.FixedSizeListArray.from_arrays(flat, hidden_size)
-    return pl.from_arrow(pa.table({_EMBEDDING_COLUMN: fixed}))
+    flat = pa.array(query_embed.reshape(-1).numpy().astype("float32"), type=pa.float32())
+    return pa.FixedSizeListArray.from_arrays(flat, hidden_size)
 
 
 def _identifiers_from_schema_df(schema_df: pl.DataFrame) -> pl.DataFrame:
@@ -306,6 +251,161 @@ def _identifiers_from_schema_df(schema_df: pl.DataFrame) -> pl.DataFrame:
             .alias(TaskQuerySchema.boolean_value_name)
         )
     return out
+
+
+class _StreamingPredictionWriter(BasePredictionWriter):
+    """Lightning ``BasePredictionWriter`` that streams per-batch results to single parquets.
+
+    Writes probabilities to ``output_parquet`` and (when ``embeddings_output_parquet``
+    is set) pooled query embeddings to that sibling.  Each ``write_on_batch_end``
+    call appends one row group to each open writer so EQ_predict's CPU-memory
+    footprint doesn't scale with cohort size — only one batch's ``predict_step``
+    dict is alive at a time (Lightning drops it after the writer hook returns when
+    ``return_predictions=False``).
+
+    Identifiers come from slicing the dataset's pre-loaded ``schema_df`` with a running
+    offset; correctness depends on the dataloader iterating in ``schema_df`` row order,
+    which ``main()`` enforces via the ``SequentialSampler`` guard.
+
+    Partial-write semantics: ``close()`` is idempotent and is invoked from ``main()``'s
+    ``try/finally`` block, so a Python-level exception mid-stream still flushes both
+    parquet footers and leaves valid files covering exactly the batches that completed.
+    Hard kills (SIGKILL) cannot be recovered — parquet has no append-after-close, so
+    single-file streaming has no defense against them.
+    """
+
+    def __init__(
+        self,
+        output_parquet: Path,
+        schema_df: pl.DataFrame,
+        embeddings_output_parquet: Path | None = None,
+        hidden_size: int | None = None,
+    ) -> None:
+        super().__init__(write_interval="batch")
+        if embeddings_output_parquet is not None and hidden_size is None:
+            raise ValueError(
+                "embeddings_output_parquet requires hidden_size — needed to build the "
+                "fixed-size-list arrow schema for the streamed embeddings sibling."
+            )
+        self._output_parquet = output_parquet
+        self._schema_df = schema_df
+        self._embeddings_output_parquet = embeddings_output_parquet
+        self._hidden_size = hidden_size
+        self._writer: pq.ParquetWriter | None = None
+        self._emb_writer: pq.ParquetWriter | None = None
+        self._offset: int = 0
+        self._arrow_schema: pa.Schema | None = None
+        self._emb_arrow_schema: pa.Schema | None = None
+
+    def setup(self, trainer, pl_module, stage: str) -> None:
+        if stage != "predict":
+            return
+        # Pre-build the canonical arrow schema from a zero-row aligned table.  Doing
+        # this up front (rather than on the first batch) means an empty cohort still
+        # produces a valid PredictionSchema parquet — matches the pre-streaming
+        # behavior where the gather helpers returned an empty frame and the
+        # final ``pq.write_table`` still ran.
+        empty_ids = _identifiers_from_schema_df(self._schema_df.head(0))
+        empty_probs = pl.DataFrame(
+            schema={
+                PredictionSchema.censor_prob_name: pl.Float32,
+                PredictionSchema.occurs_prob_name: pl.Float32,
+            }
+        )
+        empty_aligned = PredictionSchema.align(empty_ids.hstack(empty_probs).to_arrow())
+        self._arrow_schema = empty_aligned.schema
+
+        self._output_parquet.parent.mkdir(parents=True, exist_ok=True)
+        self._writer = pq.ParquetWriter(self._output_parquet, schema=self._arrow_schema)
+
+        if self._embeddings_output_parquet is not None:
+            empty_ids_arrow = empty_ids.to_arrow()
+            empty_emb = pa.FixedSizeListArray.from_arrays(pa.array([], type=pa.float32()), self._hidden_size)
+            empty_emb_table = empty_ids_arrow.append_column(_EMBEDDING_COLUMN, empty_emb)
+            self._emb_arrow_schema = empty_emb_table.schema
+            self._embeddings_output_parquet.parent.mkdir(parents=True, exist_ok=True)
+            self._emb_writer = pq.ParquetWriter(
+                self._embeddings_output_parquet, schema=self._emb_arrow_schema
+            )
+
+    def write_on_batch_end(
+        self,
+        trainer,
+        pl_module,
+        prediction: dict[str, torch.Tensor],
+        batch_indices,
+        batch,
+        batch_idx: int,
+        dataloader_idx: int = 0,
+    ) -> None:
+        if self._writer is None:
+            raise RuntimeError(
+                "_StreamingPredictionWriter received a batch before setup() opened the "
+                "parquet writer.  This shouldn't happen in normal predict flow."
+            )
+
+        n = prediction["occurs_probs"].reshape(-1).numel()
+        if n == 0:
+            return
+
+        identifiers = _identifiers_from_schema_df(self._schema_df.slice(self._offset, n))
+        # Cast to Float32 here so the per-batch ``PredictionSchema.align`` doesn't have
+        # to coerce f64 → f32 every row group.
+        probs = pl.DataFrame(
+            {
+                PredictionSchema.censor_prob_name: pl.Series(
+                    prediction["censor_probs"].reshape(-1).numpy()
+                ).cast(pl.Float32),
+                PredictionSchema.occurs_prob_name: pl.Series(
+                    prediction["occurs_probs"].reshape(-1).numpy()
+                ).cast(pl.Float32),
+            }
+        )
+        aligned = PredictionSchema.align(identifiers.hstack(probs).to_arrow())
+        self._writer.write_table(aligned)
+
+        if self._emb_writer is not None:
+            emb_arr = _embedding_batch_to_arrow(prediction["query_embed"], self._hidden_size)
+            emb_table = identifiers.to_arrow().append_column(_EMBEDDING_COLUMN, emb_arr)
+            self._emb_writer.write_table(emb_table)
+
+        self._offset += n
+
+    def close(self) -> None:
+        """Idempotent close — safe to call from both Lightning's teardown and main()'s finally."""
+        if self._writer is not None:
+            self._writer.close()
+            self._writer = None
+        if self._emb_writer is not None:
+            self._emb_writer.close()
+            self._emb_writer = None
+
+    def teardown(self, trainer, pl_module, stage: str) -> None:
+        # Defense-in-depth: ``main()``'s ``try/finally`` is the primary closer.
+        if stage == "predict":
+            self.close()
+
+
+def _check_single_process_trainer(trainer) -> None:
+    """Refuse multi-process predict — :class:`_StreamingPredictionWriter` assumes one rank.
+
+    The writer opens a single ``output_parquet`` (and optionally an embeddings sibling)
+    and tracks a process-local offset into ``schema_df``.  Under multi-process predict
+    (DDP / multi-device / multi-node), every rank would open the same paths and start
+    slicing ``schema_df`` from offset 0 — corrupting the parquets and mispairing
+    probabilities with identifiers.  ``setup_model`` instantiates the trainer from the
+    saved training config, so a model trained with ``trainer.devices > 1`` carries that
+    strategy into predict.  Predict is single-pass by design (see module docstring);
+    refuse loudly rather than write corrupted output.
+    """
+    if trainer.world_size > 1:
+        raise RuntimeError(
+            f"EQ_predict requires single-process prediction, but the trainer instantiated from "
+            f"the training config has world_size={trainer.world_size} "
+            f"(num_devices={trainer.num_devices}, num_nodes={trainer.num_nodes}).  "
+            f"Override the run dir's resolved_config.yaml to set "
+            f"trainer.devices=1, trainer.strategy=auto, trainer.num_nodes=1 before running predict."
+        )
 
 
 def _derive_embeddings_path(output_parquet: Path) -> Path:
@@ -345,6 +445,24 @@ def _derive_timing_path(output_parquet: Path) -> Path:
         PosixPath('/tmp/predictions.timing.parquet')
     """
     return output_parquet.with_suffix(".timing" + output_parquet.suffix)
+
+
+def _tmp_path(p: Path) -> Path:
+    """Return a sibling ``.tmp`` path used as the streaming target before atomic rename.
+
+    Appending ``.tmp`` to the full file name (rather than swapping the suffix)
+    keeps the original parquet suffix in the temp name — useful when grepping
+    for stray temp files left by hard kills, and avoids any tooling that keys
+    off the ``.parquet`` extension misinterpreting the partial file.
+
+    Examples:
+        >>> _tmp_path(Path("/tmp/predictions.parquet"))
+        PosixPath('/tmp/predictions.parquet.tmp')
+
+        >>> _tmp_path(Path("/a/predictions.embeddings.parquet"))
+        PosixPath('/a/predictions.embeddings.parquet.tmp')
+    """
+    return p.with_name(p.name + ".tmp")
 
 
 _SPLIT_TO_DATAMODULE_ATTRS: dict[str, tuple[str, str]] = {
@@ -397,6 +515,8 @@ def main(cfg: DictConfig) -> None:
     logger.info(f"Loading tasks from {tasks_dir} (split={split})")
 
     train_cfg, model, trainer = setup_model(model_run_dir, ckpt_name=ckpt_name)
+    _check_single_process_trainer(trainer)
+
     batch_size_override = cfg.get("batch_size")
     if batch_size_override is not None:
         train_cfg.datamodule.batch_size = int(batch_size_override)
@@ -423,66 +543,94 @@ def main(cfg: DictConfig) -> None:
     _check_vocab(set(dataset.query.unique().to_list()), train_cfg)
     logger.info(f"Loaded {len(dataset)} tasks across {dataset.query.n_unique()} query codes")
 
+    # Stream per-batch predictions to a ``.tmp`` sibling of ``output_parquet`` (and
+    # the optional embeddings sibling) so memory doesn't scale with cohort size.
+    # The callback opens the parquet writers in ``setup``, appends one row group per
+    # batch in ``write_on_batch_end``, and is closed by the ``finally`` below
+    # (idempotent — Lightning's ``teardown`` also calls ``close()``).  Pairing this
+    # with ``return_predictions=False`` means Lightning drops each batch's
+    # ``predict_step`` dict as soon as the writer hook returns.
+    #
+    # On full success (predict completes, row-count invariant holds, timing
+    # parquet flushed) all temp files are atomically renamed onto the canonical
+    # paths via ``Path.replace`` so the canonical paths are guaranteed complete.
+    # On a soft failure (Python exception / KeyboardInterrupt) the writer is
+    # still ``close()``'d so the partial parquet's footer is flushed — leaving a
+    # viewable forensic ``.tmp`` on disk that downstream consumers won't pick up
+    # (canonical path stays absent).  A subsequent successful run truncates the
+    # stale ``.tmp`` via the new ``ParquetWriter``; manual ``rm`` clears it
+    # otherwise.  Hard kills (SIGKILL) leave a footer-less ``.tmp`` that needs
+    # recovery tooling to read — unavoidable property of streaming parquet.
+    output_tmp = _tmp_path(output_parquet)
+    embeddings_tmp = _tmp_path(embeddings_output_parquet) if embeddings_output_parquet is not None else None
+    timing_tmp = _tmp_path(timing_output_parquet)
+
+    hidden_size = model.model.HF_model.config.hidden_size if save_embeddings else None
+    writer = _StreamingPredictionWriter(
+        output_tmp,
+        dataset.schema_df,
+        embeddings_output_parquet=embeddings_tmp,
+        hidden_size=hidden_size,
+    )
+    trainer.callbacks.append(writer)
+
     # Pass the split's dataloader directly — MTD's ``Datamodule`` has no
     # ``predict_dataloader``, so ``trainer.predict(datamodule=D)`` would hit the base
     # class's ``MisconfigurationException``.  The SequentialSampler check above
     # guarantees order preservation.
     t0 = time.perf_counter()
-    pred_batches = trainer.predict(model=model, dataloaders=dataloader, ckpt_path=None)
-    total_seconds = time.perf_counter() - t0
+    try:
+        trainer.predict(model=model, dataloaders=dataloader, ckpt_path=None, return_predictions=False)
+        # Success-path invariant — MTD guarantees ``schema_df`` preserves the input
+        # labels frame's length + order, so the writer should have streamed one
+        # prediction per schema_df row.  A mismatch is a silent invariant violation;
+        # fail loudly so the rename below never runs.
+        if writer._offset != dataset.schema_df.height:
+            raise RuntimeError(
+                f"Prediction row count ({writer._offset}) doesn't match dataset row count "
+                f"({dataset.schema_df.height}).  This is an MTD invariant violation — "
+                f"the dataloader should have yielded one prediction per schema_df row."
+            )
+        writer.close()
+        total_seconds = time.perf_counter() - t0
 
-    probs = _gather_probabilities(pred_batches)
-    identifiers = _identifiers_from_schema_df(dataset.schema_df)
-
-    # MTD guarantees ``schema_df`` preserves the input labels frame's length + order
-    # (see ``get_task_seq_bounds_and_labels`` docstring), and the dataloader is
-    # ``shuffle=False`` — so ``probs`` comes back 1:1 matched with ``identifiers``.
-    # A row-count mismatch would indicate a silent invariant violation; fail loudly.
-    if probs.height != identifiers.height:
-        raise RuntimeError(
-            f"Prediction row count ({probs.height}) doesn't match dataset row count "
-            f"({identifiers.height}).  This is an MTD invariant violation — "
-            f"the dataloader should have yielded one prediction per schema_df row."
+        n_rows = dataset.schema_df.height
+        n_tasks = dataset.schema_df.select(["query", "duration_days"]).unique().height
+        timing_table = pa.table(
+            {
+                "total_seconds": pa.array([total_seconds], type=pa.float64()),
+                "n_rows": pa.array([n_rows], type=pa.int64()),
+                "n_tasks": pa.array([n_tasks], type=pa.int64()),
+                "seconds_per_row": pa.array([total_seconds / n_rows if n_rows else 0.0], type=pa.float64()),
+                "seconds_per_task": pa.array(
+                    [total_seconds / n_tasks if n_tasks else 0.0], type=pa.float64()
+                ),
+            }
         )
+        timing_tmp.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(timing_table, timing_tmp)
 
-    out = identifiers.hstack(probs)
+        # Atomic rename phase.  ``Path.replace`` is per-file atomic on POSIX; the
+        # multi-file window between renames is microseconds vs. the minutes-long
+        # streaming window, so a crash here is vastly less likely to leave a
+        # partial set than streaming directly to the final paths.
+        output_tmp.replace(output_parquet)
+        if embeddings_tmp is not None and embeddings_output_parquet is not None:
+            embeddings_tmp.replace(embeddings_output_parquet)
+        timing_tmp.replace(timing_output_parquet)
+    except BaseException:
+        # Flush parquet footers so the partial ``.tmp`` files are viewable for
+        # forensics; do NOT unlink — canonical paths stay absent because the
+        # rename block never ran, so no consumer will mistake a partial for a
+        # finished run.  Stale ``.tmp`` files are overwritten by the next
+        # successful run or removed manually.
+        writer.close()
+        raise
 
-    output_parquet.parent.mkdir(parents=True, exist_ok=True)
-    # Final canonicalization pass — ``align`` casts / reorders columns to match the
-    # schema's canonical arrow layout, and we write the aligned arrow table directly
-    # via pyarrow so the schema-coerced dtypes actually land on disk (a polars
-    # round-trip would re-infer types from the aligned data, which defeats the point).
-    aligned = PredictionSchema.align(out.to_arrow())
-    pq.write_table(aligned, output_parquet)
-    logger.info(f"Wrote {out.height} predictions to {output_parquet}")
-
-    n_rows = dataset.schema_df.height
-    n_tasks = dataset.schema_df.select(["query", "duration_days"]).unique().height
-    timing_table = pa.table(
-        {
-            "total_seconds": pa.array([total_seconds], type=pa.float64()),
-            "n_rows": pa.array([n_rows], type=pa.int64()),
-            "n_tasks": pa.array([n_tasks], type=pa.int64()),
-            "seconds_per_row": pa.array([total_seconds / n_rows if n_rows else 0.0], type=pa.float64()),
-            "seconds_per_task": pa.array([total_seconds / n_tasks if n_tasks else 0.0], type=pa.float64()),
-        }
-    )
-    timing_output_parquet.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(timing_table, timing_output_parquet)
-    logger.info(f"Wrote timing ({total_seconds:.2f}s, {n_tasks} tasks) to {timing_output_parquet}")
-
+    logger.info(f"Wrote {writer._offset} predictions to {output_parquet}")
     if embeddings_output_parquet is not None:
-        # ``hidden_size`` comes from the model's own config so the sidecar's
-        # ``fixed_size_list<float32>[hidden_size]`` schema is well-defined even
-        # for a degenerate empty cohort that produces zero predict batches.
-        # The model object is already owned here (returned by ``setup_model``
-        # and passed into ``trainer.predict``), so reading the property is not
-        # additional coupling.
-        hidden_size = model.model.HF_model.config.hidden_size
-        embeddings_out = identifiers.hstack(_gather_embeddings(pred_batches, hidden_size))
-        embeddings_output_parquet.parent.mkdir(parents=True, exist_ok=True)
-        pq.write_table(embeddings_out.to_arrow(), embeddings_output_parquet)
-        logger.info(f"Wrote {embeddings_out.height} embeddings to {embeddings_output_parquet}")
+        logger.info(f"Wrote {writer._offset} embeddings to {embeddings_output_parquet}")
+    logger.info(f"Wrote timing ({total_seconds:.2f}s, {n_tasks} tasks) to {timing_output_parquet}")
 
 
 if __name__ == "__main__":
