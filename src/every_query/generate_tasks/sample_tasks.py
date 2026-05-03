@@ -15,11 +15,13 @@ produce identical labels — determinism comes from :func:`~every_query.utils.se
 splitting the task and context axes, not from persisted intermediate state.  Set
 ``overwrite=true`` to regenerate labels for a worker whose output file already exists.
 
-Design decisions (see issue #33):
-- **Seeding**: tasks-seed depends only on ``(seed, task_shard)``, contexts-seed depends on
-  ``(seed, input_shard, task_shard)``. Fixing ``task_shard`` and varying ``input_shard`` evaluates the
-  *same* tasks on *different* patients; fixing ``input_shard`` and varying ``task_shard`` evaluates
-  *different* tasks on *different* patients; the full sweep covers the product.
+Design decisions (see issues #33, #182):
+- **Seeding**: both tasks-seed and contexts-seed depend on ``(seed, input_shard, task_shard)``.
+  Every ``(input_shard, task_shard)`` worker draws independently, so a ``K × T`` sweep
+  produces ``K × T × n_tasks`` unique ``(code, duration_days)`` pairs. Prior to #182 the
+  tasks-seed depended only on ``(seed, task_shard)``, which silently capped unique tasks at
+  ``T × n_tasks`` regardless of how many input shards the sweep walked — a same-tasks-different-
+  patients symmetry that was implicit semantic policy and is no longer the default.
 - **Task composition**: draw ``N`` tasks once and ``N x M`` contexts once, then zip them. Mathematically
   equivalent to ``N`` independent per-task draws under iid sampling, with one seed per side.
 - **Censoring**: computed from ``max_time`` per subject (one groupby up-front per shard). Censored
@@ -485,6 +487,14 @@ def run_worker(
     protocol.  Determinism comes from :func:`derive_seed` separating the task and context
     axes; a rerun with identical inputs produces identical labels.
 
+    Both the tasks-seed and the contexts-seed depend on ``(seed, input_shard, task_shard)``.
+    The previous behaviour — tasks-seed depending only on ``(seed, task_shard)`` and intentionally
+    drawing the same task list across input shards for a fixed ``task_shard`` — duplicated unique
+    `(code, duration)` pairs by a factor of ``K`` for any sweep with ``K`` input shards, capping
+    pretraining task variety at ``T × n_tasks`` regardless of how many input shards the sweep walked.
+    See payalchandak/EveryQuery#182 for the motivation; the cardinality contract for a
+    ``K × T`` sweep is now ``K × T × n_tasks`` unique tasks (instead of ``T × n_tasks``).
+
     Returns:
         The path of the labeled parquet, or ``None`` if labels already existed at that path
         and ``overwrite=False``.
@@ -496,7 +506,7 @@ def run_worker(
         return None
 
     query_codes = read_query_codes(codes_dir)
-    tasks_seed = derive_seed(seed, "tasks", task_shard)
+    tasks_seed = derive_seed(seed, "tasks", input_shard, task_shard)
     tasks = sample_tasks(
         n=n_tasks,
         query_codes=query_codes,

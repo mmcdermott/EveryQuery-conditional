@@ -539,14 +539,18 @@ class TestRunWorkerPipeline:
 
         assert _task_multiset(labels_a_fp) != _task_multiset(labels_b_fp)
 
-    def test_input_shard_axis_preserves_tasks(self, tmp_path, synthetic_events, synthetic_query_codes):
-        """Fixing ``task_shard`` and varying ``input_shard`` keeps the same tasks but draws *different*
-        contexts.
+    def test_input_shard_axis_changes_tasks_and_contexts(
+        self, tmp_path, synthetic_events, synthetic_query_codes
+    ):
+        """Fixing ``task_shard`` and varying ``input_shard`` must change *both* the sampled tasks
+        and the sampled contexts.
 
-        This is what enables ``hydra -m input_shard=range(K)`` to evaluate *the same* sampled tasks
-        across every shard — a key property for producing a coherent PT dataset — while ensuring
-        each shard's worker draws independent contexts (otherwise parallelism across shards
-        would be statistically wasteful).
+        Both seeds depend on ``(seed, input_shard, task_shard)``, so per-worker draws are
+        statistically independent across the input-shard axis. This is what gives a ``K × T``
+        sweep the full ``K × T × n_tasks`` unique-task cardinality (instead of the prior
+        ``T × n_tasks`` cap).
+
+        See payalchandak/EveryQuery#182.
         """
         data_dir, codes_dir = _write_fake_cohort(
             tmp_path, synthetic_events, synthetic_query_codes, shard_name="0"
@@ -577,18 +581,63 @@ class TestRunWorkerPipeline:
         df_0 = pl.read_parquet(labels_0_fp)
         df_1 = pl.read_parquet(labels_1_fp)
 
-        # Same tasks across input shards (task_seed depends only on task_shard).
+        # Tasks differ across input shards (tasks_seed now includes input_shard).
         tasks_0 = sorted(set(zip(df_0["query"].to_list(), df_0["duration_days"].to_list(), strict=True)))
         tasks_1 = sorted(set(zip(df_1["query"].to_list(), df_1["duration_days"].to_list(), strict=True)))
-        assert tasks_0 == tasks_1, "tasks should be identical across input_shards at fixed task_shard"
+        assert tasks_0 != tasks_1, (
+            "tasks should differ across input_shards at fixed task_shard "
+            "(tasks_seed depends on both axes after #182)"
+        )
 
-        # ... but the sampled context pairs must differ (context_seed depends on both axes).
+        # Contexts differ across input shards too (contexts_seed depends on both axes).
         pairs_0 = set(df_0.select("subject_id", "prediction_time").iter_rows())
         pairs_1 = set(df_1.select("subject_id", "prediction_time").iter_rows())
         assert pairs_0 != pairs_1, (
             "contexts should differ across input_shards at fixed task_shard "
             "(contexts_seed depends on both axes)"
         )
+
+    def test_task_shard_axis_changes_tasks_at_fixed_input_shard(
+        self, tmp_path, synthetic_events, synthetic_query_codes
+    ):
+        """Belt-and-suspenders: confirm task_shard is still a meaningful sampling axis after the
+        seeding change. (The original ``test_task_shard_axis_changes_tasks`` covers this with
+        the original seeding scheme; this duplicate makes the post-#182 contract explicit.)
+        """
+        data_dir, codes_dir = _write_fake_cohort(
+            tmp_path, synthetic_events, synthetic_query_codes, shard_name="0"
+        )
+        out_dir = tmp_path / "out"
+        kwargs = {
+            "data_dir": data_dir,
+            "codes_dir": codes_dir,
+            "out_dir": out_dir,
+            "split": "train",
+            "input_shard": "0",
+            "seed": 1,
+            "n_tasks": 16,
+            "contexts_per_task": 1,
+            "duration_min": 10,
+            "duration_max": 365,
+            "min_context_per_subject": 5,
+        }
+        labels_a_fp = run_worker(task_shard=0, **kwargs)
+        labels_b_fp = run_worker(task_shard=1, **kwargs)
+        tasks_a = set(
+            zip(
+                pl.read_parquet(labels_a_fp)["query"].to_list(),
+                pl.read_parquet(labels_a_fp)["duration_days"].to_list(),
+                strict=True,
+            )
+        )
+        tasks_b = set(
+            zip(
+                pl.read_parquet(labels_b_fp)["query"].to_list(),
+                pl.read_parquet(labels_b_fp)["duration_days"].to_list(),
+                strict=True,
+            )
+        )
+        assert tasks_a != tasks_b
 
     def test_stale_labels_on_config_change_without_overwrite(
         self, tmp_path, synthetic_events, synthetic_query_codes
