@@ -186,14 +186,114 @@ def find_checkpoint_path(output_dir: Path) -> Path | None:
 
 
 def _init_env() -> None:
-    """Validate required env vars and configure thread counts for polars/OMP."""
-    from every_query.utils._env import ensure_env
+    """Load ``.env`` and configure thread counts for polars/OMP.
 
-    ensure_env()
+    Env-var *validation* is config-aware and happens in :func:`validate_training_config`
+    once Hydra has composed the config — a CLI path override means the backing env var
+    need not be set at all.  See #184.
+    """
+    from every_query.utils._env import load_env
+
+    load_env()
     num_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 1))
     threads_per_file = max(1, num_cpus // 10)
     os.environ["POLARS_MAX_THREADS"] = str(threads_per_file)
     os.environ["OMP_NUM_THREADS"] = str(threads_per_file)
+
+
+def _is_wandb_logger(logger_cfg: Any) -> bool:
+    """True if a resolved ``trainer.logger`` entry is a WandB logger config.
+
+    Examples:
+        >>> from omegaconf import OmegaConf
+        >>> wandb = OmegaConf.create({"_target_": "pytorch_lightning.loggers.wandb.WandbLogger"})
+        >>> _is_wandb_logger(wandb)
+        True
+        >>> _is_wandb_logger(OmegaConf.create({"_target_": "lightning.pytorch.loggers.CSVLogger"}))
+        False
+        >>> _is_wandb_logger(False)
+        False
+        >>> _is_wandb_logger(None)
+        False
+    """
+    if isinstance(logger_cfg, DictConfig):
+        return "WandbLogger" in str(logger_cfg.get("_target_", ""))
+    return False
+
+
+def validate_training_config(cfg: DictConfig) -> None:
+    """Validate the *resolved* training config after Hydra composition.
+
+    Replaces the old blind ``REQUIRED_ENV_VARS`` presence gate (see #184).  A CLI
+    override can supply any of these paths without the backing env var being set, so we
+    check the resolved config *values* rather than env-var presence.
+    ``OmegaConf.select`` with ``throw_on_resolution_failure=False`` turns an unset
+    ``${oc.env:...}`` interpolation into ``None`` rather than a cryptic
+    ``InterpolationResolutionError`` mid-run.
+
+    Raises:
+        SystemExit: with every problem found, if the resolved config is invalid.
+
+    Examples:
+        A fully-specified config with existing input dirs and a disabled logger passes:
+
+        >>> import tempfile
+        >>> from omegaconf import OmegaConf
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     cfg = OmegaConf.create({
+        ...         "output_dir": d,
+        ...         "datamodule": {"config": {"tensorized_cohort_dir": d, "task_labels_dir": d}},
+        ...         "trainer": {"logger": False},
+        ...     })
+        ...     validate_training_config(cfg)  # no error
+
+        A missing input directory raises ``SystemExit`` naming the offending key:
+
+        >>> cfg = OmegaConf.create({
+        ...     "output_dir": "/tmp",
+        ...     "datamodule": {"config": {"tensorized_cohort_dir": "/no/such/dir/xyz",
+        ...                               "task_labels_dir": "/tmp"}},
+        ...     "trainer": {"logger": False},
+        ... })
+        >>> validate_training_config(cfg)
+        Traceback (most recent call last):
+            ...
+        SystemExit: ...
+    """
+    errors: list[str] = []
+
+    # Read inputs — must resolve to existing directories.
+    for key, env_hint in (
+        ("datamodule.config.tensorized_cohort_dir", "FINAL_DATA_DIR"),
+        ("datamodule.config.task_labels_dir", "TASK_DIR"),
+    ):
+        value = OmegaConf.select(cfg, key, throw_on_resolution_failure=False)
+        if value is None:
+            errors.append(f"{key} is unset — pass {key}=... on the CLI or export ${env_hint}.")
+        elif not Path(value).is_dir():
+            errors.append(f"{key}={value!r} does not exist or is not a directory.")
+
+    # Write target — must resolve; training creates it, so don't require pre-existence.
+    output_dir = OmegaConf.select(cfg, "output_dir", throw_on_resolution_failure=False)
+    if output_dir is None:
+        errors.append("output_dir is unset — pass output_dir=... on the CLI or export $OUTPUT_DIR.")
+
+    # WandB entity — required only when the trainer actually uses a WandB logger.
+    logger_cfg = OmegaConf.select(cfg, "trainer.logger", throw_on_resolution_failure=False)
+    logger_entries = logger_cfg if isinstance(logger_cfg, ListConfig) else [logger_cfg]
+    for entry in logger_entries:
+        if _is_wandb_logger(entry):
+            entity = OmegaConf.select(entry, "entity", throw_on_resolution_failure=False)
+            if not entity:
+                errors.append(
+                    "trainer.logger is a WandbLogger but `entity` is unset — export "
+                    "$WANDB_ENTITY, pass trainer.logger.entity=..., or disable wandb "
+                    "with trainer.logger=false."
+                )
+
+    if errors:
+        bullet = "\n  - ".join(errors)
+        raise SystemExit(f"Invalid training configuration (see #184):\n  - {bullet}")
 
 
 CONFIGS = str(files("every_query") / "train" / "configs")
@@ -202,6 +302,7 @@ CONFIGS = str(files("every_query") / "train" / "configs")
 @hydra.main(version_base="1.3", config_path=CONFIGS, config_name="config.yaml")
 def main(cfg: DictConfig) -> float | None:
     _init_env()
+    validate_training_config(cfg)
 
     if not isinstance(cfg.query.codes, ListConfig):
         raise ValueError("query.codes must be a list")

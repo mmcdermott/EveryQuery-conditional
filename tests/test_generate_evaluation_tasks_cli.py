@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING
 import polars as pl
 import pyarrow.parquet as pq
 
-from conftest import ENSURE_ENV_PLACEHOLDERS, run_and_check
+from conftest import run_and_check
 from every_query.data.schema import TaskQuerySchema
 
 if TYPE_CHECKING:
@@ -55,7 +55,6 @@ def test_eq_generate_evaluation_tasks_end_to_end(
             f"durations=[{','.join(str(d) for d in durations)}]",
             "seed=42",
         ],
-        env=ENSURE_ENV_PLACEHOLDERS,
         timeout=120.0,
     )
 
@@ -119,7 +118,6 @@ def test_eq_generate_evaluation_tasks_deterministic(
     for out in (out_a, out_b):
         run_and_check(
             ["EQ_generate_evaluation_tasks", f"out_dir={out!s}", *common_args],
-            env=ENSURE_ENV_PLACEHOLDERS,
             timeout=120.0,
         )
 

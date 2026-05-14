@@ -1,42 +1,21 @@
-"""Load .env and validate that required environment variables are set.
+"""Load ``.env`` so machine-specific paths reach Hydra ``${oc.env:...}`` interpolations.
 
-Imported early by both train.py and tasks.py so that a missing .env on a fresh machine surfaces a single clear
-error rather than a mid-run KeyError or Hydra InterpolationResolutionError.
+This module deliberately does *not* validate env-var presence.  A CLI override —
+``EQ_train datamodule.config.tensorized_cohort_dir=/path`` — supplies a path without the
+backing env var ever being set, so a blind presence check would reject valid runs.
+Validation of the *resolved* config (do the input directories exist? is a wandb entity
+set when the wandb logger is actually active?) happens after Hydra composition, in
+:func:`every_query.train.train.validate_training_config`.  See #184 for the history.
 """
-
-import os
-import sys
 
 from dotenv import load_dotenv
 
-REQUIRED_ENV_VARS = (
-    "PROJECT_DIR",
-    "OUTPUT_DIR",
-    "TASK_DIR",
-    "FINAL_DATA_DIR",
-    "WANDB_ENTITY",
-)
-# `PROCESSED` and `INTERMEDIATE` are used by the preprocessing pipeline (the dirs it
-# writes to) and by the generate_tasks stage as dotenv fallbacks inside
-# `sample_tasks.py::_resolve_path` / `sample_evaluation_tasks.py::_resolve_path`.
-# They're not gated by this `REQUIRED_ENV_VARS` check because:
-#   1. `_resolve_path` already tolerates a missing env var when the caller supplies the
-#      path directly (the normal CLI / test path).
-#   2. No Hydra config interpolates `${oc.env:PROCESSED}` or `${oc.env:INTERMEDIATE}`,
-#      so demo fixtures / `--help` invocations don't need throwaway placeholders.
-# If you're running a full fresh-machine setup that includes preprocessing, set both
-# in `.env` (see `.env.example`).  See #117 for the history.
 
+def load_env() -> None:
+    """Load ``.env`` into ``os.environ`` so ``${oc.env:...}`` interpolations can resolve.
 
-def ensure_env() -> None:
+    A thin wrapper over :func:`dotenv.load_dotenv` — it neither requires nor validates
+    any specific variable.  Config-aware path/identity validation lives in
+    :func:`every_query.train.train.validate_training_config` (see #184).
+    """
     load_dotenv()
-    missing = [v for v in REQUIRED_ENV_VARS if not os.environ.get(v)]
-    if missing:
-        joined = ", ".join(missing)
-        print(
-            f"ERROR: required environment variables not set: {joined}\n"
-            "Copy .env.example to .env and fill in machine-specific paths, "
-            "or export these variables before running.",
-            file=sys.stderr,
-        )
-        sys.exit(1)

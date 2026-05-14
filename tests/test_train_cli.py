@@ -14,6 +14,13 @@ import pytest
 _VENV_BIN = str(Path(sys.executable).parent)
 
 
+# Env vars `ensure_env()` used to gate on, before #184 replaced the blind presence
+# check with config-aware ``validate_training_config``.  ``_demo_train.yaml`` passes
+# every path on the CLI and sets ``trainer.logger: false``, so none of these are
+# needed — `_run_train_subprocess` scrubs them by default to prove that.
+_FORMERLY_GATED_ENV_VARS = ("PROJECT_DIR", "OUTPUT_DIR", "TASK_DIR", "FINAL_DATA_DIR", "WANDB_ENTITY")
+
+
 def _run_train_subprocess(
     task_labels_dir: Path,
     tensorized_cohort_dir: Path,
@@ -23,14 +30,17 @@ def _run_train_subprocess(
     do_overwrite: bool = True,
     extra_overrides: list[str] | None = None,
 ) -> subprocess.CompletedProcess:
-    """Run ``python -m every_query.train.train`` as a subprocess with the demo config."""
+    """Run ``python -m every_query.train.train`` as a subprocess with the demo config.
+
+    No path env vars are set — the demo config + CLI overrides supply every path, and
+    #184 made `EQ_train` validate the *resolved* config rather than env-var presence.
+    Any of the formerly-gated vars inherited from the test runner's environment are
+    scrubbed so this stays an honest "CLI-only, zero env vars" exercise.
+    """
     env = os.environ.copy()
     env["PATH"] = _VENV_BIN + os.pathsep + env.get("PATH", "")
-    # Provide dummy env vars so ensure_env() passes in the subprocess.
-    # Hydra CLI overrides control the actual paths used by the test.
-    for var in ("PROJECT_DIR", "OUTPUT_DIR", "TASK_DIR", "FINAL_DATA_DIR"):
-        env.setdefault(var, str(output_dir))
-    env.setdefault("WANDB_ENTITY", "test")
+    for var in _FORMERLY_GATED_ENV_VARS:
+        env.pop(var, None)
 
     overrides = [
         f"output_dir={output_dir}",
@@ -228,4 +238,39 @@ class TestTrainResumeRejectsStructuralDrift:
         )
         assert "max_seq_len" in drifted.stderr, (
             f"Expected error to name 'max_seq_len', got:\n{drifted.stderr}"
+        )
+
+
+class TestTrainConfigValidation:
+    """``EQ_train`` validates the *resolved* config, not env-var presence (#184).
+
+    ``TestTrainCliRuns`` already proves the happy path runs with **zero** path env
+    vars set (``_run_train_subprocess`` scrubs ``_FORMERLY_GATED_ENV_VARS``, and
+    ``_demo_train.yaml`` sets ``trainer.logger: false`` so no ``WANDB_ENTITY`` is
+    needed).  These tests cover the rejection path: a path that *is* supplied but
+    doesn't point at a real directory must fail early with a clear message.
+    """
+
+    def test_missing_cohort_dir_rejected(self, task_labels_dir, tmp_path_factory) -> None:
+        output_dir = tmp_path_factory.mktemp("cli_bad_cohort")
+        bogus_cohort = output_dir / "does_not_exist_cohort"
+        result = _run_train_subprocess(task_labels_dir, bogus_cohort, output_dir)
+        assert result.returncode != 0, (
+            f"Expected a nonexistent tensorized_cohort_dir to be rejected, but the run "
+            f"succeeded.\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert "tensorized_cohort_dir" in result.stderr, (
+            f"Expected the error to name 'tensorized_cohort_dir', got:\n{result.stderr}"
+        )
+
+    def test_missing_task_labels_dir_rejected(self, tensorized_cohort_dir, tmp_path_factory) -> None:
+        output_dir = tmp_path_factory.mktemp("cli_bad_tasks")
+        bogus_tasks = output_dir / "does_not_exist_tasks"
+        result = _run_train_subprocess(bogus_tasks, tensorized_cohort_dir, output_dir)
+        assert result.returncode != 0, (
+            f"Expected a nonexistent task_labels_dir to be rejected, but the run "
+            f"succeeded.\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert "task_labels_dir" in result.stderr, (
+            f"Expected the error to name 'task_labels_dir', got:\n{result.stderr}"
         )
