@@ -312,10 +312,12 @@ def build(train_csv: Path, eval_dir: Path, out: Path):
     )
     P(
         "<b>Answer tokens & loss.</b> Teacher-forced answers use three classes — NO / YES / CENSORED — so a "
-        "later query can see that an earlier answer was unobserved. Loss is BCE on the YES-vs-NO answers at "
-        "observed positions; censored positions are masked out. The censor query (position 0) is always "
-        "observed and contributes a separate <i>censor</i> loss term; total loss is "
-        "w&middot;occurs + (1-w)&middot;censor with w = 0.5.",
+        "later query can see that an earlier answer was unobserved. There is a single answer head: censoring "
+        "is not a separate task but simply the distinguished first query, so the loss is one binary "
+        "cross-entropy over <i>every</i> observed query position in the sequence (censored positions masked "
+        "out), with each position predicted simultaneously in one forward pass. We report AUROC broken down by "
+        "censor query (position 0) vs. occurrence queries (positions &ge; 1) purely for interpretability — "
+        "they share the same head but have very different prevalence and semantics.",
         "Body",
     )
     arch = summary.get("_arch", {})
@@ -397,7 +399,8 @@ def build(train_csv: Path, eval_dir: Path, out: Path):
     rtbl = [
         ["quantity", "value"],
         ["held-out sequences", f"{rnd['n_sequences']:,}"],
-        ["censor-query AUROC", _fmt(rnd["censor_auroc"])],
+        ["overall answer AUROC (all observed positions)", _fmt(rnd.get("answer_auroc_overall"))],
+        ["censor-query AUROC (position 0)", _fmt(rnd["censor_auroc"])],
         ["censor-query prevalence", _fmt(rnd["censor_prevalence"])],
         ["occurrence AUROC (pooled, pos ≥1)", _fmt(rnd["occurs_auroc_pooled"])],
         ["occurrence prevalence", _fmt(rnd["occurs_prevalence"], 4)],

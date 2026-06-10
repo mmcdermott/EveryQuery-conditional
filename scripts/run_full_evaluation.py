@@ -179,9 +179,11 @@ def main():
     # Headline: censor-query AUROC (position 0) and pooled occurrence AUROC (positions >=1).
     censor = rnd.filter(pl.col("position") == 0)
     occ = rnd.filter((pl.col("position") >= 1) & pl.col("answer").is_not_null())
+    allobs = rnd.filter(pl.col("answer").is_not_null())
     summary["random"] = {
         "n_sequences": ds.schema_df.height,
         "n_query_positions": rnd.height,
+        "answer_auroc_overall": _auroc(allobs["answer"].to_list(), allobs["answer_prob"].to_list()),
         "censor_auroc": _auroc(censor["answer"].to_list(), censor["answer_prob"].to_list()),
         "censor_prevalence": float(censor["answer"].mean()),
         "occurs_auroc_pooled": _auroc(occ["answer"].to_list(), occ["answer_prob"].to_list()),

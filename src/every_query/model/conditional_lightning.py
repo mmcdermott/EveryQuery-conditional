@@ -30,17 +30,19 @@ class ConditionalQueryLightningModule(EveryQueryLightningModule):
     def __init__(self, model: ConditionalQueryModel, optimizer=None, LR_scheduler=None):
         super().__init__(model=model, optimizer=optimizer, LR_scheduler=LR_scheduler)
         # Replace the parent's metric set with per-position AUROCs.
-        self.metrics = {
-            train_split: {},
-            tuning_split: {
+        # A single answer head produces all per-query logits; these AUROCs are *breakdowns*
+        # of that one head's predictions, not separate tasks:
+        #   answer_auc — pooled over every observed query position (censor + occurrence);
+        #   censor_auc — position 0 only (the __CENSOR__ data-presence query);
+        #   occurs_auc — positions >= 1 only (plain code-occurrence queries).
+        def _metric_set():
+            return {
+                "answer_auc": BinaryAUROC().cpu(),
                 "censor_auc": BinaryAUROC().cpu(),
                 "occurs_auc": BinaryAUROC().cpu(),
-            },
-            held_out_split: {
-                "censor_auc": BinaryAUROC().cpu(),
-                "occurs_auc": BinaryAUROC().cpu(),
-            },
-        }
+            }
+
+        self.metrics = {train_split: {}, tuning_split: _metric_set(), held_out_split: _metric_set()}
 
     def _log_metrics(
         self,
@@ -80,6 +82,12 @@ class ConditionalQueryLightningModule(EveryQueryLightningModule):
         probs = outputs.answer_logits.detach().cpu().sigmoid().float()
         targets = (batch.q_answers == ANSWER_YES).detach().cpu().long()
         observed = outputs.valid_mask.detach().cpu()
+
+        # Overall: every observed query position pooled.
+        if observed.any():
+            self._update_metric(
+                name="answer_auc", split=split, preds=probs[observed], target=targets[observed]
+            )
 
         censor_sel = observed[:, 0]
         if censor_sel.any():

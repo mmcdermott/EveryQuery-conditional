@@ -165,7 +165,10 @@ class ConditionalQueryModel(torch.nn.Module):
         decoder_heads: Attention heads in the decoder.
         decoder_ffn_mult: Decoder feed-forward width as a multiple of ``hidden_size``.
         max_queries: Maximum query blocks per sequence (sizes the block-position embedding).
-        occurs_loss_weight: Total loss is ``w * occurs_loss + (1 - w) * censor_loss``.
+        occurs_loss_weight: **Retained for checkpoint/config back-compat but no longer used.**
+            The loss is now a single BCE over all observed query positions (a single answer
+            head; censoring is just the first query), so there is no censor-vs-occurs weight to
+            set.  ``censor_loss`` / ``occurs_loss`` survive only as reported metric breakdowns.
         censor_query_index: Vocab index reserved for the censor-query code token.  Defaults to
             ``vocab_size - 1`` (the dataset reserves the top index).  Must be < vocab_size.
     """
@@ -325,14 +328,21 @@ class ConditionalQueryModel(torch.nn.Module):
         targets = (batch.q_answers == ANSWER_YES).float()
         observed = batch.q_mask & (batch.q_answers != ANSWER_CENSORED)
 
+        # There is a *single* answer head: censoring is not a separate task, it is just the
+        # distinguished first query (the __CENSOR__ block at position 0).  The training loss is
+        # therefore one BCE over *every* observed query position — every query in the sequence
+        # is a simultaneous prediction point — letting the natural mix of censor vs. occurrence
+        # queries weight itself rather than imposing an arbitrary 50/50 split.
+        loss = self._masked_bce(answer_logits, targets, observed)
+
+        # ``censor_loss`` / ``occurs_loss`` are computed here only as *reported* breakdowns of
+        # that single objective (position 0 vs. positions >= 1) — they do not re-weight ``loss``.
         censor_mask = torch.zeros_like(observed)
         censor_mask[:, 0] = observed[:, 0]
         occurs_mask = observed.clone()
         occurs_mask[:, 0] = False
-
         censor_loss = self._masked_bce(answer_logits, targets, censor_mask)
         occurs_loss = self._masked_bce(answer_logits, targets, occurs_mask)
-        loss = self.occurs_loss_weight * occurs_loss + (1 - self.occurs_loss_weight) * censor_loss
 
         outputs = ConditionalQueryOutput(
             last_hidden_state=None,
