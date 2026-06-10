@@ -29,18 +29,25 @@ class ConditionalQueryLightningModule(EveryQueryLightningModule):
 
     def __init__(self, model: ConditionalQueryModel, optimizer=None, LR_scheduler=None):
         super().__init__(model=model, optimizer=optimizer, LR_scheduler=LR_scheduler)
-        # Replace the parent's metric set with per-position AUROCs.
         # A single answer head produces all per-query logits; these AUROCs are *breakdowns*
         # of that one head's predictions, not separate tasks:
-        #   answer_auc — pooled over every observed query position (censor + occurrence);
-        #   censor_auc — position 0 only (the __CENSOR__ data-presence query);
-        #   occurs_auc — positions >= 1 only (plain code-occurrence queries).
+        #   answer_auc       — pooled over every observed query position (censor + occurrence);
+        #   censor_auc       — position 0 only (the __CENSOR__ data-presence query);
+        #   occurs_auc       — positions >= 1 only (plain code-occurrence queries);
+        #   answer_auc_pos{j}— position j alone.  Later positions condition on strictly more
+        #                      teacher-forced answers, so if the model is exploiting that
+        #                      conditioning their AUROC should trend upward with j.
+        self._n_positions = model.max_queries
+
         def _metric_set():
-            return {
+            m = {
                 "answer_auc": BinaryAUROC().cpu(),
                 "censor_auc": BinaryAUROC().cpu(),
                 "occurs_auc": BinaryAUROC().cpu(),
             }
+            for j in range(self._n_positions):
+                m[f"answer_auc_pos{j}"] = BinaryAUROC().cpu()
+            return m
 
         self.metrics = {train_split: {}, tuning_split: _metric_set(), held_out_split: _metric_set()}
 
@@ -107,6 +114,19 @@ class ConditionalQueryLightningModule(EveryQueryLightningModule):
                 preds=probs[occurs_sel],
                 target=targets[occurs_sel],
             )
+
+        # Per-position AUROC: position j is observed where observed[:, j] is True.  Sequences
+        # shorter than j+1 simply contribute no rows at position j.
+        n_pos = min(self._n_positions, observed.shape[1])
+        for j in range(n_pos):
+            sel_j = observed[:, j]
+            if sel_j.any():
+                self._update_metric(
+                    name=f"answer_auc_pos{j}",
+                    split=split,
+                    preds=probs[:, j][sel_j],
+                    target=targets[:, j][sel_j],
+                )
 
     def on_before_optimizer_step(self, optimizer):
         """Log the total gradient L2 norm (pre-clipping) as a training-stability signal."""

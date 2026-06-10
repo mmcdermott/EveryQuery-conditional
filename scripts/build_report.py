@@ -396,6 +396,16 @@ def build(train_csv: Path, eval_dir: Path, out: Path):
         "query horizon.",
         "Body",
     )
+    P(
+        "<b>Per-position AUROC is the cleanest test of the conditional design.</b> Because occurrence queries "
+        "are sampled i.i.d. for every position &ge; 1 (same code and horizon distribution regardless of where "
+        "they sit), positions differ only in how many prior queries and teacher-forced answers they condition "
+        "on. A model that genuinely uses the autoregressive context should therefore answer later positions at "
+        "least as well as earlier ones — AUROC should trend upward (or flat), never systematically downward, "
+        "as position increases. Position 0 is the censor query and a different prediction problem, so it is "
+        "not directly comparable to the occurrence positions.",
+        "Body",
+    )
     rtbl = [
         ["quantity", "value"],
         ["held-out sequences", f"{rnd['n_sequences']:,}"],
