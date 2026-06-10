@@ -81,7 +81,11 @@ def make_training_figures(csv_fp: Path, figs: Path) -> dict:
     a1.set_xlabel("step")
     a1.set_ylabel("tuning loss")
     a1.set_title("Validation loss")
-    for col, label, c in [("tuning/censor_auc", "censor", "#4C72B0"), ("tuning/occurs_auc", "occurs", "#C44E52")]:
+    for col, label, c in [
+        ("tuning/answer_auc", "answer (pooled)", "#333333"),
+        ("tuning/censor_auc", "censor (pos 0)", "#4C72B0"),
+        ("tuning/occurs_auc", "occurs (pooled)", "#C44E52"),
+    ]:
         x, y = series(col)
         if x:
             a2.plot(x, y, "-o", ms=3, label=label, c=c)
@@ -90,10 +94,30 @@ def make_training_figures(csv_fp: Path, figs: Path) -> dict:
     a2.set_xlabel("step")
     a2.set_ylabel("AUROC")
     a2.set_ylim(0.4, 1.0)
-    a2.set_title("Validation AUROC")
-    a2.legend(fontsize=8)
+    a2.set_title("Validation AUROC (pooled)")
+    a2.legend(fontsize=7)
     fig.tight_layout()
     fig.savefig(figs / "val_curves.png", dpi=150)
+    plt.close(fig)
+
+    # Per-position validation AUROC over training (occurrence positions 1..4).
+    fig, ax = plt.subplots(figsize=(6.0, 3.2))
+    plotted = False
+    for j, c in zip(range(1, 5), ["#4C72B0", "#55A868", "#C44E52", "#8172B3"], strict=True):
+        x, y = series(f"tuning/answer_auc_pos{j}")
+        if x:
+            ax.plot(x, y, "-o", ms=2.5, label=f"position {j}", c=c)
+            info[f"final_pos{j}_auc"] = y[-1]
+            plotted = True
+    ax.axhline(0.5, ls="--", c="grey", lw=1)
+    ax.set_xlabel("step")
+    ax.set_ylabel("validation AUROC (pooled within position)")
+    ax.set_title("Per-position validation AUROC over training")
+    ax.set_ylim(0.5, 1.0)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    if plotted:
+        fig.savefig(figs / "val_per_position.png", dpi=150)
     plt.close(fig)
 
     # Grad norm + LR.
@@ -379,11 +403,18 @@ def build(train_csv: Path, eval_dir: Path, out: Path):
         ["metric", "value"],
         ["best tuning loss", _fmt(tinfo.get("best_tuning_loss"))],
         ["final tuning loss", _fmt(tinfo.get("final_tuning_loss"))],
-        ["final tuning censor AUROC", _fmt(tinfo.get("censor_auc"))],
-        ["final tuning occurs AUROC", _fmt(tinfo.get("occurs_auc"))],
+        ["final tuning censor AUROC (pos 0)", _fmt(tinfo.get("final_censor_auc"))],
+        ["final tuning occurs AUROC (pooled)", _fmt(tinfo.get("final_occurs_auc"))],
         ["median / max grad norm", f"{_fmt(tinfo.get('median_grad_norm'),2)} / {_fmt(tinfo.get('max_grad_norm'),2)}"],
     ]
     E.append(_table(tt, col_widths=[2.8 * inch, 2.0 * inch]))
+    P(
+        "Note these training-time AUROCs are pooled (computed across all codes at once) and so are "
+        "base-rate inflated; the held-out within-query metrics in §5 are the trustworthy ones. They are "
+        "shown here only to document training dynamics and stability.",
+        "Small",
+    )
+    img(figs / "val_per_position.png", width=5.4 * inch)
 
     E.append(PageBreak())
 
@@ -391,34 +422,42 @@ def build(train_csv: Path, eval_dir: Path, out: Path):
     P("5. Evaluation I — random queries", "H1c")
     P(
         "Held-out evaluation on randomly sampled query sequences (the same distribution as training, "
-        "teacher-forced). We report AUROC for the censor query (position 0) and pooled AUROC for occurrence "
-        "queries (positions &ge; 1, censored answers dropped), plus breakdowns by sequence position and by "
-        "query horizon.",
+        "teacher-forced). Censored answers are dropped before AUROC.",
         "Body",
     )
     P(
-        "<b>Per-position AUROC is the cleanest test of the conditional design.</b> Because occurrence queries "
-        "are sampled i.i.d. for every position &ge; 1 (same code and horizon distribution regardless of where "
-        "they sit), positions differ only in how many prior queries and teacher-forced answers they condition "
-        "on. A model that genuinely uses the autoregressive context should therefore answer later positions at "
-        "least as well as earlier ones — AUROC should trend upward (or flat), never systematically downward, "
-        "as position increases. Position 0 is the censor query and a different prediction problem, so it is "
-        "not directly comparable to the occurrence positions.",
+        "<b>Pooled vs. within-query AUROC.</b> A naïve AUROC that pools all occurrence queries together is "
+        "<i>base-rate inflated</i>: most positive/negative pairs it scores are <i>cross-query</i> (a positive "
+        "for a common code vs. a negative for a rare one), which are separable just from the model learning "
+        "per-code prevalence — not from answering any single query well. With codes drawn uniformly over a "
+        "~12k vocabulary spanning orders-of-magnitude prevalence, that inflation is large. The honest metric is "
+        "<b>within-query AUROC</b> — AUROC computed inside each query code (so every scored pair shares a base "
+        "rate) and then macro-averaged over codes. We report both so the gap is explicit; the within-query "
+        "number is the one to trust.",
         "Body",
     )
     rtbl = [
         ["quantity", "value"],
         ["held-out sequences", f"{rnd['n_sequences']:,}"],
-        ["overall answer AUROC (all observed positions)", _fmt(rnd.get("answer_auroc_overall"))],
         ["censor-query AUROC (position 0)", _fmt(rnd["censor_auroc"])],
         ["censor-query prevalence", _fmt(rnd["censor_prevalence"])],
-        ["occurrence AUROC (pooled, pos ≥1)", _fmt(rnd["occurs_auroc_pooled"])],
+        ["occurrence AUROC — pooled (base-rate inflated)", _fmt(rnd.get("occurs_auroc_pooled_inflated"))],
+        ["occurrence AUROC — macro within-query", _fmt(rnd.get("occurs_auroc_macro_per_query"))],
+        ["  (query codes with ≥10 pos & ≥10 neg)", f"{rnd.get('n_query_groups_macro','—')}"],
         ["occurrence prevalence", _fmt(rnd["occurs_prevalence"], 4)],
         ["occurrence censored fraction", _fmt(rnd["occurs_censored_frac"])],
     ]
-    E.append(_table(rtbl, col_widths=[3.2 * inch, 1.8 * inch]))
+    E.append(_table(rtbl, col_widths=[3.6 * inch, 1.6 * inch]))
     E.append(Spacer(1, 8))
-    img(figs / "auroc_by_position.png", width=4.8 * inch)
+    P(
+        "<b>Per-position (within-query) is the cleanest conditioning test.</b> Occurrence queries are sampled "
+        "i.i.d. at every position &ge; 1, so positions differ only in how many prior teacher-forced answers "
+        "they condition on. Macro-averaging the per-(query, position) AUROCs within each position therefore "
+        "isolates the conditioning effect; a model that exploits the autoregressive context should hold or "
+        "improve with position, never fall systematically.",
+        "Body",
+    )
+    img(figs / "auroc_pooled_vs_macro_by_position.png", width=5.2 * inch)
     img(figs / "auroc_by_horizon.png", width=4.8 * inch)
 
     # by-query top/bottom table
@@ -436,6 +475,29 @@ def build(train_csv: Path, eval_dir: Path, out: Path):
                     [q, r["duration_bucket"], str(r["n_observed"]), _fmt(r["prevalence"], 3), _fmt(r["auroc"])]
                 )
             E.append(_table(rows, col_widths=[2.9 * inch, 0.8 * inch, 0.5 * inch, 0.6 * inch, 0.6 * inch], font=7.5))
+
+    # 5b. Matched-code position probe
+    probe = summary.get("probe")
+    probe_pq_fp = eval_dir / "probe_macro_by_position.parquet"
+    if probe and probe_pq_fp.exists():
+        P("Matched-code position probe", "H2c")
+        P(
+            "The random-query per-position macro is limited by how often each code lands at each position. "
+            "The probe removes that limitation: for ~20 curated common codes (admissions, discharges, ICU "
+            "transfers, death, frequent labs / meds / diagnoses) the <i>same</i> code is placed at positions "
+            "1–4 across many held-out patients, with random filler queries before it. Per-(code, position) "
+            "within-code AUROC then has ample positives, and tracking a fixed code across positions varies "
+            "<i>only</i> the number of prior teacher-forced answers it conditions on — the definitive "
+            "conditioning curve.",
+            "Body",
+        )
+        pm = pl.read_parquet(probe_pq_fp)
+        rows = [["target position", "# prior answers", "macro within-code AUROC", "# codes"]]
+        for r in pm.iter_rows(named=True):
+            rows.append([str(r["position"]), str(int(r["position"]) - 1), _fmt(r["macro_auroc"]), str(r["n_codes"])])
+        E.append(_table(rows, col_widths=[1.4 * inch, 1.4 * inch, 1.9 * inch, 0.8 * inch], font=8))
+        E.append(Spacer(1, 6))
+        img(figs / "probe_by_position.png", width=5.0 * inch)
 
     E.append(PageBreak())
 
@@ -484,26 +546,27 @@ def build(train_csv: Path, eval_dir: Path, out: Path):
     cond_fp = eval_dir / "conditioning_effect.parquet"
     if cond_fp.exists():
         cond = pl.read_parquet(cond_fp)
-        rows = [["position", "matched pairs", "AUROC alone", "AUROC in-context", "mean |ΔP|", "corr"]]
+        rows = [["pos", "matched pairs", "macro AUROC alone", "macro AUROC in-ctx", "mean |ΔP|", "corr"]]
         for r in cond.iter_rows(named=True):
             rows.append(
                 [
                     str(r["position"]),
                     f"{r['n_matched']:,}",
-                    _fmt(r["auroc_singleton"]),
-                    _fmt(r["auroc_incontext"]),
+                    _fmt(r.get("macro_auroc_singleton")),
+                    _fmt(r.get("macro_auroc_incontext")),
                     _fmt(r["mean_abs_prob_shift"]),
                     _fmt(r["corr_probs"]),
                 ]
             )
-        E.append(_table(rows, col_widths=[0.8*inch, 1.1*inch, 1.0*inch, 1.2*inch, 0.9*inch, 0.6*inch], font=7.5))
+        E.append(_table(rows, col_widths=[0.5*inch, 1.1*inch, 1.3*inch, 1.3*inch, 0.9*inch, 0.6*inch], font=7.5))
         E.append(Spacer(1, 8))
     img(figs / "conditioning_scatter.png", width=4.2 * inch)
 
     # 8. Discussion
     P("8. Discussion & conclusions", "H1c")
     cz = rnd["censor_auroc"]
-    oz = rnd["occurs_auroc_pooled"]
+    oz_pooled = rnd.get("occurs_auroc_pooled_inflated")
+    oz_macro = rnd.get("occurs_auroc_macro_per_query")
     cl_best = cl.filter(pl.col("target_auroc").is_not_null())
     best_task = cl_best.sort("target_auroc", descending=True).row(0, named=True) if cl_best.height else None
     cond_txt = ""
@@ -517,10 +580,11 @@ def build(train_csv: Path, eval_dir: Path, out: Path):
         )
     for para in [
         f"<b>The reformulation works.</b> A single model, trained only on randomly assembled query "
-        f"sequences, answers held-out queries well above chance: censor-query AUROC {_fmt(cz)} and pooled "
-        f"occurrence AUROC {_fmt(oz)} across thousands of distinct (code, horizon) combinations it was never "
-        f"specifically trained on. Performance rises with horizon, as expected — longer windows make "
-        f"occurrence both more likely and more predictable from accumulated history.",
+        f"sequences, answers held-out queries well above chance: censor-query AUROC {_fmt(cz)}, and "
+        f"within-query occurrence AUROC {_fmt(oz_macro)} macro-averaged over query codes (vs. a "
+        f"base-rate-inflated pooled {_fmt(oz_pooled)} — the gap is exactly the cross-query base-rate effect, "
+        f"which is why we lead with the within-query number). These cover thousands of distinct (code, "
+        f"horizon) combinations the model was never specifically trained on.",
         f"<b>Censoring is handled natively.</b> Folding the censor question into the first query block "
         f"removes the need for the separate censor head of the original EveryQuery while keeping every later "
         f"query answerable: positions ≥1 are predicted even when their own answers are unobserved, because "
@@ -532,12 +596,16 @@ def build(train_csv: Path, eval_dir: Path, out: Path):
             + ", predicting downstream outcomes (mortality, ICU transfer, readmission) conditioned on earlier "
             "events in the same query sequence — the capability the block-autoregressive form was built to add."
         ),
+        "<b>On metrics.</b> Pooled AUROC across heterogeneous query codes is base-rate inflated — most "
+        "scored pairs are cross-query and separable by prevalence alone — so all headline numbers here are "
+        "within-query (AUROC computed inside each code, then macro-averaged). The matched-code probe and the "
+        "clinical tasks, being single-code-many-patients by construction, are within-query by design and are "
+        "the most trustworthy measurements.",
         "<b>Limitations.</b> Evaluation is teacher-forced (earlier answers are ground truth, not model "
-        "samples), so it measures conditional calibration, not free-running multi-step rollout. Query codes "
-        "are sampled uniformly over the full vocabulary, so most occurrence queries are low-prevalence and "
-        "the pooled metric is dominated by easy negatives; the per-horizon and clinical breakdowns are the "
-        "more informative views. Sequences are capped at five queries and assembled in random order, by "
-        "design — natural temporal ordering and longer chains are natural next steps.",
+        "samples), so it measures conditional calibration, not free-running multi-step rollout. Within-query "
+        "macro metrics are restricted to codes with enough held-out positives, so very rare codes are "
+        "under-represented. Sequences are capped at five queries and assembled in random order, by design — "
+        "natural temporal ordering and longer chains are natural next steps.",
     ]:
         P(para, "Body")
 

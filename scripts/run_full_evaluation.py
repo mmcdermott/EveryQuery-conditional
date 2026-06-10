@@ -52,6 +52,32 @@ def _auroc(y, p):
     return float(roc_auc_score(y, p))
 
 
+def per_group_auroc(df: pl.DataFrame, group_cols: list[str], min_pos: int = 10, min_neg: int = 10):
+    """Within-group AUROC over observed (non-null answer) rows.
+
+    Returns a frame with one row per group: counts and AUROC (null when a group has
+    fewer than ``min_pos`` positives or ``min_neg`` negatives — too few for a stable
+    within-group estimate).  Computing AUROC *inside* a group (e.g. a single query code)
+    means every positive/negative pair shares that group's base rate, so the estimate is
+    not inflated by cross-group base-rate separation the way a pooled AUROC is.
+    """
+    rows = []
+    for key, g in df.group_by(group_cols, maintain_order=True):
+        obs = g.filter(pl.col("answer").is_not_null())
+        y = obs["answer"].to_list()
+        n_pos = int(sum(y))
+        n_neg = len(y) - n_pos
+        au = _auroc(y, obs["answer_prob"].to_list()) if (n_pos >= min_pos and n_neg >= min_neg) else None
+        rows.append({**dict(zip(group_cols, key, strict=True)), "n": len(y), "n_pos": n_pos, "auroc": au})
+    return pl.DataFrame(rows)
+
+
+def macro_auroc(group_df: pl.DataFrame):
+    """Mean within-group AUROC over groups that had a defined estimate (+ how many qualified)."""
+    valid = group_df.filter(pl.col("auroc").is_not_null())
+    return (float(valid["auroc"].mean()) if valid.height else None, valid.height)
+
+
 def load_model(run_dir: Path) -> ConditionalQueryLightningModule:
     ckpt = run_dir / "best_model.ckpt"
     if not ckpt.is_file():
@@ -85,10 +111,15 @@ def predict_dataset(model, dataset, batch_size=256) -> pl.DataFrame:
         pl.col("durations").alias("duration_days"),
         pl.col("answers").alias("answer"),
     ).with_columns(pl.Series("answer_prob", probs_per_row, dtype=pl.List(pl.Float32)))
+    # ``seq_id`` is a per-sequence (per schema_df row) identifier.  It is load-bearing for the
+    # position probe, where several sequences share the same (subject_id, prediction_time) but
+    # place the target code at different positions — without it they'd be indistinguishable
+    # after the explode below.
+    out = out.with_row_index("seq_id")
     n_q = pl.col("query").list.len()
     out = out.with_columns(pl.int_ranges(0, n_q).alias("position"))
     return out.explode("position", "query", "duration_days", "answer", "answer_prob").select(
-        "subject_id", "prediction_time", "position", "query", "duration_days", "answer", "answer_prob"
+        "seq_id", "subject_id", "prediction_time", "position", "query", "duration_days", "answer", "answer_prob"
     )
 
 
@@ -148,6 +179,9 @@ def main():
     p.add_argument("--cohort-dir", required=True, type=Path)
     p.add_argument("--tasks-dir", required=True, type=Path)
     p.add_argument("--clinical-dir", required=True, type=Path)
+    p.add_argument("--probe-dir", type=Path, default=None,
+                   help="dir with probe/tasks.parquet from make_position_probe.py (matched-code "
+                        "per-position conditioning probe); skipped if omitted")
     p.add_argument("--out-dir", required=True, type=Path)
     p.add_argument("--split", default="held_out")
     p.add_argument("--batch-size", type=int, default=256)
@@ -176,22 +210,45 @@ def main():
     by_pos.write_parquet(args.out_dir / "metrics.by_position.parquet")
     by_query.write_parquet(args.out_dir / "metrics.by_query.parquet")
 
-    # Headline: censor-query AUROC (position 0) and pooled occurrence AUROC (positions >=1).
     censor = rnd.filter(pl.col("position") == 0)
     occ = rnd.filter((pl.col("position") >= 1) & pl.col("answer").is_not_null())
-    allobs = rnd.filter(pl.col("answer").is_not_null())
+
+    # Pooled occurrence AUROC — over all positions>=1 query codes at once.  This is the
+    # base-rate-INFLATED number: most positive/negative pairs are cross-query, separable
+    # just by per-code prevalence, so it overstates within-query skill.  Kept only as a
+    # contrast against the macro (within-query) AUROC below.
+    occ_pooled = _auroc(occ["answer"].to_list(), occ["answer_prob"].to_list())
+
+    # Within-query AUROC: compute AUROC inside each occurrence query code, then macro-average.
+    pg_query = per_group_auroc(occ, ["query"], min_pos=10, min_neg=10)
+    pg_query.write_parquet(args.out_dir / "occ_auroc_by_query.parquet")
+    macro_q, n_q_groups = macro_auroc(pg_query)
+
+    # Within-query AUROC broken out by sequence position (positions >=1).  Macro-averaging the
+    # per-(query, position) AUROCs within each position is the clean conditioning test: same
+    # query distribution at every position, only the count of prior teacher-forced answers differs.
+    pg_qp = per_group_auroc(occ, ["query", "position"], min_pos=8, min_neg=8)
+    pg_qp.write_parquet(args.out_dir / "occ_auroc_by_query_position.parquet")
+    by_pos_macro = []
+    for pos in sorted(pg_qp["position"].unique().to_list()):
+        m, ng = macro_auroc(pg_qp.filter(pl.col("position") == pos))
+        by_pos_macro.append({"position": pos, "macro_auroc": m, "n_query_groups": ng})
+    pl.DataFrame(by_pos_macro).write_parquet(args.out_dir / "macro_auroc_by_position.parquet")
+
     summary["random"] = {
         "n_sequences": ds.schema_df.height,
         "n_query_positions": rnd.height,
-        "answer_auroc_overall": _auroc(allobs["answer"].to_list(), allobs["answer_prob"].to_list()),
         "censor_auroc": _auroc(censor["answer"].to_list(), censor["answer_prob"].to_list()),
         "censor_prevalence": float(censor["answer"].mean()),
-        "occurs_auroc_pooled": _auroc(occ["answer"].to_list(), occ["answer_prob"].to_list()),
+        "occurs_auroc_pooled_inflated": occ_pooled,
+        "occurs_auroc_macro_per_query": macro_q,
+        "n_query_groups_macro": n_q_groups,
         "occurs_prevalence": float(occ["answer"].mean()),
         "occurs_censored_frac": float(
             rnd.filter(pl.col("position") >= 1)["answer"].null_count()
             / max(1, rnd.filter(pl.col("position") >= 1).height)
         ),
+        "macro_auroc_by_position": by_pos_macro,
     }
 
     # 2. Clinical designed tasks --------------------------------------------------------
@@ -250,14 +307,24 @@ def main():
         if joined.height < 10:
             continue
         cond_pairs[position] = joined
+        # Within-query macro AUROC for each setting (avoids the cross-query base-rate inflation),
+        # computed over the same matched rows so singleton vs in-context is a fair comparison.
+        macro_s, _ = macro_auroc(
+            per_group_auroc(joined.rename({"prob_singleton": "answer_prob"}), ["query"], 8, 8)
+        )
+        macro_c, _ = macro_auroc(
+            per_group_auroc(joined.rename({"prob_incontext": "answer_prob"}), ["query"], 8, 8)
+        )
         cond_rows.append(
             {
                 "position": position,
                 "n_matched": joined.height,
-                "auroc_singleton": _auroc(
+                "macro_auroc_singleton": macro_s,
+                "macro_auroc_incontext": macro_c,
+                "auroc_singleton_pooled": _auroc(
                     joined["answer"].to_list(), joined["prob_singleton"].to_list()
                 ),
-                "auroc_incontext": _auroc(
+                "auroc_incontext_pooled": _auroc(
                     joined["answer"].to_list(), joined["prob_incontext"].to_list()
                 ),
                 "mean_abs_prob_shift": float(
@@ -277,8 +344,39 @@ def main():
         best_pos = min(cond_pairs)
         cond_pairs[best_pos].write_parquet(args.out_dir / "conditioning_pairs.parquet")
 
-    # 4. Figures ------------------------------------------------------------------------
-    _make_figures(args.out_dir, by_pos, by_query, clinical, cond, rnd, cond_pairs)
+    # 4. Dense matched-code position probe ----------------------------------------------
+    # The cleanest conditioning curve: for ~20 curated codes the *same* code sits at
+    # positions 1..P across many patients, so per-(code, position) AUROC has enough
+    # positives and a fixed code compared across positions varies only the number of
+    # prior teacher-forced answers it conditions on.  Target = each sequence's last query.
+    probe_macro = []
+    if args.probe_dir is not None and (args.probe_dir / "probe" / "tasks.parquet").exists():
+        pds = make_dataset(args.cohort_dir, args.probe_dir / "probe", args.split)
+        ppred = predict_dataset(model, pds, args.batch_size)
+        # Target of each probe sequence is its own last position; key on the per-sequence id so
+        # sequences sharing a (subject, prediction_time) but different target positions stay distinct.
+        last = ppred.group_by("seq_id").agg(pl.col("position").max().alias("_lp"))
+        ptgt = ppred.join(last, on="seq_id").filter(
+            pl.col("position") == pl.col("_lp")
+        ).rename({"query": "target_query", "position": "target_position"})
+        ptgt.write_parquet(args.out_dir / "probe_predictions.parquet")
+
+        pg_probe = per_group_auroc(ptgt, ["target_query", "target_position"], min_pos=10, min_neg=10)
+        pg_probe.write_parquet(args.out_dir / "probe_auroc_by_query_position.parquet")
+        for pos in sorted(pg_probe["target_position"].unique().to_list()):
+            sub = pg_probe.filter(pl.col("target_position") == pos)
+            m, ng = macro_auroc(sub)
+            probe_macro.append({"position": pos, "macro_auroc": m, "n_codes": ng})
+        # Per-code curve across positions (codes present at every position with a defined AUROC).
+        pl.DataFrame(probe_macro).write_parquet(args.out_dir / "probe_macro_by_position.parquet")
+        summary["probe"] = {
+            "n_sequences": pds.schema_df.height,
+            "macro_auroc_by_position": probe_macro,
+        }
+        print("probe macro by position:", probe_macro)
+
+    # 5. Figures ------------------------------------------------------------------------
+    _make_figures(args.out_dir, by_pos, by_query, clinical, cond, rnd, cond_pairs, summary)
 
     with open(args.out_dir / "summary.json", "w") as f:
         json.dump(summary, f, indent=2)
@@ -286,18 +384,65 @@ def main():
     print(json.dumps(summary, indent=2))
 
 
-def _make_figures(out_dir, by_pos, by_query, clinical, cond, rnd, cond_pairs):
+def _make_figures(out_dir, by_pos, by_query, clinical, cond, rnd, cond_pairs, summary):
     figs = out_dir / "figs"
 
-    # AUROC by position.
+    # Pooled-vs-within-query AUROC by position: the pooled (base-rate-inflated) per-position
+    # AUROC next to the macro within-query per-position AUROC, so the inflation is visible and
+    # the clean conditioning trend is the macro line.
+    bp = by_pos.filter((pl.col("auroc").is_not_null()) & (pl.col("position") >= 1))
+    macro_bp = pl.DataFrame(summary["random"]["macro_auroc_by_position"]).filter(
+        pl.col("macro_auroc").is_not_null()
+    )
+    if bp.height or macro_bp.height:
+        fig, ax = plt.subplots(figsize=(6, 3.6))
+        if bp.height:
+            ax.plot(bp["position"], bp["auroc"], "-o", c="#BBBBBB", label="pooled (base-rate inflated)")
+        if macro_bp.height:
+            ax.plot(macro_bp["position"], macro_bp["macro_auroc"], "-o", c="#C44E52",
+                    label="macro within-query (clean)")
+        ax.axhline(0.5, ls="--", c="grey", lw=1)
+        ax.set_xlabel("occurrence-query position (# of prior answers conditioned on)")
+        ax.set_ylabel("AUROC")
+        ax.set_title("Occurrence AUROC by position: pooled vs. within-query")
+        ax.set_ylim(0.4, 1.0)
+        ax.legend(fontsize=8)
+        fig.tight_layout()
+        fig.savefig(figs / "auroc_pooled_vs_macro_by_position.png", dpi=150)
+        plt.close(fig)
+
+    # Matched-code probe: per-code curves across positions + macro mean.
+    probe_fp = out_dir / "probe_auroc_by_query_position.parquet"
+    if probe_fp.exists():
+        pg = pl.read_parquet(probe_fp).filter(pl.col("auroc").is_not_null())
+        if pg.height:
+            fig, ax = plt.subplots(figsize=(6.2, 3.8))
+            for code, g in pg.group_by("target_query"):
+                g = g.sort("target_position")
+                ax.plot(g["target_position"], g["auroc"], "-", c="#CCCCCC", lw=0.7, alpha=0.8)
+            mac = pl.read_parquet(out_dir / "probe_macro_by_position.parquet").filter(
+                pl.col("macro_auroc").is_not_null()
+            )
+            ax.plot(mac["position"], mac["macro_auroc"], "-o", c="#C44E52", lw=2.0,
+                    label="macro mean over codes")
+            ax.set_xlabel("target-query position (# of prior answers)")
+            ax.set_ylabel("within-code AUROC")
+            ax.set_title("Matched-code probe: same code at positions 1..P\n(grey = each code; red = macro mean)")
+            ax.set_xticks(sorted(pg["target_position"].unique().to_list()))
+            ax.legend(fontsize=8)
+            fig.tight_layout()
+            fig.savefig(figs / "probe_by_position.png", dpi=150)
+            plt.close(fig)
+
+    # Legacy pooled AUROC by position (incl. censor at 0) — kept for reference.
     bp = by_pos.filter(pl.col("auroc").is_not_null())
     if bp.height:
         fig, ax = plt.subplots(figsize=(6, 3.5))
         ax.bar(bp["position"].to_list(), bp["auroc"].to_list(), color="#4C72B0")
         ax.axhline(0.5, ls="--", c="grey", lw=1)
         ax.set_xlabel("query position in sequence (0 = censor query)")
-        ax.set_ylabel("AUROC")
-        ax.set_title("Held-out AUROC by sequence position")
+        ax.set_ylabel("pooled AUROC")
+        ax.set_title("Pooled AUROC by sequence position (incl. censor)")
         ax.set_ylim(0.4, 1.0)
         fig.tight_layout()
         fig.savefig(figs / "auroc_by_position.png", dpi=150)
