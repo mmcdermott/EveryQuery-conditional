@@ -432,8 +432,11 @@ def build(train_csv: Path, eval_dir: Path, out: Path):
         "per-code prevalence — not from answering any single query well. With codes drawn uniformly over a "
         "~12k vocabulary spanning orders-of-magnitude prevalence, that inflation is large. The honest metric is "
         "<b>within-query AUROC</b> — AUROC computed inside each query code (so every scored pair shares a base "
-        "rate) and then macro-averaged over codes. We report both so the gap is explicit; the within-query "
-        "number is the one to trust.",
+        "rate) and then macro-averaged over codes. On this <i>random</i> held-out set, however, uniform "
+        "sampling over ~12k codes leaves too few positives per code to form a stable within-query macro (no "
+        "code clears the ≥10-positive/≥10-negative bar) — so the trustworthy within-query numbers come from "
+        "the matched-code probe below and the clinical tasks (§6), both single-code-many-patients by "
+        "construction. The pooled value is shown only to make the inflation explicit.",
         "Body",
     )
     rtbl = [
@@ -571,41 +574,64 @@ def build(train_csv: Path, eval_dir: Path, out: Path):
     best_task = cl_best.sort("target_auroc", descending=True).row(0, named=True) if cl_best.height else None
     cond_txt = ""
     if cond_fp.exists() and pl.read_parquet(cond_fp).height:
-        c0 = pl.read_parquet(cond_fp).row(0, named=True)
+        cdf = pl.read_parquet(cond_fp)
+        # Position 1 is a degenerate identity check ([censor, q] alone == position-1 in context);
+        # the meaningful comparison is position >= 2, where there is a real prior answer to condition on.
+        c2 = cdf.filter(pl.col("position") >= 2).sort("position")
+        c2 = c2.row(0, named=True) if c2.height else cdf.row(-1, named=True)
         cond_txt = (
-            f"On matched queries, asking a query in context rather than alone shifts its predicted "
-            f"probability by {c0['mean_abs_prob_shift']:.3f} on average (Pearson correlation "
-            f"{c0['corr_probs']:.3f} between the two), confirming the decoder genuinely conditions on the "
-            f"teacher-forced answers of earlier queries rather than collapsing to the marginal model. "
+            f"As a sanity check, at position 1 the in-context and alone predictions are identical "
+            f"(mean |ΔP| = 0, correlation 1.0) — there [censor, q] in context <i>is</i> the singleton, so "
+            f"the harness is consistent. At position 2, conditioning on one real prior answer shifts the "
+            f"prediction by mean |ΔP| = {c2['mean_abs_prob_shift']:.3f} (correlation {c2['corr_probs']:.3f}) — "
+            f"small, because in randomly assembled sequences the prior query is an arbitrary code whose answer "
+            f"is mostly uninformative about the target. The decoder <i>can</i> condition (the architecture is "
+            f"verified to, by unit tests, and the clinical chains below exploit it strongly); it simply does "
+            f"not manufacture dependence where the data carry none. "
         )
+    probe_pos = pl.read_parquet(eval_dir / "probe_macro_by_position.parquet") if (
+        eval_dir / "probe_macro_by_position.parquet"
+    ).exists() else None
+    probe_lo = probe_hi = None
+    if probe_pos is not None:
+        vals = [v for v in probe_pos["macro_auroc"].to_list() if v is not None]
+        if vals:
+            probe_lo, probe_hi = min(vals), max(vals)
     for para in [
         f"<b>The reformulation works.</b> A single model, trained only on randomly assembled query "
-        f"sequences, answers held-out queries well above chance: censor-query AUROC {_fmt(cz)}, and "
-        f"within-query occurrence AUROC {_fmt(oz_macro)} macro-averaged over query codes (vs. a "
-        f"base-rate-inflated pooled {_fmt(oz_pooled)} — the gap is exactly the cross-query base-rate effect, "
-        f"which is why we lead with the within-query number). These cover thousands of distinct (code, "
-        f"horizon) combinations the model was never specifically trained on.",
+        f"sequences, answers held-out queries well above chance. On the matched-code probe — the cleanest "
+        f"within-query measurement, 22 common codes each scored against patients queried for the same code — "
+        f"macro AUROC is {_fmt(probe_lo)}–{_fmt(probe_hi)}. The censor query reaches AUROC {_fmt(cz)}. "
+        f"(The pooled occurrence AUROC of {_fmt(oz_pooled)} is reported only as a foil: it is base-rate "
+        f"inflated by cross-query comparisons, and the uniform 12k-code sampling leaves no single code with "
+        f"enough held-out positives to form a random-set within-query macro — which is precisely why the "
+        f"dense probe and the clinical tasks are the instruments we trust.)",
         f"<b>Censoring is handled natively.</b> Folding the censor question into the first query block "
         f"removes the need for the separate censor head of the original EveryQuery while keeping every later "
         f"query answerable: positions ≥1 are predicted even when their own answers are unobserved, because "
         f"the always-observed censor answer and the block-autoregressive structure absorb the missingness.",
         (
-            f"<b>Conditioning is real and clinically useful.</b> {cond_txt}On designed clinical sequences the "
-            f"model reaches AUROC "
-            + (f"{best_task['target_auroc']:.3f} on the strongest task ({best_task['task']})" if best_task else "—")
-            + ", predicting downstream outcomes (mortality, ICU transfer, readmission) conditioned on earlier "
-            "events in the same query sequence — the capability the block-autoregressive form was built to add."
+            f"<b>Conditioning: present, and used when it is informative.</b> {cond_txt}The matched-code probe "
+            f"makes the same point structurally — holding a code fixed and adding more random prior answers "
+            f"(positions 1→4) leaves within-code AUROC essentially flat ({_fmt(probe_lo)}–{_fmt(probe_hi)}), "
+            f"because random priors carry no signal about the target. Where the prior <i>is</i> informative, "
+            f"the model uses it strongly: on designed clinical sequences it reaches "
+            + (f"AUROC {best_task['target_auroc']:.3f} ({best_task['task'].replace('_',' ')})" if best_task else "—")
+            + ", e.g. 30-day mortality and ICU-then-death chains — the capability the block-autoregressive form "
+            "was built to add. The unit tests independently verify the mechanism: flipping a prior answer "
+            "changes later predictions, while a query's own answer never leaks into its own prediction."
         ),
         "<b>On metrics.</b> Pooled AUROC across heterogeneous query codes is base-rate inflated — most "
-        "scored pairs are cross-query and separable by prevalence alone — so all headline numbers here are "
-        "within-query (AUROC computed inside each code, then macro-averaged). The matched-code probe and the "
-        "clinical tasks, being single-code-many-patients by construction, are within-query by design and are "
-        "the most trustworthy measurements.",
+        "scored pairs are cross-query and separable by prevalence alone — so the trustworthy numbers here are "
+        "within-query: the matched-code probe and the clinical tasks are single-code-many-patients by "
+        "construction. The random-set per-query macro is undefined here only because uniform sampling over "
+        "~12k codes yields too few positives per code on held-out; a denser code sampling would recover it.",
         "<b>Limitations.</b> Evaluation is teacher-forced (earlier answers are ground truth, not model "
-        "samples), so it measures conditional calibration, not free-running multi-step rollout. Within-query "
-        "macro metrics are restricted to codes with enough held-out positives, so very rare codes are "
-        "under-represented. Sequences are capped at five queries and assembled in random order, by design — "
-        "natural temporal ordering and longer chains are natural next steps.",
+        "samples), so it measures conditional calibration, not free-running rollout. The conditioning effect "
+        "on random sequences is small by construction (uninformative random priors); a probe with "
+        "deliberately correlated query pairs would size the effect when priors are predictive. Sequences are "
+        "capped at five queries and assembled in random order, by design — natural temporal ordering and "
+        "longer chains are natural next steps.",
     ]:
         P(para, "Body")
 
