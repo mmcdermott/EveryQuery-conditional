@@ -6,10 +6,10 @@ Covers, in order of pipeline position:
 2. ``ConditionalQueryModel`` — forward shape, loss masking, and *functional* information-flow
    tests: a query's prediction must be invariant to its own answer and to later queries, but
    sensitive to earlier answers and the patient context.
-3. ``ConditionalQueryPytorchDataset`` — label parquet loading, censor-sentinel encoding, and
-   collation (padding, answer classes, masks).
-4. ``sample_query_sequences`` — sequence sampling structure and ground-truth labeling logic
-   on a hand-built events frame.
+3. ``ConditionalQueryPytorchDataset`` — label parquet loading, code encoding, and collation
+   (padding, binary answer classes, masks).
+4. ``sample_query_sequences`` — fully-random sequence sampling and binary observed-occurrence
+   labeling on a hand-built events frame.
 """
 
 from datetime import datetime
@@ -21,17 +21,15 @@ import torch
 
 from every_query.data.seq_dataset import (
     ANSWERS_COL,
-    CENSOR_QUERY_CODE,
+    EOS_CODE,
     ConditionalQueryBatch,
     ConditionalQueryPytorchDataset,
 )
 from every_query.generate_tasks.sample_query_sequences import (
     build_sequence_index_df,
-    label_sequence_index_df,
+    label_binary_occurrence,
 )
-from every_query.generate_tasks.sample_tasks import compute_max_time_per_subject
 from every_query.model.conditional_model import (
-    ANSWER_CENSORED,
     ANSWER_NO,
     ANSWER_YES,
     TOKENS_PER_QUERY,
@@ -80,7 +78,7 @@ def test_mask_no_fully_masked_rows():
 # ── 2. Model forward / information flow ─────────────────────────────────
 
 VOCAB = 50
-CENSOR_IDX = VOCAB - 1
+EOS_IDX = VOCAB - 1
 
 MODEL_OVERRIDES = {
     "hidden_size": 32,
@@ -124,7 +122,7 @@ def make_batch(
     if patient_codes is None:
         patient_codes = [[3, 4, 5, 6]] * B
     if q_codes is None:
-        q_codes = [[CENSOR_IDX] + list(range(7, 6 + L))] * B
+        q_codes = [[EOS_IDX] + list(range(7, 6 + L))] * B
     if q_durations is None:
         q_durations = [[30.0] * L] * B
     if q_mask is None:
@@ -143,20 +141,18 @@ def make_batch(
 
 
 def test_forward_shapes_and_finite_loss(tiny_model):
-    batch = make_batch([[ANSWER_YES, ANSWER_NO, ANSWER_YES], [ANSWER_NO, ANSWER_CENSORED, ANSWER_NO]])
+    batch = make_batch([[ANSWER_YES, ANSWER_NO, ANSWER_YES], [ANSWER_NO, ANSWER_NO, ANSWER_NO]])
     loss, out = tiny_model(batch)
     assert out.answer_logits.shape == (2, 3)
     assert loss.isfinite()
-    assert out.censor_loss.isfinite() and out.occurs_loss.isfinite()
 
 
-def test_loss_masks_censored_answers(tiny_model):
-    """Flipping a censored answer's *target interpretation* must not change the loss, because
-    censored positions are excluded — but flipping an observed one must."""
-    base = make_batch([[ANSWER_YES, ANSWER_CENSORED, ANSWER_NO]])
-    loss_base, out_base = tiny_model(base)
-    assert not out_base.valid_mask[0, 1], "censored position should be invalid for loss"
-    assert out_base.valid_mask[0, 0] and out_base.valid_mask[0, 2]
+def test_loss_covers_all_real_positions_only(tiny_model):
+    """Every real (non-padding) position is valid for loss; padding positions are excluded."""
+    batch = make_batch([[ANSWER_YES, ANSWER_NO, ANSWER_YES]], q_mask=[[True, True, False]])
+    _, out = tiny_model(batch)
+    assert out.valid_mask[0, 0] and out.valid_mask[0, 1]
+    assert not out.valid_mask[0, 2], "padding position must be excluded from loss"
 
 
 def test_own_answer_does_not_change_own_logit(tiny_model):
@@ -184,8 +180,8 @@ def test_prior_answer_changes_later_logit(tiny_model):
 
 def test_later_query_does_not_change_earlier_logit(tiny_model):
     """Changing Q_3's code must not affect predictions for A_1 / A_2."""
-    a = make_batch([[ANSWER_YES, ANSWER_NO, ANSWER_YES]], q_codes=[[CENSOR_IDX, 7, 8]])
-    b = make_batch([[ANSWER_YES, ANSWER_NO, ANSWER_YES]], q_codes=[[CENSOR_IDX, 7, 20]])
+    a = make_batch([[ANSWER_YES, ANSWER_NO, ANSWER_YES]], q_codes=[[EOS_IDX, 7, 8]])
+    b = make_batch([[ANSWER_YES, ANSWER_NO, ANSWER_YES]], q_codes=[[EOS_IDX, 7, 20]])
     _, out_a = tiny_model(a)
     _, out_b = tiny_model(b)
     torch.testing.assert_close(out_a.answer_logits[0, :2], out_b.answer_logits[0, :2])
@@ -195,7 +191,7 @@ def test_later_query_does_not_change_earlier_logit(tiny_model):
 def test_own_query_changes_own_logit(tiny_model):
     """The prediction for A_j must depend on Q_j's code and duration."""
     base = make_batch([[ANSWER_YES, ANSWER_NO, ANSWER_YES]])
-    diff_code = make_batch([[ANSWER_YES, ANSWER_NO, ANSWER_YES]], q_codes=[[CENSOR_IDX, 30, 8]])
+    diff_code = make_batch([[ANSWER_YES, ANSWER_NO, ANSWER_YES]], q_codes=[[EOS_IDX, 30, 8]])
     diff_dur = make_batch(
         [[ANSWER_YES, ANSWER_NO, ANSWER_YES]], q_durations=[[30.0, 300.0, 30.0]]
     )
@@ -216,10 +212,10 @@ def test_patient_context_changes_logits(tiny_model):
 
 def test_padded_queries_do_not_change_real_logits(tiny_model):
     """Appending a padded (masked-out) query block must leave real predictions unchanged."""
-    short = make_batch([[ANSWER_YES, ANSWER_NO]], q_codes=[[CENSOR_IDX, 7]], q_durations=[[30.0, 7.0]])
+    short = make_batch([[ANSWER_YES, ANSWER_NO]], q_codes=[[EOS_IDX, 7]], q_durations=[[30.0, 7.0]])
     padded = make_batch(
         [[ANSWER_YES, ANSWER_NO, ANSWER_NO]],
-        q_codes=[[CENSOR_IDX, 7, 9]],
+        q_codes=[[EOS_IDX, 7, 9]],
         q_durations=[[30.0, 7.0, 99.0]],
         q_mask=[[True, True, False]],
     )
@@ -229,7 +225,7 @@ def test_padded_queries_do_not_change_real_logits(tiny_model):
 
 
 def test_gradients_flow_and_are_finite(tiny_model):
-    batch = make_batch([[ANSWER_YES, ANSWER_NO, ANSWER_CENSORED], [ANSWER_NO, ANSWER_YES, ANSWER_NO]])
+    batch = make_batch([[ANSWER_YES, ANSWER_NO, ANSWER_NO], [ANSWER_NO, ANSWER_YES, ANSWER_NO]])
     tiny_model.train()
     loss, _ = tiny_model(batch)
     loss.backward()
@@ -257,7 +253,7 @@ def test_tiny_model_overfits_one_batch():
     opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
     model.train()
     first = None
-    for _ in range(40):
+    for _ in range(80):
         opt.zero_grad()
         loss, _ = model(batch)
         if first is None:
@@ -272,16 +268,17 @@ def test_tiny_model_overfits_one_batch():
 
 def test_seq_dataset_loads_and_encodes(seq_dataset):
     assert len(seq_dataset) > 0
-    assert seq_dataset.censor_query_index == max(seq_dataset.code_to_index.values()) + 1
-    assert seq_dataset.encode_query(CENSOR_QUERY_CODE) == seq_dataset.censor_query_index
+    # EOS may be absent in the tiny test cohort; encode_query is a plain vocab lookup.
+    a_code = next(iter(seq_dataset.code_to_index))
+    assert seq_dataset.encode_query(a_code) == seq_dataset.code_to_index[a_code]
     with pytest.raises(KeyError):
         seq_dataset.encode_query("NOT_A_REAL_CODE")
 
 
 def test_seq_dataset_getitem_carries_sequences(seq_dataset):
     item = seq_dataset[0]
-    assert item["queries"][0] == CENSOR_QUERY_CODE
     assert len(item["queries"]) == len(item["durations"]) == len(item["answers"])
+    assert all(isinstance(a, bool) for a in item["answers"]), "answers are binary, never None"
     assert "dynamic" in item
 
 
@@ -295,10 +292,6 @@ def test_seq_collate_shapes_and_padding(seq_dataset, seq_sample_batch):
     assert batch.q_answers.shape == (B, L)
     assert batch.q_mask.shape == (B, L)
 
-    # First position of every sample is the censor sentinel and real.
-    assert (batch.q_codes[:, 0] == seq_dataset.censor_query_index).all()
-    assert batch.q_mask[:, 0].all()
-
     # Padded positions carry zeros / mask False; the fixture mixes lengths 2 and 3.
     lengths = batch.q_mask.sum(dim=1)
     assert lengths.min() == 2 and lengths.max() == 3
@@ -308,19 +301,22 @@ def test_seq_collate_shapes_and_padding(seq_dataset, seq_sample_batch):
 
 
 def test_seq_collate_answer_classes(seq_dataset, seq_sample_batch):
-    """Fixture rows alternate: even rows end censored (None); odd rows fully observed."""
+    """Binary answers: True -> ANSWER_YES, False -> ANSWER_NO; padding holds ANSWER_NO."""
     batch = seq_sample_batch
     raw = seq_dataset.schema_df[ANSWERS_COL].to_list()
     for i, answers in enumerate(raw):
         for j, ans in enumerate(answers):
-            expected = ANSWER_CENSORED if ans is None else (ANSWER_YES if ans else ANSWER_NO)
+            expected = ANSWER_YES if ans else ANSWER_NO
             assert batch.q_answers[i, j].item() == expected, f"row {i} pos {j}"
+        # padding beyond the real length is ANSWER_NO
+        for j in range(len(answers), batch.n_queries):
+            assert batch.q_answers[i, j].item() == ANSWER_NO
 
 
 def test_seq_dataset_end_to_end_forward(seq_dataset, seq_sample_batch):
     """The collated fixture batch runs through a tiny model sized to the fixture vocab."""
     torch.manual_seed(0)
-    vocab = seq_dataset.censor_query_index + 1
+    vocab = max(seq_dataset.code_to_index.values()) + 1
     overrides = dict(MODEL_OVERRIDES, vocab_size=vocab)
     model = ConditionalQueryModel(
         config_overrides=overrides, decoder_layers=1, decoder_heads=2, decoder_ffn_mult=2
@@ -331,7 +327,7 @@ def test_seq_dataset_end_to_end_forward(seq_dataset, seq_sample_batch):
     assert out.answer_logits.shape == (seq_sample_batch.batch_size, seq_sample_batch.n_queries)
 
 
-# ── 4. Sequence sampling + labeling ─────────────────────────────────────
+# ── 4. Sequence sampling + binary labeling ──────────────────────────────
 
 
 def _events(rows: list[tuple[int, datetime, str]]) -> pl.DataFrame:
@@ -351,87 +347,65 @@ def test_build_sequence_index_structure():
             "prediction_time": [datetime(2024, 1, 1), datetime(2024, 2, 1), datetime(2024, 3, 1)],
         }
     ).with_columns(pl.col("prediction_time").cast(pl.Datetime("us")))
-    idx = build_sequence_index_df(ctx, ["A", "B", "C"], 1, 4, 1, 365, seed=3)
+    codes = ["A", "B", "C", EOS_CODE]
+    idx = build_sequence_index_df(ctx, codes, 1, 5, 1, 365, seed=3)
 
     per_ctx = idx.group_by("_ctx_id").len()
-    assert per_ctx["len"].min() >= 2 and per_ctx["len"].max() <= 5
+    assert per_ctx["len"].min() >= 1 and per_ctx["len"].max() <= 5
+    # All queries are ordinary codes (no privileged censor position / sentinel).
+    assert bool(idx["query"].is_in(codes).all())
+    # Positions within each context start at 0 and are contiguous.
+    assert idx.filter(pl.col("_position") == 0)["_ctx_id"].n_unique() == 3
 
-    pos0 = idx.filter(pl.col("_position") == 0)
-    assert pos0.height == 3
-    assert pos0["query"].unique().to_list() == [CENSOR_QUERY_CODE]
-    assert not idx.filter(pl.col("_position") > 0)["query"].is_in([CENSOR_QUERY_CODE]).any()
+
+def test_eos_first_fraction_forces_eos_at_position_0():
+    ctx = pl.DataFrame(
+        {"subject_id": [1, 2], "prediction_time": [datetime(2024, 1, 1), datetime(2024, 2, 1)]}
+    ).with_columns(pl.col("prediction_time").cast(pl.Datetime("us")))
+    idx = build_sequence_index_df(ctx, ["A", "B", EOS_CODE], 2, 2, 1, 365, 0, eos_first_fraction=1.0)
+    assert idx.filter(pl.col("_position") == 0)["query"].unique().to_list() == [EOS_CODE]
 
 
-def test_label_sequence_known_answers():
-    """Hand-checkable labeling: subject 1 has events at known times.
+def test_label_binary_known_answers():
+    """Hand-checkable binary observed-occurrence labeling.
 
-    Events for subject 1: code A at day 10, code B at day 100; last event day 100.
+    Subject 1: A at day 10, B at day 100 (last event = TIMELINE//END at day 100).
     Context at day 5:
-      - censor query, 30d  → data after day 35?  yes (event at day 100)         → True
-      - A within 10d       → A at day 10 < day 15 window end                     → True
-      - B within 10d       → no B before day 15; window inside observation       → False
-      - C within 200d      → no C ever; window end day 205 > max_time day 100    → null (censored)
-      - A within 200d      → A observed in window; occurrence overrides the
-        truncated window (terminal-event semantics)                              → True
+      - A within 10d   → A at day 10 in (day5, day15)                         → True
+      - B within 10d   → no B before day 15                                   → False
+      - C within 200d  → no C ever                                            → False (not null!)
+      - A within 200d  → A observed in window                                 → True
+      - END within 10d → record ends day 100, not within (day5, day15)        → False
+      - END within 200d→ record ends day 100, within (day5, day205)           → True
     """
-    t0 = datetime(2024, 1, 1)
-
-    def day(n):
-        return datetime(2024, 1, 1 + n) if n < 30 else datetime(2024, 1 + n // 30, 1 + n % 28)
-
     events = _events(
         [
-            (1, day(0), "X"),
-            (1, day(10), "A"),
+            (1, datetime(2024, 1, 1), "X"),
+            (1, datetime(2024, 1, 11), "A"),  # day 10
             (1, datetime(2024, 4, 10), "B"),  # ~day 100
+            (1, datetime(2024, 4, 10), EOS_CODE),  # record ends with B's day
         ]
     )
     pred_time = datetime(2024, 1, 6)  # day 5
-
     index_df = pl.DataFrame(
         {
-            "_ctx_id": [0, 0, 0, 0, 0],
-            "_position": [0, 1, 2, 3, 4],
-            "subject_id": [1, 1, 1, 1, 1],
-            "prediction_time": [pred_time] * 5,
-            "query": [CENSOR_QUERY_CODE, "A", "B", "C", "A"],
-            "duration_days": [30.0, 10.0, 10.0, 200.0, 200.0],
+            "_ctx_id": [0] * 6,
+            "_position": list(range(6)),
+            "subject_id": [1] * 6,
+            "prediction_time": [pred_time] * 6,
+            "query": ["A", "B", "C", "A", EOS_CODE, EOS_CODE],
+            "duration_days": [10.0, 10.0, 200.0, 200.0, 10.0, 200.0],
         }
     ).with_columns(
         pl.col("prediction_time").cast(pl.Datetime("us")),
         pl.col("duration_days").cast(pl.Float32),
         pl.col("_ctx_id").cast(pl.UInt32),
     )
-
-    labeled = label_sequence_index_df(index_df, events, compute_max_time_per_subject(events))
+    labeled = label_binary_occurrence(index_df, events)
     assert labeled.height == 1
     row = labeled.row(0, named=True)
-    assert row["queries"] == [CENSOR_QUERY_CODE, "A", "B", "C", "A"]
-    assert row["answers"][0] is True, "data exists after day 35"
-    assert row["answers"][1] is True, "A occurred at day 10 within (day5, day15)"
-    assert row["answers"][2] is False, "no B in window, window fully observed"
-    assert row["answers"][3] is None, "no C ever; window extends past last event -> censored"
-    assert row["answers"][4] is True, "A observed in window; occurrence overrides truncation"
-
-
-def test_label_sequence_censor_query_false_when_no_later_data():
-    events = _events([(1, datetime(2024, 1, 1), "X"), (1, datetime(2024, 1, 10), "A")])
-    index_df = pl.DataFrame(
-        {
-            "_ctx_id": [0],
-            "_position": [0],
-            "subject_id": [1],
-            "prediction_time": [datetime(2024, 1, 5)],
-            "query": [CENSOR_QUERY_CODE],
-            "duration_days": [30.0],
-        }
-    ).with_columns(
-        pl.col("prediction_time").cast(pl.Datetime("us")),
-        pl.col("duration_days").cast(pl.Float32),
-        pl.col("_ctx_id").cast(pl.UInt32),
-    )
-    labeled = label_sequence_index_df(index_df, events, compute_max_time_per_subject(events))
-    assert labeled.row(0, named=True)["answers"] == [False], "no data after day 35 -> censor answer False"
+    assert row["answers"] == [True, False, False, True, False, True]
+    assert all(a is not None for a in row["answers"]), "binary labels are never null"
 
 
 def test_sampler_determinism():

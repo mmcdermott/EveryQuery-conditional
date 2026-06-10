@@ -155,12 +155,17 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
             c: int(i)
             for c, i in zip(code_meta["code"].to_list(), code_meta["code/vocab_index"].to_list(), strict=True)
         }
+        # The conditional model expresses censoring by querying the end-of-timeline code; a
+        # production cohort should have it.  We warn rather than raise so the dataset still works
+        # on cohorts (e.g. tiny test fixtures) that lack it — censoring queries simply aren't
+        # available there.  ``eos_query_index`` is ``None`` when absent.
         if EOS_CODE not in self.code_to_index:
-            raise ValueError(
-                f"End-of-timeline code {EOS_CODE!r} is not in the cohort vocabulary; the conditional "
-                f"model handles censoring by querying it, so it must be a real code."
+            logger.warning(
+                "End-of-timeline code %r is not in the cohort vocabulary; censoring-as-a-query "
+                "is unavailable for this cohort.",
+                EOS_CODE,
             )
-        self.eos_query_index: int = self.code_to_index[EOS_CODE]
+        self.eos_query_index: int | None = self.code_to_index.get(EOS_CODE)
 
     @property
     def labels_df(self) -> pl.DataFrame:

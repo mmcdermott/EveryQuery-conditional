@@ -22,7 +22,6 @@ import hydra
 import polars as pl
 from omegaconf import DictConfig
 
-from every_query.data.seq_dataset import CENSOR_QUERY_CODE
 from every_query.evaluate.metrics import _auroc_or_none
 
 logger = logging.getLogger(__name__)
@@ -72,7 +71,7 @@ def compute_sequence_metrics(predictions: pl.DataFrame) -> tuple[pl.DataFrame, p
         ...     "subject_id": [1, 1, 2, 2],
         ...     "prediction_time": [datetime(2024, 1, 1)] * 4,
         ...     "position": [0, 1, 0, 1],
-        ...     "query": ["__CENSOR__", "A", "__CENSOR__", "A"],
+        ...     "query": ["TIMELINE//END", "A", "TIMELINE//END", "A"],
         ...     "duration_days": [30.0, 7.0, 30.0, 7.0],
         ...     "answer": [True, True, False, False],
         ...     "answer_prob": [0.9, 0.8, 0.2, 0.3],
@@ -80,13 +79,12 @@ def compute_sequence_metrics(predictions: pl.DataFrame) -> tuple[pl.DataFrame, p
         >>> by_pos, by_query = compute_sequence_metrics(preds)
         >>> by_pos["auroc"].to_list()
         [1.0, 1.0]
-        >>> by_query["query"].to_list()
-        ['A']
+        >>> sorted(by_query["query"].to_list())
+        ['A', 'TIMELINE//END']
     """
     by_position = _group_metrics(predictions, ["position"])
 
-    non_censor = predictions.filter(pl.col("query") != CENSOR_QUERY_CODE).with_columns(_bucket_expr())
-    by_query = _group_metrics(non_censor, ["query", "duration_bucket"])
+    by_query = _group_metrics(predictions.with_columns(_bucket_expr()), ["query", "duration_bucket"])
 
     return by_position, by_query
 

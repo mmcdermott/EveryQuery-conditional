@@ -12,7 +12,6 @@ import pytest
 from meds import train_split, tuning_split
 
 from conftest import ENSURE_ENV_PLACEHOLDERS, run_and_check
-from every_query.data.seq_dataset import CENSOR_QUERY_CODE
 
 NEW_CLIS = ["EQ_generate_query_sequences", "EQ_predict_sequences", "EQ_evaluate_sequences"]
 
@@ -38,8 +37,8 @@ def cq_sequence_tasks_dir(eq_preprocessed_dataset: Path, tmp_path_factory) -> Pa
                 "input_shard=0",
                 "task_shard=0",
                 "n_contexts=8",
-                "min_extra_queries=1",
-                "max_extra_queries=4",
+                "min_queries=1",
+                "max_queries=5",
                 "duration_min=1",
                 "duration_max=30",
                 "min_context_per_subject=1",
@@ -62,11 +61,10 @@ def test_generated_sequences_conform(cq_sequence_tasks_dir: Path):
     lens_d = df["durations"].list.len()
     lens_a = df["answers"].list.len()
     assert (lens_q == lens_d).all() and (lens_q == lens_a).all()
-    assert int(lens_q.min()) >= 2 and int(lens_q.max()) <= 5
+    assert int(lens_q.min()) >= 1 and int(lens_q.max()) <= 5
 
-    assert (df["queries"].list.first() == CENSOR_QUERY_CODE).all()
-    # Censor answers (position 0) are never null.
-    assert df["answers"].list.first().null_count() == 0
+    # Binary observed-occurrence answers: every element non-null, no privileged first query.
+    assert df["answers"].explode().null_count() == 0
 
 
 @pytest.fixture(scope="session")
@@ -118,10 +116,9 @@ def test_conditional_predict_and_evaluate(
     preds = pl.read_parquet(predictions_fp)
     tasks = pl.read_parquet(tasks_dir / "tasks.parquet")
     assert preds.height == int(tasks["queries"].list.len().sum()), "one output row per query position"
-    assert preds.filter(pl.col("position") == 0)["query"].unique().to_list() == [CENSOR_QUERY_CODE]
     assert preds["answer_prob"].is_between(0.0, 1.0).all()
-    # Position-0 (censor) answers are observed; row order preserves input sequence order.
-    assert preds.filter(pl.col("position") == 0)["answer"].null_count() == 0
+    # Binary observed-occurrence answers are always present (never null).
+    assert preds["answer"].null_count() == 0
 
     metrics_stem = tmp_path / "metrics"
     run_and_check(

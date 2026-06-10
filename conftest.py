@@ -405,12 +405,10 @@ def seq_task_labels_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
         {seq_task_labels_dir}/{split}/{shard}.parquet
 
-    Each row: ``(subject_id, prediction_time, queries, durations, answers)`` where
-    ``queries[0]`` is the censor sentinel and ``answers`` is nullable (None = censored).
+    Each row: ``(subject_id, prediction_time, queries, durations, answers)``.  Answers are
+    binary observed-occurrence (no nulls); queries are ordinary codes in random order.
     Sequence lengths vary (2 and 3 blocks) so collation exercises padding.
     """
-    from every_query.data.seq_dataset import CENSOR_QUERY_CODE
-
     task_dir = tmp_path_factory.mktemp("cq_seq_labels")
 
     for split, subjects in [(train_split, _TRAIN_SUBJECTS), (tuning_split, _TUNING_SUBJECTS)]:
@@ -420,11 +418,11 @@ def seq_task_labels_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
         rows = []
         for i, subj in enumerate(subjects):
             if i % 2 == 0:
-                queries = [CENSOR_QUERY_CODE, _QUERY_CODES[0], _QUERY_CODES[1]]
+                queries = [_QUERY_CODES[0], _QUERY_CODES[1], _QUERY_CODES[0]]
                 durations = [30.0, 7.0, 60.0]
-                answers = [True, False, None]  # last answer censored
+                answers = [True, False, True]
             else:
-                queries = [CENSOR_QUERY_CODE, _QUERY_CODES[1]]
+                queries = [_QUERY_CODES[1], _QUERY_CODES[0]]
                 durations = [14.0, 3.0]
                 answers = [False, True]
             rows.append(
