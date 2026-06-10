@@ -22,9 +22,10 @@ Design decisions (see issue #33):
   *different* tasks on *different* patients; the full sweep covers the product.
 - **Task composition**: draw ``N`` tasks once and ``N x M`` contexts once, then zip them. Mathematically
   equivalent to ``N`` independent per-task draws under iid sampling, with one seed per side.
-- **Censoring**: computed from ``max_time`` per subject (one groupby up-front per shard). Censored
-  rows get ``boolean_value=True`` and ``occurs=False`` regardless of whether the event actually
-  fired in the window.
+- **Censoring**: computed from ``max_time`` per subject (one groupby up-front per shard).  An
+  observed in-window occurrence labels ``True`` even when the record ends inside the window;
+  only an unobservable non-occurrence (no in-window event, window extends past ``max_time``)
+  is labeled ``null`` (censored).
 - **Single-pass evaluation**: one ``join_asof(strategy="forward", by=["subject_id","query"])`` across
   the whole ``index_df`` against the events table, regardless of how many distinct codes are present.
 """
@@ -274,12 +275,14 @@ def evaluate_index_df(
     Three-valued semantics (matches ``TaskQuerySchema`` + ``LabelSchema``'s nullable
     ``boolean_value``):
 
-        - ``boolean_value = null``: censored — ``(prediction_time + duration_days) >
-          max_time[subject_id]``; observation ended before we could see whether the event
-          fired.
-        - ``boolean_value = True``: not censored and an event with matching ``query`` code
-          fell strictly within ``(prediction_time, prediction_time + duration_days)``.
-        - ``boolean_value = False``: not censored and no such event fell within the window.
+        - ``boolean_value = True``: an event with matching ``query`` code fell strictly
+          within ``(prediction_time, prediction_time + duration_days)`` — regardless of
+          whether the record extends past the window (an observed occurrence is an
+          occurrence; essential for terminal events like death, which end the record).
+        - ``boolean_value = False``: no such event fell within the window AND the window is
+          fully observed (``prediction_time + duration_days <= max_time[subject_id]``).
+        - ``boolean_value = null``: censored — no in-window event was observed and the
+          window extends past ``max_time[subject_id]``, so a non-occurrence is unknowable.
 
     The ``>`` on event time is enforced by shifting the asof key by ``+1µs`` since datetimes are
     stored at microsecond precision, which turns ``strategy="forward"``'s ``>=`` into a strict ``>``.
@@ -364,8 +367,19 @@ def evaluate_index_df(
     censored = (window_end > pl.col("max_time")).fill_null(True)
     event_in_window = pl.col(DataSchema.time_name).is_not_null() & (pl.col(DataSchema.time_name) < window_end)
 
-    # Collapsed nullable label: null when censored, else True/False from event_in_window.
-    boolean_value = pl.when(censored).then(pl.lit(None, dtype=pl.Boolean)).otherwise(event_in_window)
+    # Collapsed nullable label.  An *observed* in-window occurrence is True even when the
+    # record ends before the window does — the event happened; the truncated window only
+    # makes a *non*-occurrence unknowable.  This matters enormously for terminal events:
+    # a death at day 5 ends the record, so under "censored → null regardless" a 30-day
+    # mortality query could essentially never be labeled True (its positive prevalence on
+    # MIMIC-IV drops to ~0.06%); with occurrence-overrides-censoring it is ~5%.
+    boolean_value = (
+        pl.when(event_in_window)
+        .then(pl.lit(True))
+        .when(~censored)
+        .then(pl.lit(False))
+        .otherwise(pl.lit(None, dtype=pl.Boolean))
+    )
 
     return joined.with_columns(boolean_value.alias(TaskQuerySchema.boolean_value_name)).select(out_cols)
 

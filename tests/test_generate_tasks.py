@@ -121,10 +121,12 @@ def test_labels_match_ground_truth(
         # ~20-row fixture output, and the cost is bounded by CPU + parquet I/O, not test
         # complexity.  Favours readability + ground-truth correctness over vectorisation.
         #
-        # Collapsed nullable boolean_value per TaskQuerySchema:
-        #   null  → censored (window_end > max_time OR subject absent from events_df)
+        # Collapsed nullable boolean_value per TaskQuerySchema (occurrence overrides
+        # censoring — an observed in-window event is True even when the record ends
+        # inside the window; only an unobservable *non*-occurrence is null):
         #   True  → event occurred in (prediction_time, window_end)
-        #   False → no event in window and not censored
+        #   False → no event in window and window fully observed (window_end <= max_time)
+        #   null  → no event in window and window extends past max_time (or subject absent)
         for row in labels.iter_rows(named=True):
             subj = row["subject_id"]
             window_end = row["prediction_time"] + timedelta(days=row["duration_days"])
@@ -142,7 +144,7 @@ def test_labels_match_ground_truth(
                 & (pl.col("time") < window_end)
             ).is_empty()
 
-            expected_boolean = None if expected_censored else event_fires
+            expected_boolean = True if event_fires else (None if expected_censored else False)
 
             ctx = (
                 f"split={split}, subject_id={subj}, query={row['query']!r}, "

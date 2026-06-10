@@ -367,10 +367,12 @@ def test_label_sequence_known_answers():
 
     Events for subject 1: code A at day 10, code B at day 100; last event day 100.
     Context at day 5:
-      - censor query, 30d  → data after day 35?  yes (event at day 100)        → True
-      - A within 10d       → A at day 10 < day 15 window end, not censored      → True
-      - B within 10d       → no B before day 15; window inside observation      → False
-      - A within 200d      → window end day 205 > max_time day 100              → null (censored)
+      - censor query, 30d  → data after day 35?  yes (event at day 100)         → True
+      - A within 10d       → A at day 10 < day 15 window end                     → True
+      - B within 10d       → no B before day 15; window inside observation       → False
+      - C within 200d      → no C ever; window end day 205 > max_time day 100    → null (censored)
+      - A within 200d      → A observed in window; occurrence overrides the
+        truncated window (terminal-event semantics)                              → True
     """
     t0 = datetime(2024, 1, 1)
 
@@ -388,12 +390,12 @@ def test_label_sequence_known_answers():
 
     index_df = pl.DataFrame(
         {
-            "_ctx_id": [0, 0, 0, 0],
-            "_position": [0, 1, 2, 3],
-            "subject_id": [1, 1, 1, 1],
-            "prediction_time": [pred_time] * 4,
-            "query": [CENSOR_QUERY_CODE, "A", "B", "A"],
-            "duration_days": [30.0, 10.0, 10.0, 200.0],
+            "_ctx_id": [0, 0, 0, 0, 0],
+            "_position": [0, 1, 2, 3, 4],
+            "subject_id": [1, 1, 1, 1, 1],
+            "prediction_time": [pred_time] * 5,
+            "query": [CENSOR_QUERY_CODE, "A", "B", "C", "A"],
+            "duration_days": [30.0, 10.0, 10.0, 200.0, 200.0],
         }
     ).with_columns(
         pl.col("prediction_time").cast(pl.Datetime("us")),
@@ -404,11 +406,12 @@ def test_label_sequence_known_answers():
     labeled = label_sequence_index_df(index_df, events, compute_max_time_per_subject(events))
     assert labeled.height == 1
     row = labeled.row(0, named=True)
-    assert row["queries"] == [CENSOR_QUERY_CODE, "A", "B", "A"]
+    assert row["queries"] == [CENSOR_QUERY_CODE, "A", "B", "C", "A"]
     assert row["answers"][0] is True, "data exists after day 35"
     assert row["answers"][1] is True, "A occurred at day 10 within (day5, day15)"
     assert row["answers"][2] is False, "no B in window, window fully observed"
-    assert row["answers"][3] is None, "200d window extends past last event -> censored"
+    assert row["answers"][3] is None, "no C ever; window extends past last event -> censored"
+    assert row["answers"][4] is True, "A observed in window; occurrence overrides truncation"
 
 
 def test_label_sequence_censor_query_false_when_no_later_data():
