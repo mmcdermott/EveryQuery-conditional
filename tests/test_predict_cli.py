@@ -17,6 +17,7 @@ import os
 import subprocess
 import sys
 from datetime import datetime
+from importlib.metadata import version as metadata_version
 from pathlib import Path
 
 import polars as pl
@@ -37,7 +38,13 @@ _VENV_BIN = str(Path(sys.executable).parent)
 # ``simple_static_sharded_by_split`` testing dataset's vocab after preprocessing.
 _HELD_OUT_SUBJECT = 1500733
 _PRED_TIME = datetime(2010, 6, 3, 15, 0, 0)
-_QUERY_CODES = ["DISCHARGE", "DOB"]
+# meds_testing_helpers 0.3.1 renamed the fixture's birth code from ``DOB`` to
+# ``MEDS_BIRTH``; resolve at import time so the tests pass under either pin.
+_BIRTH_CODE = (
+    "DOB" if tuple(int(x) for x in metadata_version("meds_testing_helpers").split(".")[:3]) < (0, 3, 1)
+    else "MEDS_BIRTH"
+)
+_QUERY_CODES = ["DISCHARGE", _BIRTH_CODE]
 _DURATION_DAYS = 30.0
 
 
@@ -130,7 +137,7 @@ def test_eq_predict_preserves_input_row_order(
     """
     # Non-alphabetical query order, mixed durations — exercises the order check past
     # the alphabetical HR/TEMP happy path of the main integration test.
-    expected_queries = ["DOB", "DISCHARGE", "DOB"]
+    expected_queries = [_BIRTH_CODE, "DISCHARGE", _BIRTH_CODE]
     expected_durations = [60.0, 30.0, 30.0]
 
     tasks_dir = tmp_path / "tasks"

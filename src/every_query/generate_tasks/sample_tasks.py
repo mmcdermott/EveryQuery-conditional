@@ -267,6 +267,7 @@ def evaluate_index_df(
     index_df: pl.DataFrame,
     events_df: pl.DataFrame,
     max_time_per_subject: pl.DataFrame,
+    id_cols: tuple[str, ...] = (),
 ) -> pl.DataFrame:
     """Label an index DataFrame with the single nullable ``boolean_value`` column via a single ``join_asof``.
 
@@ -289,10 +290,14 @@ def evaluate_index_df(
             the output.
         events_df: Shard events with columns ``subject_id``, ``time``, ``code``.
         max_time_per_subject: Output of ``compute_max_time_per_subject``.
+        id_cols: Extra ``index_df`` columns carried through to the output unchanged (e.g. a
+            ``(ctx_id, position)`` pair used by the query-sequence sampler to reassemble
+            per-context lists).  The labeling join reorders rows, so callers that need to
+            recover input identity must thread it through here.
 
     Returns:
         DataFrame with columns ``(subject_id, prediction_time, boolean_value, query,
-        duration_days)``.  ``boolean_value`` is nullable (``null`` = censored).
+        duration_days, *id_cols)``.  ``boolean_value`` is nullable (``null`` = censored).
     """
     # Output column set lives on ``TaskQuerySchema`` — the 4 required columns plus the
     # inherited (optional) ``boolean_value`` for the collapsed label.  Defining it once
@@ -304,13 +309,17 @@ def evaluate_index_df(
         TaskQuerySchema.boolean_value_name,
         TaskQuerySchema.query_name,
         TaskQuerySchema.duration_days_name,
+        *id_cols,
     ]
 
     # Empty-input fast-path: use the schema-driven empty builder in ``every_query.data``
     # rather than hand-rolling a matching polars schema dict — same column set, same
     # dtypes, guaranteed to pass ``TaskQuerySchema.align()`` downstream.
     if index_df.height == 0:
-        return empty_task_query_df().select(out_cols)
+        empty = empty_task_query_df()
+        if id_cols:
+            empty = empty.hstack(index_df.select(id_cols))
+        return empty.select(out_cols)
 
     # Left side: index rows with a +1µs-shifted prediction_time for the strict-> asof key.
     left = index_df.with_columns(

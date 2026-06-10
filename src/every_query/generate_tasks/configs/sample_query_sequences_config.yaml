@@ -1,0 +1,41 @@
+# Hydra config for the conditional query-*sequence* label generator.
+#
+# Sweep with:
+#   EQ_generate_query_sequences -m input_shard=0,1,2,... task_shard=range(0,K)
+#
+# Path roots follow the same `.env` fallback convention as `sample_tasks_config.yaml`:
+#   data_dir  -> $INTERMEDIATE   (event shards live under `{data_dir}/data/{split}/*.parquet`)
+#   out_dir   -> $TASK_DIR       (labeled shards land as {split}/*.parquet; consumable as
+#                                 MTD's task_labels_dir directly)
+#   query_codes: null -> $PROCESSED/metadata/codes.parquet
+
+data_dir: null
+out_dir: null
+query_codes: null
+
+split: train
+input_shard: "0"
+task_shard: 0
+seed: 1
+
+# Number of patient contexts (= query sequences) sampled by this worker.
+n_contexts: 4096
+
+# Each sequence is [censor query] + Uniform{min..max} iid code queries, so total block count
+# is at most max_extra_queries + 1 (default: 5).
+min_extra_queries: 1
+max_extra_queries: 4
+
+# Duration distribution bounds (log-uniform over integer days), shared by the censor query.
+duration_min: 1
+duration_max: 731
+
+# Minimum prior events a subject must have accumulated before a prediction time is valid.
+min_context_per_subject: 50
+
+overwrite: false
+
+hydra:
+  output_subdir: null
+  job:
+    chdir: false

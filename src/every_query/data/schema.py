@@ -97,6 +97,38 @@ class TaskQuerySchema(LabelSchema):
     boolean_value: Optional(pa.bool_(), nullable=True)
 
 
+class QuerySeqSchema(LabelSchema):
+    """A conditional query-sequence row: one patient context plus an ordered list of queries.
+
+    Each row is a ``(subject_id, prediction_time)`` context with three aligned list columns:
+
+    Attributes:
+        queries: Ordered list of MEDS code strings.  Element 0 is always the censor sentinel
+            ``__CENSOR__`` (see ``every_query.data.seq_dataset.CENSOR_QUERY_CODE``), asking
+            "will any data be present after ``prediction_time + durations[0]``?".
+        durations: Per-query horizons in days (``float32``), aligned with ``queries``.
+        answers: Per-query nullable booleans aligned with ``queries``.  ``null`` means the
+            answer is unobserved (the window extends past the subject's last recorded event);
+            element 0 is never null.
+
+    Examples:
+        >>> from datetime import datetime
+        >>> import pyarrow as pa
+        >>> data = pa.Table.from_pylist([
+        ...     {"subject_id": 1, "prediction_time": datetime(2023, 1, 1),
+        ...      "queries": ["__CENSOR__", "ICD//I10"], "durations": [30.0, 7.0],
+        ...      "answers": [True, None]},
+        ... ])
+        >>> aligned = QuerySeqSchema.align(data)
+        >>> [f.name for f in aligned.schema]
+        ['subject_id', 'prediction_time', 'queries', 'durations', 'answers']
+    """
+
+    queries: Required(pa.large_list(pa.large_string()), nullable=False)
+    durations: Required(pa.large_list(pa.float32()), nullable=False)
+    answers: Required(pa.large_list(pa.bool_()), nullable=False)
+
+
 def empty_task_query_df() -> pl.DataFrame:
     """Build an empty polars DataFrame shaped like ``TaskQuerySchema``'s required columns plus the inherited
     ``boolean_value`` (the collapsed label column).

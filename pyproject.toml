@@ -83,6 +83,11 @@ EQ_predict = "every_query.predict.predict:main"
 # EQ_gen_eval_index / EQ_gen_eval_tasks / EQ_select_model) has been deleted per
 # the #83 consolidation wave; recover from git history if needed.
 EQ_evaluate = "every_query.evaluate.evaluate:main"
+# Conditional query-sequence pipeline (block-autoregressive decoder over query/answer
+# blocks; see src/every_query/model/conditional_model.py).
+EQ_generate_query_sequences = "every_query.generate_tasks.sample_query_sequences:main"
+EQ_predict_sequences = "every_query.predict.predict_sequences:main"
+EQ_evaluate_sequences = "every_query.evaluate.evaluate_sequences:main"
 
 [tool.coverage.run]
 # Measure coverage for EQ_* CLIs launched via subprocess in tests/test_cli_smoke.py.
