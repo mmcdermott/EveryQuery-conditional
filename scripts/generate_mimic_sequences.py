@@ -34,11 +34,13 @@ def main():
     p.add_argument("--split", default="train")
     p.add_argument("--n-contexts", type=int, default=2048)
     p.add_argument("--task-shards", type=int, default=1)
-    p.add_argument("--min-extra-queries", type=int, default=1)
-    p.add_argument("--max-extra-queries", type=int, default=4)
+    p.add_argument("--min-queries", type=int, default=1)
+    p.add_argument("--max-queries", type=int, default=5)
     p.add_argument("--duration-min", type=int, default=1)
     p.add_argument("--duration-max", type=int, default=365)
     p.add_argument("--min-context-per-subject", type=int, default=10)
+    p.add_argument("--eos-first-fraction", type=float, default=0.0)
+    p.add_argument("--duration-mode", default="random", choices=["random", "same", "nondecreasing"])
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--jobs", type=int, default=8)
     p.add_argument("--limit-shards", type=int, default=None)
@@ -65,11 +67,13 @@ def main():
             task_shard=ts,
             seed=args.seed,
             n_contexts=args.n_contexts,
-            min_extra_queries=args.min_extra_queries,
-            max_extra_queries=args.max_extra_queries,
+            min_queries=args.min_queries,
+            max_queries=args.max_queries,
             duration_min=args.duration_min,
             duration_max=args.duration_max,
             min_context_per_subject=args.min_context_per_subject,
+            eos_first_fraction=args.eos_first_fraction,
+            duration_mode=args.duration_mode,
         )
         for shard in shards
         for ts in range(args.task_shards)

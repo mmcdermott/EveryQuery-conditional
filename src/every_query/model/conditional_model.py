@@ -20,11 +20,17 @@ prepending the query to the patient sequence, this model answers a *sequence* of
   conditioned on the patient state, all prior queries and their (ground-truth, teacher-forced)
   answers, and ``Q_j`` itself — but never on ``A_j``.
 
-**Censoring** is handled by convention rather than a separate head: the first query of every
-sequence is the special *censor query* ``(__CENSOR__, duration)`` asking "will any data be present
-after prediction_time + duration?".  Its answer is always observed.  Subsequent query answers may
-be unobserved (censored); these contribute no loss, and their teacher-forced input token uses a
-dedicated ``CENSORED`` answer-vocabulary entry so later queries know the prior answer was unknown.
+**Every answer is binary**: each query asks *"is ``code_j`` observed in ``(t, t + duration_j]``?"*
+and the answer is simply YES/NO (an event we did not observe — because the record ends first — is
+NO, not a special "censored" class).  Censoring is expressed *as a query* instead: the
+end-of-timeline code ``TIMELINE//END`` is an ordinary vocabulary code, so a query
+``(TIMELINE//END, d)`` answered YES means "the record ends within ``d``" (the ``d``-window is not
+fully observed) and NO means "data continue past ``t + d``".  A later query that conditions on that
+answer recovers — and generalizes — the original EveryQuery's implicit ``P(occurs | data exist
+after d)``: with ``TIMELINE//END = NO`` you get exactly that quantity, with ``= YES`` you get
+``P(occurs | record ends within d)`` (the actionable form for terminal events such as death), and
+the unconditioned ``(code, d)`` query gives the marginal.  Nothing is masked from the loss except
+padding; there is no separate censor head and no reserved sentinel index.
 """
 
 import logging
@@ -39,11 +45,16 @@ from every_query.model.model import MLP
 
 logger = logging.getLogger(__name__)
 
-# Answer-token vocabulary for teacher forcing.
+# Answer-token vocabulary for teacher forcing.  Answers are binary: every query asks
+# "is this code observed in (t, t+d]?" and the answer is YES/NO.  There is no separate
+# "censored" answer class — censoring is expressed *as a query*, by asking about the
+# end-of-timeline code (TIMELINE//END): "[TIMELINE//END, d]" answered YES means the record
+# ends within d (the window is not fully observed), NO means data continue past t+d.  A
+# downstream query conditions on that answer, which is strictly more expressive than the
+# original EveryQuery's implicit "P(occurs | data exist after d)".
 ANSWER_NO = 0
 ANSWER_YES = 1
-ANSWER_CENSORED = 2
-N_ANSWER_CLASSES = 3
+N_ANSWER_CLASSES = 2
 
 # Token-type indices within a query block.
 TOKEN_CODE = 0
@@ -122,17 +133,13 @@ class ConditionalQueryOutput(BaseModelOutput):
     """Output container for :class:`ConditionalQueryModel`.
 
     Attributes:
-        answer_logits: ``(batch, n_queries)`` logits, one per query block.  Position 0 is the
-            censor query; positions ``>= 1`` are occurrence queries.
-        censor_loss: BCE loss over position-0 answers (always observed).
-        occurs_loss: BCE loss over positions ``>= 1``, masked to observed (non-censored,
-            non-padding) answers.
-        valid_mask: ``(batch, n_queries)`` bool — True where the answer is observed (loss applied).
+        answer_logits: ``(batch, n_queries)`` logits, one binary occurrence prediction per query
+            block (probability that the query's code is observed in its window).
+        valid_mask: ``(batch, n_queries)`` bool — True at real (non-padding) query positions, all
+            of which carry loss.
     """
 
     answer_logits: torch.FloatTensor | None = None
-    censor_loss: torch.FloatTensor | None = None
-    occurs_loss: torch.FloatTensor | None = None
     valid_mask: torch.BoolTensor | None = None
 
     @property
@@ -165,12 +172,6 @@ class ConditionalQueryModel(torch.nn.Module):
         decoder_heads: Attention heads in the decoder.
         decoder_ffn_mult: Decoder feed-forward width as a multiple of ``hidden_size``.
         max_queries: Maximum query blocks per sequence (sizes the block-position embedding).
-        occurs_loss_weight: **Retained for checkpoint/config back-compat but no longer used.**
-            The loss is now a single BCE over all observed query positions (a single answer
-            head; censoring is just the first query), so there is no censor-vs-occurs weight to
-            set.  ``censor_loss`` / ``occurs_loss`` survive only as reported metric breakdowns.
-        censor_query_index: Vocab index reserved for the censor-query code token.  Defaults to
-            ``vocab_size - 1`` (the dataset reserves the top index).  Must be < vocab_size.
     """
 
     PRECISION_TO_MODEL_WEIGHTS_DTYPE: ClassVar[dict[str, torch.dtype]] = {
@@ -193,8 +194,6 @@ class ConditionalQueryModel(torch.nn.Module):
         decoder_heads: int | None = None,
         decoder_ffn_mult: int = 4,
         max_queries: int = 8,
-        occurs_loss_weight: float = 0.5,
-        censor_query_index: int | None = None,
     ):
         super().__init__()
 
@@ -238,15 +237,6 @@ class ConditionalQueryModel(torch.nn.Module):
         self.answer_mlp = MLP(layers=[H, 128, 1], dropout_prob=mlp_dropout)
 
         self.max_queries = max_queries
-        self.occurs_loss_weight = occurs_loss_weight
-        self.censor_query_index = (
-            censor_query_index if censor_query_index is not None else self.HF_model_config.vocab_size - 1
-        )
-        if self.censor_query_index >= self.HF_model_config.vocab_size:
-            raise ValueError(
-                f"censor_query_index ({self.censor_query_index}) must be < vocab_size "
-                f"({self.HF_model_config.vocab_size})."
-            )
         self.criterion = torch.nn.BCEWithLogitsLoss()
 
         self.hparams = {
@@ -259,8 +249,6 @@ class ConditionalQueryModel(torch.nn.Module):
             "decoder_heads": n_heads,
             "decoder_ffn_mult": decoder_ffn_mult,
             "max_queries": max_queries,
-            "occurs_loss_weight": occurs_loss_weight,
-            "censor_query_index": self.censor_query_index,
         }
 
     @property
@@ -326,29 +314,16 @@ class ConditionalQueryModel(torch.nn.Module):
         answer_logits = self.answer_mlp(answer_hidden).squeeze(-1)  # (B, L)
 
         targets = (batch.q_answers == ANSWER_YES).float()
-        observed = batch.q_mask & (batch.q_answers != ANSWER_CENSORED)
-
-        # There is a *single* answer head: censoring is not a separate task, it is just the
-        # distinguished first query (the __CENSOR__ block at position 0).  The training loss is
-        # therefore one BCE over *every* observed query position — every query in the sequence
-        # is a simultaneous prediction point — letting the natural mix of censor vs. occurrence
-        # queries weight itself rather than imposing an arbitrary 50/50 split.
-        loss = self._masked_bce(answer_logits, targets, observed)
-
-        # ``censor_loss`` / ``occurs_loss`` are computed here only as *reported* breakdowns of
-        # that single objective (position 0 vs. positions >= 1) — they do not re-weight ``loss``.
-        censor_mask = torch.zeros_like(observed)
-        censor_mask[:, 0] = observed[:, 0]
-        occurs_mask = observed.clone()
-        occurs_mask[:, 0] = False
-        censor_loss = self._masked_bce(answer_logits, targets, censor_mask)
-        occurs_loss = self._masked_bce(answer_logits, targets, occurs_mask)
+        # Every real (non-padding) query position is a simultaneous, equally-weighted binary
+        # prediction point.  Padding positions are the only exclusion; there is no censored
+        # answer class to mask — censoring is just the TIMELINE//END query, answered like any
+        # other code.
+        valid = batch.q_mask
+        loss = self._masked_bce(answer_logits, targets, valid)
 
         outputs = ConditionalQueryOutput(
             last_hidden_state=None,
             answer_logits=answer_logits,
-            censor_loss=censor_loss,
-            occurs_loss=occurs_loss,
-            valid_mask=observed,
+            valid_mask=valid,
         )
         return loss, outputs

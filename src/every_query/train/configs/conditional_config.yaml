@@ -7,9 +7,9 @@
 #     ModernBERT-base defaults are for a 50k-token text vocab and 22 layers);
 #   - logger is a local CSVLogger (training-stability curves are read from metrics.csv).
 #
-# vocab_size must be >= (max code/vocab_index + 2): one slot for padding at 0 and one
-# reserved top index for the censor-query sentinel.  For the MIMIC-IV v0.3.0 cohort the
-# max vocab index is 11958, so the sentinel sits at 11959 and vocab_size is 11960.
+# vocab_size must be > max code/vocab_index (index 0 is padding).  For the MIMIC-IV v0.3.0
+# cohort the max vocab index is 11958, so vocab_size is 11959.  No sentinel slot is needed —
+# the end-of-timeline code (TIMELINE//END, index 11884) is an ordinary vocabulary code.
 
 defaults:
   - _self_
@@ -44,13 +44,12 @@ lightning_module:
     decoder_heads: 6
     decoder_ffn_mult: 4
     max_queries: 8
-    occurs_loss_weight: 0.5
     config_overrides:
       hidden_size: 384
       num_attention_heads: 6
       intermediate_size: 1536
       max_position_embeddings: 512
-      vocab_size: 11960
+      vocab_size: 11959
       pad_token_id: 0
       cls_token_id: 1
       bos_token_id: 1

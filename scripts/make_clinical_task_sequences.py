@@ -43,17 +43,28 @@ MICU_ADM = "ICU_ADMISSION//Medical Intensive Care Unit (MICU)"
 HOME_DISCHARGE = "HOSPITAL_DISCHARGE//HOME"
 ER_ADMISSION = "HOSPITAL_ADMISSION//EW EMER.//EMERGENCY ROOM"
 
+# Censor-query horizon for position 0.  IMPORTANT: this must NOT equal the target horizon.
+# The censor query answers "is there data after prediction_time + horizon?", which — for a
+# terminal target like death, and structurally for any occurrence label (a False label requires
+# the window be fully observed) — is the complement of the target answer at the *same* horizon.
+# Teacher-forcing that same-horizon censor answer leaks the label (mortality AUROC -> 0.99).
+# We instead use a short, fixed censor horizon (default 1 day): it keeps position 0 in
+# distribution (the model always saw a censor query there) without revealing whether the
+# multi-day target window is observable.  Censoring of the TARGET is handled where it belongs —
+# the 3-valued label drops unobservable windows (null), which are excluded from the metrics.
+CENSOR_HORIZON_DAYS = 1.0
+
 TASKS: dict[str, list[tuple[str, float]]] = {
-    "mortality_30d": [(CENSOR_QUERY_CODE, 30.0), (DEATH, 30.0)],
-    "icu_then_death": [(CENSOR_QUERY_CODE, 30.0), (MICU_ADM, 7.0), (DEATH, 30.0)],
+    "mortality_30d": [(CENSOR_QUERY_CODE, CENSOR_HORIZON_DAYS), (DEATH, 30.0)],
+    "icu_then_death": [(CENSOR_QUERY_CODE, CENSOR_HORIZON_DAYS), (MICU_ADM, 7.0), (DEATH, 30.0)],
     "discharge_then_readmit": [
-        (CENSOR_QUERY_CODE, 90.0),
+        (CENSOR_QUERY_CODE, CENSOR_HORIZON_DAYS),
         (HOME_DISCHARGE, 14.0),
         (ER_ADMISSION, 90.0),
     ],
-    "readmit_90d": [(CENSOR_QUERY_CODE, 90.0), (ER_ADMISSION, 90.0)],
+    "readmit_90d": [(CENSOR_QUERY_CODE, CENSOR_HORIZON_DAYS), (ER_ADMISSION, 90.0)],
     "home_discharge_then_death": [
-        (CENSOR_QUERY_CODE, 180.0),
+        (CENSOR_QUERY_CODE, CENSOR_HORIZON_DAYS),
         (HOME_DISCHARGE, 30.0),
         (DEATH, 180.0),
     ],

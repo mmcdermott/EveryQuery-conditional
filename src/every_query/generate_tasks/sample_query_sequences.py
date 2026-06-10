@@ -33,14 +33,14 @@ import numpy as np
 import polars as pl
 from omegaconf import DictConfig
 
+from meds import DataSchema
+
 from every_query.data.schema import QuerySeqSchema, TaskQuerySchema
-from every_query.data.seq_dataset import CENSOR_QUERY_CODE
+from every_query.data.seq_dataset import EOS_CODE
 from every_query.generate_tasks.sample_tasks import (
     _atomic_write_parquet,
     _read_event_shard,
     _resolve_path,
-    compute_max_time_per_subject,
-    evaluate_index_df,
     read_query_codes,
     sample_contexts,
 )
@@ -77,22 +77,30 @@ def sample_log_uniform_durations(
 def build_sequence_index_df(
     contexts: pl.DataFrame,
     query_codes: list[str],
-    min_extra_queries: int,
-    max_extra_queries: int,
+    min_queries: int,
+    max_queries: int,
     duration_low: int,
     duration_high: int,
     seed: int,
+    eos_first_fraction: float = 0.0,
+    duration_mode: str = "random",
 ) -> pl.DataFrame:
-    """Expand each sampled context into a flat per-query index frame.
+    """Expand each sampled context into a flat, fully-random per-query index frame.
 
-    For context ``i``, draws ``L_i ~ Uniform{min_extra_queries..max_extra_queries}`` code
-    queries (codes uniform over ``query_codes``, durations log-uniform), prepends the censor
-    query at position 0, and emits one row per query with ``(_ctx_id, _position)`` identity
-    columns so the labeled rows can be reassembled into ordered lists.
+    For context ``i`` draws ``L_i ~ Uniform{min_queries..max_queries}`` queries, each an
+    independent (code, duration) pair: code uniform over ``query_codes`` (which includes the
+    end-of-timeline code ``TIMELINE//END`` like any other), duration log-uniform.  There is **no**
+    privileged censor position — the end-of-timeline query is just one possible code.  Two
+    optional, default-off reweightings support a later sweep (see issue scope):
+
+      - ``eos_first_fraction``: probability that a sequence's position 0 is forced to be the
+        ``TIMELINE//END`` query (upweights the censoring-control pattern).  ``0.0`` = pure random.
+      - ``duration_mode``: ``"random"`` (independent durations, default); ``"same"`` (all queries
+        in a sequence share one duration); ``"nondecreasing"`` (durations sorted ascending) — the
+        latter two reflect that many censoring-style asks reuse one horizon.
 
     Returns:
-        DataFrame with columns ``(_ctx_id, _position, subject_id, prediction_time, query,
-        duration_days)``.  Position 0 of every context has ``query == CENSOR_QUERY_CODE``.
+        DataFrame ``(_ctx_id, _position, subject_id, prediction_time, query, duration_days)``.
 
     Examples:
         >>> from datetime import datetime
@@ -100,12 +108,10 @@ def build_sequence_index_df(
         ...     "subject_id": [1, 2],
         ...     "prediction_time": [datetime(2024, 1, 1), datetime(2024, 2, 1)],
         ... })
-        >>> idx = build_sequence_index_df(ctx, ["A", "B"], 1, 3, 1, 365, seed=0)
-        >>> idx.group_by("_ctx_id").len().sort("_ctx_id")["len"].min() >= 2  # censor + >=1
+        >>> idx = build_sequence_index_df(ctx, ["A", "B", "TIMELINE//END"], 1, 4, 1, 365, seed=0)
+        >>> idx.group_by("_ctx_id").len()["len"].max() <= 4
         True
-        >>> idx.filter(pl.col("_position") == 0)["query"].unique().to_list()
-        ['__CENSOR__']
-        >>> bool((idx.filter(pl.col("_position") > 0)["query"].is_in(["A", "B"])).all())
+        >>> bool(idx["query"].is_in(["A", "B", "TIMELINE//END"]).all())
         True
 
         Determinism:
@@ -113,35 +119,56 @@ def build_sequence_index_df(
         >>> build_sequence_index_df(ctx, ["A", "B"], 1, 3, 1, 365, 7).equals(
         ...     build_sequence_index_df(ctx, ["A", "B"], 1, 3, 1, 365, 7))
         True
+
+        ``eos_first_fraction=1.0`` forces position 0 to the end-of-timeline query:
+
+        >>> idx = build_sequence_index_df(
+        ...     ctx, ["A", "B", "TIMELINE//END"], 2, 2, 1, 365, 0, eos_first_fraction=1.0)
+        >>> idx.filter(pl.col("_position") == 0)["query"].unique().to_list()
+        ['TIMELINE//END']
     """
-    if min_extra_queries < 1:
-        raise ValueError(f"min_extra_queries must be >= 1 (got {min_extra_queries})")
-    if max_extra_queries < min_extra_queries:
-        raise ValueError(
-            f"max_extra_queries ({max_extra_queries}) must be >= min_extra_queries ({min_extra_queries})"
-        )
+    if min_queries < 1:
+        raise ValueError(f"min_queries must be >= 1 (got {min_queries})")
+    if max_queries < min_queries:
+        raise ValueError(f"max_queries ({max_queries}) must be >= min_queries ({min_queries})")
     if not query_codes:
         raise ValueError("query_codes must be non-empty")
+    if duration_mode not in ("random", "same", "nondecreasing"):
+        raise ValueError(f"duration_mode must be random|same|nondecreasing (got {duration_mode!r})")
 
     rng = np.random.default_rng(seed)
     n_ctx = contexts.height
+    if n_ctx == 0:
+        return contexts.head(0).select(
+            pl.lit(0, dtype=pl.UInt32).alias(CTX_ID_COL),
+            pl.lit(0, dtype=pl.Int64).alias(POSITION_COL),
+            TaskQuerySchema.subject_id_name,
+            TaskQuerySchema.prediction_time_name,
+            pl.lit("", dtype=pl.Utf8).alias(TaskQuerySchema.query_name),
+            pl.lit(0.0, dtype=pl.Float32).alias(TaskQuerySchema.duration_days_name),
+        )
 
-    n_extra = rng.integers(min_extra_queries, max_extra_queries + 1, size=n_ctx)
-    seq_lens = n_extra + 1  # + censor query at position 0
+    seq_lens = rng.integers(min_queries, max_queries + 1, size=n_ctx)
     total = int(seq_lens.sum())
-
     ctx_ids = np.repeat(np.arange(n_ctx, dtype=np.int64), seq_lens)
-    # Position within each sequence: 0..L_i
-    positions = np.concatenate([np.arange(n) for n in seq_lens]) if n_ctx else np.array([], dtype=np.int64)
+    positions = np.concatenate([np.arange(n) for n in seq_lens])
 
-    is_censor = positions == 0
-    codes = np.empty(total, dtype=object)
-    codes[is_censor] = CENSOR_QUERY_CODE
-    n_code_rows = int((~is_censor).sum())
-    codes[~is_censor] = np.array(query_codes, dtype=object)[
-        rng.integers(0, len(query_codes), size=n_code_rows)
-    ]
+    codes = np.array(query_codes, dtype=object)[rng.integers(0, len(query_codes), size=total)]
+    if eos_first_fraction > 0:
+        force = rng.random(n_ctx) < eos_first_fraction
+        # position-0 row index of each context within the flattened arrays
+        starts = np.concatenate([[0], np.cumsum(seq_lens)[:-1]])
+        codes[starts[force]] = EOS_CODE
+
     durations = sample_log_uniform_durations(total, duration_low, duration_high, rng)
+    if duration_mode != "random":
+        offsets = np.concatenate([[0], np.cumsum(seq_lens)])
+        for i in range(n_ctx):
+            sl = slice(offsets[i], offsets[i + 1])
+            if duration_mode == "same":
+                durations[sl] = durations[offsets[i]]
+            elif duration_mode == "nondecreasing":
+                durations[sl] = np.sort(durations[sl])
 
     expanded = contexts.with_row_index(CTX_ID_COL).join(
         pl.DataFrame(
@@ -165,53 +192,72 @@ def build_sequence_index_df(
     ).sort(CTX_ID_COL, POSITION_COL)
 
 
-def label_sequence_index_df(
-    index_df: pl.DataFrame,
-    events_df: pl.DataFrame,
-    max_time_per_subject: pl.DataFrame,
-) -> pl.DataFrame:
-    """Label a flat sequence index and reassemble it into ``QuerySeqSchema``-shaped list rows.
+def label_binary_occurrence(index_df: pl.DataFrame, events_df: pl.DataFrame) -> pl.DataFrame:
+    """Label every query with a binary *observed-occurrence* answer and reassemble into list rows.
 
-    Code-query rows are labeled with the same single-pass ``join_asof`` as the single-query
-    sampler (nullable ``boolean_value``; null = censored).  Censor-query rows (position 0) get
-    ``answers[0] = (prediction_time + duration <= max_time)`` — i.e. *not* censored — which is
-    always observed.
+    ``answer = True`` iff an event whose code equals the query occurs strictly within
+    ``(prediction_time, prediction_time + duration_days)`` **and is present in the record**.  There
+    is no censoring/null: an event we cannot observe (because the record ends first) is ``False``.
+    Censoring is captured separately by the ``TIMELINE//END`` query — which, being the last event
+    of each record, answers ``True`` exactly when the record ends within the window.
+
+    The strict ``>`` lower bound is enforced by shifting the asof key ``+1µs`` (microsecond-precision
+    datetimes), mirroring ``sample_tasks.evaluate_index_df``.
 
     Returns:
-        DataFrame with columns ``(subject_id, prediction_time, queries, durations, answers)``,
-        one row per ``_ctx_id``, lists ordered by ``_position``.
+        DataFrame ``(subject_id, prediction_time, queries, durations, answers)``, one row per
+        ``_ctx_id``, lists ordered by ``_position``.
+
+    Examples:
+        >>> from datetime import datetime
+        >>> events = pl.DataFrame({
+        ...     "subject_id": [1, 1, 1],
+        ...     "time": [datetime(2024, 1, 1), datetime(2024, 1, 5), datetime(2024, 1, 20)],
+        ...     "code": ["A", "B", "TIMELINE//END"],
+        ... }).with_columns(pl.col("time").cast(pl.Datetime("us")))
+        >>> idx = pl.DataFrame({
+        ...     "_ctx_id": [0, 0, 0],
+        ...     "_position": [0, 1, 2],
+        ...     "subject_id": [1, 1, 1],
+        ...     "prediction_time": [datetime(2024, 1, 2)] * 3,
+        ...     "query": ["B", "A", "TIMELINE//END"],
+        ...     "duration_days": [10.0, 10.0, 10.0],
+        ... }).with_columns(
+        ...     pl.col("prediction_time").cast(pl.Datetime("us")),
+        ...     pl.col("duration_days").cast(pl.Float32),
+        ...     pl.col("_ctx_id").cast(pl.UInt32))
+        >>> row = label_binary_occurrence(idx, events).row(0, named=True)
+        >>> row["answers"]  # B in (2,12]=yes; A at day1 not >day2 =no; END at day20 not in window =no
+        [True, False, False]
     """
-    code_rows = index_df.filter(pl.col(POSITION_COL) > 0)
-    censor_rows = index_df.filter(pl.col(POSITION_COL) == 0)
+    sid = TaskQuerySchema.subject_id_name
+    pt = TaskQuerySchema.prediction_time_name
+    q = TaskQuerySchema.query_name
+    d = TaskQuerySchema.duration_days_name
 
-    labeled_codes = evaluate_index_df(
-        code_rows, events_df, max_time_per_subject, id_cols=(CTX_ID_COL, POSITION_COL)
+    left = index_df.with_columns((pl.col(pt) + pl.duration(microseconds=1)).alias("_pts")).sort(
+        sid, q, "_pts"
     )
-
-    # Censor-query label: data present after prediction_time + duration.  `fill_null(False)`
-    # resolves subjects missing from max_time_per_subject to "no data after horizon".
-    duration_expr = pl.duration(days=pl.col(TaskQuerySchema.duration_days_name))
-    window_end = pl.col(TaskQuerySchema.prediction_time_name) + duration_expr
-    labeled_censor = (
-        censor_rows.join(max_time_per_subject, on=TaskQuerySchema.subject_id_name, how="left")
-        .with_columns(
-            (window_end <= pl.col("max_time"))
-            .fill_null(False)
-            .alias(TaskQuerySchema.boolean_value_name)
-        )
-        .select(labeled_codes.columns)
+    right = (
+        events_df.rename({DataSchema.code_name: q})
+        .select(sid, q, DataSchema.time_name)
+        .sort(sid, q, DataSchema.time_name)
     )
+    joined = left.join_asof(
+        right, by=[sid, q], left_on="_pts", right_on=DataSchema.time_name, strategy="forward"
+    )
+    window_end = pl.col(pt) + pl.duration(days=pl.col(d))
+    answer = (pl.col(DataSchema.time_name).is_not_null() & (pl.col(DataSchema.time_name) < window_end))
 
-    flat = pl.concat([labeled_censor, labeled_codes], how="vertical").sort(CTX_ID_COL, POSITION_COL)
-
+    flat = joined.with_columns(answer.alias("answer")).sort(CTX_ID_COL, POSITION_COL)
     return (
         flat.group_by(CTX_ID_COL, maintain_order=True)
         .agg(
-            pl.col(TaskQuerySchema.subject_id_name).first(),
-            pl.col(TaskQuerySchema.prediction_time_name).first(),
-            pl.col(TaskQuerySchema.query_name).alias("queries"),
-            pl.col(TaskQuerySchema.duration_days_name).alias("durations"),
-            pl.col(TaskQuerySchema.boolean_value_name).alias("answers"),
+            pl.col(sid).first(),
+            pl.col(pt).first(),
+            pl.col(q).alias("queries"),
+            pl.col(d).alias("durations"),
+            pl.col("answer").alias("answers"),
         )
         .drop(CTX_ID_COL)
     )
@@ -226,11 +272,13 @@ def run_worker(
     task_shard: int,
     seed: int,
     n_contexts: int,
-    min_extra_queries: int,
-    max_extra_queries: int,
+    min_queries: int,
+    max_queries: int,
     duration_min: int,
     duration_max: int,
     min_context_per_subject: int,
+    eos_first_fraction: float = 0.0,
+    duration_mode: str = "random",
     overwrite: bool = False,
 ) -> Path | None:
     """Run the sequence-sampling pipeline for one ``(input_shard, task_shard)`` worker."""
@@ -255,15 +303,16 @@ def run_worker(
     index_df = build_sequence_index_df(
         contexts=contexts,
         query_codes=query_codes,
-        min_extra_queries=min_extra_queries,
-        max_extra_queries=max_extra_queries,
+        min_queries=min_queries,
+        max_queries=max_queries,
         duration_low=duration_min,
         duration_high=duration_max,
         seed=queries_seed,
+        eos_first_fraction=eos_first_fraction,
+        duration_mode=duration_mode,
     )
 
-    max_time_df = compute_max_time_per_subject(events_df)
-    labeled = label_sequence_index_df(index_df, events_df, max_time_df)
+    labeled = label_binary_occurrence(index_df, events_df)
 
     aligned = QuerySeqSchema.align(labeled.to_arrow())
     labels_fp.parent.mkdir(parents=True, exist_ok=True)
@@ -295,11 +344,13 @@ def main(cfg: DictConfig) -> None:
         task_shard=int(cfg.task_shard),
         seed=int(cfg.seed),
         n_contexts=int(cfg.n_contexts),
-        min_extra_queries=int(cfg.min_extra_queries),
-        max_extra_queries=int(cfg.max_extra_queries),
+        min_queries=int(cfg.min_queries),
+        max_queries=int(cfg.max_queries),
         duration_min=int(cfg.duration_min),
         duration_max=int(cfg.duration_max),
         min_context_per_subject=int(cfg.min_context_per_subject),
+        eos_first_fraction=float(cfg.get("eos_first_fraction", 0.0)),
+        duration_mode=str(cfg.get("duration_mode", "random")),
         overwrite=bool(cfg.get("overwrite", False)),
     )
 

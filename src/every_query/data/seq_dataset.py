@@ -3,21 +3,21 @@
 The on-disk label rows follow :class:`~every_query.data.schema.QuerySeqSchema`: one row per
 ``(subject_id, prediction_time)`` context carrying three aligned list columns —
 
-- ``queries``: list of MEDS code strings; element 0 is always the censor sentinel
-  :data:`CENSOR_QUERY_CODE`;
+- ``queries``: list of MEDS code strings (any vocabulary code, in random order — including the
+  end-of-timeline code :data:`EOS_CODE`, which is an ordinary code, not a special sentinel);
 - ``durations``: list of float horizon lengths (days);
-- ``answers``: list of nullable booleans.  ``null`` means the answer is unobserved (the window
-  extends past the subject's last recorded event).  Element 0 (the censor query, "will any data be
-  present after prediction_time + duration?") is never null.
+- ``answers``: list of booleans.  ``answers[j]`` is simply *"was ``queries[j]`` observed in
+  ``(prediction_time, prediction_time + durations[j]]``?"* — binary, never null.  An event we
+  could not observe (because the record ends first) is ``False``; censoring is expressed by a
+  separate ``TIMELINE//END`` query rather than a null answer.
 
 The dataset tensorizes each sequence into fixed-position tensors padded to the batch's longest
 query list:
 
-- ``q_codes``     (B, L) long — vocab indices; censor sentinel maps to ``censor_query_index``
-  (== the dataset vocab size, one past the last real code index), padding is 0;
+- ``q_codes``     (B, L) long — vocab indices; padding is 0;
 - ``q_durations`` (B, L) float — horizon in days, 0 at padding;
-- ``q_answers``   (B, L) long — teacher-forcing classes ``ANSWER_NO`` / ``ANSWER_YES`` /
-  ``ANSWER_CENSORED`` (padding holds ``ANSWER_NO``; it is ignored under ``q_mask``);
+- ``q_answers``   (B, L) long — teacher-forcing classes ``ANSWER_NO`` / ``ANSWER_YES`` (padding
+  holds ``ANSWER_NO``; it is ignored under ``q_mask``);
 - ``q_mask``      (B, L) bool — True at real (non-padding) query positions.
 
 Unlike :class:`~every_query.data.dataset.EveryQueryPytorchDataset`, **no query token is prepended
@@ -38,11 +38,14 @@ from meds_torchdata import MEDSPytorchDataset
 from meds_torchdata.config import MEDSTorchDataConfig
 from meds_torchdata.types import MEDSTorchBatch
 
-from every_query.model.conditional_model import ANSWER_CENSORED, ANSWER_NO, ANSWER_YES
+from every_query.model.conditional_model import ANSWER_NO, ANSWER_YES
 
 logger = logging.getLogger(__name__)
 
-CENSOR_QUERY_CODE = "__CENSOR__"
+# End-of-timeline code: a real MEDS vocabulary code emitted once per subject at the record's last
+# timestamp.  A query ``(EOS_CODE, d)`` therefore answers "does the record end within d?" — the
+# mechanism by which the conditional model handles censoring (see conditional_model docstring).
+EOS_CODE = "TIMELINE//END"
 
 QUERIES_COL = "queries"
 DURATIONS_COL = "durations"
@@ -152,9 +155,12 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
             c: int(i)
             for c, i in zip(code_meta["code"].to_list(), code_meta["code/vocab_index"].to_list(), strict=True)
         }
-        # Reserve one index past the last real code for the censor sentinel.  The model's
-        # embedding table must therefore be sized to at least ``censor_query_index + 1``.
-        self.censor_query_index: int = max(self.code_to_index.values()) + 1
+        if EOS_CODE not in self.code_to_index:
+            raise ValueError(
+                f"End-of-timeline code {EOS_CODE!r} is not in the cohort vocabulary; the conditional "
+                f"model handles censoring by querying it, so it must be a real code."
+            )
+        self.eos_query_index: int = self.code_to_index[EOS_CODE]
 
     @property
     def labels_df(self) -> pl.DataFrame:
@@ -173,13 +179,11 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
         return pl.concat([read_df(fp) for fp in self.config.task_labels_fps], how="vertical")
 
     def encode_query(self, code_name: str) -> int:
-        """Map a query code string to its vocab index (censor sentinel → reserved top index).
+        """Map a query code string to its vocab index.
 
         Unknown codes raise rather than silently PAD-encode — a query against a code the encoder
-        never saw would produce an arbitrary answer.
+        never saw would produce an arbitrary answer.  ``TIMELINE//END`` is an ordinary code here.
         """
-        if code_name == CENSOR_QUERY_CODE:
-            return self.censor_query_index
         if code_name not in self.code_to_index:
             raise KeyError(f"Query code {code_name!r} is not in the training vocabulary.")
         return self.code_to_index[code_name]
@@ -211,10 +215,7 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
             q_codes[i, :n] = torch.as_tensor(codes, dtype=torch.long)
             q_durations[i, :n] = torch.as_tensor(item["durations"], dtype=torch.float)
             q_answers[i, :n] = torch.as_tensor(
-                [
-                    ANSWER_CENSORED if a is None else (ANSWER_YES if a else ANSWER_NO)
-                    for a in item["answers"]
-                ],
+                [ANSWER_YES if a else ANSWER_NO for a in item["answers"]],
                 dtype=torch.long,
             )
             q_mask[i, :n] = True

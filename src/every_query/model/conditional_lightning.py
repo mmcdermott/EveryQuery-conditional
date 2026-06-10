@@ -29,22 +29,17 @@ class ConditionalQueryLightningModule(EveryQueryLightningModule):
 
     def __init__(self, model: ConditionalQueryModel, optimizer=None, LR_scheduler=None):
         super().__init__(model=model, optimizer=optimizer, LR_scheduler=LR_scheduler)
-        # A single answer head produces all per-query logits; these AUROCs are *breakdowns*
-        # of that one head's predictions, not separate tasks:
-        #   answer_auc       — pooled over every observed query position (censor + occurrence);
-        #   censor_auc       — position 0 only (the __CENSOR__ data-presence query);
-        #   occurs_auc       — positions >= 1 only (plain code-occurrence queries);
+        # A single binary answer head produces every per-query logit.  Training-time AUROCs are
+        # pooled (across all codes) and therefore base-rate inflated — kept only to track
+        # dynamics/stability; the trustworthy within-query numbers are computed at held-out
+        # evaluation.
+        #   answer_auc       — pooled over every (non-padding) query position;
         #   answer_auc_pos{j}— position j alone.  Later positions condition on strictly more
-        #                      teacher-forced answers, so if the model is exploiting that
-        #                      conditioning their AUROC should trend upward with j.
+        #                      teacher-forced answers; per-position lets us watch that trend.
         self._n_positions = model.max_queries
 
         def _metric_set():
-            m = {
-                "answer_auc": BinaryAUROC().cpu(),
-                "censor_auc": BinaryAUROC().cpu(),
-                "occurs_auc": BinaryAUROC().cpu(),
-            }
+            m = {"answer_auc": BinaryAUROC().cpu()}
             for j in range(self._n_positions):
                 m[f"answer_auc_pos{j}"] = BinaryAUROC().cpu()
             return m
@@ -71,18 +66,6 @@ class ConditionalQueryLightningModule(EveryQueryLightningModule):
             batch_size=batch_size,
             sync_dist=sync_dist,
         )
-        for name in ("censor_loss", "occurs_loss"):
-            value = getattr(outputs, name, None)
-            if value is not None:
-                self.log(
-                    f"{split}/{name}",
-                    float(value.detach().cpu()),
-                    on_step=is_train,
-                    on_epoch=not is_train,
-                    batch_size=batch_size,
-                    sync_dist=sync_dist,
-                )
-
         if is_train or outputs.answer_logits is None:
             return
 
@@ -90,32 +73,13 @@ class ConditionalQueryLightningModule(EveryQueryLightningModule):
         targets = (batch.q_answers == ANSWER_YES).detach().cpu().long()
         observed = outputs.valid_mask.detach().cpu()
 
-        # Overall: every observed query position pooled.
+        # Overall: every real query position pooled.
         if observed.any():
             self._update_metric(
                 name="answer_auc", split=split, preds=probs[observed], target=targets[observed]
             )
 
-        censor_sel = observed[:, 0]
-        if censor_sel.any():
-            self._update_metric(
-                name="censor_auc",
-                split=split,
-                preds=probs[:, 0][censor_sel],
-                target=targets[:, 0][censor_sel],
-            )
-
-        occurs_sel = observed.clone()
-        occurs_sel[:, 0] = False
-        if occurs_sel.any():
-            self._update_metric(
-                name="occurs_auc",
-                split=split,
-                preds=probs[occurs_sel],
-                target=targets[occurs_sel],
-            )
-
-        # Per-position AUROC: position j is observed where observed[:, j] is True.  Sequences
+        # Per-position AUROC: position j is real where observed[:, j] is True.  Sequences
         # shorter than j+1 simply contribute no rows at position j.
         n_pos = min(self._n_positions, observed.shape[1])
         for j in range(n_pos):

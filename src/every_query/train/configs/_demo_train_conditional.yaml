@@ -39,7 +39,6 @@ lightning_module:
     decoder_heads: 2
     decoder_ffn_mult: 2
     max_queries: 8
-    occurs_loss_weight: 0.5
     config_overrides:
       hidden_size: 64
       num_hidden_layers: 2

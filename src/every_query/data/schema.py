@@ -103,21 +103,21 @@ class QuerySeqSchema(LabelSchema):
     Each row is a ``(subject_id, prediction_time)`` context with three aligned list columns:
 
     Attributes:
-        queries: Ordered list of MEDS code strings.  Element 0 is always the censor sentinel
-            ``__CENSOR__`` (see ``every_query.data.seq_dataset.CENSOR_QUERY_CODE``), asking
-            "will any data be present after ``prediction_time + durations[0]``?".
+        queries: Ordered list of MEDS code strings (any vocabulary code, random order — including
+            the end-of-timeline code ``TIMELINE//END``, which is an ordinary code).
         durations: Per-query horizons in days (``float32``), aligned with ``queries``.
-        answers: Per-query nullable booleans aligned with ``queries``.  ``null`` means the
-            answer is unobserved (the window extends past the subject's last recorded event);
-            element 0 is never null.
+        answers: Per-query booleans aligned with ``queries`` — *"was ``queries[j]`` observed in
+            ``(prediction_time, prediction_time + durations[j]]``?"*.  Binary, never null; an
+            unobservable event (record ends first) is ``False``.  Censoring is carried by a
+            ``TIMELINE//END`` query rather than a null answer.
 
     Examples:
         >>> from datetime import datetime
         >>> import pyarrow as pa
         >>> data = pa.Table.from_pylist([
         ...     {"subject_id": 1, "prediction_time": datetime(2023, 1, 1),
-        ...      "queries": ["__CENSOR__", "ICD//I10"], "durations": [30.0, 7.0],
-        ...      "answers": [True, None]},
+        ...      "queries": ["TIMELINE//END", "ICD//I10"], "durations": [30.0, 7.0],
+        ...      "answers": [False, True]},
         ... ])
         >>> aligned = QuerySeqSchema.align(data)
         >>> [f.name for f in aligned.schema]
