@@ -21,6 +21,22 @@ Everything below is the original mid-refactor note (kept for context); all of it
 
 ---
 
+## UPDATE (big iid run, fixed-length): 
+- Verified NO cross-shard query replication: queries_seed=derive_seed(seed,"seq_queries",input_shard,task_shard)
+  includes input_shard (orig EQ bug used task_shard only). Empirically 28.79M seqs -> 86.9% unique
+  query sequences, 227,602 distinct subjects (all of MIMIC-IV across all 292 shards). 13% repeats are
+  iid chance collisions in short/low-duration sequences, not systematic.
+- Switched to FIXED length 5 (was variable 1-5): with the block-causal mask, position j's prediction
+  depends only on blocks 0..j, so shorter sequences are redundant prefixes; fixed length trains all
+  positions per sequence with uniform per-position sample counts (fixes pos-4 val noise). Regenerated
+  all splits fixed-5; run = experiments/runs/big_v2, one epoch ~300k steps, no knobs, val every 5k.
+- Position encodings confirmed proper: encoder=ModernBERT native; decoder=learned block_pos_embed
+  (block idx) + token_type_embed (code/dur/answer), TransformerDecoder adds none itself.
+- Early signal (pre-fixed-length, step 5k): per-position AUROC pos0->pos3 monotone up (0.722->0.740),
+  pos4 noisy low (few samples) -> motivated the fixed-length switch.
+- Goal: confirm per-position AUROC trends UP with position (conditioning works) given enough unique
+  iid query coverage -> tests the undersampling hypothesis vs the v2 baseline (experiments/runs/main_v2).
+
 ## What changed (the v2 redesign — binary observed-occurrence labels)
 
 Per user direction, the conditional model was reworked so that:
