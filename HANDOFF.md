@@ -1,6 +1,25 @@
 # Conditional-queries redesign — handoff / resume notes
 
-_Last updated mid-session. Branch: `conditional-queries`._
+_Branch: `conditional-queries`._
+
+## STATUS: v2 COMPLETE (Phase 1 + Phase 2 trained, evaluated, reported)
+
+Final deliverable: `EveryQuery_Conditional_Report_v2.pdf` (repo root + `experiments/`).
+Runs: `experiments/runs/main_v2` (baseline, eos_first=0), `experiments/runs/eos_v2`
+(EOS-aware: eos_first=0.5, duration_mode=same). Evals: `experiments/eval_v2_{baseline,eos}`.
+
+Headline results (held-out, leak-free):
+- Marginal within-query AUROC ~0.63 macro; death AUROC 0.79–0.83 (vs v1's leaked 0.991).
+- Nested-horizon conditioning STRONG & real: P(C@30|C@7=YES) vs (=NO) = 0.62/0.13 (baseline),
+  0.71/0.15 (eos-aware) — proves the decoder uses informative priors; v1 flat-probe was flat
+  only because random fillers were uninformative.
+- END-conditioned death prediction did NOT emerge in either run: the (1)/(2) knobs upweight
+  END's position & couple durations but never make the rare death TARGET follow an END query.
+  Next step = a 3rd knob upweighting curated clinical target codes so [END d][death d] is trained.
+
+Everything below is the original mid-refactor note (kept for context); all of it is DONE.
+
+---
 
 ## What changed (the v2 redesign — binary observed-occurrence labels)
 

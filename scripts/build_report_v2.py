@@ -230,7 +230,7 @@ def build(baseline_eval, baseline_csv, eos_eval, eos_csv, out):
 
     # 4. Training
     P("4. Training stability", "H1c")
-    img(figs / "train_baseline.png", width=6.6 * inch)
+    img(figs / "train_baseline.png", w=6.6 * inch)
     tt = [["metric", "baseline" + (" | EOS-aware" if t_eos else "")]]
     def pair(k, nd=3):
         a = _fmt(t_base.get(k), nd)
@@ -266,43 +266,66 @@ def build(baseline_eval, baseline_csv, eos_eval, eos_csv, out):
         drows.append(["EOS-aware (sweep)", _fmt(eh.get("P_death_given_data_continues"), 4),
                       _fmt(eh.get("P_death_given_record_ends"), 4), _fmt(eh.get("prevalence"), 4)])
     E.append(_table(drows, col_widths=[1.7 * inch, 1.7 * inch, 1.7 * inch, 1.1 * inch], font=8))
-    img(figs / "death_eos_comparison.png", width=4.6 * inch)
-    P("A model that uses the censoring query should drive P(death|EOS=YES) well above "
-      "P(death|EOS=NO≈0). Under pure-random training EOS is ~1/12k of queries, so the baseline barely "
-      "separates them — the motivation for the Phase-2 sweep, which upweights the EOS-first / "
-      "shared-duration pattern.", "Body")
+    img(figs / "death_eos_comparison.png", w=4.6 * inch)
+    P("A model that uses the censoring query should drive P(death|END=YES) above P(death|END=NO). Both "
+      "runs fail to separate them (see §C/Discussion): END is rare in random training, and the EOS-aware "
+      "sweep upweights END's <i>position</i> and couples <i>durations</i> but never makes the rare death "
+      "<i>target</i> follow an END query — so the specific [END d][death d] pattern is still untrained.", "Body")
 
-    c = base["C_nested"]
-    P(f"<b>C. Informative-prior conditioning (nested horizons).</b> Teacher-forcing the true C@7d "
-      f"answer, the baseline predicts P(C@30d | C@7d=YES) = {_fmt(c['mean_P_target_given_prior_yes'])} "
-      f"vs | C@7d=NO) = {_fmt(c['mean_P_target_given_prior_no'])} — "
-      + ("a clear" if (c['mean_P_target_given_prior_yes'] or 0) > 2 * (c['mean_P_target_given_prior_no'] or 1) else "a modest")
-      + " separation in the entailment-correct direction.", "Body")
-    img(figs / "nested_conditioning.png", width=4.6 * inch)
+    # Per-code death true-eos AUROC (leak-free death prediction) for both runs.
+    def _death_auroc(s):
+        for r in s.get("B_eos", []):
+            if r["query"] == "MEDS_DEATH":
+                return r.get("auroc_true_eos")
+        return None
+    P(f"Note the EOS forced-answer barely moves death probability in either run, yet death is "
+      f"<i>predictable</i>: scoring [END d][death d] with the true END answer gives a leak-free death "
+      f"AUROC of <b>{_fmt(_death_auroc(base))}</b> (baseline)"
+      + (f" / {_fmt(_death_auroc(eos))} (EOS-aware)" if eos else "")
+      + " — driven by the patient encoder, not the censoring bit. (v1's 0.991 was the leak; this is the "
+      "honest number.) The forced-EOS gap stays flat because <font face='Courier'>eos_first_fraction</font> "
+      "upweights END at <i>position 0</i> but never makes the rare death <i>target</i> co-occur with an "
+      "END query at a matched horizon — so [END d][death d] is still essentially never trained.", "Body")
 
-    if eos:
-        P("<b>Phase-2 sweep (EOS-aware training).</b> Re-training with eos_first_fraction=0.5 and "
-          "shared per-sequence durations, then re-evaluating identically, tests whether the "
-          "censoring-conditioned queries improve. See the death table and figure above for the "
-          "head-to-head.", "Body")
-        ea = eos["A_marginal"]
-        P(f"EOS-aware marginal within-query AUROC: {_fmt(ea['macro_within_query_auroc'])} "
-          f"(vs baseline {_fmt(a['macro_within_query_auroc'])}).", "Body")
+    cb = base["C_nested"]
+    ce = eos["C_nested"] if eos else None
+    P(f"<b>C. Informative-prior conditioning (nested horizons).</b> This is the strongest positive "
+      f"result. Teacher-forcing the true C@7d answer, the model predicts P(C@30d | C@7d=YES) vs "
+      f"P(C@30d | C@7d=NO) = <b>{_fmt(cb['mean_P_target_given_prior_yes'])}</b> vs "
+      f"<b>{_fmt(cb['mean_P_target_given_prior_no'])}</b> (baseline)"
+      + (f", improving to {_fmt(ce['mean_P_target_given_prior_yes'])} vs {_fmt(ce['mean_P_target_given_prior_no'])} "
+         f"with the duration-coupled EOS-aware run" if ce else "")
+      + ". The logical entailment is C@7d=YES ⇒ C@30d=YES (true target rate = 1.0 by construction); the "
+      "model moves sharply toward it, and the shared-duration sweep — which makes nested same-code pairs "
+      "more common — pushes the conditioned estimate closer to the entailment value. This cleanly "
+      "demonstrates the decoder uses prior answers when they carry signal.", "Body")
+    img(figs / "nested_conditioning.png", w=4.6 * inch)
 
     # 6. Discussion
     P("6. Discussion", "H1c")
+    am = a["macro_within_query_auroc"]
     for para in [
-        "<b>The redesign is sound and leak-free.</b> Binary observed-occurrence labels with EOS-as-a-"
-        "query remove the terminal-event leak that inflated v1 mortality to 0.991, while strictly "
-        "generalizing EveryQuery: the old P(occurs | data after d) is just the EOS=NO slice, and the "
-        "model additionally answers the EOS=YES slice where death actually occurs.",
-        "<b>Conditioning is used when it is trained.</b> The marginal occurrence task is answered well "
-        "above chance; the censoring and nested-horizon conditioning are weak under pure-random "
-        "training (EOS and informative prior pairs are rare) and strengthen when the sampler upweights "
-        "those patterns — quantified by the Phase-1 vs Phase-2 contrast.",
+        "<b>The redesign is sound and leak-free.</b> Binary observed-occurrence labels with END-as-a-"
+        "query remove the terminal-event leak that inflated v1 mortality to 0.991 (AUROC 0.996 from the "
+        "censor answer alone), while strictly generalizing EveryQuery: the old P(occurs | data after d) is "
+        f"just the END=NO slice. Held-out death prediction is now a legitimate AUROC ~0.79–0.83, and "
+        f"marginal occurrence reaches macro within-query AUROC {_fmt(am)} over curated codes.",
+        "<b>Conditioning works — when the prior is informative <i>and</i> trained.</b> The nested-horizon "
+        "test is unambiguous: the model separates P(C@30d) by a factor of ~5 on the C@7d answer "
+        f"({_fmt(cb['mean_P_target_given_prior_no'])}→{_fmt(cb['mean_P_target_given_prior_yes'])}), and the "
+        "duration-coupling sweep improves it further. This answers the central question the v1 flat-probe "
+        "left open — the architecture does condition; v1 looked flat only because its random fillers were "
+        "uninformative.",
+        "<b>The honest negative: END-conditioned death prediction did not emerge.</b> Neither the random "
+        "baseline nor the EOS-aware sweep made conditioning on the END answer move the death prediction, "
+        "because both sweep knobs operate on END's <i>position</i> and on <i>durations</i>, not on the "
+        "target-code distribution — death (1/12k) almost never appears as the query that follows an END "
+        "query. The clear next step is a third knob that upweights a curated set of clinically meaningful "
+        "<i>target</i> codes (death, ICU, readmission) so the [END d][C d] censoring-control pattern is "
+        "actually trained; we deliberately did not over-fit the two knobs the user scoped.",
         "<b>Limitations.</b> Evaluation is teacher-forced (conditional calibration, not free-running "
-        "rollout). Within-query macros use curated common codes with enough held-out positives. The "
-        "sweep explores a couple of points by design — not an exhaustive hyperparameter search.",
+        "rollout). Within-query macros use curated common codes with enough held-out positives. The sweep "
+        "is two points by design, not an exhaustive search.",
     ]:
         P(para, "Body")
 
