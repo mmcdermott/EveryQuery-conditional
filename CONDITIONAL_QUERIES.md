@@ -96,9 +96,12 @@ Key source modules:
 | `make_position_probe.py` | Matched-code position probe (a fixed code at positions 1..P). |
 | `eval_v2.py` | Query-form review eval: marginal `[C,d]`, EOS-conditioned `[END d][C d]` (P(C\|record ends) vs P(C\|data continue)), nested horizons. Counterfactual conditioning by overriding teacher-forced prior answers. |
 | `eval_macro_position.py` | **The definitive conditioning eval** (see [§4](#4-evaluation-methodology)). |
+| `eval_clinical.py` | **Designed clinical tasks** over three held-out anchor families (post-admission, post-discharge at HOME-discharge, random-time); single-query within-task AUROC + teacher-forced conditioning demos. Readmission anchored at discharge; each task names its exact MEDS code. |
+| `eval_occurs_uncensored.py` | **Original-EveryQuery-comparable** macro occurs-AUROC on the uncensored cohort: `[TIMELINE//END,D]=0 [C,D]` scored only where the record extends past `t+D`. |
 | `eval_per_position.py` | Pooled per-position AUROC with bootstrap CIs (superseded by the macro eval; kept for reference). |
 | `eval_position_effect.py` | Earlier controlled 0/2/4-prior probe on curated codes. |
-| `build_report_v2.py` | Assemble the PDF report. |
+| `build_report_final.py` | Assemble the final PDF report (`reports/EveryQuery_Conditional_Report_FINAL.pdf`) from the macro, clinical, and uncensored summary JSONs (saved under `reports/results/`). |
+| `build_report_v2.py` | Earlier PDF report builder (kept for reference). |
 
 ---
 
