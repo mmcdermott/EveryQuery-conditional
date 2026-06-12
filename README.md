@@ -3,6 +3,16 @@
 [![tests](https://github.com/payalchandak/EveryQuery/actions/workflows/tests.yaml/badge.svg?branch=dev)](https://github.com/payalchandak/EveryQuery/actions/workflows/tests.yaml)
 [![codecov](https://codecov.io/gh/payalchandak/EveryQuery/branch/dev/graph/badge.svg)](https://codecov.io/gh/payalchandak/EveryQuery)
 
+> [!IMPORTANT]
+> **This fork (`conditional-queries` branch) adds a conditional query-sequence model** — a
+> bidirectional patient encoder + block-autoregressive decoder that answers an ordered list of
+> queries, each conditioned on the patient state and the teacher-forced answers of all earlier
+> queries. Binary observed-occurrence labels; censoring is expressed by querying the real
+> `TIMELINE//END` code rather than via a separate head. See
+> **[CONDITIONAL_QUERIES.md](CONDITIONAL_QUERIES.md)** for the design, the new
+> `EQ_generate_query_sequences` / `EQ_predict_sequences` / `EQ_evaluate_sequences` CLIs, the macro
+> per-task evaluation methodology, and results.
+
 A framework for training and evaluating foundation models over structured EHR data, built on
 the [MEDS](https://github.com/Medical-Event-Data-Standard) ecosystem —
 [`meds-torch-data`](https://github.com/mmcdermott/meds-torch-data) for tensorization,
