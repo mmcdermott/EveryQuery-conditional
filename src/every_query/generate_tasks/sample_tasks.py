@@ -479,15 +479,16 @@ def _read_event_shard(file_path: str | Path) -> pl.DataFrame:
     )
 
 
-def read_query_codes(codes_or_path: list[str] | ListConfig | str | Path | None) -> list[str]:
-    """Resolve a query-code list — from default metadata, an explicit list, or a file path.
+def read_query_codes(
+    codes_or_path: list[str] | ListConfig | str | Path | None,
+) -> list[str]:
+    """Resolve a query-code list — from an explicit list, or a file/directory path.
 
     Accepts:
-    - ``None`` (load ``$PROCESSED/metadata/codes.parquet``),
     - an explicit list (from Hydra ``query_codes: [A, B, C]`` or a code-group YAML default),
-    - a metadata root directory (``codes.parquet`` is expected at ``{dir}/metadata/codes.parquet``
-      — matches the ``$PROCESSED`` layout), or
-    - a direct path to a ``codes.parquet`` file.
+    - a metadata root directory (``codes.parquet`` is expected at ``{dir}/metadata/codes.parquet``;
+      e.g. ``query_codes=$PROCESSED`` to load the full vocabulary), or
+    - a direct path to a ``codes.parquet``/YAML file.
 
     The ``.unique().sort()`` makes the returned list deterministic across workers reading
     the same metadata file (polars' default hash-based unique is order-unstable across
@@ -501,16 +502,13 @@ def read_query_codes(codes_or_path: list[str] | ListConfig | str | Path | None) 
         # parquet branch below already dedups via ``.unique().sort()``.
         seen: set[str] = set()
         return [c for c in codes_or_path if not (c in seen or seen.add(c))]
-    if codes_or_path is None:
-        processed = os.environ.get("PROCESSED")
-        if not processed:
-            raise ValueError(
-                "query_codes is null and $PROCESSED is not set; pass query_codes=... or export "
-                "$PROCESSED so the sampler can read $PROCESSED/metadata/codes.parquet."
-            )
-        p = Path(processed)
-    else:
-        p = Path(str(codes_or_path))
+    if not codes_or_path:
+        raise ValueError(
+            "query_codes is unset; pass an explicit list (query_codes=[A,B]), a codes.parquet/YAML "
+            "path, or a metadata root directory (query_codes=$PROCESSED) to load the full vocabulary "
+            "from {dir}/metadata/codes.parquet."
+        )
+    p = Path(str(codes_or_path))
     if p.suffix in {".yaml", ".yml"}:
         import yaml
 
@@ -591,30 +589,31 @@ def _atomic_write_json(obj: object, fp: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _resolve_path(cfg_value: str | None, env_var: str, name: str) -> Path:
-    """Prefer an explicit cfg value; fall back to ``$env_var``; otherwise raise.
-
-    Used by ``main`` to resolve path roots such as ``data_dir`` and ``out_dir``.
-    Factored out so tests can exercise the fallback matrix without spinning up a full Hydra run.
-    """
-    if cfg_value is not None:
-        return Path(str(cfg_value))
-    env_value = os.environ.get(env_var)
-    if env_value:
-        return Path(env_value)
-    raise ValueError(
-        f"{name} must be set: pass {name}=... on the CLI, set it in sample_training_tasks_config.yaml, "
-        f"or export ${env_var} (or define it in .env — sample_tasks calls load_dotenv())."
-    )
-
-
 # ---------------------------------------------------------------------------
 # Config & path resolution for the 5-stage sampler (issue #203)
 # ---------------------------------------------------------------------------
 #
 # These helpers establish the sampler's input surface (see ``redesign-spec.md``).  Kept as pure path
-# functions (no file I/O, no dir creation) so they are unit-testable without a Hydra run — same
-# rationale as ``_resolve_path``.
+# functions (no file I/O, no dir creation) so they are unit-testable without a Hydra run.
+
+
+def _require_path_arg(value: object, name: str) -> Path:
+    """Coerce a required path arg to ``Path``, rejecting unset/empty values with a clear message.
+
+    Path roots are mandatory (``???``) Hydra args, but a value supplied as ``{name}=$VAR`` with an
+    *unexported* shell var expands to an empty override (``{name}=``) that Hydra parses as ``None`` —
+    which overrides the ``???`` sentinel, so ``MissingMandatoryValue`` never fires and the value would
+    otherwise slip through as the literal path ``None``.  ``cfg.get(name)`` returns ``None`` for both
+    the truly-unset (``???``) and empty-override cases, so guarding here gives one clear up-front
+    error for both (mirrors the empty-check the removed ``_resolve_path`` did; see #235).
+    """
+    s = "" if value is None else str(value).strip()
+    if not s:
+        raise ValueError(
+            f"{name} is unset or empty. Pass {name}=/path on the CLI "
+            f"(if you wrote {name}=$VAR, the shell variable is unset — export it or `source env.sh`)."
+        )
+    return Path(s)
 
 
 def default_artifacts_dir(training_tasks_dir: Path) -> Path:
@@ -631,36 +630,26 @@ def default_artifacts_dir(training_tasks_dir: Path) -> Path:
     return training_tasks_dir.parent / f"{training_tasks_dir.name}_artifacts"
 
 
-def resolve_training_task_paths(cfg: DictConfig | None = None) -> tuple[Path, Path, Path]:
-    """Resolve the redesigned sampler's three path roots (``override > env var > raise``).
+def resolve_training_task_paths(cfg: DictConfig) -> tuple[Path, Path, Path]:
+    """Resolve the redesigned sampler's three path roots from required Hydra keys.
 
-    The two input roots are machine-specific.  Each takes an optional Hydra override
-    (``cfg.data_dir`` / ``cfg.out_dir``) and falls back to its env var when the override is null —
-    the same ``override > env > raise`` contract that ``EQ_process_data`` and the sibling
-    :mod:`sample_evaluation_tasks` use, so ``.env`` keeps working for cluster runs while CLI/test
-    callers can point the sampler at an arbitrary directory.
+    The two input roots are machine-specific Hydra args (supplied on the CLI, typically as
+    shell-expanded ``data_dir=$INTERMEDIATE out_dir=$TRAINING_TASKS_DIR``).  Both are mandatory; an
+    unset or empty value (including ``data_dir=$VAR`` with an unexported ``$VAR``) raises a clear
+    ``ValueError`` via :func:`_require_path_arg` — there is no env-var fallback (see issue #235).
 
-    - ``path_to_data`` — MEDS dataset root; ``cfg.data_dir`` else ``$INTERMEDIATE``.
-    - ``training_tasks_dir`` — final-output-only root; ``cfg.out_dir`` else ``$TRAINING_TASKS_DIR``.
-    - ``training_task_artifacts_dir`` — intermediate-artifacts root.  Has no key/env var of its own:
-      it is always :func:`default_artifacts_dir` (the ``{name}_artifacts`` sibling of
+    - ``path_to_data`` — MEDS dataset root (``cfg.data_dir``).
+    - ``training_tasks_dir`` — final-output-only root (``cfg.out_dir``).
+    - ``training_task_artifacts_dir`` — intermediate-artifacts root.  Has no key of its own: it is
+      always :func:`default_artifacts_dir` (the ``{name}_artifacts`` sibling of
       ``training_tasks_dir``), which keeps the two output trees disjoint and never-nested by
       construction (spec invariant 7).
-
-    Both required roots go through :func:`_resolve_path`, which raises a clear message when neither
-    the override nor the env var is set.
-
-    Args:
-        cfg: Resolved sampler config; ``cfg.data_dir`` / ``cfg.out_dir`` (when non-null) override the
-            env vars.  ``None`` (the default) resolves from env vars only.
 
     Returns:
         ``(path_to_data, training_tasks_dir, training_task_artifacts_dir)`` as ``Path``s.
     """
-    data_dir_override = cfg.get("data_dir") if cfg is not None else None
-    out_dir_override = cfg.get("out_dir") if cfg is not None else None
-    path_to_data = _resolve_path(data_dir_override, "INTERMEDIATE", "data_dir")
-    training_tasks_dir = _resolve_path(out_dir_override, "TRAINING_TASKS_DIR", "out_dir")
+    path_to_data = _require_path_arg(cfg.get("data_dir"), "data_dir")
+    training_tasks_dir = _require_path_arg(cfg.get("out_dir"), "out_dir")
     training_task_artifacts_dir = default_artifacts_dir(training_tasks_dir)
 
     return path_to_data, training_tasks_dir, training_task_artifacts_dir
@@ -1383,14 +1372,13 @@ def _log_coverage_summary(out_files: list[Path], written: int) -> None:
 
 
 def run(cfg: DictConfig) -> None:
-    """Execute the 5-stage pipeline for a fully-resolved config (no Hydra/dotenv side effects).
+    """Execute the 5-stage pipeline for a fully-resolved config (no Hydra side effects).
 
     Split out from :func:`main` so it is callable directly (tests, programmatic drivers) without
-    triggering Hydra arg parsing or ``load_dotenv()``; :func:`main` is the thin Hydra entry point that
-    loads ``.env`` and delegates here.  Path roots come from :func:`resolve_training_task_paths`
-    (``cfg.data_dir`` / ``cfg.out_dir`` override, else ``$INTERMEDIATE`` / ``$TRAINING_TASKS_DIR``),
+    triggering Hydra arg parsing; :func:`main` is the thin Hydra entry point that delegates here.
+    Path roots come from :func:`resolve_training_task_paths` (``cfg.data_dir`` / ``cfg.out_dir``)
     plus the sibling ``_artifacts`` intermediate root; query codes via :func:`read_query_codes`
-    (falls back to ``$PROCESSED`` when ``cfg.query_codes`` is null).
+    (``cfg.query_codes`` as a list, file path, or metadata root dir → ``{dir}/metadata/codes.parquet``).
 
     Stages 0-3 run sequentially in this driver process and produce the partitioned Stage 3 index;
     Stage 4 then fans out one :func:`label_one_shard` worker per shard via a ``ProcessPoolExecutor``
@@ -1485,17 +1473,10 @@ def run(cfg: DictConfig) -> None:
 
 @hydra.main(version_base=None, config_path=CONFIGS, config_name="sample_training_tasks_config")
 def main(cfg: DictConfig) -> None:
-    """Hydra entry point (``EQ_generate_training_tasks``) — loads ``.env``, then runs :func:`run`.
+    """Hydra entry point (``EQ_generate_training_tasks``) — delegates to :func:`run`.
 
-    Loads ``.env`` via python-dotenv first (the repo convention where machine paths live in a
-    gitignored ``.env`` rather than being exported by the user), then delegates the whole 5-stage
-    pipeline to :func:`run`.
+    Path roots come from Hydra args (``data_dir`` / ``out_dir``); see :func:`resolve_training_task_paths`.
     """
-    # Late import so `load_dotenv()` doesn't run at module import time (which would be an
-    # unexpected side effect for programmatic callers / tests of the pure primitives).
-    from dotenv import load_dotenv
-
-    load_dotenv()
     run(cfg)
 
 

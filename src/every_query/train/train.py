@@ -236,7 +236,7 @@ def validate_training_config(cfg: DictConfig) -> None:
         if not value:
             raise ValueError(
                 f"datamodule.config.{node} is unset. Pass it as a CLI override "
-                f"(datamodule.config.{node}=/path) or set ${env_var} in your .env."
+                f"(datamodule.config.{node}=/path, typically =${env_var})."
             )
         if not Path(value).is_dir():
             raise NotADirectoryError(
@@ -250,23 +250,19 @@ def validate_training_config(cfg: DictConfig) -> None:
     output_dir = cfg.get("output_dir")
     if not output_dir or str(output_dir).startswith(("None/", "null/")):
         raise ValueError(
-            "output_dir is unset (is $OUTPUT_DIR set?). Pass output_dir=/path "
-            "or set $OUTPUT_DIR in your .env."
+            "output_dir is unset (is $OUTPUT_DIR exported?). Pass output_dir=/path or export $OUTPUT_DIR."
         )
 
     if _is_wandb_logger(cfg.trainer.get("logger")) and not cfg.trainer.logger.get("entity"):
         raise ValueError(
             "trainer.logger.entity is unset for a wandb logger. Pass "
-            "trainer.logger.entity=<entity> or set $WANDB_ENTITY in your .env "
+            "trainer.logger.entity=<entity> or export $WANDB_ENTITY "
             "(or disable the logger with trainer.logger=false)."
         )
 
 
 def _init_env() -> None:
-    """Load ``.env`` and configure thread counts for polars/OMP."""
-    from dotenv import load_dotenv
-
-    load_dotenv()  # so ${oc.env:...} interpolations resolve
+    """Configure thread counts for polars/OMP from the SLURM/system environment."""
     num_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 1))
     threads_per_file = max(1, num_cpus // 10)
     os.environ["POLARS_MAX_THREADS"] = str(threads_per_file)

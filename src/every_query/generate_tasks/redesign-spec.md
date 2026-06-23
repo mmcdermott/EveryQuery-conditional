@@ -85,22 +85,23 @@ These hold throughout the design; later sections reference them rather than rest
 | `split`                            | split to process                                                                                                                                                                                       |
 | `seed`                             | top-level seed; all draws derive from it                                                                                                                                                               |
 
-Path roots are **not** Hydra keys — they are machine-specific and resolved from env vars only (via
-`load_dotenv()` in `main()`); see `resolve_training_task_paths`:
+Path roots are **required Hydra args** (machine-specific, no `.env`/env-var fallback — see #235);
+pass them as shell-expanded vars (`data_dir=$INTERMEDIATE out_dir=$TRAINING_TASKS_DIR`). See
+`resolve_training_task_paths`:
 
-| env var / derived                            | meaning                                                                                     |
-| -------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| `$INTERMEDIATE` → `path_to_data`             | MEDS dataset root, with `path_to_data/data/{train,tuning,test}/{i}.parquet`. Required.      |
-| `$TRAINING_TASKS_DIR` → `training_tasks_dir` | final-output-only root (see *Artifact layout*). Required.                                   |
-| `training_task_artifacts_dir`                | intermediate-artifact root (see *Artifact layout*). No env var: always the sibling default. |
+| key / derived                    | meaning                                                                                 |
+| -------------------------------- | --------------------------------------------------------------------------------------- |
+| `data_dir` → `path_to_data`      | MEDS dataset root, with `path_to_data/data/{train,tuning,test}/{i}.parquet`. Required.  |
+| `out_dir` → `training_tasks_dir` | final-output-only root (see *Artifact layout*). Required.                               |
+| `training_task_artifacts_dir`    | intermediate-artifact root (see *Artifact layout*). No key: always the sibling default. |
 
 **`QueryDistribution(query_codes, min_duration, max_duration, uniform|log-uniform)`** — owns both the
 code draw and the duration draw, so Stage 1 is just `query_dist.sample(num_queries, rng) -> list[QuerySpec]`.
 
 - `query_codes`: already-resolved `list[str]` code universe (one code per query). **Resolution stays
-    outside the dataclass** — the caller runs `read_query_codes()` (default
-    `$PROCESSED/metadata/codes.parquet`, an explicit Hydra list, or a YAML/parquet path; see
-    `read_query_codes` in `sample_tasks.py`) and passes the result in, e.g.
+    outside the dataclass** — the caller runs `read_query_codes()` (a metadata root dir →
+    `{dir}/metadata/codes.parquet`, e.g. `query_codes=$PROCESSED`; an explicit Hydra list; or a
+    YAML/parquet path; see `read_query_codes` in `sample_tasks.py`) and passes the result in, e.g.
     `QueryDistribution.from_config(cfg, query_codes=read_query_codes(...))`. The dataclass does no file I/O.
 - `min_duration`, `max_duration`: duration bounds in days.
 - `uniform|log-uniform`: duration sampling distribution.
