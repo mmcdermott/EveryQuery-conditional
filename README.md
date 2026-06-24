@@ -7,19 +7,12 @@
 [![Config: Hydra](https://img.shields.io/badge/config-hydra-89b8cd)](https://hydra.cc)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A framework for training and evaluating foundation models over structured EHR data, built on
-the [MEDS](https://github.com/Medical-Event-Data-Standard) ecosystem —
-[`meds-torch-data`](https://github.com/mmcdermott/meds-torch-data) for tensorization,
-[`MEDS-transforms`](https://github.com/mmcdermott/MEDS_transforms) for preprocessing, PyTorch
-Lightning for training.
-
-Given a tensorized MEDS cohort, EveryQuery trains a ModernBERT-style encoder to answer
+Given a MEDS dataset, EveryQuery trains a ModernBERT-style encoder to answer
 "query" prediction tasks of the form: *given a subject's history up to time `t`, will code
 `c` occur within `d` days?* The same trained model is then evaluated against arbitrary
 `(code, duration)` combinations.
 
-> [!NOTE]
-> The Phase-1 + Phase-2 refactor from [#54](https://github.com/payalchandak/EveryQuery/issues/54) has landed: the full `preprocess → generate_training_tasks / generate_evaluation_tasks → train → predict → evaluate` pipeline uses the cross-stage [`TaskQuerySchema`](src/every_query/data/schema.py) throughout. `EQ_evaluate` now resolves to the single-stage evaluator that consumes `PredictionSchema` parquets; the legacy four-stage evaluator has been deleted (recover from git history if needed). See [Roadmap](#roadmap) for the remaining #83 cleanup.
+EveryQuery is built on the [MEDS](https://github.com/Medical-Event-Data-Standard) ecosystem leveraging [`meds-torch-data`](https://github.com/mmcdermott/meds-torch-data) for tensorization and [`MEDS-transforms`](https://github.com/mmcdermott/MEDS_transforms) for preprocessing.
 
 ## Install
 
@@ -212,12 +205,12 @@ EQ_generate_evaluation_tasks codes=/path/to/sampled_codes.yaml …
 ```bash
 EQ_train \
 	datamodule.config.tensorized_cohort_dir="$TENSORIZED_COHORT_DIR" \
-	datamodule.config.task_labels_dir="$TRAINING_TASKS_DIR"
+	datamodule.config.task_labels_dir="$TRAINING_TASKS_DIR" \
+	output_dir="$TRAINING_OUTPUT_DIR"
 ```
 
-`tensorized_cohort_dir` and `task_labels_dir` are required Hydra args (no `.env` fallback — see [#235](https://github.com/payalchandak/EveryQuery/issues/235)); `task_labels_dir` is where `EQ_generate_training_tasks` writes. `output_dir` is a required Hydra arg (a base path you supply with `output_dir=`, e.g. `=$TRAINING_OUTPUT_DIR`); Hydra appends `<YYYY-MM-DD>/<HH-MM-SS>` for per-run uniqueness via its native `run.dir`/`sweep.dir` (see [#251](https://github.com/payalchandak/EveryQuery/issues/251)). The wandb run is auto-named (`logger.name=null`); each run logs its `run_dir` so you can match a dashboard run back to its folder on disk. `EQ_train` reads the long-format labels written by `EQ_generate_training_tasks` directly — the inline collation step that lived in `train.py` was removed in [#76](https://github.com/payalchandak/EveryQuery/pull/76).
-
-Seeding: `cfg.seed` (default `140799`) is passed through `lightning.seed_everything` *before* model + datamodule instantiation (fix landed in [#124](https://github.com/payalchandak/EveryQuery/pull/124)), so model weight initialization is byte-reproducible across Python versions and platforms for a given seed.
+- `output_dir` is a required Hydra arg that is a base path you supply with `output_dir=`, e.g. `=$TRAINING_OUTPUT_DIR`. Hydra appends `<YYYY-MM-DD>/<HH-MM-SS>` for per-run uniqueness.
+- If you want to override more parameters for training refer to `src/every_query/train/configs/config.yaml`
 
 ### 4. Predict
 
@@ -314,50 +307,6 @@ tests/
     ├── README.md
     └── test_training_validity.py
 ```
-
-## Roadmap
-
-Overall refactor umbrella: [#54](https://github.com/payalchandak/EveryQuery/issues/54) —
-target architecture is `preprocess → generate_tasks → train → predict → evaluate` with a
-shared cross-stage task-query schema.
-
-### Phase 2 status
-
-| Sub-phase                         | Issue                                                       | State                                                                                                                                                           |
-| --------------------------------- | ----------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 2.1: TaskQuerySchema design       | [#80](https://github.com/payalchandak/EveryQuery/issues/80) | ✅ merged via [#96](https://github.com/payalchandak/EveryQuery/pull/96) (also closes #122)                                                                      |
-| 2.2: EQ_predict                   | [#81](https://github.com/payalchandak/EveryQuery/issues/81) | ✅ merged via [#99](https://github.com/payalchandak/EveryQuery/pull/99)                                                                                         |
-| 2.3: eval-suite inventory         | [#82](https://github.com/payalchandak/EveryQuery/issues/82) | Decisions captured on the issue + reflected in #100's scope; no code change needed                                                                              |
-| 2.4: EQ_evaluate consolidation    | [#83](https://github.com/payalchandak/EveryQuery/issues/83) | ✅ new `evaluate.py` is the `EQ_evaluate` entry point (rewired in this PR); `every_query.evaluate.eval` + siblings deleted — recover from git history if needed |
-| 2.5: EQ_generate_evaluation_tasks | (part of this PR)                                           | ✅ new dense-grid task-generator endpoint to feed `EQ_predict`; training-task endpoint renamed to `EQ_generate_training_tasks` for clarity                      |
-
-### E2E testing status ([#104](https://github.com/payalchandak/EveryQuery/issues/104))
-
-| Subprocess test                         | Issue                                                         | State                                                                                                                                              |
-| --------------------------------------- | ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `test_process_data.py`                  | (pre-104)                                                     | ✅ merged                                                                                                                                          |
-| `test_generate_tasks.py`                | [#107](https://github.com/payalchandak/EveryQuery/issues/107) | ✅ merged via [#112](https://github.com/payalchandak/EveryQuery/pull/112) (training-task shape)                                                    |
-| `test_generate_evaluation_tasks_cli.py` | (part of this PR)                                             | ✅ dense-grid + determinism coverage for the new eval-task endpoint                                                                                |
-| `test_train.py`                         | [#108](https://github.com/payalchandak/EveryQuery/issues/108) | ✅ merged via [#113](https://github.com/payalchandak/EveryQuery/pull/113)                                                                          |
-| `test_predict_cli.py`                   | (part of #99)                                                 | ✅ merged via [#99](https://github.com/payalchandak/EveryQuery/pull/99) (row-order preservation covered)                                           |
-| `test_evaluate_cli.py`                  | [#109](https://github.com/payalchandak/EveryQuery/issues/109) | ✅ merged via [#100](https://github.com/payalchandak/EveryQuery/pull/100); rewired to the `EQ_evaluate` console script in this PR                  |
-| training-validity (model learns)        | [#118](https://github.com/payalchandak/EveryQuery/issues/118) | ✅ merged via [#119](https://github.com/payalchandak/EveryQuery/pull/119); runs the full `EQ_predict` → `EQ_evaluate` chain as subprocesses (slow) |
-
-### Hygiene / follow-ups
-
-| Issue                                                         | Description                                                                                                                     |
-| ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| [#62](https://github.com/payalchandak/EveryQuery/issues/62)   | Promote `aces_to_eq` / `process_composite` to entry points — draft PR [#95](https://github.com/payalchandak/EveryQuery/pull/95) |
-| [#64](https://github.com/payalchandak/EveryQuery/issues/64)   | Drop gitignored `{train,eval}_codes` defaults (design pick pending)                                                             |
-| [#117](https://github.com/payalchandak/EveryQuery/issues/117) | Env-var audit — phase 1 merged via [#127](https://github.com/payalchandak/EveryQuery/pull/127); phases 2-4 pending              |
-| [#125](https://github.com/payalchandak/EveryQuery/issues/125) | Adopt hypothesis-based property tests for the sampler                                                                           |
-| [#129](https://github.com/payalchandak/EveryQuery/issues/129) | Rename `PredictionSchema.occurs_prob` → `label_prob` post-NeurIPS once non-occurrence task types land                           |
-| [#59](https://github.com/payalchandak/EveryQuery/issues/59)   | Docs: final rewrite after the refactor settles                                                                                  |
-
-### Model / architecture research (non-blocking)
-
-- [#101](https://github.com/payalchandak/EveryQuery/issues/101) / [#102](https://github.com/payalchandak/EveryQuery/issues/102) — RoPE for time-deltas
-- [#103](https://github.com/payalchandak/EveryQuery/issues/103) — Evaluate alternatives to ModernBERT as the encoder backbone
 
 ## Acknowledgements
 
