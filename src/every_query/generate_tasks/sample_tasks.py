@@ -1417,9 +1417,14 @@ def run(cfg: DictConfig) -> None:
 
     # Stage 2: Sample (num_queries*num_contexts_per_query) patient contexts
     total_rows = cfg.num_queries * cfg.num_contexts_per_query
+    # Re-sort by subject_id: Stage 2 treats row position as subject_idx, so this read must restore the
+    # same canonical order Stage 0 wrote (eligible.sort("subject_id"), see build_prediction_times). A
+    # plain read_parquet happens to preserve that order today, but sorting here makes the subject_idx ->
+    # subject_id mapping independent of parquet round-trip order (e.g. if Stage 0 ever moves to a
+    # partitioned/multi-file write or this read gains pushdown that reorders row groups).
     prediction_time_counts_df = pl.read_parquet(
         prediction_time_counts_path(training_task_artifacts_dir, cfg.split)
-    )
+    ).sort("subject_id")
 
     sampled_patient_contexts = sample_patient_contexts(
         prediction_time_counts=prediction_time_counts_df,
