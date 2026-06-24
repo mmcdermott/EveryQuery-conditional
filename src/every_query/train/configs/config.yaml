@@ -1,10 +1,29 @@
 defaults:
   - _self_
 
-output_dir: ${oc.env:TRAINING_OUTPUT_DIR,null}/${run_id:}/
+output_dir: ??? # required base — supply via `output_dir=`; Hydra appends <date>/<time> (see hydra block)
 do_overwrite: true
 do_resume: false
 seed: 140799
+
+# Uniqueness comes from Hydra's native run/sweep dir (not a custom resolver): each launch lands in
+# ${output_dir}/<date>/<time>/.  ${now:} is fixed once per launch, so run.dir and sweep.dir share
+# one timestamp.  Reuse the same output_dir across runs/sweeps — no collisions.
+hydra:
+  run:
+    dir: ${output_dir}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: ${output_dir}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}_${hydra.job.override_dirname} # one subdir per sweep job; job.num prefix guarantees uniqueness even if two jobs share an override set
+  job:
+    config:
+      override_dirname:
+        # keep only the swept hyperparameters in the subdir name — drop the always-present path args
+        # (their `/` would otherwise nest the sweep folders).
+        exclude_keys:
+          - output_dir
+          - datamodule.config.tensorized_cohort_dir
+          - datamodule.config.task_labels_dir
 
 datamodule:
   _target_: meds_torchdata.extensions.lightning_datamodule.Datamodule
@@ -50,7 +69,7 @@ trainer:
   _target_: lightning.pytorch.trainer.Trainer
   logger:
     _target_: pytorch_lightning.loggers.wandb.WandbLogger
-    name: "${run_id:}"
+    name: null # standard wandb auto-naming; runs are told apart by auto-logged hyperparameters
     save_dir: "${trainer.default_root_dir}/loggers"
     offline: False
     id: null # pass correct id to resume experiment!
@@ -85,7 +104,7 @@ trainer:
       stopping_threshold: null # stop training immediately once the monitored quantity reaches this
       divergence_threshold: null # stop training as soon as the monitored quantity becomes worse than this
       check_on_train_epoch_end: false # set to false so that early stopping is checked after each validation loop
-  default_root_dir: ${output_dir}
+  default_root_dir: ${hydra:runtime.output_dir} # single source of truth: run.dir OR sweep.dir/subdir
   min_epochs: 0 # prevents early stopping
   max_epochs: null # We don't control the max epochs, we control the max steps.
   max_steps: 80000

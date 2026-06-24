@@ -2,7 +2,6 @@ import builtins
 import logging
 import os
 import shutil
-from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
@@ -17,16 +16,6 @@ from omegaconf import DictConfig, OmegaConf
 from every_query.train.resume_check import validate_resume_directory
 
 logger = logging.getLogger(__name__)
-
-_RUN_ID = None
-
-
-@OmegaConfResolver(replace=True)
-def run_id():
-    global _RUN_ID
-    if _RUN_ID is None:
-        _RUN_ID = datetime.now(UTC).strftime("%Y-%m-%d/%H-%M-%S")
-    return _RUN_ID
 
 
 @OmegaConfResolver(replace=True)
@@ -243,16 +232,17 @@ def validate_training_config(cfg: DictConfig) -> None:
                 f"datamodule.config.{node} ({value!r}, from ${env_var}) is not an existing directory."
             )
 
-    # An unset $TRAINING_OUTPUT_DIR resolves the shipped ``${oc.env:TRAINING_OUTPUT_DIR,null}/${run_id:}/``
-    # interpolation to the *truthy* string ``'None/<run_id>/'`` (the null default is
-    # stringified into the surrounding path), so a bare falsy check is not enough — reject a
-    # leading ``None/`` / ``null/`` segment too, lest the run write to a literal ``None/...`` dir.
-    output_dir = cfg.get("output_dir")
-    if not output_dir or str(output_dir).startswith(("None/", "null/")):
-        raise ValueError(
-            "output_dir is unset (is $TRAINING_OUTPUT_DIR exported?). "
-            "Pass output_dir=/path or export $TRAINING_OUTPUT_DIR."
-        )
+    # ``output_dir`` is a required base (``???``); supply it with ``output_dir=/path``.  An unset
+    # value surfaces as Hydra's "Missing mandatory value" error on access, but guard explicitly too
+    # for callers that build the config without Hydra (e.g. the tests).
+    if not cfg.get("output_dir"):
+        raise ValueError("output_dir is unset. Pass output_dir=/path.")
+
+    # main() writes to trainer.default_root_dir (the Hydra-resolved per-run/per-job dir), not
+    # output_dir directly.  Validate the dir actually used so a stray default_root_dir= override
+    # can't pass this gate while artifacts land somewhere unintended.
+    if not cfg.trainer.get("default_root_dir"):
+        raise ValueError("trainer.default_root_dir is unset.")
 
     if _is_wandb_logger(cfg.trainer.get("logger")) and not cfg.trainer.logger.get("entity"):
         raise ValueError(
@@ -284,35 +274,38 @@ def main(cfg: DictConfig) -> float | None:
             "Only `do_overwrite` will be used, and the output directory will be cleared."
         )
 
-    output_dir = Path(cfg.output_dir)
-    if output_dir.is_file():
-        raise NotADirectoryError(f"Output directory {output_dir} is a file, not a directory.")
+    # The per-run/per-job dir Hydra resolved (run.dir for a single run, sweep.dir/subdir for a sweep
+    # job) — *not* cfg.output_dir, which is only the shared base.  Reading the resolved dir keeps
+    # sweep jobs from rmtree-ing/writing to the common base and colliding.
+    run_dir = Path(cfg.trainer.default_root_dir)
+    if run_dir.is_file():
+        raise NotADirectoryError(f"Run directory {run_dir} is a file, not a directory.")
 
-    cfg_path = output_dir / "config.yaml"
+    cfg_path = run_dir / "config.yaml"
     ckpt_path = None
     if cfg_path.exists():
         if cfg.do_overwrite:
-            logger.info(f"Overwriting existing output directory {output_dir}.")
-            shutil.rmtree(output_dir, ignore_errors=True)
+            logger.info(f"Overwriting existing run directory {run_dir}.")
+            shutil.rmtree(run_dir, ignore_errors=True)
         elif cfg.do_resume:
-            logger.info(f"Resuming training in existing output directory {output_dir}.")
-            validate_resume_directory(output_dir, cfg)
-            ckpt_path = find_checkpoint_path(output_dir)
+            logger.info(f"Resuming training in existing run directory {run_dir}.")
+            validate_resume_directory(run_dir, cfg)
+            ckpt_path = find_checkpoint_path(run_dir)
         else:
             raise FileExistsError(
-                f"Output directory {output_dir} already exists and is populated. "
+                f"Run directory {run_dir} already exists and is populated. "
                 "Use `do_overwrite` or `do_resume` to proceed."
             )
 
-    # Ensure output_dir exists *after* any overwrite rmtree above, then write the config for this
+    # Ensure run_dir exists *after* any overwrite rmtree above, then write the config for this
     # run.  On resume (without overwrite) we keep the original run's config untouched so the
     # resumed run stays bit-identical to the first.  On overwrite the previous rmtree wiped the
     # old config; writing it here restores reproducibility for downstream tools that load
     # ``resolved_config.yaml`` from the run dir.  Fixes #31.
-    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(run_dir, exist_ok=True)
     if not cfg.do_resume or cfg.do_overwrite:
-        OmegaConf.save(cfg, output_dir / "config.yaml")
-        save_resolved_config(cfg, output_dir / "resolved_config.yaml")
+        OmegaConf.save(cfg, run_dir / "config.yaml")
+        save_resolved_config(cfg, run_dir / "resolved_config.yaml")
 
     logger.info("Setting torch float32 matmul precision to 'medium'.")
     torch.set_float32_matmul_precision("medium")
@@ -337,6 +330,11 @@ def main(cfg: DictConfig) -> float | None:
 
     trainer = instantiate(cfg.trainer)
 
+    # Log the run dir up front so every run (even crashed/in-flight) is matchable from the wandb UI
+    # back to its folder on disk — best_ckpt_path below is only logged after fit() completes.
+    for log in trainer.loggers:
+        log.log_hyperparams({"run_dir": str(run_dir)})
+
     trainer_kwargs = {"model": M, "datamodule": D}
     if ckpt_path:
         logger.info(f"Trying to resume training from checkpoint {ckpt_path}.")
@@ -351,7 +349,7 @@ def main(cfg: DictConfig) -> float | None:
         for log in trainer.loggers:
             log.log_hyperparams({"best_ckpt_path": best_ckpt_path})
 
-    output_fp = Path(cfg.output_dir) / "best_model.ckpt"
+    output_fp = run_dir / "best_model.ckpt"
     shutil.copyfile(best_ckpt_path, output_fp)
 
     best_score = trainer.checkpoint_callback.best_model_score

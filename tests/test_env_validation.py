@@ -29,7 +29,7 @@ def _make_cfg(
                     "task_labels_dir": task_labels_dir,
                 }
             },
-            "trainer": {"logger": logger},
+            "trainer": {"logger": logger, "default_root_dir": output_dir},
         }
     )
 
@@ -96,23 +96,6 @@ def test_missing_output_dir_raises(existing_dirs):
         tensorized_cohort_dir=str(cohort),
         task_labels_dir=str(tasks),
         output_dir=None,
-        logger=False,
-    )
-    with pytest.raises(ValueError, match="output_dir"):
-        validate_training_config(cfg)
-
-
-def test_unset_output_dir_env_resolves_to_none_string_raises(existing_dirs, tmp_path):
-    """An unset $TRAINING_OUTPUT_DIR resolves the config interpolation to a truthy 'None/<run_id>/'.
-
-    Regression guard for the #234 review gap: the gate must reject this, not let a run write
-    to a directory literally named ``None/...``.
-    """
-    cohort, tasks = existing_dirs
-    cfg = _make_cfg(
-        tensorized_cohort_dir=str(cohort),
-        task_labels_dir=str(tasks),
-        output_dir="None/2026-06-22/12-00-00/",
         logger=False,
     )
     with pytest.raises(ValueError, match="output_dir"):
