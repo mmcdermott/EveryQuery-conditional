@@ -1025,6 +1025,10 @@ def build_prediction_times(
     # Gapless zero-based index over each subject's ascending distinct times.  No within-subject ties
     # (step above deduped), so int_range is identical to a dense rank and cheaper (invariant 2).
     # prediction_times columns: (subject_id, time, shard, prediction_time_index).
+    # This depends on `_read_prediction_time_shard` having already dropped null-`time` rows before
+    # `distinct` reaches this sort/rank — nulls sort first, so an unfiltered null would claim
+    # `prediction_time_index = 0` and inflate `n_prediction_times`. Do not reorder dedup/rank ahead of
+    # that filter.
     prediction_times = distinct.sort(["subject_id", "time"]).with_columns(
         pl.int_range(pl.len()).over("subject_id").alias("prediction_time_index")
     )
@@ -1034,6 +1038,10 @@ def build_prediction_times(
         pl.col("shard").first(),
         pl.len().alias("n_prediction_times"),
     )
+    # Strict `>` (not `>=`) is load-bearing: Stage 2 draws `rng.integers(low=min, high=n)`, which is a
+    # valid (non-empty) range only when `n > min`. `>=` would let a subject with
+    # `n_prediction_times == min_prediction_times_per_subject` reach Stage 2 and raise on an illegal
+    # empty draw range.
     eligible = counts.filter(pl.col("n_prediction_times") > min_prediction_times_per_subject).sort(
         "subject_id"
     )
