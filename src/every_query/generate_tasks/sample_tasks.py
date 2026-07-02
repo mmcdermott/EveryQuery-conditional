@@ -368,18 +368,27 @@ def evaluate_index_df(
           ``(prediction_time + duration_days) > max_time[subject_id]`` (censored).
         - ``boolean_value = False``: no matching event and the full window is observed.
 
-    The ``>`` on event time is enforced by shifting the asof key by ``+1µs`` since datetimes are
-    stored at microsecond precision, which turns ``strategy="forward"``'s ``>=`` into a strict ``>``.
+    The ``>`` on event time is enforced with ``join_asof(..., allow_exact_matches=False)``, which
+    excludes exact-key matches from ``strategy="forward"``'s default ``>=`` search, leaving a
+    strict ``>``.
 
     Args:
         index_df: Output of ``build_index_df``. Must have columns ``subject_id``, ``prediction_time``,
             ``query``, ``duration_days``. If ``task_id`` is present it is ignored and dropped from
             the output.
-        events_df: Shard events with columns ``subject_id``, ``time``, ``code``.
+        events_df: Shard events with columns ``subject_id``, ``time``, ``code``.  Every subject
+            in ``index_df`` must have at least one non-null-``time`` event here (guaranteed when
+            ``index_df`` derives from the same shard read via :func:`_read_event_shard`).
 
     Returns:
         DataFrame with columns ``(subject_id, prediction_time, boolean_value, query,
         duration_days)``.  ``boolean_value`` is nullable (``null`` = censored).
+
+    Raises:
+        ValueError: If any ``index_df`` row references a subject with no events in ``events_df``.
+            Both pipelines build ``index_df`` from the same shard as ``events_df``, so an unknown
+            subject means the inputs are mismatched (e.g. a stale ``_prediction_times`` cache) —
+            labeling would silently proceed on the wrong data.
     """
     # Output column set lives on ``TaskQuerySchema`` — the 4 required columns plus the
     # inherited (optional) ``boolean_value`` for the collapsed label.  Defining it once
@@ -403,10 +412,12 @@ def evaluate_index_df(
         pl.col(DataSchema.time_name).max().alias("max_time")
     )
 
-    # Left side: index rows with a +1µs-shifted prediction_time for the strict-> asof key.
-    left = index_df.with_columns(
-        (pl.col(TaskQuerySchema.prediction_time_name) + pl.duration(microseconds=1)).alias("_pt_shifted")
-    ).sort([TaskQuerySchema.subject_id_name, TaskQuerySchema.query_name, "_pt_shifted"])
+    # Left side: index rows sorted by (subject_id, query, prediction_time).  ``join_asof``
+    # requires both sides to be sorted ascending on the asof key within each ``by`` group;
+    # an unsorted input produces silently wrong matches rather than raising.
+    left = index_df.sort(
+        [TaskQuerySchema.subject_id_name, TaskQuerySchema.query_name, TaskQuerySchema.prediction_time_name]
+    )
 
     # Right side: events renamed so the join-by column name matches the left.  The events
     # frame uses ``DataSchema.code_name`` for the code column; we rename it to the
@@ -417,33 +428,63 @@ def evaluate_index_df(
         .sort([TaskQuerySchema.subject_id_name, TaskQuerySchema.query_name, DataSchema.time_name])
     )
 
+    # What we need, in sampler terms: each ``left`` row is one task instance — "does query ``q``
+    # occur for subject ``s`` after ``prediction_time``?" — and answering that (and the later
+    # censoring check) requires the timestamp of the *first* occurrence of ``q`` for ``s`` after
+    # ``prediction_time``, if any. ``join_asof`` finds that "next occurrence" timestamp for every
+    # task instance in one pass; the alternative (filtering ``events_df`` down to matching
+    # ``(s, q)`` rows after ``prediction_time`` and taking the min, per task instance) would be
+    # quadratic in the number of task instances. Mechanically, ``join_asof`` is a "nearest-key"
+    # join: for each row on ``left`` it finds at most one row on ``right`` whose key is close to
+    # the left row's key, rather than every row that matches exactly (a normal equality join).
+    # What each parameter below does, and why it's set that way here:
+    #   - ``by``: exact-equality columns checked *before* the asof search — a task instance for
+    #     ``(s, q)`` can only match events for that same ``(s, q)``, never another subject's
+    #     events or a different query code's events.  Equivalent to grouping both frames by
+    #     ``(subject_id, query)`` and asof-joining independently within each group.
+    #   - ``left_on`` / ``right_on``: the ordered ("asof") key compared inexactly — here
+    #     ``prediction_time`` on the left vs. the event ``time`` on the right. Both sides must
+    #     already be sorted ascending on this key within each ``by`` group (see above).
+    #   - ``strategy="forward"``: for each task instance, match the *earliest* event whose time is
+    #     ``>=`` ``prediction_time`` — i.e. the next time ``q`` happens for ``s``, searching
+    #     forward from the prediction time.  ``"backward"`` would instead take the latest prior
+    #     event (``<=``, most recent history); ``"nearest"`` whichever is closer either direction.
+    #     We need "forward" because a label is about what happens *after* the prediction, not
+    #     what already happened before it.
+    #   - ``allow_exact_matches=False``: excludes an event landing at exactly ``prediction_time``
+    #     from that forward search, turning the default ``>=`` into a strict ``>``.  Labels are
+    #     defined on the open interval ``(prediction_time, prediction_time + duration_days]`` — an
+    #     event simultaneous with the prediction time isn't "in the future" relative to it — so
+    #     this is how that open lower bound is enforced directly, instead of faking it by shifting
+    #     the join key by ``+1µs`` before searching.
+    #   - Task instances with no qualifying event (``q`` never occurs for ``s``, or only occurs
+    #     at/before ``prediction_time``) get ``time=null`` in the
+    #     result — handled below as "no matching event in the observed window".
     joined = left.join_asof(
         right,
         by=[TaskQuerySchema.subject_id_name, TaskQuerySchema.query_name],
-        left_on="_pt_shifted",
+        left_on=TaskQuerySchema.prediction_time_name,
         right_on=DataSchema.time_name,
         strategy="forward",
+        allow_exact_matches=False,
     )
     joined = joined.join(max_time_per_subject, on=TaskQuerySchema.subject_id_name, how="left")
 
-    # Rows whose subject is not present in max_time_per_subject (typically a pre-seeded or
-    # hand-edited index_df referencing subjects outside this shard) come out of the left join
-    # with max_time=null.  A naïve comparison would produce null booleans, which is the
-    # correct "censored" signal under the collapsed label semantics — so we just log a
-    # warning for visibility and let the `(window_end > max_time).fill_null(True)` below
-    # resolve the missing-subject case to censored.
+    # Rows whose subject is not present in max_time_per_subject come out of the left join with
+    # max_time=null.  Both pipelines build index_df and events_df from the same shard, so this
+    # can only mean mismatched inputs (e.g. a stale _prediction_times cache) — raise rather than
+    # launder the mismatch into censored labels (see docstring Raises).
     n_unknown = joined.filter(pl.col("max_time").is_null()).height
     if n_unknown > 0:
-        logger.warning(
-            "%d index_df row(s) reference subjects not present in events_df; "
-            "they will be labeled as censored (boolean_value=null).",
-            n_unknown,
+        raise ValueError(
+            f"{n_unknown} index_df row(s) reference subjects with no events in events_df; "
+            "index_df and events_df must come from the same shard — this indicates mismatched "
+            "inputs (e.g. a stale _prediction_times cache)."
         )
 
     duration_expr = pl.duration(seconds=pl.col(TaskQuerySchema.duration_days_name) * 86_400)
     window_end = pl.col(TaskQuerySchema.prediction_time_name) + duration_expr
-    # `(window_end > max_time).fill_null(True)` resolves the missing-subject case to censored.
-    censored = (window_end > pl.col("max_time")).fill_null(True)
+    censored = window_end > pl.col("max_time")
     event_in_window = pl.col(DataSchema.time_name).is_not_null() & (
         pl.col(DataSchema.time_name) <= window_end
     )
@@ -476,13 +517,17 @@ def _read_event_shard(file_path: str | Path) -> pl.DataFrame:
       ``Categorical``/``Utf8`` or ``<integer vocab index>``/``Utf8`` joins would either raise or
       silently produce zero matches.  Upstream stages may store codes as categoricals or integer
       vocab indices; casting to ``Utf8`` here avoids coupling to either representation.
-    - ``time`` is cast to ``pl.Datetime("us")`` because ``evaluate_index_df`` implements strict
-      ``>`` via a ``+1µs`` shift on the asof key.  At millisecond precision that shift would
-      round to zero and silently turn the comparison into ``>=``.
+    - ``time`` is cast to ``pl.Datetime("us")`` to match the dtype ``evaluate_index_df`` uses for
+      ``index_df``'s ``prediction_time`` (see :func:`_read_prediction_time_shard`); ``join_asof``
+      requires its ``left_on``/``right_on`` columns to share a dtype.
+    - Null-``time`` rows (MEDS static measurements, e.g. demographics) are dropped, mirroring
+      :func:`_read_prediction_time_shard`: they are not events in time, and their handling by
+      ``join_asof``'s key search is unspecified rather than guaranteed-skipped.
     """
     return (
         pl.read_parquet(file_path)
         .select(["subject_id", "time", "code"])
+        .filter(pl.col("time").is_not_null())
         .with_columns(
             pl.col("time").cast(pl.Datetime("us")),
             pl.col("code").cast(pl.Utf8),
@@ -896,13 +941,14 @@ def _read_prediction_time_shard(file_path: str | Path, shard: str) -> pl.DataFra
 
     Reads only ``subject_id``/``time`` (Stage 0 never needs event payloads).  Null-``time`` rows (e.g.
     MEDS static measurements like demographics) are dropped: they are not valid prediction times for
-    the downstream ``+1µs`` strict-after asof rule, and — because ``sort(["subject_id", "time"])``
+    the downstream strict-after asof rule (``evaluate_index_df``'s
+    ``join_asof(..., allow_exact_matches=False)``), and — because ``sort(["subject_id", "time"])``
     places nulls first — an unfiltered null would otherwise claim ``prediction_time_index = 0`` and
     inflate ``n_prediction_times`` past the eligibility boundary.  ``time`` is cast to
-    ``pl.Datetime("us")`` for the same reason as :func:`_read_event_shard`: the label window uses a
-    ``+1µs`` strict-after shift downstream, and a coarser precision would silently round it to zero.
-    Dedups to distinct ``(subject_id, time)`` so the per-subject row count is a count of *prediction
-    times*, not events.
+    ``pl.Datetime("us")`` for the same reason as :func:`_read_event_shard`: it must share a dtype
+    with the events frame's ``time`` column for ``join_asof`` to match against.  Dedups to distinct
+    ``(subject_id, time)`` so the per-subject row count is a count of *prediction times*, not
+    events.
     """
     return (
         pl.read_parquet(file_path, columns=["subject_id", "time"])
