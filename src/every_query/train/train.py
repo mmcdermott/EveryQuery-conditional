@@ -341,6 +341,12 @@ def main(cfg: DictConfig) -> float | None:
     if ckpt_path:
         logger.info(f"Trying to resume training from checkpoint {ckpt_path}.")
         trainer_kwargs["ckpt_path"] = ckpt_path
+    if not ckpt_path:
+        # Baseline val metrics at step 0 so tuning curves start from the untrained model.
+        # The sanity check can't do this: it doesn't write to loggers.
+        logger.info("Running baseline validation")
+        trainer.validate(M, datamodule=D)
+
     logger.info("Fitting model")
     trainer.fit(**trainer_kwargs)
 
