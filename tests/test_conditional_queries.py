@@ -531,26 +531,30 @@ def test_sequence_spec_rejects_bad_durations():
         SequenceSpec("s", ("A",), (True,))
 
 
-def test_eval_sampling_defaults_match_training_config():
+def test_eval_sampling_defaults_stay_in_training_distribution():
     """A sampled evaluation grid must default to the distribution the model was pretrained on.
 
     ``sample_evaluation_query_sequences`` reuses ``build_sequence_index_df``, so these knobs mean
-    exactly the same thing on both sides; a drifted default would silently produce an
-    out-of-distribution horizon or sequence length and read as an unexplained metric shift.
+    exactly the same thing on both sides; a drifted default would silently produce
+    out-of-distribution queries and read as an unexplained metric shift rather than an error.
+
+    The code/duration knobs must match training *exactly* — a wider ``duration_max`` samples
+    horizons the model never saw. Sequence length is different: the eval grid deliberately fixes
+    one length (``min_queries == max_queries``) so every sequence has the same positions, which
+    keeps per-position comparisons clean. That only needs to sit *inside* training's range.
     """
     configs = Path(sample_evaluation_query_sequences.CONFIGS)
     train_cfg = yaml.safe_load((configs / "sample_query_sequences_config.yaml").read_text())
     eval_cfg = yaml.safe_load((configs / "sample_evaluation_query_sequences_config.yaml").read_text())
 
-    shared = [
-        "min_queries",
-        "max_queries",
-        "duration_min",
-        "duration_max",
-        "eos_first_fraction",
-        "duration_mode",
-    ]
-    assert {k: eval_cfg[k] for k in shared} == {k: train_cfg[k] for k in shared}
+    exact = ["duration_min", "duration_max", "eos_first_fraction", "duration_mode"]
+    assert {k: eval_cfg[k] for k in exact} == {k: train_cfg[k] for k in exact}
+
+    assert eval_cfg["min_queries"] == eval_cfg["max_queries"], "eval grid uses one fixed length"
+    assert train_cfg["min_queries"] <= eval_cfg["min_queries"] <= train_cfg["max_queries"], (
+        f"eval length {eval_cfg['min_queries']} is outside training's "
+        f"{train_cfg['min_queries']}..{train_cfg['max_queries']} range"
+    )
 
     # The Python-level defaults on ``run_worker`` must agree with the YAML too — programmatic
     # callers bypass Hydra entirely.

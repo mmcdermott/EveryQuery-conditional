@@ -500,11 +500,13 @@ def run_worker(
     query_codes: list[str],
     sequences_path: str | Path | None = None,
     n_sequences: int = 64,
-    # These four mirror ``sample_query_sequences``' defaults so a sampled evaluation grid comes
-    # from the same distribution the model was pretrained on.  Keep them in sync with
+    # Fixed length 3, inside training's 1..5 range: one length per grid keeps per-position
+    # comparisons clean without going off-distribution.
+    min_queries: int = 3,
+    max_queries: int = 3,
+    # The duration bounds mirror ``sample_query_sequences``' defaults so horizons come from the
+    # distribution the model was pretrained on.  Keep in sync with
     # ``configs/sample_query_sequences_config.yaml``.
-    min_queries: int = 1,
-    max_queries: int = 5,
     duration_min: int = 1,
     duration_max: int = 731,
     seed: int = 1,
