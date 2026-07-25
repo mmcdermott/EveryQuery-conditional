@@ -5,15 +5,28 @@ Chain: ``EQ_generate_query_sequences`` → ``EQ_train --config-name=_demo_train_
 session fixture cohort (mirrors the single-query CLI chain in ``conftest.py``).
 """
 
+import importlib.util
 import json
 from pathlib import Path
 
+import numpy as np
 import polars as pl
 import pytest
 import yaml
 from meds import train_split, tuning_split
 
 from conftest import ENSURE_ENV_PLACEHOLDERS, run_and_check
+
+EVAL_V3 = Path(__file__).parent.parent / "scripts" / "eval_v3.py"
+
+
+def _load_eval_v3():
+    """Import ``scripts/eval_v3.py`` as a module; it is a script, not an installed entry point."""
+    spec = importlib.util.spec_from_file_location("eval_v3", EVAL_V3)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
 
 NEW_CLIS = [
     "EQ_generate_query_sequences",
@@ -416,7 +429,7 @@ def test_eval_v3_scores_supplied_sequences(
     n_seqs = pl.read_parquet(tasks_fp).height
 
     out_dir = tmp_path / "eval_v3_out"
-    script = Path(__file__).parent.parent / "scripts" / "eval_v3.py"
+    script = EVAL_V3
     run_and_check(
         [
             "python",
@@ -434,6 +447,10 @@ def test_eval_v3_scores_supplied_sequences(
             "--batch-size",
             "4",
             "--all-positions",
+            "--min-pos",
+            "1",
+            "--min-neg",
+            "1",
         ],
         env=ENSURE_ENV_PLACEHOLDERS,
         timeout=300.0,
@@ -444,7 +461,11 @@ def test_eval_v3_scores_supplied_sequences(
     assert preds["prob"].is_between(0.0, 1.0).all()
     assert preds["true_answer"].null_count() == 0
     assert (preds["n_queries"] == 3).all()
-    assert (preds["prior_answers"].list.len() == 2).all()
+    for col in ("prior_queries", "prior_durations", "prior_answers"):
+        assert (preds[col].list.len() == 2).all()
+    # The conditional label describes both priors, and is what by_conditional.parquet groups on.
+    assert preds["conditional"].null_count() == 0
+    assert preds["conditional"].str.count_matches(r"=(YES|NO)").to_list() == [2] * n_seqs
     # --all-positions keeps every position, and the last one is what `prob` reports.
     assert (preds["all_position_probs"].list.len() == 3).all()
     assert preds["all_position_probs"].list.last().to_numpy() == pytest.approx(
@@ -455,6 +476,14 @@ def test_eval_v3_scores_supplied_sequences(
     assert summary["n_sequences"] == n_seqs
     assert summary["split"] == tuning_split
     assert summary["force_prior"] == "none"
+    # Per-conditional accounting is always reported, even when the cohort is too small to score:
+    # n_conditionals_total counts every distinct context, scored counts those clearing the gate.
+    assert summary["n_conditionals_total"] == preds["conditional"].n_unique()
+    assert summary["n_conditionals_scored"] <= summary["n_conditionals_total"]
+    if summary["n_conditionals_scored"]:
+        by_cond = pl.read_parquet(out_dir / "by_conditional.parquet")
+        assert by_cond.height == summary["n_conditionals_scored"]
+        assert by_cond["auroc"].is_between(0.0, 1.0).all()
 
     # Counterfactual conditioning: overriding every prior answer must change the scored
     # distribution (the target query and its context are identical across the two runs).
@@ -488,6 +517,106 @@ def test_eval_v3_scores_supplied_sequences(
     assert json.loads((forced_dir / "summary.json").read_text())["force_prior"] == "yes"
 
 
+def _conditional_frame(n_per_combo: int = 30) -> pl.DataFrame:
+    """Rows spanning all 4 answer combos of a 2-prior sequence, plus a block of marginals."""
+    rng = np.random.default_rng(0)
+    combos = [(True, True), (True, False), (False, True), (False, False)]
+    rows = []
+    for a1, a2 in combos:
+        for _ in range(n_per_combo):
+            rows.append(
+                {
+                    "prior_queries": ["A", "B"],
+                    "prior_durations": [7.0, 30.0],
+                    "prior_answers": [a1, a2],
+                    "target_query": "C",
+                    "target_duration_days": 30.0,
+                    "true_answer": bool(rng.random() < (0.8 if a1 else 0.2)),
+                    "prob": float(rng.random()),
+                }
+            )
+    for _ in range(n_per_combo):
+        rows.append(
+            {
+                "prior_queries": [],
+                "prior_durations": [],
+                "prior_answers": [],
+                "target_query": "C",
+                "target_duration_days": 30.0,
+                "true_answer": bool(rng.random() < 0.5),
+                "prob": float(rng.random()),
+            }
+        )
+    return pl.DataFrame(rows).with_columns(
+        pl.col("prior_durations").cast(pl.List(pl.Float32)),
+        pl.col("target_duration_days").cast(pl.Float32),
+    )
+
+
+def test_eval_v3_conditional_labels_are_one_per_context():
+    """Each distinct prior (query, duration, answer) tuple-sequence gets its own stable label."""
+    ev3 = _load_eval_v3()
+    out = ev3.with_conditional(_conditional_frame(), None)
+
+    assert out.height == 5 * 30
+    labels = set(out["conditional"].unique().to_list())
+    assert labels == {
+        ev3.MARGINAL_LABEL,
+        "A@7d=YES | B@30d=YES",
+        "A@7d=YES | B@30d=NO",
+        "A@7d=NO | B@30d=YES",
+        "A@7d=NO | B@30d=NO",
+    }, "2 conditioned queries ⇒ 4 conditionals; an empty prior list is the marginal"
+    # Row order must survive the explode/group_by round trip — probs are attached positionally.
+    assert out["prob"].to_list() == _conditional_frame()["prob"].to_list()
+
+
+def test_eval_v3_force_prior_relabels_the_conditional():
+    """Under --force-prior the label must report what the model saw, not the recorded answers."""
+    ev3 = _load_eval_v3()
+    forced = ev3.with_conditional(_conditional_frame(), True)
+    assert set(forced["conditional"].unique().to_list()) == {
+        ev3.MARGINAL_LABEL,
+        "A@7d=YES | B@30d=YES",
+    }, "every conditioned row collapses onto the single forced context"
+
+
+def test_eval_v3_macro_auroc_splits_by_conditional():
+    """Per-conditional grouping yields one AUROC per estimand, and drops thin groups honestly."""
+    ev3 = _load_eval_v3()
+    out = ev3.with_conditional(_conditional_frame(), None)
+
+    tbl, macro, n_groups = ev3.macro_auroc(out, ev3.CONDITIONAL_KEYS, min_pos=3, min_neg=3)
+    assert n_groups == 5 and tbl.height == 5
+    assert set(tbl.columns) == {*ev3.CONDITIONAL_KEYS, "n", "prevalence", "auroc"}
+    assert (tbl["n"] == 30).all()
+    assert macro == pytest.approx(float(tbl["auroc"].mean()))
+
+    # The coarse view pools all 5 contexts into one row — the eval_v2 behaviour being refined.
+    qtbl, _, n_q = ev3.macro_auroc(out, ["target_query"], min_pos=3, min_neg=3)
+    assert n_q == 1 and qtbl.height == 1 and int(qtbl["n"][0]) == out.height
+
+    # A gate no group can clear scores nothing, rather than raising or reporting a bogus mean.
+    empty, none_macro, n_all = ev3.macro_auroc(out, ev3.CONDITIONAL_KEYS, min_pos=10_000, min_neg=1)
+    assert empty.height == 0 and none_macro is None and n_all == 5
+
+
+def test_eval_v3_macro_auroc_never_scores_a_single_class_group():
+    """AUROC is undefined on one class, so the floor holds even when the gate is set to 0."""
+    ev3 = _load_eval_v3()
+    df = pl.DataFrame(
+        {
+            "target_query": ["A", "A", "B", "B"],
+            "true_answer": [True, True, True, False],
+            "prob": [0.1, 0.2, 0.9, 0.4],
+        }
+    )
+    tbl, macro, n_groups = ev3.macro_auroc(df, ["target_query"], min_pos=0, min_neg=0)
+    assert n_groups == 2
+    assert tbl["target_query"].to_list() == ["B"], "the all-positive group A must be skipped"
+    assert macro == pytest.approx(1.0)
+
+
 def test_eval_v3_rejects_wrong_split(
     cq_trained_model_dir: Path, eq_preprocessed_dataset: Path, cq_sequence_tasks_dir: Path, tmp_path: Path
 ):
@@ -497,7 +626,7 @@ def test_eval_v3_rejects_wrong_split(
     src = cq_sequence_tasks_dir / train_split / "0__0000.parquet"
     (tasks_dir / train_split / "tasks.parquet").write_bytes(src.read_bytes())
 
-    script = Path(__file__).parent.parent / "scripts" / "eval_v3.py"
+    script = EVAL_V3
     with pytest.raises(RuntimeError, match=r"(?s)Dataset has .* rows but the supplied parquet"):
         run_and_check(
             [

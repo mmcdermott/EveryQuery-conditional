@@ -25,6 +25,10 @@ Differences from ``eval_v2.score_last`` worth knowing:
   rows whose ``subject_id`` is absent from ``split``.  Probabilities are attached positionally
   (as in ``eval_v2``), so this asserts row count *and* per-row key equality first, and carries any
   extra columns (e.g. ``_ctx_id``) through from the supplied parquet.
+- **AUROC is reported per *conditional*, not just per target code.**  ``eval_v2`` groups only by
+  the target code, which pools rows whose teacher-forced contexts differ — i.e. different
+  estimands.  Here each distinct ``(prior queries + their answers) -> (target query, horizon)`` is
+  one task, scored separately; ``by_query.parquet`` keeps the coarser eval_v2-comparable view.
 
 Usage:
 
@@ -72,6 +76,10 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 KEY_COLS = ("subject_id", "prediction_time")
 SEQ_COLS = (QUERIES_COL, DURATIONS_COL, ANSWERS_COL)
 FORCE_PRIOR = {"none": None, "no": ANSWER_NO, "yes": ANSWER_YES}
+
+MARGINAL_LABEL = "<marginal>"
+# The estimand a row belongs to: same conditioning context + same target question = same task.
+CONDITIONAL_KEYS = ("conditional", "target_query", "target_duration_days")
 
 
 # ── Inputs ──────────────────────────────────────────────────────────────
@@ -253,26 +261,73 @@ def score_last(model, ds, batch_size: int, force_prior: int | None, keep_all_pos
     return last_probs, all_probs
 
 
-def macro_within_query(df: pl.DataFrame, prob_col="prob", min_pos=10, min_neg=10):
-    """Per-target-code AUROC, macro-averaged.
+def with_conditional(out: pl.DataFrame, force_prior: int | None) -> pl.DataFrame:
+    """Attach ``conditional``: the teacher-forced context the model actually saw, as a stable string.
+
+    Rendered ``code@Nd=YES | code@Nd=NO`` in sequence order, or ``<marginal>`` for a single-query
+    sequence.  Under ``--force-prior`` the label reports the *overridden* answers, since those — not
+    the recorded ones — are what conditioned the prediction.
+    """
+    parts = (
+        out.select("prior_queries", "prior_durations", "prior_answers")
+        .with_row_index("_i")
+        .explode("prior_queries", "prior_durations", "prior_answers")
+    )
+    if force_prior is not None:
+        parts = parts.with_columns(
+            pl.when(pl.col("prior_answers").is_not_null())
+            .then(pl.lit(bool(force_prior)))
+            .alias("prior_answers")
+        )
+    # An empty prior list explodes to one all-null row, and `pl.format` propagates the null, so
+    # those groups join to "" below and fall through to MARGINAL_LABEL.
+    labels = (
+        parts.with_columns(
+            pl.format(
+                "{}@{}d={}",
+                pl.col("prior_queries"),
+                pl.col("prior_durations").cast(pl.Utf8).str.strip_suffix(".0"),
+                pl.when(pl.col("prior_answers")).then(pl.lit("YES")).otherwise(pl.lit("NO")),
+            ).alias("_part")
+        )
+        .group_by("_i")
+        .agg(pl.col("_part").str.join(" | ").alias("conditional"))
+        .sort("_i")  # group_by is order-unstable; restore row order before positional attachment
+    )
+    conditional = labels["conditional"].fill_null("").replace("", MARGINAL_LABEL)
+    return out.with_columns(conditional.alias("conditional"))
+
+
+def macro_auroc(df: pl.DataFrame, group_cols, prob_col="prob", min_pos=10, min_neg=10):
+    """Per-group AUROC, macro-averaged over groups with enough of both classes.
 
     Pooled AUROC is base-rate inflated (≈0.91 vs an honest macro ≈0.77 on ``big_v2``); see
-    ``CONDITIONAL_QUERIES.md:127-152``.
+    ``CONDITIONAL_QUERIES.md:127-152``.  ``group_cols`` chooses the estimand: ``["target_query"]``
+    reproduces eval_v2's view, ``CONDITIONAL_KEYS`` scores each conditioning context separately.
+
+    Returns ``(table, macro, n_groups_total)`` — the total counts *all* groups, so the caller can
+    report how many were dropped for thin support.
     """
-    rows = []
-    for (code,), g in df.group_by(["target_query"]):
+    group_cols = list(group_cols)
+    rows, n_groups = [], 0
+    for key, g in df.group_by(group_cols):
+        n_groups += 1
         y = g["true_answer"].to_list()
         npos = int(sum(y))
-        if npos >= min_pos and (len(y) - npos) >= min_neg:
-            auroc = None
-            if len(np.unique(y)) > 1:
-                auroc = float(roc_auc_score(y, g[prob_col].to_list()))
-            rows.append({"query": code, "n": len(y), "prevalence": npos / len(y), "auroc": auroc})
+        # max(..., 1): AUROC is undefined on one class, so the floor holds even at --min-pos 0.
+        if npos >= max(min_pos, 1) and (len(y) - npos) >= max(min_neg, 1):
+            rows.append(
+                dict(
+                    zip(group_cols, key, strict=True),
+                    n=len(y),
+                    prevalence=npos / len(y),
+                    auroc=float(roc_auc_score(y, g[prob_col].to_list())),
+                )
+            )
     if not rows:
-        return pl.DataFrame(), None
-    t = pl.DataFrame(rows).sort("query")
-    scored = t.filter(pl.col("auroc").is_not_null())
-    return t, (float(scored["auroc"].mean()) if scored.height else None)
+        return pl.DataFrame(), None, n_groups
+    t = pl.DataFrame(rows).sort(*group_cols)
+    return t, float(t["auroc"].mean()), n_groups
 
 
 # ── Driver ──────────────────────────────────────────────────────────────
@@ -298,6 +353,12 @@ def main():
     ap.add_argument("--all-positions", action="store_true", help="also emit every position's probability")
     ap.add_argument(
         "--no-metrics", action="store_true", help="skip AUROC (use when answers are placeholders)"
+    )
+    ap.add_argument(
+        "--min-pos", type=int, default=10, help="min positives for a group to be scored (default: 10)"
+    )
+    ap.add_argument(
+        "--min-neg", type=int, default=10, help="min negatives for a group to be scored (default: 10)"
     )
     args = ap.parse_args()
 
@@ -333,8 +394,12 @@ def main():
         pl.col(QUERIES_COL).list.last().alias("target_query"),
         pl.col(DURATIONS_COL).list.last().alias("target_duration_days"),
         pl.col(ANSWERS_COL).list.last().alias("true_answer"),
-        pl.col(ANSWERS_COL).list.slice(0, pl.col(ANSWERS_COL).list.len() - 1).alias("prior_answers"),
+        *(
+            pl.col(c).list.slice(0, pl.col(c).list.len() - 1).alias(f"prior_{name}")
+            for c, name in ((QUERIES_COL, "queries"), (DURATIONS_COL, "durations"), (ANSWERS_COL, "answers"))
+        ),
     ).with_columns(pl.Series("prob", last_probs, dtype=pl.Float64))
+    out = with_conditional(out, force_prior)
     if extras:
         out = out.hstack(supplied.select(extras))
         print(f"carried through extra column(s): {extras}")
@@ -356,7 +421,29 @@ def main():
     }
 
     if not args.no_metrics:
-        tbl, macro = macro_within_query(out)
+        gate = {"min_pos": args.min_pos, "min_neg": args.min_neg}
+        summary["min_pos"], summary["min_neg"] = args.min_pos, args.min_neg
+
+        # Primary: one AUROC per estimand P(target | this exact conditioning context).
+        cond_tbl, cond_macro, n_cond = macro_auroc(out, CONDITIONAL_KEYS, **gate)
+        if cond_tbl.height:
+            cond_tbl.write_parquet(args.out_dir / "by_conditional.parquet")
+        summary["macro_within_conditional_auroc"] = cond_macro
+        summary["n_conditionals_scored"] = cond_tbl.height
+        summary["n_conditionals_total"] = n_cond
+        summary["n_rows_scored"] = int(cond_tbl["n"].sum()) if cond_tbl.height else 0
+        print(
+            f"macro within-conditional AUROC: {cond_macro} over {cond_tbl.height}/{n_cond} "
+            f"conditionals (>= {args.min_pos} pos and {args.min_neg} neg each)"
+        )
+        if cond_tbl.height < n_cond:
+            print(
+                f"  {n_cond - cond_tbl.height} conditional(s) had too few of one class to score; "
+                "lower --min-pos/--min-neg or generate more replicates per context."
+            )
+
+        # Secondary: eval_v2's coarser view, which pools unlike contexts under one target code.
+        tbl, macro, _ = macro_auroc(out, ["target_query"], **gate)
         if tbl.height:
             tbl.write_parquet(args.out_dir / "by_query.parquet")
         summary["macro_within_query_auroc"] = macro
