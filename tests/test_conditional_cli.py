@@ -10,11 +10,17 @@ from pathlib import Path
 
 import polars as pl
 import pytest
+import yaml
 from meds import train_split, tuning_split
 
 from conftest import ENSURE_ENV_PLACEHOLDERS, run_and_check
 
-NEW_CLIS = ["EQ_generate_query_sequences", "EQ_predict_sequences", "EQ_evaluate_sequences"]
+NEW_CLIS = [
+    "EQ_generate_query_sequences",
+    "EQ_generate_evaluation_query_sequences",
+    "EQ_predict_sequences",
+    "EQ_evaluate_sequences",
+]
 
 
 @pytest.mark.parametrize("cli", NEW_CLIS)
@@ -102,6 +108,156 @@ def test_supplied_contexts_mode(eq_preprocessed_dataset: Path, tmp_path: Path):
     assert counts.height == cohort.height and (counts["len"] == 4).all()
 
 
+@pytest.fixture
+def cq_cohort_fp(eq_preprocessed_dataset: Path, tmp_path: Path) -> Path:
+    """A small supplied cohort index df: one prediction time per subject, on the train split."""
+    intermediate = eq_preprocessed_dataset.parent / "intermediate"
+    shard = pl.read_parquet(next((intermediate / "data" / train_split).rglob("*.parquet")))
+    cohort = shard.group_by("subject_id").agg(pl.col("time").max().alias("prediction_time")).head(3)
+    fp = tmp_path / "cohort.parquet"
+    cohort.write_parquet(fp)
+    return fp
+
+
+def test_dense_grid_sampled_sequences(eq_preprocessed_dataset: Path, cq_cohort_fp: Path, tmp_path: Path):
+    """``EQ_generate_evaluation_query_sequences`` labels the *same* N sequences at every context."""
+    intermediate = eq_preprocessed_dataset.parent / "intermediate"
+    n_contexts = pl.read_parquet(cq_cohort_fp).height
+    out_dir = tmp_path / "out"
+    run_and_check(
+        [
+            "EQ_generate_evaluation_query_sequences",
+            f"data_dir={intermediate!s}",
+            f"out_dir={out_dir!s}",
+            f"split={train_split}",
+            f"contexts_path={cq_cohort_fp!s}",
+            "n_sequences=3",
+            "min_queries=4",
+            "max_queries=4",
+            "duration_min=1",
+            "duration_max=30",
+        ],
+        env={"PROCESSED": str(eq_preprocessed_dataset)},
+        timeout=120.0,
+    )
+
+    df = pl.read_parquet(out_dir / train_split / "cohort__sampled3.parquet")
+    assert df.height == n_contexts * 3
+    assert (df["queries"].list.len() == 4).all()
+    assert df["answers"].explode().null_count() == 0
+
+    # The dense property: every context is asked the identical set of 3 sequences.
+    spec_str = pl.concat_str(
+        pl.col("queries").list.join("|"),
+        pl.col("durations").cast(pl.List(pl.Utf8)).list.join("|"),
+    )
+    per_ctx = df.group_by("subject_id", "prediction_time").agg(spec_str.sort().alias("specs"))
+    assert per_ctx.height == n_contexts
+    assert per_ctx["specs"].n_unique() == 1, "all contexts must share one set of query sequences"
+
+    # Row order is context-major: row i is (contexts[i // N], specs[i % N]).
+    subjects = df["subject_id"].unique(maintain_order=True)
+    assert df["subject_id"].to_list() == [s for s in subjects for _ in range(3)]
+    first_specs = df.head(3).select("queries", "durations").rows()
+    for c in range(n_contexts):
+        assert df.slice(c * 3, 3).select("queries", "durations").rows() == first_specs
+
+
+def test_dense_grid_skips_existing_output(eq_preprocessed_dataset: Path, cq_cohort_fp: Path, tmp_path: Path):
+    """Re-running without ``overwrite=true`` leaves the existing parquet untouched."""
+    intermediate = eq_preprocessed_dataset.parent / "intermediate"
+    out_dir = tmp_path / "out"
+    cmd = [
+        "EQ_generate_evaluation_query_sequences",
+        f"data_dir={intermediate!s}",
+        f"out_dir={out_dir!s}",
+        f"split={train_split}",
+        f"contexts_path={cq_cohort_fp!s}",
+        "n_sequences=2",
+        "min_queries=2",
+        "max_queries=2",
+        "duration_min=1",
+        "duration_max=30",
+    ]
+    env = {"PROCESSED": str(eq_preprocessed_dataset)}
+    run_and_check(cmd, env=env, timeout=120.0)
+    fp = out_dir / train_split / "cohort__sampled2.parquet"
+    before = fp.stat().st_mtime_ns
+
+    run_and_check(cmd, env=env, timeout=120.0)
+    assert fp.stat().st_mtime_ns == before, "second run must skip, not rewrite"
+
+    run_and_check([*cmd, "overwrite=true"], env=env, timeout=120.0)
+    assert fp.stat().st_mtime_ns != before, "overwrite=true must regenerate"
+
+
+def test_dense_grid_designed_sequences_per_spec_dirs(
+    eq_preprocessed_dataset: Path, cq_cohort_fp: Path, tmp_path: Path
+):
+    """Designed named sequences from YAML, one independently-scoreable output dir per task."""
+    intermediate = eq_preprocessed_dataset.parent / "intermediate"
+    n_contexts = pl.read_parquet(cq_cohort_fp).height
+    codes = pl.read_parquet(eq_preprocessed_dataset / "metadata" / "codes.parquet")["code"].to_list()
+    target = codes[0]
+
+    sequences_fp = tmp_path / "designed.yaml"
+    sequences_fp.write_text(
+        yaml.safe_dump(
+            {
+                "end_then_target": [["TIMELINE//END", 1], [target, 30]],
+                "target_only": [[target, 7]],
+            }
+        )
+    )
+
+    out_dir = tmp_path / "out"
+    run_and_check(
+        [
+            "EQ_generate_evaluation_query_sequences",
+            f"data_dir={intermediate!s}",
+            f"out_dir={out_dir!s}",
+            f"split={train_split}",
+            f"contexts_path={cq_cohort_fp!s}",
+            f"sequences_path={sequences_fp!s}",
+            "per_spec_dirs=true",
+        ],
+        env={"PROCESSED": str(eq_preprocessed_dataset)},
+        timeout=120.0,
+    )
+
+    # Each spec gets its own `tasks_dir`-shaped directory: {out_dir}/{name}/{split}/tasks.parquet.
+    two = pl.read_parquet(out_dir / "end_then_target" / train_split / "tasks.parquet")
+    one = pl.read_parquet(out_dir / "target_only" / train_split / "tasks.parquet")
+    assert two.height == n_contexts and one.height == n_contexts
+    assert two["queries"].to_list() == [["TIMELINE//END", target]] * n_contexts
+    assert two["durations"].to_list() == [[1.0, 30.0]] * n_contexts
+    assert one["queries"].to_list() == [[target]] * n_contexts
+    assert one["answers"].explode().null_count() == 0
+
+
+def test_dense_grid_rejects_out_of_vocab_code(
+    eq_preprocessed_dataset: Path, cq_cohort_fp: Path, tmp_path: Path
+):
+    """A typo'd designed code must fail before inference, not inside collate mid-run."""
+    intermediate = eq_preprocessed_dataset.parent / "intermediate"
+    sequences_fp = tmp_path / "designed.yaml"
+    sequences_fp.write_text(yaml.safe_dump({"typo": [["NOT_A_REAL_CODE", 30]]}))
+
+    with pytest.raises(RuntimeError, match=r"absent from the query vocabulary"):
+        run_and_check(
+            [
+                "EQ_generate_evaluation_query_sequences",
+                f"data_dir={intermediate!s}",
+                f"out_dir={tmp_path / 'out'!s}",
+                f"split={train_split}",
+                f"contexts_path={cq_cohort_fp!s}",
+                f"sequences_path={sequences_fp!s}",
+            ],
+            env={"PROCESSED": str(eq_preprocessed_dataset)},
+            timeout=120.0,
+        )
+
+
 @pytest.fixture(scope="session")
 def cq_trained_model_dir(
     eq_preprocessed_dataset: Path, cq_sequence_tasks_dir: Path, tmp_path_factory
@@ -169,6 +325,60 @@ def test_conditional_predict_and_evaluate(
     assert by_pos.height >= 1 and by_pos["position"].min() == 0
     assert {"n_rows", "n_observed", "prevalence", "auroc"} <= set(by_pos.columns)
     assert by_query.height >= 1
+
+
+def test_dense_grid_is_scoreable_by_predict_sequences(
+    cq_trained_model_dir: Path, eq_preprocessed_dataset: Path, tmp_path: Path
+):
+    """The dense grid feeds ``EQ_predict_sequences`` directly: N sequences x every cohort context."""
+    intermediate = eq_preprocessed_dataset.parent / "intermediate"
+    shard = pl.read_parquet(next((intermediate / "data" / tuning_split).rglob("*.parquet")))
+    cohort = shard.group_by("subject_id").agg(pl.col("time").max().alias("prediction_time")).head(3)
+    cohort_fp = tmp_path / "cohort.parquet"
+    cohort.write_parquet(cohort_fp)
+
+    tasks_dir = tmp_path / "tasks"
+    run_and_check(
+        [
+            "EQ_generate_evaluation_query_sequences",
+            f"data_dir={intermediate!s}",
+            f"out_dir={tasks_dir!s}",
+            f"split={tuning_split}",
+            f"contexts_path={cohort_fp!s}",
+            "n_sequences=2",
+            "min_queries=3",
+            "max_queries=3",
+            "duration_min=1",
+            "duration_max=30",
+        ],
+        env={"PROCESSED": str(eq_preprocessed_dataset)},
+        timeout=120.0,
+    )
+    tasks_fp = tasks_dir / tuning_split / "cohort__sampled2.parquet"
+    tasks = pl.read_parquet(tasks_fp)
+    assert tasks.height == cohort.height * 2
+
+    predictions_fp = tmp_path / "predictions.parquet"
+    run_and_check(
+        [
+            "EQ_predict_sequences",
+            f"model_run_dir={cq_trained_model_dir!s}",
+            f"tasks_dir={tasks_dir!s}",
+            f"output_parquet={predictions_fp!s}",
+            f"split={tuning_split}",
+        ],
+        env=ENSURE_ENV_PLACEHOLDERS,
+        timeout=300.0,
+    )
+
+    preds = pl.read_parquet(predictions_fp)
+    # One row per (sequence, position); no cohort row silently dropped by the schema_df semi-join.
+    assert preds.height == cohort.height * 2 * 3
+    assert preds["answer_prob"].is_between(0.0, 1.0).all()
+    # Each of the 2 shared sequences is scored once per context, so every (query, duration) pair
+    # appears exactly `n_contexts` times.
+    per_query = preds.group_by("query", "duration_days", "position").len()
+    assert (per_query["len"] == cohort.height).all()
 
 
 def test_eval_v3_scores_supplied_sequences(

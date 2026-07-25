@@ -1,0 +1,74 @@
+# Hydra config for the dense-grid conditional query-*sequence* evaluation generator.
+#
+# Sibling to `sample_query_sequences_config.yaml` (scattered shape: every context draws its
+# own independent sequence).  This endpoint takes a supplied cohort and labels the *same* N
+# query sequences at every context in it — the row shape per-sequence metrics need.
+#
+# Relationship to `sample_evaluation_tasks_config.yaml`: same dense-grid motivation, but that
+# one emits flat TaskQuerySchema rows for EQ_predict/EQ_evaluate, while this one emits
+# QuerySeqSchema rows (queries/durations/answers list columns) for EQ_predict_sequences.
+#
+# Path roots follow the same `.env` fallback convention as `sample_tasks_config.yaml`:
+#   data_dir  -> $INTERMEDIATE   (event shards live under `{data_dir}/data/{split}/*.parquet`;
+#                                 every cohort subject must be present in `split`)
+#   out_dir   -> $TASK_DIR
+#   query_codes: null -> $PROCESSED/metadata/codes.parquet
+#
+# Output layout (both directly usable as `EQ_predict_sequences tasks_dir=...`):
+#   per_spec_dirs=false  ->  {out_dir}/{split}/{contexts_stem}__{specs_tag}.parquet
+#   per_spec_dirs=true   ->  {out_dir}/{spec_name}/{split}/tasks.parquet
+
+data_dir: null
+out_dir: null
+query_codes: null
+
+split: held_out # typical inference split; use `tuning` for intermediate validation.
+seed: 1
+
+# --- The cohort (required) ------------------------------------------------
+# Parquet with at least (subject_id, prediction_time).  Extra columns are dropped; duplicate
+# contexts are deduped (a dense grid asks each sequence about each context exactly once).
+contexts_path: null
+
+# --- The N query sequences ------------------------------------------------
+# Designed sequences, as either
+#   YAML/JSON mapping    name -> [[code, duration], ...]
+#   YAML/JSON list       [[[code, duration], ...], ...]        (names auto-generated)
+#   long-format parquet  (seq_id, position, query, duration_days)
+# e.g.
+#   mortality_30d:
+#     - [TIMELINE//END, 1]
+#     - [MEDS_DEATH, 30]
+# Leave null to instead draw `n_sequences` sequences once from the same
+# (uniform codes x log-uniform durations) distribution the training sampler uses; those N
+# sequences are then shared across the whole cohort.
+sequences_path: null
+
+# Number of sequences to sample (sequences_path=null only).
+n_sequences: 64
+
+# Sampled-sequence length and duration bounds (sequences_path=null only).  min==max gives a
+# fixed length; 5 matches the big_v2 training run.
+min_queries: 5
+max_queries: 5
+duration_min: 1
+duration_max: 365
+
+# Sampled-sequence distribution knobs, matching `sample_query_sequences_config.yaml`
+# (sequences_path=null only).  Defaults reproduce the fully-random training baseline.
+eos_first_fraction: 0.0
+duration_mode: random
+
+# Write one output dir per sequence (`{out_dir}/{spec_name}/{split}/tasks.parquet`) instead of
+# one combined parquet.  Useful with designed, named sequences: each dir is independently
+# scoreable, so per-task metrics need no post-hoc grouping.  With the combined file, sequence
+# identity is recoverable from the queries/durations columns, or from row order — row i is
+# (contexts[i // N], specs[i % N]).
+per_spec_dirs: false
+
+overwrite: false
+
+hydra:
+  output_subdir: null
+  job:
+    chdir: false

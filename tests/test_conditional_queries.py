@@ -18,6 +18,7 @@ import numpy as np
 import polars as pl
 import pytest
 import torch
+import yaml
 
 from every_query.data.seq_dataset import (
     ANSWERS_COL,
@@ -25,7 +26,15 @@ from every_query.data.seq_dataset import (
     ConditionalQueryBatch,
     ConditionalQueryPytorchDataset,
 )
+from every_query.generate_tasks.sample_evaluation_query_sequences import (
+    SequenceSpec,
+    build_dense_sequence_index_df,
+    read_sequence_specs,
+    sample_sequence_specs,
+    validate_spec_codes,
+)
 from every_query.generate_tasks.sample_query_sequences import (
+    CTX_ID_COL,
     build_sequence_index_df,
     label_binary_occurrence,
 )
@@ -417,3 +426,103 @@ def test_sampler_determinism():
     c = build_sequence_index_df(ctx, ["A", "B"], 1, 4, 1, 365, seed=12)
     assert a.equals(b)
     assert not a.equals(c)
+
+
+# ── 5. sample_evaluation_query_sequences (dense grid) ────────────────────
+
+
+def test_read_sequence_specs_yaml_mapping_and_list(tmp_path):
+    """Both YAML forms parse; the mapping form keeps its names, the list form generates them."""
+    mapping_fp = tmp_path / "mapping.yaml"
+    mapping_fp.write_text(yaml.safe_dump({"mortality_30d": [[EOS_CODE, 1], ["MEDS_DEATH", 30]]}))
+    (spec,) = read_sequence_specs(mapping_fp)
+    assert spec.name == "mortality_30d"
+    assert spec.queries == (EOS_CODE, "MEDS_DEATH")
+    assert spec.durations == (1, 30)
+
+    list_fp = tmp_path / "list.yaml"
+    list_fp.write_text(yaml.safe_dump([[["A", 7]], [["B", 14], ["C", 30]]]))
+    specs = read_sequence_specs(list_fp)
+    assert [s.name for s in specs] == ["seq_0000", "seq_0001"]
+    assert [len(s) for s in specs] == [1, 2]
+
+
+def test_read_sequence_specs_parquet_orders_by_position(tmp_path):
+    """The long-format parquet form is ordered by ``position``, not by row order."""
+    fp = tmp_path / "specs.parquet"
+    pl.DataFrame(
+        {
+            "seq_id": ["s", "s", "s"],
+            "position": [2, 0, 1],
+            "query": ["third", "first", "second"],
+            "duration_days": [3.0, 1.0, 2.0],
+        }
+    ).write_parquet(fp)
+    (spec,) = read_sequence_specs(fp)
+    assert spec.queries == ("first", "second", "third")
+    assert spec.durations == (1.0, 2.0, 3.0)
+
+
+def test_read_sequence_specs_rejects_malformed(tmp_path):
+    bad = tmp_path / "bad.yaml"
+    bad.write_text(yaml.safe_dump({"s": [["A", 7, 9]]}))
+    with pytest.raises(ValueError, match=r"\[code, duration\] pair"):
+        read_sequence_specs(bad)
+
+    empty = tmp_path / "empty.yaml"
+    empty.write_text(yaml.safe_dump({}))
+    with pytest.raises(ValueError, match="contains no sequences"):
+        read_sequence_specs(empty)
+
+    unsupported = tmp_path / "specs.txt"
+    unsupported.write_text("A 7")
+    with pytest.raises(ValueError, match=r"must be a \.yaml"):
+        read_sequence_specs(unsupported)
+
+
+def test_spec_names_sanitised_for_output_dirs(tmp_path):
+    """MEDS codes contain ``/``, so names become path-safe; post-sanitisation clashes are errors."""
+    fp = tmp_path / "s.yaml"
+    fp.write_text(yaml.safe_dump({"MEDS_DEATH//30d": [["A", 30]]}))
+    (spec,) = read_sequence_specs(fp)
+    assert spec.name == "MEDS_DEATH_30d", "runs of unsafe chars collapse to a single underscore"
+
+    clash = tmp_path / "clash.yaml"
+    clash.write_text(yaml.safe_dump({"a/b": [["A", 1]], "a|b": [["B", 1]]}))
+    with pytest.raises(ValueError, match="sanitise to"):
+        read_sequence_specs(clash)
+
+
+def test_dense_grid_shares_one_spec_set_across_contexts():
+    """The defining property: every context is asked the identical N sequences, in the same order."""
+    ctx = pl.DataFrame(
+        {
+            "subject_id": [1, 2, 3],
+            "prediction_time": [datetime(2024, 1, 1), datetime(2024, 2, 1), datetime(2024, 3, 1)],
+        }
+    ).with_columns(pl.col("prediction_time").cast(pl.Datetime("us")))
+    specs = sample_sequence_specs(4, ["A", "B", EOS_CODE], 2, 3, 1, 365, seed=3)
+    idx = build_dense_sequence_index_df(ctx, specs)
+
+    assert idx.height == ctx.height * sum(len(s) for s in specs)
+    # _ctx_id is unique per (context, spec) and context-major.
+    assert idx[CTX_ID_COL].n_unique() == ctx.height * len(specs)
+    per_ctx = idx.group_by("subject_id").agg(pl.col("query").alias("qs"), pl.col("duration_days").alias("ds"))
+    assert per_ctx["qs"].n_unique() == 1 and per_ctx["ds"].n_unique() == 1
+
+
+def test_validate_spec_codes_rejects_out_of_vocab():
+    specs = [SequenceSpec("s", ("A", "NOPE"), (1.0, 2.0))]
+    validate_spec_codes([SequenceSpec("ok", ("A",), (1.0,))], ["A", "B"])  # no error
+    with pytest.raises(ValueError, match="absent from the query vocabulary"):
+        validate_spec_codes(specs, ["A", "B"])
+
+
+def test_sequence_spec_rejects_bad_durations():
+    with pytest.raises(ValueError, match="finite number > 0"):
+        SequenceSpec("s", ("A",), (-1.0,))
+    with pytest.raises(ValueError, match="finite number > 0"):
+        SequenceSpec("s", ("A",), (float("inf"),))
+    # ``bool`` is an int subclass; True must not silently become 1.0 days.
+    with pytest.raises(TypeError, match="must be a number"):
+        SequenceSpec("s", ("A",), (True,))
