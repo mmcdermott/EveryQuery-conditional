@@ -18,7 +18,17 @@ input_shard: "0"
 task_shard: 0
 seed: 1
 
-# Number of patient contexts (= query sequences) sampled by this worker.
+# --- Supplied-cohort mode -------------------------------------------------
+# Path to a parquet of (subject_id, prediction_time) rows to score, e.g.
+#   EQ_generate_query_sequences contexts_path=cohort.parquet n_replicates=50 split=held_out \
+#     min_queries=5 max_queries=5 duration_max=365 data_dir=... out_dir=... query_codes=...
+# When set: contexts come from that file (repeated `n_replicates`x, one sampled query sequence
+# each), events are gathered across every shard of `split`, the output is named after the file
+# stem, and `input_shard` / `n_contexts` / `min_context_per_subject` are unused.
+contexts_path: null
+n_replicates: 1
+
+# Number of patient contexts (= query sequences) sampled by this worker (contexts_path=null only).
 n_contexts: 4096
 
 # Each sequence is Uniform{min..max} i.i.d. queries (random code incl. TIMELINE//END, random

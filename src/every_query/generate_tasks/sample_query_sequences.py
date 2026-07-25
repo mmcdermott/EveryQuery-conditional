@@ -247,7 +247,7 @@ def label_binary_occurrence(index_df: pl.DataFrame, events_df: pl.DataFrame) -> 
         right, by=[sid, q], left_on="_pts", right_on=DataSchema.time_name, strategy="forward"
     )
     window_end = pl.col(pt) + pl.duration(days=pl.col(d))
-    answer = (pl.col(DataSchema.time_name).is_not_null() & (pl.col(DataSchema.time_name) < window_end))
+    answer = pl.col(DataSchema.time_name).is_not_null() & (pl.col(DataSchema.time_name) < window_end)
 
     flat = joined.with_columns(answer.alias("answer")).sort(CTX_ID_COL, POSITION_COL)
     return (
@@ -261,6 +261,56 @@ def label_binary_occurrence(index_df: pl.DataFrame, events_df: pl.DataFrame) -> 
         )
         .drop(CTX_ID_COL)
     )
+
+
+def read_supplied_contexts(contexts_path: str | Path, n_replicates: int) -> pl.DataFrame:
+    """Read a user-supplied ``(subject_id, prediction_time)`` index parquet, repeated ``n_replicates`` times.
+
+    Extra columns are dropped; ``prediction_time`` is cast to ``Datetime("us")`` for the same reason
+    ``_read_event_shard`` casts event times (the ``+1µs`` strict-``>`` shift in
+    :func:`label_binary_occurrence` rounds to zero at millisecond precision).
+
+    Each output row becomes one independently-sampled query sequence, so ``n_replicates=N`` yields
+    ``N`` sequences per supplied row.  Replicate ``r`` of supplied row ``i`` is at row ``r*W + i``.
+    """
+    if n_replicates < 1:
+        raise ValueError(f"n_replicates must be >= 1 (got {n_replicates})")
+    sid = TaskQuerySchema.subject_id_name
+    pt = TaskQuerySchema.prediction_time_name
+
+    df = pl.read_parquet(contexts_path)
+    missing = {sid, pt} - set(df.columns)
+    if missing:
+        raise ValueError(f"{contexts_path} is missing required column(s) {sorted(missing)}")
+    df = df.select(pl.col(sid).cast(pl.Int64), pl.col(pt).cast(pl.Datetime("us")))
+    return pl.concat([df] * n_replicates) if n_replicates > 1 else df
+
+
+def read_events_for_subjects(split_dir: Path, subjects: pl.Series) -> pl.DataFrame:
+    """Gather the events of ``subjects`` from every shard under ``split_dir``.
+
+    A supplied cohort is an arbitrary subject set rather than one shard, so its events are spread
+    across shards.  The per-shard prefilter keeps peak memory at the cohort's own events — the
+    unfiltered union of a real split is tens of millions of rows.
+    """
+    wanted = subjects.unique()
+    frames = [
+        ev
+        for fp in sorted(split_dir.rglob("*.parquet"))
+        if (ev := _read_event_shard(fp).filter(pl.col(DataSchema.subject_id_name).is_in(wanted))).height
+    ]
+    if not frames:
+        raise ValueError(f"No events under {split_dir} for any of the {wanted.len()} supplied subjects.")
+    events_df = pl.concat(frames, how="vertical").sort([DataSchema.subject_id_name, DataSchema.time_name])
+    n_found = events_df[DataSchema.subject_id_name].n_unique()
+    if n_found < wanted.len():
+        # Silent here would mean all-False answers now and a silent row-drop in EQ_predict_sequences
+        # later (its schema_df semi-join drops subjects absent from the split without erroring).
+        raise ValueError(
+            f"{wanted.len() - n_found} of {wanted.len()} supplied subjects have no events under "
+            f"{split_dir}; check that `split` matches the cohort."
+        )
+    return events_df
 
 
 def run_worker(
@@ -279,27 +329,50 @@ def run_worker(
     min_context_per_subject: int,
     eos_first_fraction: float = 0.0,
     duration_mode: str = "random",
+    contexts_path: str | Path | None = None,
+    n_replicates: int = 1,
     overwrite: bool = False,
 ) -> Path | None:
-    """Run the sequence-sampling pipeline for one ``(input_shard, task_shard)`` worker."""
-    labels_fp = out_dir / split / f"{input_shard}__{task_shard:04d}.parquet"
+    """Run the sequence-sampling pipeline for one ``(input_shard, task_shard)`` worker.
+
+    With ``contexts_path`` set, the contexts are read from that parquet (repeated ``n_replicates`` times)
+    instead of being sampled from one shard, and events are gathered across the whole split; the
+    output is named after the supplied file and ``n_contexts`` / ``min_context_per_subject`` /
+    ``input_shard`` are unused.
+    """
+    stem = Path(contexts_path).stem if contexts_path is not None else input_shard
+    labels_fp = out_dir / split / f"{stem}__{task_shard:04d}.parquet"
     if labels_fp.exists() and not overwrite:
         logger.info("Labels already exist at %s, skipping.", labels_fp)
         return None
 
-    shard_path = data_dir / "data" / split / f"{input_shard}.parquet"
-    events_df = _read_event_shard(shard_path)
-    logger.info("Loaded %d events from %s", events_df.height, shard_path)
+    if contexts_path is not None:
+        contexts = read_supplied_contexts(contexts_path, n_replicates)
+        subjects = contexts[TaskQuerySchema.subject_id_name]
+        events_df = read_events_for_subjects(data_dir / "data" / split, subjects)
+        logger.info(
+            "Loaded %d contexts from %s (x%d) and %d events from %s/data/%s",
+            contexts.height,
+            contexts_path,
+            n_replicates,
+            events_df.height,
+            data_dir,
+            split,
+        )
+    else:
+        shard_path = data_dir / "data" / split / f"{input_shard}.parquet"
+        events_df = _read_event_shard(shard_path)
+        logger.info("Loaded %d events from %s", events_df.height, shard_path)
 
-    contexts_seed = derive_seed(seed, "seq_contexts", input_shard, task_shard)
-    contexts = sample_contexts(
-        events_df=events_df,
-        n=n_contexts,
-        min_context_per_subject=min_context_per_subject,
-        seed=contexts_seed,
-    )
+        contexts_seed = derive_seed(seed, "seq_contexts", input_shard, task_shard)
+        contexts = sample_contexts(
+            events_df=events_df,
+            n=n_contexts,
+            min_context_per_subject=min_context_per_subject,
+            seed=contexts_seed,
+        )
 
-    queries_seed = derive_seed(seed, "seq_queries", input_shard, task_shard)
+    queries_seed = derive_seed(seed, "seq_queries", stem, task_shard)
     index_df = build_sequence_index_df(
         contexts=contexts,
         query_codes=query_codes,
@@ -351,6 +424,8 @@ def main(cfg: DictConfig) -> None:
         min_context_per_subject=int(cfg.min_context_per_subject),
         eos_first_fraction=float(cfg.get("eos_first_fraction", 0.0)),
         duration_mode=str(cfg.get("duration_mode", "random")),
+        contexts_path=cfg.get("contexts_path"),
+        n_replicates=int(cfg.get("n_replicates", 1)),
         overwrite=bool(cfg.get("overwrite", False)),
     )
 

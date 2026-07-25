@@ -67,6 +67,40 @@ def test_generated_sequences_conform(cq_sequence_tasks_dir: Path):
     assert df["answers"].explode().null_count() == 0
 
 
+def test_supplied_contexts_mode(eq_preprocessed_dataset: Path, tmp_path: Path):
+    """``contexts_path`` scores a user-supplied index df: N sequences per row, K queries each."""
+    intermediate = eq_preprocessed_dataset.parent / "intermediate"
+    shard = pl.read_parquet(next((intermediate / "data" / train_split).rglob("*.parquet")))
+    cohort = shard.group_by("subject_id").agg(pl.col("time").max().alias("prediction_time")).head(3)
+    cohort_fp = tmp_path / "cohort.parquet"
+    cohort.write_parquet(cohort_fp)
+
+    out_dir = tmp_path / "out"
+    run_and_check(
+        [
+            "EQ_generate_query_sequences",
+            f"data_dir={intermediate!s}",
+            f"out_dir={out_dir!s}",
+            f"split={train_split}",
+            f"contexts_path={cohort_fp!s}",
+            "n_replicates=4",
+            "min_queries=5",
+            "max_queries=5",
+            "duration_min=1",
+            "duration_max=365",
+        ],
+        env={"PROCESSED": str(eq_preprocessed_dataset)},
+        timeout=120.0,
+    )
+
+    df = pl.read_parquet(out_dir / train_split / "cohort__0000.parquet")
+    assert df.height == cohort.height * 4
+    assert (df["queries"].list.len() == 5).all()
+    # Every supplied context is present, each replicated exactly 4x.
+    counts = df.group_by("subject_id", "prediction_time").len()
+    assert counts.height == cohort.height and (counts["len"] == 4).all()
+
+
 @pytest.fixture(scope="session")
 def cq_trained_model_dir(
     eq_preprocessed_dataset: Path, cq_sequence_tasks_dir: Path, tmp_path_factory
