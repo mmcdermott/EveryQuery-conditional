@@ -12,7 +12,9 @@ Covers, in order of pipeline position:
    labeling on a hand-built events frame.
 """
 
+import inspect
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import polars as pl
@@ -26,6 +28,7 @@ from every_query.data.seq_dataset import (
     ConditionalQueryBatch,
     ConditionalQueryPytorchDataset,
 )
+from every_query.generate_tasks import sample_evaluation_query_sequences
 from every_query.generate_tasks.sample_evaluation_query_sequences import (
     SequenceSpec,
     build_dense_sequence_index_df,
@@ -526,3 +529,31 @@ def test_sequence_spec_rejects_bad_durations():
     # ``bool`` is an int subclass; True must not silently become 1.0 days.
     with pytest.raises(TypeError, match="must be a number"):
         SequenceSpec("s", ("A",), (True,))
+
+
+def test_eval_sampling_defaults_match_training_config():
+    """A sampled evaluation grid must default to the distribution the model was pretrained on.
+
+    ``sample_evaluation_query_sequences`` reuses ``build_sequence_index_df``, so these knobs mean
+    exactly the same thing on both sides; a drifted default would silently produce an
+    out-of-distribution horizon or sequence length and read as an unexplained metric shift.
+    """
+    configs = Path(sample_evaluation_query_sequences.CONFIGS)
+    train_cfg = yaml.safe_load((configs / "sample_query_sequences_config.yaml").read_text())
+    eval_cfg = yaml.safe_load((configs / "sample_evaluation_query_sequences_config.yaml").read_text())
+
+    shared = [
+        "min_queries",
+        "max_queries",
+        "duration_min",
+        "duration_max",
+        "eos_first_fraction",
+        "duration_mode",
+    ]
+    assert {k: eval_cfg[k] for k in shared} == {k: train_cfg[k] for k in shared}
+
+    # The Python-level defaults on ``run_worker`` must agree with the YAML too — programmatic
+    # callers bypass Hydra entirely.
+    defaults = inspect.signature(sample_evaluation_query_sequences.run_worker).parameters
+    for k in ("min_queries", "max_queries", "duration_min", "duration_max"):
+        assert defaults[k].default == eval_cfg[k], f"run_worker default for {k} != config"

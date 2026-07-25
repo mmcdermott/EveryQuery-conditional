@@ -500,10 +500,13 @@ def run_worker(
     query_codes: list[str],
     sequences_path: str | Path | None = None,
     n_sequences: int = 64,
-    min_queries: int = 5,
+    # These four mirror ``sample_query_sequences``' defaults so a sampled evaluation grid comes
+    # from the same distribution the model was pretrained on.  Keep them in sync with
+    # ``configs/sample_query_sequences_config.yaml``.
+    min_queries: int = 1,
     max_queries: int = 5,
     duration_min: int = 1,
-    duration_max: int = 365,
+    duration_max: int = 731,
     seed: int = 1,
     eos_first_fraction: float = 0.0,
     duration_mode: str = "random",
@@ -621,10 +624,12 @@ def main(cfg: DictConfig) -> None:
             contexts_path=cohort.parquet sequences_path=tasks.yaml \\
             split=held_out per_spec_dirs=true data_dir=... out_dir=... query_codes=...
 
-    Usage (``N`` sequences drawn from the training distribution, one combined parquet):
+    Usage (``N`` sequences drawn from the training distribution, one combined parquet).  The
+    sampling defaults mirror ``sample_query_sequences_config.yaml``; if the checkpoint was
+    trained with overrides, pass the same ones here:
 
         EQ_generate_evaluation_query_sequences \\
-            contexts_path=cohort.parquet n_sequences=64 min_queries=5 max_queries=5 \\
+            contexts_path=cohort.parquet n_sequences=64 \\
             split=held_out data_dir=... out_dir=... query_codes=...
     """
     from dotenv import load_dotenv

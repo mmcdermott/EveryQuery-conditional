@@ -119,9 +119,11 @@ EQ_generate_evaluation_query_sequences \
     split=held_out per_spec_dirs=true
 
 # Or N sequences drawn once from the training distribution, one combined parquet
-# at {out_dir}/{split}/{cohort_stem}__sampled64.parquet:
+# at {out_dir}/{split}/{cohort_stem}__sampled64.parquet.  The sampling defaults mirror
+# `sample_query_sequences_config.yaml`; if the checkpoint was trained with overrides,
+# pass the same ones here (e.g. min_queries=5 max_queries=5 duration_max=365):
 EQ_generate_evaluation_query_sequences \
-    contexts_path=cohort.parquet n_sequences=64 min_queries=5 max_queries=5 \
+    contexts_path=cohort.parquet n_sequences=64 \
     split=held_out
 ```
 

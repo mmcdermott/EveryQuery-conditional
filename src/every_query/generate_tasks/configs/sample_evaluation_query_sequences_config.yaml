@@ -31,31 +31,47 @@ seed: 1
 contexts_path: null
 
 # --- The N query sequences ------------------------------------------------
-# Designed sequences, as either
-#   YAML/JSON mapping    name -> [[code, duration], ...]
-#   YAML/JSON list       [[[code, duration], ...], ...]        (names auto-generated)
+# Path to designed sequences.  Leave null to instead draw `n_sequences` of them from the
+# training query distribution (see the sampling knobs below).
+sequences_path: null
+#
+# `sequences_path` accepts any of:
+#   YAML/JSON mapping    name -> [[code, duration], ...]     (names become output dir names)
+#   YAML/JSON list       [[[code, duration], ...], ...]      (names auto-generated)
 #   long-format parquet  (seq_id, position, query, duration_days)
-# e.g.
+# e.g. designed.yaml:
 #   mortality_30d:
 #     - [TIMELINE//END, 1]
 #     - [MEDS_DEATH, 30]
-# Leave null to instead draw `n_sequences` sequences once from the same
-# (uniform codes x log-uniform durations) distribution the training sampler uses; those N
-# sequences are then shared across the whole cohort.
-sequences_path: null
+# On this path nothing is sampled: the codes and durations are exactly what you wrote, and
+# `query_codes` is used only to reject codes outside the model's vocabulary.
 
-# Number of sequences to sample (sequences_path=null only).
+# --- Sampling knobs (all `sequences_path: null` only) ---------------------
+# Every default below mirrors `sample_query_sequences_config.yaml` so a sampled evaluation
+# grid is drawn from the same distribution the model was pretrained on.  If your checkpoint
+# was trained with overrides, pass the same overrides here — an out-of-distribution horizon
+# or sequence length shows up as an unexplained metric shift, not as an error.
+
+# Number of sequences to draw.  They are drawn once and shared across every cohort context.
 n_sequences: 64
 
-# Sampled-sequence length and duration bounds (sequences_path=null only).  min==max gives a
-# fixed length; 5 matches the big_v2 training run.
-min_queries: 5
+# Sequence length ~ Uniform{min_queries..max_queries} inclusive, per sequence.  min==max
+# gives a fixed length, which makes per-position comparisons across sequences cleaner;
+# 1..5 matches training.
+min_queries: 1
 max_queries: 5
-duration_min: 1
-duration_max: 365
 
-# Sampled-sequence distribution knobs, matching `sample_query_sequences_config.yaml`
-# (sequences_path=null only).  Defaults reproduce the fully-random training baseline.
+# Duration bounds in days.  Each query's horizon is drawn log-uniformly over the continuous
+# [min, max] interval, then rounded and clipped to whole days — so it skews short: over
+# 1..731 the median is ~27d and ~52% of horizons are <= 30d.
+duration_min: 1
+duration_max: 731
+
+# Codes are drawn per query (not per sequence) iid uniform over `query_codes`, with
+# replacement — a code can repeat within a sequence, and TIMELINE//END is an ordinary member,
+# so it lands on any given query with probability 1/|vocab|.  `eos_first_fraction` forces
+# position 0 to be the end-of-timeline query that often instead.  `duration_mode` couples
+# horizons within a sequence: random | same | nondecreasing.
 eos_first_fraction: 0.0
 duration_mode: random
 
