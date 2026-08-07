@@ -272,6 +272,14 @@ class EveryQueryModel(torch.nn.Module):
         "transformer-engine": torch.bfloat16,
     }
 
+    # Keys this class derives or forces later in ``__init__``, so a ``config_overrides`` entry for
+    # any of them would be accepted, recorded in ``hparams``/``resolved_config.yaml``, and then
+    # silently discarded.  Reject instead, naming the real control surface — the same guard
+    # MEDS_EIC_AR applies via ``Model._RESERVED_ROLLING_KWARGS``.
+    _DERIVED_CONFIG_KEYS: ClassVar[frozenset[str]] = frozenset(
+        {"pad_token_id", "mlp_dropout", "output_hidden_states", "output_attentions", "use_cache"}
+    )
+
     def __init__(
         self,
         precision: str = "32-true",
@@ -288,7 +296,22 @@ class EveryQueryModel(torch.nn.Module):
         self.HF_model_config: ModernBertConfig = AutoConfig.from_pretrained(model_name)
 
         if config_overrides:
+            derived = self._DERIVED_CONFIG_KEYS.intersection(config_overrides)
+            if derived:
+                raise ValueError(
+                    f"These config keys are derived, not configurable: {sorted(derived)}.  "
+                    f"pad_token_id is fixed to EveryQueryBatch.PAD_INDEX ({EveryQueryBatch.PAD_INDEX}) "
+                    "so the embedding's padding row matches the mask `_hf_inputs` builds; "
+                    "mlp_dropout is the `mlp_dropout=` argument; the output/cache flags are forced "
+                    "off for training."
+                )
             for key, value in config_overrides.items():
+                # Blind setattr would accept a typo (`hiden_size`), store it in `hparams`, and
+                # leave the model quietly training at the HF default.
+                if not hasattr(self.HF_model_config, key):
+                    raise ValueError(
+                        f"Config for HF model {self.HF_model_config.model_type} does not have attribute {key}"
+                    )
                 setattr(self.HF_model_config, key, value)
 
         # Applied after config_overrides so the explicit parameter takes precedence
@@ -319,6 +342,11 @@ class EveryQueryModel(torch.nn.Module):
         self.HF_model_config.output_attentions = False
         self.HF_model_config.use_cache = False
         self.HF_model_config.mlp_dropout = float(mlp_dropout)
+        # Not a knob: this must be the collate's pad index, since `_hf_inputs` builds the
+        # attention mask from the same constant and ModernBERT passes it to
+        # `nn.Embedding(..., padding_idx=...)`.  ModernBERT's own default is its tokenizer's
+        # [PAD] (50283), which is out of range once `vocab_size` is sized from the data.
+        self.HF_model_config.pad_token_id = EveryQueryBatch.PAD_INDEX
 
         self.HF_model = ModernBertModel._from_config(self.HF_model_config, **extra_kwargs)
 
