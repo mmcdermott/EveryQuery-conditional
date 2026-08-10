@@ -11,11 +11,14 @@ from unittest.mock import patch
 
 import lightning as L
 import torch
+from hydra import compose, initialize_config_dir
 from torch.utils.data import DataLoader
+from transformers import ModernBertConfig
 
-from conftest import DEMO_CONFIG_OVERRIDES
+from conftest import DEMO_CONFIG_OVERRIDES, DEMO_PRECISION
 from every_query.model import EveryQueryModel, EveryQueryOutput
 from every_query.model.lightning_module import EveryQueryLightningModule
+from every_query.train.train import CONFIGS
 
 # ── test_model_forward_shape ────────────────────────────────────────────
 
@@ -68,7 +71,7 @@ class TestModelBackward:
         model = EveryQueryModel(
             config_overrides=DEMO_CONFIG_OVERRIDES,
             do_demo=True,
-            precision="32-true",
+            precision=DEMO_PRECISION,
         )
         model.train()
 
@@ -94,7 +97,7 @@ class TestLightningTrainingStep:
         model = EveryQueryModel(
             config_overrides=DEMO_CONFIG_OVERRIDES,
             do_demo=True,
-            precision="32-true",
+            precision=DEMO_PRECISION,
         )
         module = EveryQueryLightningModule(
             model=model,
@@ -119,7 +122,7 @@ class TestTrainerFitTwoSteps:
         model = EveryQueryModel(
             config_overrides=DEMO_CONFIG_OVERRIDES,
             do_demo=True,
-            precision="32-true",
+            precision=DEMO_PRECISION,
         )
         module = EveryQueryLightningModule(
             model=model,
@@ -162,7 +165,7 @@ class TestCheckpointRoundtrip:
         model = EveryQueryModel(
             config_overrides=DEMO_CONFIG_OVERRIDES,
             do_demo=True,
-            precision="32-true",
+            precision=DEMO_PRECISION,
         )
         module = EveryQueryLightningModule(
             model=model,
@@ -197,7 +200,7 @@ class TestCheckpointRoundtrip:
 
         loaded = EveryQueryLightningModule.load_from_checkpoint(str(ckpt_path))
 
-        assert loaded.hparams["model"]["precision"] == "32-true"
+        assert loaded.hparams["model"]["precision"] == DEMO_PRECISION
         assert loaded.hparams["model"]["do_demo"] is True
         assert loaded.hparams["optimizer"]["_target_"] == "torch.optim.adamw.AdamW"
         assert loaded.hparams["LR_scheduler"] is None
@@ -250,7 +253,7 @@ class TestDemoModeChecks:
         model = EveryQueryModel(
             config_overrides=DEMO_CONFIG_OVERRIDES,
             do_demo=True,
-            precision="32-true",
+            precision=DEMO_PRECISION,
         )
         with torch.no_grad():
             next(iter(model.censor_mlp.parameters())).fill_(float("nan"))
@@ -259,3 +262,39 @@ class TestDemoModeChecks:
             model(sample_batch)
 
         assert any("nan" in msg.lower() for msg in caplog.messages)
+
+
+# ── test_mixed_precision_wiring ─────────────────────────────────────────
+
+
+class TestMixedPrecisionWiring:
+    """AMP is the Trainer's job; weights stay fp32 so the optimizer has full-precision masters."""
+
+    def test_trainer_config_sets_precision(self):
+        """``trainer.precision`` drives AMP; the model field mirrors it rather than setting its own."""
+        with initialize_config_dir(CONFIGS, version_base=None):
+            cfg = compose(config_name="config")
+        assert cfg.trainer.precision == "bf16-mixed"
+        assert cfg.lightning_module.model.precision == cfg.trainer.precision
+
+    def test_weights_stay_fp32_when_the_hf_config_declares_bf16(self):
+        """A published checkpoint declaring ``torch_dtype: bfloat16`` must not drag the weights down.
+
+        ``_from_config`` falls back to ``config.dtype`` when no dtype is passed, so without an
+        explicit ``torch_dtype`` this yields bf16 parameters and the optimizer loses its
+        full-precision masters — autocast is supposed to handle the casting, not the weights.
+        """
+        # Built locally rather than fetched, so the assertion doesn't depend on what the
+        # real ModernBERT config.json happens to declare today.
+        bf16_config = ModernBertConfig(torch_dtype=torch.bfloat16)
+
+        with patch("every_query.model.model.AutoConfig.from_pretrained", return_value=bf16_config):
+            model = EveryQueryModel(config_overrides=DEMO_CONFIG_OVERRIDES, precision="bf16-mixed")
+
+        assert {p.dtype for p in model.parameters()} == {torch.float32}
+
+    def test_loss_stays_fp32_under_autocast(self, demo_model, sample_batch):
+        """``binary_cross_entropy_with_logits`` is on autocast's fp32 cast list — no manual wrapping."""
+        with torch.autocast("cpu", dtype=torch.bfloat16), torch.no_grad():
+            loss, _ = demo_model(sample_batch)
+        assert loss.dtype is torch.float32

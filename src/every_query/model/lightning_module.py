@@ -252,7 +252,7 @@ class EveryQueryLightningModule(L.LightningModule):
                 self._update_metric(
                     name="censor_auc",
                     split=split,
-                    preds=outputs.censor_logits.detach().cpu().squeeze(1).sigmoid().float(),
+                    preds=outputs.censor_logits.detach().cpu().squeeze(1).float().sigmoid(),
                     target=batch.censor.detach().cpu().long(),
                 )
             if (
@@ -260,7 +260,7 @@ class EveryQueryLightningModule(L.LightningModule):
                 and getattr(batch, "occurs", None) is not None
             ):
                 mask = (~batch.censor).detach().cpu().bool() if hasattr(batch, "censor") else None
-                preds = outputs.occurs_logits.detach().cpu().squeeze(1).sigmoid().float()
+                preds = outputs.occurs_logits.detach().cpu().squeeze(1).float().sigmoid()
                 target = batch.occurs.detach().cpu().long()
                 if mask is not None:
                     preds = preds[mask]
@@ -588,7 +588,7 @@ class EveryQueryLightningModule(L.LightningModule):
             >>> loaded.hparams['LR_scheduler'] is None
             True
             >>> loaded.hparams['model']['precision']
-            '32-true'
+            'bf16-mixed'
             >>> loaded.hparams['model']['do_demo']
             True
 

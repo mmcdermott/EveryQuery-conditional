@@ -138,8 +138,16 @@ class EveryQueryOutput(BaseModelOutput):
             tensor(True)
             >>> EveryQueryOutput.logits_to_probs(torch.tensor([[-1000.0]])) < 0.001
             tensor(True)
+
+            bf16 logits are upcast before the sigmoid — bf16 sigmoid would round to
+            exactly 1.0 from a logit of ~6, flattening every confident prediction into
+            a tie for ranking metrics like AUROC:
+
+            >>> probs = EveryQueryOutput.logits_to_probs(torch.tensor([[8.0]], dtype=torch.bfloat16))
+            >>> probs.dtype, bool(probs < 1.0)
+            (torch.float32, True)
         """
-        return torch.sigmoid(logits).squeeze()
+        return torch.sigmoid(logits.float()).squeeze()
 
     @property
     def occurs_probs(self) -> torch.Tensor | None:

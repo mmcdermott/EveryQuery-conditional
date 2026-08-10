@@ -89,7 +89,10 @@ class TaskAurocTrackingCallback(Callback):
         # naive is_global_zero gate + sync_dist=True would deadlock).
         if self._loader is None or not trainer.is_global_zero:
             return
-        self._compute_and_log(pl_module.model, pl_module.device, pl_module.log)
+        # Manual forwards here run outside Lightning's step hooks, so the precision plugin's
+        # autocast context must be entered explicitly to match validation_step numerics.
+        with trainer.precision_plugin.forward_context():
+            self._compute_and_log(pl_module.model, pl_module.device, pl_module.log)
 
     def _compute_and_log(self, model, device, log_fn):
         """Score the pair set and log the macro win/tie/loss AUROC estimate.
@@ -103,7 +106,7 @@ class TaskAurocTrackingCallback(Callback):
                 batch = move_data_to_device(batch, device)
                 _, outputs = model(batch)
                 # Squeeze only dim 1 so a trailing size-1 batch doesn't collapse to a 0-d scalar.
-                probs = outputs.occurs_logits.detach().cpu().squeeze(1).sigmoid().float().tolist()
+                probs = outputs.occurs_logits.detach().cpu().squeeze(1).float().sigmoid().tolist()
                 queries = batch.query.detach().cpu().tolist()
                 durations = batch.duration_days.detach().cpu().tolist()
                 labels = batch.occurs.detach().cpu().tolist()
