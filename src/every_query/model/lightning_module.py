@@ -584,9 +584,19 @@ class EveryQueryLightningModule(L.LightningModule):
                 f"estimated_stepping_batches={num_training_steps}. "
                 "Set a finite Trainer(max_steps=...) or use a finite dataloader."
             )
+        num_warmup_steps = int(self.warmup_ratio * num_training_steps)
+        # save_hyperparameters ran at init, before the trainer existed; log the
+        # fit-time step counts separately so they show up in wandb's config.
+        if self.logger is not None:
+            self.logger.log_hyperparams(
+                {
+                    "LR_scheduler/num_training_steps": int(num_training_steps),
+                    "LR_scheduler/num_warmup_steps": num_warmup_steps,
+                }
+            )
         scheduler = self.LR_scheduler_factory(
             optimizer,
-            num_warmup_steps=int(self.warmup_ratio * num_training_steps),
+            num_warmup_steps=num_warmup_steps,
             num_training_steps=num_training_steps,
         )
 
