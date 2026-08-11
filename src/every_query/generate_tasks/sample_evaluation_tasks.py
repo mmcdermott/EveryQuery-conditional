@@ -8,13 +8,14 @@ row shape needed to compute per-``(query, duration_days)`` metrics over a split
 — every `(subject, time)` gets scored on every task the caller asked about.
 
 Pipeline:
-    1. For the chosen input shard, sample up to ``K`` candidate prediction times
-       per subject (any event time at which the subject has accumulated at least
-       ``min_context_per_subject`` prior events).
+    1. For each shard discovered under ``{data_dir}/data/{split}/*.parquet``,
+       sample up to ``K`` candidate prediction times per subject (any event time
+       at which the subject has accumulated at least ``min_context_per_subject``
+       prior events).
     2. Cross-join with the full ``(codes x durations)`` grid.
     3. Label via :func:`every_query.generate_tasks.sample_tasks.evaluate_index_df`
        (single ``join_asof`` across the whole index frame).
-    4. Align to ``TaskQuerySchema`` and write a single parquet per worker.
+    4. Align to ``TaskQuerySchema`` and write one parquet per shard.
 
 Seeding:
     Prediction-time sampling is deterministic in ``(seed, input_shard, split)``.
@@ -38,6 +39,7 @@ from every_query.generate_tasks.sample_tasks import (
     _atomic_write_parquet,
     _read_event_shard,
     _require_path_arg,
+    _split_shards,
     evaluate_index_df,
     read_query_codes,
 )
@@ -165,7 +167,7 @@ def sample_prediction_times_per_subject(
 def build_evaluation_index_df(
     prediction_times: pl.DataFrame,
     codes: list[str],
-    durations: list[int],
+    durations: list[float],
 ) -> pl.DataFrame:
     """Cross-join prediction times with ``(codes x durations)`` into the evaluation grid.
 
@@ -206,8 +208,8 @@ def build_evaluation_index_df(
         raise ValueError("codes must be non-empty")
     if not durations:
         raise ValueError("durations must be non-empty")
-    if any(not isinstance(d, int) for d in durations):
-        raise TypeError(f"durations must all be ints (got {[type(d).__name__ for d in durations]})")
+    if any(isinstance(d, bool) or not isinstance(d, int | float) for d in durations):
+        raise TypeError(f"durations must all be numbers (got {[type(d).__name__ for d in durations]})")
 
     out_schema = {
         TaskQuerySchema.subject_id_name: prediction_times.schema.get(
@@ -307,7 +309,7 @@ def run_worker(
     split: str,
     input_shard: str,
     codes: list[str],
-    durations: list[int],
+    durations: list[float],
     prediction_times_per_subject: int,
     min_context_per_subject: int,
     seed: int,
@@ -409,20 +411,21 @@ CONFIGS = str(files("every_query") / "generate_tasks" / "configs")
 
 @hydra.main(version_base=None, config_path=CONFIGS, config_name="sample_evaluation_tasks_config")
 def main(cfg: DictConfig) -> None:
-    """Produce one evaluation-tasks parquet per (split, input_shard) pair.
+    """Produce one evaluation-tasks parquet per shard of the chosen split.
+
+    Shards are discovered from ``{data_dir}/data/{split}/*.parquet`` and all of
+    them are processed in this one invocation — there is no shard knob, so a
+    partial split can't be evaluated silently.
 
     Required path args mirror ``sample_tasks`` (``data_dir``, ``out_dir``); eval
     outputs land under a new ``eval/`` subdir so training-task parquets and
     evaluation-task parquets don't collide in one directory.
 
-    Usage (single worker):
+    Usage:
         EQ_generate_evaluation_tasks \\
-            split=held_out input_shard=0 \\
+            split=held_out \\
             prediction_times_per_subject=5 \\
             'query_codes=[HR, TEMP]' 'durations=[1, 7, 30]'
-
-    Sweep across shards with
-    ``python -m every_query.generate_tasks.sample_evaluation_tasks -m input_shard=0,1,2,...``.
     """
     data_dir = _require_path_arg(cfg.get("data_dir"), "data_dir")
     out_dir = _require_path_arg(cfg.get("out_dir"), "out_dir")
@@ -430,23 +433,14 @@ def main(cfg: DictConfig) -> None:
     # Either an explicit list or a dir/path (query_codes=$TENSORIZED_COHORT_DIR loads the full universe).
     codes = read_query_codes(cfg.get("query_codes"))
 
-    # Durations must be whole-day ints — silent truncation (e.g. ``0.5 → 0``) would
-    # change the window semantics.  ``TaskQuerySchema.duration_days`` is float32 on
-    # disk, but the CLI contract here is integer days; fractional durations are a
-    # deliberate-future-feature (see #129), not a silent-today feature.
-    durations: list[int] = []
+    durations: list[float] = []
     for i, d in enumerate(cfg.durations):
         if isinstance(d, bool) or not isinstance(d, int | float):
             raise TypeError(f"cfg.durations[{i}] must be a number, got {type(d).__name__}: {d!r}")
-        if not float(d).is_integer():
-            raise ValueError(
-                f"cfg.durations[{i}] must be a whole-day integer, got {d!r}.  "
-                f"Fractional horizons aren't supported by this CLI yet — see #129."
-            )
-        durations.append(int(d))
+        durations.append(float(d))
 
     split = cfg.split
-    input_shard = str(cfg.input_shard)
+    shards = _split_shards(data_dir, split)
 
     # Reject booleans up front: Hydra/OmegaConf parses ``subject_subsample_fraction=true``
     # as a Python ``True``, which would otherwise become ``1.0`` and silently disable
@@ -460,21 +454,22 @@ def main(cfg: DictConfig) -> None:
     subject_subsample_fraction = None if ssf_raw is None else float(ssf_raw)
 
     write_unique_prediction_times = bool(cfg.get("write_unique_prediction_times", True))
-    run_worker(
-        data_dir=data_dir,
-        out_dir=Path(out_dir) / "eval",
-        split=split,
-        input_shard=input_shard,
-        codes=codes,
-        durations=durations,
-        prediction_times_per_subject=int(cfg.prediction_times_per_subject),
-        min_context_per_subject=int(cfg.min_context_per_subject),
-        seed=int(cfg.seed),
-        overwrite=bool(cfg.get("overwrite", False)),
-        subject_subsample_fraction=subject_subsample_fraction,
-        write_unique_prediction_times=write_unique_prediction_times,
-        unique_out_dir=Path(out_dir) / "eval_unique" if write_unique_prediction_times else None,
-    )
+    for input_shard in shards:
+        run_worker(
+            data_dir=data_dir,
+            out_dir=Path(out_dir) / "eval",
+            split=split,
+            input_shard=input_shard,
+            codes=codes,
+            durations=durations,
+            prediction_times_per_subject=int(cfg.prediction_times_per_subject),
+            min_context_per_subject=int(cfg.min_context_per_subject),
+            seed=int(cfg.seed),
+            overwrite=bool(cfg.get("overwrite", False)),
+            subject_subsample_fraction=subject_subsample_fraction,
+            write_unique_prediction_times=write_unique_prediction_times,
+            unique_out_dir=Path(out_dir) / "eval_unique" if write_unique_prediction_times else None,
+        )
 
 
 if __name__ == "__main__":
