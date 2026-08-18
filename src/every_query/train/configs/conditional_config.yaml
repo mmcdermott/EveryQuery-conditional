@@ -1,0 +1,121 @@
+# Training config for the conditional query-sequence model (ConditionalQueryModel).
+#
+# Differences vs. config.yaml (single-query EveryQuery):
+#   - datamodule.data_class points at ConditionalQueryPytorchDataset (query-sequence labels);
+#   - lightning_module instantiates ConditionalQueryLightningModule / ConditionalQueryModel;
+#   - encoder is sized from config_overrides for a from-scratch EHR vocabulary (the
+#     ModernBERT-base defaults are for a 50k-token text vocab and 22 layers);
+#   - logger is a local CSVLogger (training-stability curves are read from metrics.csv).
+#
+# vocab_size must be > max code/vocab_index (index 0 is padding).  For the MIMIC-IV v0.3.0
+# cohort the max vocab index is 11958, so vocab_size is 11959.  No sentinel slot is needed —
+# the end-of-timeline code (TIMELINE//END, index 11884) is an ordinary vocabulary code.
+
+defaults:
+  - _self_
+
+output_dir: ${oc.env:OUTPUT_DIR}/${run_id:}/
+do_overwrite: false
+do_resume: false
+seed: 140799
+
+datamodule:
+  _target_: meds_torchdata.extensions.lightning_datamodule.Datamodule
+  data_class: every_query.data.seq_dataset.ConditionalQueryPytorchDataset
+  config:
+    _target_: meds_torchdata.MEDSTorchDataConfig
+    tensorized_cohort_dir: ${oc.env:FINAL_DATA_DIR}
+    task_labels_dir: ${oc.env:TASK_DIR}
+    static_inclusion_mode: omit
+    seq_sampling_strategy: to_end
+    max_seq_len: 256
+  batch_size: 96
+  num_workers: 8
+  pin_memory: True
+
+lightning_module:
+  _target_: every_query.model.conditional_lightning.ConditionalQueryLightningModule
+  model:
+    _target_: every_query.model.conditional_model.ConditionalQueryModel
+    precision: "bf16-mixed"
+    mlp_dropout: 0.1
+    num_hidden_layers: 8
+    decoder_layers: 4
+    decoder_heads: 6
+    decoder_ffn_mult: 4
+    max_queries: 8
+    config_overrides:
+      hidden_size: 384
+      num_attention_heads: 6
+      intermediate_size: 1536
+      max_position_embeddings: 512
+      vocab_size: 11959
+      pad_token_id: 0
+      cls_token_id: 1
+      bos_token_id: 1
+      sep_token_id: 2
+      eos_token_id: 2
+  optimizer:
+    _target_: torch.optim.AdamW
+    _partial_: true
+    lr: 2e-4
+    weight_decay: 0.05
+    eps: 1.0e-8
+    betas: [0.9, 0.98]
+    amsgrad: false
+    fused: false
+  LR_scheduler:
+    _target_: transformers.get_cosine_schedule_with_warmup
+    _partial_: true
+    num_warmup_steps: ${int_prod:0.05,${.num_training_steps}}
+    num_training_steps: ${trainer.max_steps}
+    num_cycles: 0.5
+
+trainer:
+  _target_: lightning.pytorch.trainer.Trainer
+  logger:
+    _target_: lightning.pytorch.loggers.CSVLogger
+    save_dir: "${trainer.default_root_dir}/loggers"
+    name: "csv"
+    flush_logs_every_n_steps: 50
+  callbacks:
+    _target_: every_query.train.train.values_as_list
+    learning_rate_monitor:
+      _target_: lightning.pytorch.callbacks.LearningRateMonitor
+    model_checkpoint:
+      _target_: lightning.pytorch.callbacks.ModelCheckpoint
+      dirpath: ${trainer.default_root_dir}/checkpoints
+      monitor: "tuning/loss"
+      verbose: False
+      save_last: True
+      save_top_k: 2
+      mode: "min"
+      save_weights_only: False
+      every_n_train_steps: null
+    early_stopping:
+      _target_: lightning.pytorch.callbacks.EarlyStopping
+      monitor: "tuning/loss"
+      min_delta: 5.0e-5
+      patience: 20
+      verbose: True
+      mode: "min"
+      strict: True
+      check_finite: True
+      stopping_threshold: null
+      divergence_threshold: null
+      check_on_train_epoch_end: false
+  default_root_dir: ${output_dir}
+  min_epochs: 0
+  max_epochs: null
+  max_steps: 30000
+  accelerator: "auto"
+  devices: 1
+  strategy: "auto"
+  accumulate_grad_batches: 1
+  log_every_n_steps: 50
+  check_val_every_n_epoch: null
+  val_check_interval: 1000
+  limit_val_batches: 100
+  deterministic: False
+  gradient_clip_val: 1.0
+  precision: "bf16-mixed"

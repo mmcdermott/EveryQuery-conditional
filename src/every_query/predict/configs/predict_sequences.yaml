@@ -1,0 +1,35 @@
+# EQ_predict_sequences — inference over conditional query sequences.
+#
+# Reads all QuerySeqSchema-conformant parquets under tasks_dir, runs teacher-forced
+# inference with the trained conditional model, writes a flat per-query-position
+# parquet (subject_id, prediction_time, position, query, duration_days, answer,
+# answer_prob).  See src/every_query/predict/predict_sequences.py.
+
+defaults:
+  - _self_
+
+# Required: path to a conditional-model training run directory (best_model.ckpt +
+# resolved_config.yaml).
+model_run_dir: ???
+
+# Required: directory of QuerySeqSchema-conformant parquet files.
+tasks_dir: ???
+
+# Required: output parquet path.
+output_parquet: ???
+
+# Optional: explicit checkpoint stem under model_run_dir/checkpoints/.
+ckpt_name: null
+
+# Optional: "held_out" (default) or "tuning".  "train" is disallowed (shuffling).
+split: held_out
+
+overwrite: false
+
+# Optional inference batch-size override.
+batch_size: null
+
+hydra:
+  output_subdir: null
+  job:
+    chdir: false

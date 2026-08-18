@@ -1,0 +1,15 @@
+# EQ_evaluate_sequences — metrics over an EQ_predict_sequences output parquet.
+
+defaults:
+  - _self_
+
+# Required: the per-position predictions parquet written by EQ_predict_sequences.
+predictions_parquet: ???
+
+# Required: output stem; tables land at <stem>.by_position.parquet and <stem>.by_query.parquet.
+metrics_stem: ???
+
+hydra:
+  output_subdir: null
+  job:
+    chdir: false
