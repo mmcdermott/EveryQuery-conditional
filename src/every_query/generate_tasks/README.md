@@ -74,11 +74,13 @@ families of (scattered-for-training, dense-for-evaluation) pairs — one per mod
     > timestamp.
 
 - **`sample_evaluation_query_sequences.py`** — dense-grid conditional-sequence generator.
-    Takes a supplied cohort (`contexts_path`, required) and labels the same `N` sequences at
-    every context in it, so the only thing varying across a given sequence's rows is the
-    patient. The `N` sequences are either designed (`sequences_path=tasks.yaml`, a mapping of
-    `name -> [[code, duration], ...]`) or drawn once from the training query distribution
-    (`n_sequences=64`). Reuses `sample_query_sequences`'s cohort reader, cross-shard event
+    Labels the same `N` sequences at every context of one cohort, so the only thing varying
+    across a given sequence's rows is the patient. Both axes of that grid are supplied or
+    sampled: the cohort from `contexts_path`, or `n_contexts` of them drawn from the split via
+    upstream Stages 0 + 2 on the shared `derive_seed(seed, "contexts")` axis; the `N` sequences
+    designed (`sequences_path=tasks.yaml`, a mapping of `name -> [[code, duration], ...]`) or
+    drawn once from the training query distribution (`n_sequences=64`). Reuses
+    `sample_query_sequences`'s cohort reader, prediction-time resolution, cross-shard event
     gather, and `label_binary_occurrence` labeler; only the grid build is its own. Registered
     as `EQ_generate_evaluation_query_sequences`.
 
