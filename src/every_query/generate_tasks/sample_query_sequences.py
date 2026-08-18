@@ -10,7 +10,7 @@ Sibling of :mod:`~every_query.generate_tasks.sample_tasks`, but instead of one s
   Its answer is always observed, so the model's downstream conditional predictions are never
   conditioned on a missing first answer — this replaces the separate censor head of the
   single-query model.
-- **Q2..QL are iid draws** from (uniform codes × log-uniform durations), in an arbitrary
+- **Q2..QL are iid draws** from (uniform codes x log-uniform durations), in an arbitrary
   (random) order.  The point is not temporal structure but conditional-answering capability:
   the model trained on these sequences learns ``P(A_j | patient, Q_1..Q_j, A_1..A_{j-1})``.
 - **Answers** are nullable booleans: ``null`` = censored (window extends past the subject's
@@ -24,25 +24,22 @@ Worker decomposition, seeding, and atomic-write behavior mirror ``sample_tasks``
 """
 
 import logging
-import os
 from importlib.resources import files
 from pathlib import Path
 
 import hydra
 import numpy as np
 import polars as pl
-from omegaconf import DictConfig
-
 from meds import DataSchema
+from omegaconf import DictConfig
 
 from every_query.data.schema import QuerySeqSchema, TaskQuerySchema
 from every_query.data.seq_dataset import EOS_CODE
 from every_query.generate_tasks.sample_tasks import (
     _atomic_write_parquet,
     _read_event_shard,
-    _resolve_path,
+    _require_path_arg,
     read_query_codes,
-    sample_contexts,
 )
 from every_query.utils.seeds import derive_seed
 
@@ -326,7 +323,7 @@ def run_worker(
     max_queries: int,
     duration_min: int,
     duration_max: int,
-    min_context_per_subject: int,
+    min_prediction_times_per_subject: int,
     eos_first_fraction: float = 0.0,
     duration_mode: str = "random",
     contexts_path: str | Path | None = None,
@@ -337,7 +334,7 @@ def run_worker(
 
     With ``contexts_path`` set, the contexts are read from that parquet (repeated ``n_replicates`` times)
     instead of being sampled from one shard, and events are gathered across the whole split; the
-    output is named after the supplied file and ``n_contexts`` / ``min_context_per_subject`` /
+    output is named after the supplied file and ``n_contexts`` / ``min_prediction_times_per_subject`` /
     ``input_shard`` are unused.
     """
     stem = Path(contexts_path).stem if contexts_path is not None else input_shard
@@ -360,16 +357,18 @@ def run_worker(
             split,
         )
     else:
-        shard_path = data_dir / "data" / split / f"{input_shard}.parquet"
-        events_df = _read_event_shard(shard_path)
-        logger.info("Loaded %d events from %s", events_df.height, shard_path)
-
-        contexts_seed = derive_seed(seed, "seq_contexts", input_shard, task_shard)
-        contexts = sample_contexts(
-            events_df=events_df,
-            n=n_contexts,
-            min_context_per_subject=min_context_per_subject,
-            seed=contexts_seed,
+        # The fork sampled contexts from one shard's own events via `sample_tasks.sample_contexts`,
+        # which upstream replaced with the global, two-root 5-stage pipeline (Stage 0
+        # `build_prediction_times` -> Stage 2 `sample_patient_contexts` -> Stage 3 `build_index`).
+        # `sample_patient_contexts` consumes a Stage 0 `_prediction_time_counts` table and returns
+        # `prediction_time_index` rather than a timestamp, so it is not a drop-in for the shard-local
+        # call that used to live here — wiring it up is the sampler rewrite (Phase 2 of
+        # CONDITIONAL_V2_INTEGRATION_PLAN.md).  Failing loudly beats silently sampling from a
+        # different distribution than the one the config documents.
+        raise NotImplementedError(
+            "Sampled-context mode is not wired up yet: it needs the Stage 0/2/3 rewrite "
+            "(Phase 2 of CONDITIONAL_V2_INTEGRATION_PLAN.md). Pass `contexts_path=...` to label a "
+            "supplied (subject_id, prediction_time) cohort, which is fully functional."
         )
 
     queries_seed = derive_seed(seed, "seq_queries", stem, task_shard)
@@ -399,13 +398,15 @@ CONFIGS = str(files("every_query") / "generate_tasks" / "configs")
 
 @hydra.main(version_base=None, config_path=CONFIGS, config_name="sample_query_sequences_config")
 def main(cfg: DictConfig) -> None:
-    """Hydra entry point; path fallbacks mirror ``sample_tasks.main``."""
-    from dotenv import load_dotenv
+    """Hydra entry point; path roots are required args, mirroring ``sample_tasks.main``.
 
-    load_dotenv()
-
-    data_dir = _resolve_path(cfg.get("data_dir"), "INTERMEDIATE", "data_dir")
-    out_dir = _resolve_path(cfg.get("out_dir"), "TASK_DIR", "out_dir")
+    There is no ``.env``/env-var fallback (removed upstream in #235): ``data_dir``, ``out_dir`` and
+    ``query_codes`` are mandatory Hydra args, resolved through the same
+    :func:`~every_query.generate_tasks.sample_tasks._require_path_arg` guard the training sampler
+    uses so an unexported ``$VAR`` fails with one clear message instead of a literal ``None`` path.
+    """
+    data_dir = _require_path_arg(cfg.get("data_dir"), "data_dir")
+    out_dir = _require_path_arg(cfg.get("out_dir"), "out_dir")
     query_codes = read_query_codes(cfg.get("query_codes"))
 
     run_worker(
@@ -421,7 +422,7 @@ def main(cfg: DictConfig) -> None:
         max_queries=int(cfg.max_queries),
         duration_min=int(cfg.duration_min),
         duration_max=int(cfg.duration_max),
-        min_context_per_subject=int(cfg.min_context_per_subject),
+        min_prediction_times_per_subject=int(cfg.min_prediction_times_per_subject),
         eos_first_fraction=float(cfg.get("eos_first_fraction", 0.0)),
         duration_mode=str(cfg.get("duration_mode", "random")),
         contexts_path=cfg.get("contexts_path"),

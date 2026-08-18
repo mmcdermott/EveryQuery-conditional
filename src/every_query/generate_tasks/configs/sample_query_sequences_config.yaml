@@ -1,17 +1,28 @@
 # Hydra config for the conditional query-*sequence* label generator.
 #
-# Sweep with:
-#   EQ_generate_query_sequences -m input_shard=0,1,2,... task_shard=range(0,K)
+# Path roots are machine-specific, **required** Hydra args — no `.env`/env-var fallback (#235).
+# Pass them on the CLI as shell-expanded vars:
+#   data_dir=$TOKENIZED_EVENTS_DIR out_dir=$TRAINING_TASKS_DIR query_codes=$TENSORIZED_COHORT_DIR
 #
-# Path roots follow the same `.env` fallback convention as `sample_tasks_config.yaml`:
-#   data_dir  -> $INTERMEDIATE   (event shards live under `{data_dir}/data/{split}/*.parquet`)
-#   out_dir   -> $TASK_DIR       (labeled shards land as {split}/*.parquet; consumable as
-#                                 MTD's task_labels_dir directly)
-#   query_codes: null -> $PROCESSED/metadata/codes.parquet
+#   data_dir     MEDS dataset root (event shards under `{data_dir}/data/{split}/*.parquet`)
+#   out_dir      final-output-only root; labeled shards land as `{split}/{shard}.parquet` and
+#                nothing else, so it is directly usable as MTD's `task_labels_dir`
+#   query_codes  sampling universe: a metadata root dir (loads `{dir}/metadata/codes.parquet`),
+#                an explicit Hydra list (`query_codes=[HR,TEMP]`), or a YAML/parquet path
+#
+# All three are `???` (mandatory); leaving one unset raises OmegaConf's MissingMandatoryValue.
+# The intermediate-artifacts root has no key of its own: it is always the sibling
+# `{parent}/{name}_artifacts` of out_dir, so the two output trees never nest (invariant 7):
+#
+#   out_dir/{split}/{shard}.parquet          <- final outputs ONLY
+#   {name}_artifacts/{split}/
+#       _prediction_time_counts.parquet      <- Stage 0 summary
+#       _prediction_times/{shard}.parquet    <- Stage 0 map
+#       _index/{shard}.parquet               <- sequence index
 
-data_dir: null
-out_dir: null
-query_codes: null
+data_dir: ???
+out_dir: ???
+query_codes: ???
 
 split: train
 input_shard: "0"
@@ -24,11 +35,13 @@ seed: 1
 #     min_queries=5 max_queries=5 duration_max=365 data_dir=... out_dir=... query_codes=...
 # When set: contexts come from that file (repeated `n_replicates`x, one sampled query sequence
 # each), events are gathered across every shard of `split`, the output is named after the file
-# stem, and `input_shard` / `n_contexts` / `min_context_per_subject` are unused.
+# stem, and `input_shard` / `n_contexts` / `min_prediction_times_per_subject` are unused.
 contexts_path: null
 n_replicates: 1
 
 # Number of patient contexts (= query sequences) sampled by this worker (contexts_path=null only).
+# NOTE: the sampled-context path is not wired up on this branch — it awaits the Stage 0/2/3
+# rewrite (Phase 2 of CONDITIONAL_V2_INTEGRATION_PLAN.md).  Only `contexts_path` mode runs today.
 n_contexts: 4096
 
 # Each sequence is Uniform{min..max} i.i.d. queries (random code incl. TIMELINE//END, random
@@ -40,8 +53,16 @@ max_queries: 5
 duration_min: 1
 duration_max: 731
 
-# Minimum prior events a subject must have accumulated before a prediction time is valid.
-min_context_per_subject: 50
+# Minimum prior *prediction times* (distinct (subject_id, time) rows, NOT events) required before
+# a prediction time is eligible.  Supersedes the fork's event-based `min_context_per_subject`; the
+# value carried across is the upstream default, not a translation of the old event-count threshold
+# — the two count different things, so revisit it before any real-cohort run.
+min_prediction_times_per_subject: 50
+
+# Optional cap on the labeling worker pool; null => resolve_workers() uses cores-on-node, an
+# explicit int caps that result downward only.  Named to match `sample_training_tasks_config.yaml`;
+# read once labeling fans out per shard (Phase 2), inert until then.
+max_workers: null
 
 # --- Phase-2 sweep knobs (default OFF: fully random baseline) ---
 # Probability a sequence is forced to start with the TIMELINE//END query (upweights the

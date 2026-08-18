@@ -76,7 +76,7 @@ from every_query.generate_tasks.sample_query_sequences import (
 )
 from every_query.generate_tasks.sample_tasks import (
     _atomic_write_parquet,
-    _resolve_path,
+    _require_path_arg,
     read_query_codes,
 )
 from every_query.utils.seeds import derive_seed
@@ -618,7 +618,7 @@ CONFIGS = str(files("every_query") / "generate_tasks" / "configs")
 
 @hydra.main(version_base=None, config_path=CONFIGS, config_name="sample_evaluation_query_sequences_config")
 def main(cfg: DictConfig) -> None:
-    """Hydra entry point; path fallbacks mirror ``sample_query_sequences.main``.
+    """Hydra entry point; path roots are required args, mirroring ``sample_query_sequences.main``.
 
     Usage (designed sequences, one output dir per task):
 
@@ -634,12 +634,8 @@ def main(cfg: DictConfig) -> None:
             contexts_path=cohort.parquet n_sequences=64 \\
             split=held_out data_dir=... out_dir=... query_codes=...
     """
-    from dotenv import load_dotenv
-
-    load_dotenv()
-
-    data_dir = _resolve_path(cfg.get("data_dir"), "INTERMEDIATE", "data_dir")
-    out_dir = _resolve_path(cfg.get("out_dir"), "TASK_DIR", "out_dir")
+    data_dir = _require_path_arg(cfg.get("data_dir"), "data_dir")
+    out_dir = _require_path_arg(cfg.get("out_dir"), "out_dir")
     query_codes = read_query_codes(cfg.get("query_codes"))
 
     contexts_path = cfg.get("contexts_path")
