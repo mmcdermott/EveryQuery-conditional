@@ -99,9 +99,32 @@ out of scope here.
 
 ### Phase 1 — Port the additive files verbatim (1 commit)
 
-All 38 files upstream never touched, including `scripts/` (~10 eval + report builders),
-the 3 PDFs (~1.2MB), `reports/`, `CONDITIONAL_QUERIES.md`, `COHORT_INFERENCE_NOTES.md`,
-`HANDOFF.md`.
+**The source is the local `main` branch of this same repository — not a remote, not upstream.**
+Bring each file across with:
+
+```bash
+git checkout main -- <path>
+```
+
+Nothing needs to be fetched, cloned, or downloaded. `main` is the fork's own head (`0a7d57c`)
+and already holds every file listed below; `git checkout main -- <path>` copies the file from
+that branch into the working tree and stages it, leaving `main` itself untouched. Do **not**
+look for these files on `origin`, on `upstream`, or in a PR — `upstream` has never contained
+any of them.
+
+To enumerate the full set instead of working from the abbreviated list below:
+
+```bash
+git diff --name-only a13912b main          # merge base is fixed; verified to list 46 files
+```
+
+Equivalently, `git diff --name-only $(git merge-base main upstream/main) main`.
+
+That lists all 46 files the fork changed. Subtract the 8 overlapping files named in section 1
+(handled in Phases 4 and 5, not here) to get the 38 additive ones, and drop `sample_tasks.py`.
+
+The 38 include `scripts/` (~10 eval + report builders), the 3 PDFs (~1.2MB), `reports/`,
+`CONDITIONAL_QUERIES.md`, `COHORT_INFERENCE_NOTES.md`, and `HANDOFF.md`.
 
 Key source files:
 
