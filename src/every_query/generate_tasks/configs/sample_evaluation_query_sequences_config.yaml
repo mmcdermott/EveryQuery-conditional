@@ -1,8 +1,11 @@
 # Hydra config for the dense-grid conditional query-*sequence* evaluation generator.
 #
 # Sibling to `sample_query_sequences_config.yaml` (scattered shape: every context draws its
-# own independent sequence).  This endpoint takes a supplied cohort and labels the *same* N
-# query sequences at every context in it — the row shape per-sequence metrics need.
+# own independent sequence).  This endpoint labels the *same* N query sequences at every context
+# of one cohort — the row shape per-sequence metrics need.  Both axes of that grid are either
+# supplied or sampled: `contexts_path`/`n_contexts` for the cohort, `sequences_path`/`n_sequences`
+# for the N sequences.  With all four left at their defaults the endpoint runs on the three path
+# roots alone.
 #
 # Relationship to `sample_evaluation_tasks_config.yaml`: same dense-grid motivation, but that
 # one emits flat TaskQuerySchema rows for EQ_predict/EQ_evaluate, while this one emits
@@ -19,12 +22,20 @@
 #                explicit Hydra list, or a YAML/parquet path.  With `sequences_path` set it is
 #                used only to reject codes outside the model's vocabulary.
 #
-# All three are `???` (mandatory).  Intermediates, if any, go to the sibling
-# `{parent}/{name}_artifacts` of out_dir — never nested under it (invariant 7).
+# All three are `???` (mandatory).  The intermediate-artifacts root has no key of its own: it is
+# always the sibling `{parent}/{name}_artifacts` of out_dir, never nested under it (invariant 7).
+# A sampled cohort writes Stage 0's map there; a supplied one writes no intermediates at all:
+#
+#   out_dir/{split}/...                      <- final outputs ONLY (layout below)
+#   {name}_artifacts/{split}/
+#       _prediction_time_counts.parquet      <- Stage 0 summary   (sampled cohort only)
+#       _prediction_times/{shard}.parquet    <- Stage 0 map       (sampled cohort only)
 #
 # Output layout (both directly usable as `EQ_predict_sequences tasks_dir=...`):
-#   per_spec_dirs=false  ->  {out_dir}/{split}/{contexts_stem}__{specs_tag}.parquet
+#   per_spec_dirs=false  ->  {out_dir}/{split}/{contexts_tag}__{specs_tag}.parquet
 #   per_spec_dirs=true   ->  {out_dir}/{spec_name}/{split}/tasks.parquet
+# where `contexts_tag` is the cohort file's stem or `sampled{n_contexts}ctx`, and `specs_tag` the
+# spec file's stem or `sampled{n_sequences}`.
 
 data_dir: ???
 out_dir: ???
@@ -33,10 +44,25 @@ query_codes: ???
 split: held_out # typical inference split; use `tuning` for intermediate validation.
 seed: 1
 
-# --- The cohort (required) ------------------------------------------------
+# --- The cohort -----------------------------------------------------------
 # Parquet with at least (subject_id, prediction_time).  Extra columns are dropped; duplicate
-# contexts are deduped (a dense grid asks each sequence about each context exactly once).
+# contexts are deduped (a dense grid asks each sequence about each context exactly once).  Every
+# subject in it must be present in `split`, or labeling raises rather than answering all-False.
+# Leave null to instead sample the cohort from `split` itself (the two knobs below).
 contexts_path: null
+
+# Contexts to draw when `contexts_path` is null, via the same upstream Stages 0 + 2 the training
+# sampler uses (seeded on the same "contexts" axis), so an evaluation grid is scored at contexts
+# from the distribution training drew from.  Stage 2 draws with replacement and the repeats are
+# deduped, so this is a *ceiling* on the grid's width, not an exact count.  Unlike the training
+# sampler's `num_sequences`, it is a context budget, not a row budget: the grid ends up with
+# `n_contexts x n_sequences` labeled rows, so raise it with that product in mind.
+n_contexts: 512
+
+# Minimum prior *prediction times* (distinct (subject_id, time) rows, NOT events) required before
+# a prediction time is eligible for the draw.  Governs Stage 0 eligibility and the Stage 2 draw
+# range; matches `sample_query_sequences_config.yaml`, and is ignored for a supplied cohort.
+min_prediction_times_per_subject: 50
 
 # --- The N query sequences ------------------------------------------------
 # Path to designed sequences.  Leave null to instead draw `n_sequences` of them from the

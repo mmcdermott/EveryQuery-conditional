@@ -2,10 +2,10 @@
 
 Sibling of :mod:`~every_query.generate_tasks.sample_query_sequences` (scattered shape: every
 context draws its own independent query sequence).  This module produces the **dense** shape:
-a fixed set of ``N`` query sequences, each labeled at **every** context of a caller-supplied
-cohort.  For a given sequence the only thing varying across its rows is the patient, which is
-what per-sequence metrics need — pooling across heterogeneous sequences instead measures
-cross-query base-rate separation rather than within-task skill.
+a fixed set of ``N`` query sequences, each labeled at **every** context of one cohort.  For a
+given sequence the only thing varying across its rows is the patient, which is what per-sequence
+metrics need — pooling across heterogeneous sequences instead measures cross-query base-rate
+separation rather than within-task skill.
 
 Relationship to ``sample_evaluation_tasks``: same *motivation* (dense grid for evaluation),
 different *row shape*.  ``sample_evaluation_tasks`` emits flat ``TaskQuerySchema`` rows — one
@@ -17,8 +17,10 @@ scalar ``boolean_value`` per ``(subject, time, code, duration)`` — for the sin
 
 Pipeline (every stage but the grid build is imported from ``sample_query_sequences``):
 
-    1. Read the supplied cohort index from ``contexts_path`` — a parquet with at least
-       ``(subject_id, prediction_time)``; duplicate contexts are dropped.
+    1. Resolve the cohort — either read it from ``contexts_path`` (a parquet with at least
+       ``(subject_id, prediction_time)``), or (when that is null) sample ``n_contexts`` of them
+       from ``split`` itself via upstream Stages 0 + 2 (:func:`sample_grid_contexts`).  Duplicate
+       contexts are dropped either way: a dense grid asks each sequence about each context once.
     2. Resolve the ``N`` :class:`SequenceSpec` s: read designed ones from ``sequences_path``, or
        (when that is null) draw ``n_sequences`` once from the same
        ``uniform codes x log-uniform durations`` distribution the training sampler uses.
@@ -28,14 +30,21 @@ Pipeline (every stage but the grid build is imported from ``sample_query_sequenc
        :func:`~every_query.generate_tasks.sample_query_sequences.label_binary_occurrence`,
        align to ``QuerySeqSchema``, write.
 
+Both axes carry a tag into the combined file's name: ``contexts_tag`` is the cohort file's stem or
+``sampled{n_contexts}ctx``, ``specs_tag`` the spec file's stem or ``sampled{N}``.
+
 Because the cohort spans arbitrary subjects rather than one shard, events are gathered across
 every shard of ``split`` via ``read_events_for_subjects`` — which raises if any supplied subject
-is absent from the split, rather than silently labeling them all-``False``.
+is absent from the split, rather than silently labeling them all-``False``.  That holds on the
+sampled path too: it stays a single driver-side pass rather than a per-shard fan-out, because the
+combined output's defining contract is one context-major file (row ``i`` is
+``(contexts[i // N], specs[i % N])``), which sharding the output would break — and because
+``n_contexts`` bounds the cohort to the same size the supplied path already handles.
 
 Output layout, either
 
-    ``{out_dir}/{split}/{contexts_stem}__{specs_tag}.parquet``  (default, one combined file), or
-    ``{out_dir}/{spec_name}/{split}/tasks.parquet``             (``per_spec_dirs=true``),
+    ``{out_dir}/{split}/{contexts_tag}__{specs_tag}.parquet``  (default, one combined file), or
+    ``{out_dir}/{spec_name}/{split}/tasks.parquet``            (``per_spec_dirs=true``),
 
 both directly consumable as ``EQ_predict_sequences tasks_dir=...`` — MEDS-TorchData rglobs the
 task-labels dir, so per-spec dirs let you score (and compute metrics for) one designed task at a
@@ -62,6 +71,7 @@ from importlib.resources import files
 from pathlib import Path
 
 import hydra
+import numpy as np
 import polars as pl
 from omegaconf import DictConfig
 
@@ -73,11 +83,16 @@ from every_query.generate_tasks.sample_query_sequences import (
     label_binary_occurrence,
     read_events_for_subjects,
     read_supplied_contexts,
+    resolve_prediction_times,
 )
 from every_query.generate_tasks.sample_tasks import (
     _atomic_write_parquet,
     _require_path_arg,
+    build_prediction_times,
+    default_artifacts_dir,
+    prediction_time_counts_path,
     read_query_codes,
+    sample_patient_contexts,
 )
 from every_query.utils.seeds import derive_seed
 
@@ -483,6 +498,106 @@ def validate_spec_codes(specs: list[SequenceSpec], query_codes: list[str]) -> No
         )
 
 
+# ---------------------------------------------------------------------------
+# The cohort, source 2 of 2: sampled from the split via upstream Stages 0 + 2
+# ---------------------------------------------------------------------------
+
+
+def sample_grid_contexts(
+    data_dir: Path,
+    artifacts_dir: Path,
+    split: str,
+    n_contexts: int,
+    min_prediction_times_per_subject: int,
+    seed: int,
+    overwrite: bool = False,
+) -> pl.DataFrame:
+    """Draw the grid's cohort from ``split`` itself, for when no ``contexts_path`` is supplied.
+
+    The sampled counterpart to
+    :func:`~every_query.generate_tasks.sample_query_sequences.read_supplied_contexts`, assembled
+    entirely from upstream pieces so a sampled evaluation grid is scored at contexts from the
+    *same* distribution the training sampler draws from (``sample_query_sequences.run`` Stages 0
+    and 2, seeded on the same ``"contexts"`` axis):
+
+    1. :func:`~every_query.generate_tasks.sample_tasks.build_prediction_times` (Stage 0) writes /
+       reuses the ``_prediction_times`` map and ``_prediction_time_counts`` summary under
+       ``artifacts_dir`` — the ``{name}_artifacts`` sibling of ``out_dir`` (invariant 7).
+    2. :func:`~every_query.generate_tasks.sample_tasks.sample_patient_contexts` (Stage 2) draws
+       ``n_contexts`` ``(subject_id, shard, prediction_time_index)`` rows.
+    3. :func:`~every_query.generate_tasks.sample_query_sequences.resolve_prediction_times` turns
+       each shard's ``prediction_time_index`` *ranks* into real timestamps, one shard at a time --
+       ``build_dense_sequence_index_df`` and ``label_binary_occurrence`` both need a datetime, and
+       the per-shard call keeps that function's dtype guard and raise-on-null-join intact.
+
+    Stage 2 draws subjects **with replacement**, so the raw draw repeats contexts; a dense grid asks
+    each sequence about each context exactly once, so the draw is deduplicated here.  ``n_contexts``
+    is therefore a ceiling on the grid's width rather than an exact count — the same interpretation
+    the supplied path gives a cohort file that contains duplicate rows.
+
+    Args:
+        data_dir: MEDS root; the split's event shards live beneath it.
+        artifacts_dir: Intermediate-artifacts root (Stage 0 writes here, step 3 reads it back).
+        split: Split to sample from.
+        n_contexts: Number of contexts to draw, before deduplication.
+        min_prediction_times_per_subject: Stage 0 eligibility bound and Stage 2 draw floor.
+        seed: **Already-derived** seed for the context axis — pass
+            ``derive_seed(seed, "contexts")`` so the draw shares the training sampler's axis.
+        overwrite: Forwarded to Stage 0; forces a rebuild of a cached prediction-time map.
+
+    Returns:
+        Deduplicated ``(subject_id, prediction_time)`` rows sorted by both, shaped exactly like
+        ``read_supplied_contexts``' output so nothing downstream can tell the two sources apart.
+
+    Raises:
+        ValueError: If ``n_contexts < 1``, or a drawn context fails to resolve a timestamp.
+    """
+    if n_contexts < 1:
+        raise ValueError(f"n_contexts must be >= 1 (got {n_contexts})")
+
+    n_subjects = build_prediction_times(
+        path_to_data=data_dir,
+        training_task_artifacts_dir=artifacts_dir,
+        split=split,
+        min_prediction_times_per_subject=min_prediction_times_per_subject,
+        overwrite=overwrite,
+    )
+    logger.info("Stage 0: %s eligible subject(s) for split=%s.", f"{n_subjects:,}", split)
+
+    # Re-sort by subject_id so the subject_idx -> subject_id mapping is independent of parquet
+    # round-trip order (the same reason ``sample_query_sequences.run`` re-sorts).
+    counts = pl.read_parquet(prediction_time_counts_path(artifacts_dir, split)).sort("subject_id")
+    drawn = sample_patient_contexts(
+        prediction_time_counts=counts,
+        n=n_contexts,
+        min_prediction_times_per_subject=min_prediction_times_per_subject,
+        rng=np.random.default_rng(seed),
+    )
+    unique_ctx = drawn.unique(maintain_order=True)
+    if unique_ctx.height < drawn.height:
+        logger.info(
+            "Stage 2: drew %s context(s) with replacement; %s unique remain after dedup.",
+            f"{drawn.height:,}",
+            f"{unique_ctx.height:,}",
+        )
+
+    sid = TaskQuerySchema.subject_id_name
+    pt = TaskQuerySchema.prediction_time_name
+    # ``sort("shard")`` + ``maintain_order=True`` make the shard iteration order deterministic; the
+    # final ``sort(sid, pt)`` then makes the cohort order independent of it entirely.
+    resolved = pl.concat(
+        [
+            resolve_prediction_times(group, artifacts_dir, split, str(shard_key[0]))
+            for shard_key, group in unique_ctx.sort("shard").group_by("shard", maintain_order=True)
+        ]
+    )
+    return (
+        resolved.select(pl.col(sid).cast(pl.Int64), pl.col(pt).cast(pl.Datetime("us")))
+        .unique(maintain_order=True)
+        .sort(sid, pt)
+    )
+
+
 def _spec_fps(
     out_dir: Path,
     split: str,
@@ -500,8 +615,8 @@ def run_worker(
     data_dir: Path,
     out_dir: Path,
     split: str,
-    contexts_path: str | Path,
     query_codes: list[str],
+    contexts_path: str | Path | None = None,
     sequences_path: str | Path | None = None,
     n_sequences: int = 64,
     # Fixed length 3, inside training's 1..5 range: one length per grid keeps per-position
@@ -517,19 +632,43 @@ def run_worker(
     seed: int = 1,
     eos_first_fraction: float = 0.0,
     duration_mode: str = "random",
+    n_contexts: int = 512,
+    min_prediction_times_per_subject: int = 50,
     per_spec_dirs: bool = False,
     overwrite: bool = False,
 ) -> list[Path]:
-    """Label ``N`` shared query sequences across every context of a supplied cohort.
+    """Label ``N`` shared query sequences across every context of a cohort.
+
+    Both axes of the grid are resolved the same way — supply a path, or leave it ``None`` and it is
+    sampled:
+
+    ===================  ====================  =============================================
+    axis                 supplied              sampled (path is ``None``)
+    ===================  ====================  =============================================
+    the ``N`` sequences  ``sequences_path``    ``n_sequences`` from the training distribution
+    the cohort           ``contexts_path``     ``n_contexts`` via :func:`sample_grid_contexts`
+    ===================  ====================  =============================================
+
+    A supplied cohort is read verbatim (every one of its subjects must be present in ``split``); a
+    sampled one comes from upstream Stages 0 + 2 over ``split`` itself, whose intermediates land in
+    the ``{name}_artifacts`` sibling of ``out_dir`` (invariant 7).  Either way the cohort reaches
+    the grid build as plain ``(subject_id, prediction_time)`` rows, so the two sources differ only
+    in provenance — and in the output file's ``{contexts_tag}``: the cohort file's stem, or
+    ``sampled{n_contexts}ctx``.
 
     Args:
         data_dir: Root whose ``{data_dir}/data/{split}/*.parquet`` shards hold the cohort's events.
         out_dir: Output root (see the module docstring for the two layouts).
         split: Split whose shards to gather events from; must contain every cohort subject.
-        contexts_path: Parquet with at least ``(subject_id, prediction_time)`` — the cohort.
         query_codes: The model's query vocabulary; the sampling pool when ``sequences_path`` is
             ``None``, and the validation set for designed specs either way.
+        contexts_path: Parquet with at least ``(subject_id, prediction_time)`` — the cohort.
+            ``None`` samples ``n_contexts`` contexts from ``split`` instead.
         sequences_path: Designed specs (YAML/JSON/parquet).  ``None`` samples ``n_sequences``.
+        n_contexts: Contexts to draw when ``contexts_path`` is ``None`` — a ceiling, since the draw
+            is with replacement and then deduplicated.  Unused for a supplied cohort.
+        min_prediction_times_per_subject: Stage 0 eligibility bound and Stage 2 draw floor for the
+            sampled cohort.  Unused for a supplied cohort.
         per_spec_dirs: Write one ``{out_dir}/{spec_name}/{split}/tasks.parquet`` per spec instead
             of a single combined parquet.
         overwrite: Regenerate outputs that already exist.
@@ -568,26 +707,53 @@ def run_worker(
             )
 
     specs_tag = Path(sequences_path).stem if sequences_path else f"sampled{len(specs)}"
-    stem = f"{Path(contexts_path).stem}__{specs_tag}"
+    # ``contexts_path`` is None on the sampled path, so the cohort tag falls back to the *requested*
+    # draw size rather than the post-dedup height: output paths are resolved (and the
+    # already-exists check made) before any cohort is read.
+    contexts_tag = Path(contexts_path).stem if contexts_path is not None else f"sampled{n_contexts}ctx"
+    stem = f"{contexts_tag}__{specs_tag}"
     out_fps = _spec_fps(out_dir, split, stem, specs, per_spec_dirs)
     if not overwrite and all(fp.exists() for fp in out_fps):
         logger.info("All %d output(s) already exist (e.g. %s), skipping.", len(out_fps), out_fps[0])
         return []
 
-    contexts = read_supplied_contexts(contexts_path, n_replicates=1)
-    n_raw = contexts.height
-    contexts = contexts.unique(maintain_order=True)
-    if contexts.height < n_raw:
-        # A dense grid asks every sequence about every context once; duplicated cohort rows would
-        # silently double-weight those patients in the metrics.
-        logger.warning(
-            "Dropped %d duplicate (subject_id, prediction_time) row(s) from %s; %d unique contexts remain.",
-            n_raw - contexts.height,
-            contexts_path,
-            contexts.height,
+    if contexts_path is not None:
+        contexts = read_supplied_contexts(contexts_path, n_replicates=1)
+        n_raw = contexts.height
+        contexts = contexts.unique(maintain_order=True)
+        if contexts.height < n_raw:
+            # A dense grid asks every sequence about every context once; duplicated cohort rows
+            # would silently double-weight those patients in the metrics.
+            logger.warning(
+                "Dropped %d duplicate (subject_id, prediction_time) row(s) from %s; "
+                "%d unique contexts remain.",
+                n_raw - contexts.height,
+                contexts_path,
+                contexts.height,
+            )
+        if contexts.height == 0:
+            raise ValueError(f"{contexts_path} has no rows; nothing to evaluate.")
+    else:
+        contexts = sample_grid_contexts(
+            data_dir=Path(data_dir),
+            # The artifacts root has no config key of its own: it is always the
+            # ``{name}_artifacts`` sibling of out_dir, so the final-output and intermediate trees
+            # stay disjoint and never-nested (invariant 7).
+            artifacts_dir=default_artifacts_dir(Path(out_dir)),
+            split=split,
+            n_contexts=n_contexts,
+            min_prediction_times_per_subject=min_prediction_times_per_subject,
+            # The ``"contexts"`` axis, matching the training sampler; the spec draw above keeps its
+            # own deliberate ``("eval_seq_specs", split)`` axis.
+            seed=derive_seed(seed, "contexts"),
+            overwrite=overwrite,
         )
-    if contexts.height == 0:
-        raise ValueError(f"{contexts_path} has no rows; nothing to evaluate.")
+        logger.info(
+            "Sampled %d unique context(s) from split=%s (requested %d).",
+            contexts.height,
+            split,
+            n_contexts,
+        )
 
     events_df = read_events_for_subjects(data_dir / "data" / split, contexts[TaskQuerySchema.subject_id_name])
     logger.info(
@@ -642,25 +808,29 @@ def main(cfg: DictConfig) -> None:
         EQ_generate_evaluation_query_sequences \\
             contexts_path=cohort.parquet n_sequences=64 \\
             split=held_out data_dir=... out_dir=... query_codes=...
+
+    Usage (no cohort file at all — the grid's contexts are sampled from the split too, the way
+    ``EQ_generate_query_sequences`` samples its own).  This is the zero-argument default, so the
+    endpoint is runnable with nothing but the three path roots:
+
+        EQ_generate_evaluation_query_sequences \\
+            n_contexts=512 n_sequences=64 \\
+            split=held_out data_dir=... out_dir=... query_codes=...
     """
     data_dir = _require_path_arg(cfg.get("data_dir"), "data_dir")
     out_dir = _require_path_arg(cfg.get("out_dir"), "out_dir")
     query_codes = read_query_codes(cfg.get("query_codes"))
 
+    # Unset ``contexts_path`` is the sampled-cohort path (Stages 0 + 2 over the split), not an
+    # error: the two sources are peers, exactly as in ``sample_query_sequences.main``.
     contexts_path = cfg.get("contexts_path")
-    if contexts_path is None:
-        raise ValueError(
-            "contexts_path must be set: this endpoint labels a supplied cohort, so pass "
-            "contexts_path=/path/to/cohort.parquet (a parquet with subject_id + prediction_time). "
-            "To sample contexts from a shard instead, use EQ_generate_query_sequences."
-        )
 
     run_worker(
         data_dir=data_dir,
         out_dir=out_dir,
         split=str(cfg.split),
-        contexts_path=str(contexts_path),
         query_codes=query_codes,
+        contexts_path=None if contexts_path is None else str(contexts_path),
         sequences_path=cfg.get("sequences_path"),
         n_sequences=int(cfg.n_sequences),
         min_queries=int(cfg.min_queries),
@@ -671,6 +841,8 @@ def main(cfg: DictConfig) -> None:
         seed=int(cfg.seed),
         eos_first_fraction=float(cfg.get("eos_first_fraction", 0.0)),
         duration_mode=str(cfg.get("duration_mode", "random")),
+        n_contexts=int(cfg.n_contexts),
+        min_prediction_times_per_subject=int(cfg.min_prediction_times_per_subject),
         per_spec_dirs=bool(cfg.get("per_spec_dirs", False)),
         overwrite=bool(cfg.get("overwrite", False)),
     )
