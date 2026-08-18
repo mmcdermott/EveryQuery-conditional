@@ -26,11 +26,17 @@ import numpy as np
 import polars as pl
 from meds import DataSchema
 
-from eval_v2 import load_model, sample_eval_contexts, score_last
+from eval_v2 import (
+    add_context_sampling_args,
+    contexts_from_args,
+    load_model,
+    log_uniform_durations,
+    score_last,
+)
 from every_query.data.schema import QuerySeqSchema
 from every_query.data.seq_dataset import EOS_CODE
 from every_query.generate_tasks.sample_query_sequences import (
-    CTX_ID_COL, POSITION_COL, label_binary_occurrence, sample_log_uniform_durations,
+    CTX_ID_COL, POSITION_COL, label_binary_occurrence,
 )
 from every_query.generate_tasks.sample_tasks import read_query_codes
 
@@ -64,7 +70,7 @@ def build_uncensored_triples(ce, n_tasks, dmin, dmax, min_ctx, seed, max_valid=8
             if len(triples) >= n_tasks:
                 break
             C = codes_present[int(rng.integers(len(codes_present)))]
-            D = float(sample_log_uniform_durations(1, dmin, dmax, rng)[0])
+            D = float(log_uniform_durations(1, dmin, dmax, rng)[0])
             occ = ev.filter(pl.col(CODE) == C).select(SID, pl.col(TIME).alias("tau"))
             win = pl.duration(days=D)
             # uncensored: data past t+D
@@ -131,16 +137,18 @@ def main():
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--split", default="held_out")
     ap.add_argument("--n-tasks", type=int, default=40000)
-    ap.add_argument("--n-per-shard", type=int, default=700)
+    ap.add_argument("--min-ctx", type=int, default=10,
+                    help="Minimum prior events a context needs to be a valid anchor.")
     ap.add_argument("--dmin", type=int, default=1)
     ap.add_argument("--dmax", type=int, default=365)
     ap.add_argument("--batch-size", type=int, default=512)
     ap.add_argument("--boot", type=int, default=4000)
+    add_context_sampling_args(ap, default_n_contexts=8192)
     args = ap.parse_args()
 
     model = load_model(args.run_dir)
-    ce = sample_eval_contexts(args.intermediate, args.split, args.n_per_shard, seed=23)
-    triples = build_uncensored_triples(ce, args.n_tasks, args.dmin, args.dmax, args.min_ctx if hasattr(args, "min_ctx") else 10, seed=9)
+    ce = contexts_from_args(args, args.out.parent, seed=23)
+    triples = build_uncensored_triples(ce, args.n_tasks, args.dmin, args.dmax, args.min_ctx, seed=9)
     T = len(triples)
     print(f"{T} uncensored (query, pos, neg) triples")
 

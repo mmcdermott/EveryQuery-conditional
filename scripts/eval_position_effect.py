@@ -28,10 +28,17 @@ from every_query.generate_tasks.sample_query_sequences import (
     CTX_ID_COL,
     POSITION_COL,
     label_binary_occurrence,
-    sample_log_uniform_durations,
 )
 from every_query.generate_tasks.sample_tasks import read_query_codes
-from eval_v2 import curated_codes, load_model, sample_eval_contexts, score_last
+from every_query.utils.seeds import derive_seed
+from eval_v2 import (
+    add_context_sampling_args,
+    contexts_from_args,
+    curated_codes,
+    load_model,
+    log_uniform_durations,
+    score_last,
+)
 
 PRIORS = [0, 2, 4]
 
@@ -49,16 +56,16 @@ def build_sets(ce, codes, vocab, dmin, dmax, seed):
         ctx = ce["contexts"].filter(pl.col("_shard") == si).drop("_shard")
         if not ctx.height:
             continue
-        rng = np.random.default_rng(seed + si)
+        rng = np.random.default_rng(derive_seed(seed, si))
         rows = {n: [] for n in PRIORS}
         cid = 0
         for c in ctx.iter_rows(named=True):
             subj, t = c["subject_id"], c["prediction_time"]
             for code in codes:
-                d = float(sample_log_uniform_durations(1, dmin, dmax, rng)[0])
+                d = float(log_uniform_durations(1, dmin, dmax, rng)[0])
                 # a pool of random fillers (codes + durations) for this (context, code)
                 fcodes = [vocab[int(rng.integers(len(vocab)))] for _ in range(max(PRIORS))]
-                fdurs = sample_log_uniform_durations(max(PRIORS), dmin, dmax, rng).tolist()
+                fdurs = log_uniform_durations(max(PRIORS), dmin, dmax, rng).tolist()
                 for n in PRIORS:
                     seq = [(fcodes[j], fdurs[j]) for j in range(n)] + [(code, d)]
                     cidn = cid  # same cid space per setting is fine (separate frames)
@@ -101,19 +108,17 @@ def main():
     ap.add_argument("--processed", required=True, type=Path)
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--split", default="held_out")
-    ap.add_argument("--n-per-shard", type=int, default=200)
-    ap.add_argument("--limit-shards", type=int, default=None)
     ap.add_argument("--dmin", type=int, default=1)
     ap.add_argument("--dmax", type=int, default=365)
     ap.add_argument("--batch-size", type=int, default=512)
     ap.add_argument("--boot", type=int, default=1000)
+    add_context_sampling_args(ap, default_n_contexts=2048)
     args = ap.parse_args()
 
     model = load_model(args.run_dir)
     codes = curated_codes(args.processed)
     vocab = read_query_codes(args.processed)
-    ce = sample_eval_contexts(args.intermediate, args.split, args.n_per_shard, seed=11,
-                              limit_shards=args.limit_shards)
+    ce = contexts_from_args(args, args.out.parent, seed=11)
     print(f"{len(codes)} codes, {ce['contexts'].height} contexts")
 
     sets = build_sets(ce, codes, vocab, args.dmin, args.dmax, seed=101)

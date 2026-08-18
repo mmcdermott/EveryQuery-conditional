@@ -12,8 +12,10 @@
 
 set -euo pipefail
 
-ARCHIVE=/experiments/EQ_conditional_experiments
-COHORT_DIR="$ARCHIVE/data/tensorized_cohort"   # event shards + metadata/codes.parquet (the vocab)
+# Both overridable from the environment: the defaults name one specific archive, which is a
+# footgun for anyone else running this template unedited.
+ARCHIVE=${ARCHIVE:-/experiments/EQ_conditional_experiments}
+COHORT_DIR=${COHORT_DIR:-"$ARCHIVE/data/tensorized_cohort"}   # holds data/<split>/ and metadata/
 
 CONTEXTS_PARQUET=cohort.parquet                # <-- your index df
 OUT_DIR=cohort_tasks                           # -> $OUT_DIR/$SPLIT/<stem>__0000.parquet

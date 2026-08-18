@@ -2,21 +2,29 @@
 """Build designed, clinically meaningful query-sequence tasks over MIMIC-IV held-out subjects.
 
 Each task anchors prediction times at 24h after a (sampled) hospital admission and asks a fixed
-conditional query sequence.  All sequences start with the censor query, per the architecture's
-convention.  Output: one ``QuerySeqSchema`` parquet per task at ``{out_dir}/{task}/tasks.parquet``,
-directly consumable by ``EQ_predict_sequences tasks_dir={out_dir}/{task}``.
+conditional query sequence.  Every sequence opens with the end-of-record query
+(``TIMELINE//END``), which is how censoring is expressed since the v2 redesign.  Output: one
+``QuerySeqSchema`` parquet per task at ``{out_dir}/{task}/tasks.parquet``, directly consumable by
+``EQ_predict_sequences tasks_dir={out_dir}/{task}``.
 
-Tasks:
-  mortality_30d            [(CENSOR, 30), (MEDS_DEATH, 30)]
-  icu_then_death           [(CENSOR, 30), (MICU admission, 7), (MEDS_DEATH, 30)]
-  discharge_then_readmit   [(CENSOR, 90), (HOME discharge, 14), (ER readmission, 90)]
-  readmit_90d              [(CENSOR, 90), (ER readmission, 90)]
-  home_discharge_then_death [(CENSOR, 180), (HOME discharge, 30), (MEDS_DEATH, 180)]
+Tasks (EOS = ``TIMELINE//END``, at the short horizon below):
+  mortality_30d            [(EOS, 1), (MEDS_DEATH, 30)]
+  icu_then_death           [(EOS, 1), (MICU admission, 7), (MEDS_DEATH, 30)]
+  discharge_then_readmit   [(EOS, 1), (HOME discharge, 14), (ER readmission, 90)]
+  readmit_90d              [(EOS, 1), (ER readmission, 90)]
+  home_discharge_then_death [(EOS, 1), (HOME discharge, 30), (MEDS_DEATH, 180)]
 
 Usage:
     python scripts/make_clinical_task_sequences.py \
         --data-dir /path/to/intermediate --out-dir /path/to/tasks_clinical \
         --split held_out --max-anchors-per-subject 1 --seed 7
+
+Status (conditional-v2): repaired against the v2 binary labels.  The deleted ``__CENSOR__``
+sentinel ("is there data after t+d?") is now the real ``TIMELINE//END`` query ("does the record end
+within d?") -- its logical complement, and an ordinary answerable query rather than a sentinel.
+``label_binary_occurrence`` replaces the 3-valued ``label_sequence_index_df``: there is no null
+answer class any more, so nothing is dropped from downstream metrics and censoring must be read off
+the EOS answer itself.  Anchoring is unchanged (this script never used ``sample_contexts``).
 """
 
 import argparse
@@ -30,41 +38,43 @@ import numpy as np
 import polars as pl
 
 from every_query.data.schema import QuerySeqSchema
-from every_query.data.seq_dataset import CENSOR_QUERY_CODE
+from every_query.data.seq_dataset import EOS_CODE
 from every_query.generate_tasks.sample_query_sequences import (
     CTX_ID_COL,
     POSITION_COL,
-    label_sequence_index_df,
+    label_binary_occurrence,
 )
-from every_query.generate_tasks.sample_tasks import _read_event_shard, compute_max_time_per_subject
+from every_query.generate_tasks.sample_tasks import _read_event_shard
 
 DEATH = "MEDS_DEATH"
 MICU_ADM = "ICU_ADMISSION//Medical Intensive Care Unit (MICU)"
 HOME_DISCHARGE = "HOSPITAL_DISCHARGE//HOME"
 ER_ADMISSION = "HOSPITAL_ADMISSION//EW EMER.//EMERGENCY ROOM"
 
-# Censor-query horizon for position 0.  IMPORTANT: this must NOT equal the target horizon.
-# The censor query answers "is there data after prediction_time + horizon?", which — for a
-# terminal target like death, and structurally for any occurrence label (a False label requires
-# the window be fully observed) — is the complement of the target answer at the *same* horizon.
-# Teacher-forcing that same-horizon censor answer leaks the label (mortality AUROC -> 0.99).
-# We instead use a short, fixed censor horizon (default 1 day): it keeps position 0 in
-# distribution (the model always saw a censor query there) without revealing whether the
-# multi-day target window is observable.  Censoring of the TARGET is handled where it belongs —
-# the 3-valued label drops unobservable windows (null), which are excluded from the metrics.
-CENSOR_HORIZON_DAYS = 1.0
+# End-of-record query horizon for position 0.  IMPORTANT: this must NOT equal the target horizon.
+# ``[TIMELINE//END, h]`` answers "does the record end within h?", which — for a terminal target like
+# death, and structurally for any occurrence label at the same horizon — is near-deterministically
+# tied to the target answer at that *same* horizon.  Teacher-forcing a same-horizon EOS answer leaks
+# the label; that is the v1 failure this constant exists to avoid (30-day mortality AUROC 0.991, of
+# which 0.996 came from the censor answer alone).  A short, fixed horizon (default 1 day) keeps
+# position 0 in distribution without revealing whether the multi-day target window is observable.
+#
+# v2 note: under ``label_binary_occurrence`` there is no null/censored answer class — an
+# unobservable window is labeled False, not dropped.  So censoring of the TARGET is no longer
+# handled by the labeler; it must be read off the EOS query in the sequence.
+EOS_HORIZON_DAYS = 1.0
 
 TASKS: dict[str, list[tuple[str, float]]] = {
-    "mortality_30d": [(CENSOR_QUERY_CODE, CENSOR_HORIZON_DAYS), (DEATH, 30.0)],
-    "icu_then_death": [(CENSOR_QUERY_CODE, CENSOR_HORIZON_DAYS), (MICU_ADM, 7.0), (DEATH, 30.0)],
+    "mortality_30d": [(EOS_CODE, EOS_HORIZON_DAYS), (DEATH, 30.0)],
+    "icu_then_death": [(EOS_CODE, EOS_HORIZON_DAYS), (MICU_ADM, 7.0), (DEATH, 30.0)],
     "discharge_then_readmit": [
-        (CENSOR_QUERY_CODE, CENSOR_HORIZON_DAYS),
+        (EOS_CODE, EOS_HORIZON_DAYS),
         (HOME_DISCHARGE, 14.0),
         (ER_ADMISSION, 90.0),
     ],
-    "readmit_90d": [(CENSOR_QUERY_CODE, CENSOR_HORIZON_DAYS), (ER_ADMISSION, 90.0)],
+    "readmit_90d": [(EOS_CODE, EOS_HORIZON_DAYS), (ER_ADMISSION, 90.0)],
     "home_discharge_then_death": [
-        (CENSOR_QUERY_CODE, CENSOR_HORIZON_DAYS),
+        (EOS_CODE, EOS_HORIZON_DAYS),
         (HOME_DISCHARGE, 30.0),
         (DEATH, 180.0),
     ],
@@ -137,8 +147,6 @@ def main():
         anchors = build_anchors(events, args.max_anchors_per_subject, args.seed)
         if anchors.height == 0:
             continue
-        max_time = compute_max_time_per_subject(events)
-
         for task, spec in TASKS.items():
             n_q = len(spec)
             n_ctx = anchors.height
@@ -159,7 +167,7 @@ def main():
                 )
                 .sort(CTX_ID_COL, POSITION_COL)
             )
-            labeled = label_sequence_index_df(index_df, events, max_time)
+            labeled = label_binary_occurrence(index_df, events)
             per_task_frames[task].append(labeled)
 
     for task, frames in per_task_frames.items():
@@ -169,11 +177,14 @@ def main():
         aligned = QuerySeqSchema.align(df.to_arrow())
         pl.from_arrow(aligned).write_parquet(out_fp)
 
-        # Quick prevalence summary for the final (target) query.
+        # Quick prevalence summary for the final (target) query.  v2 answers are non-null
+        # booleans, so the old "censored fraction" is gone; the position-0 EOS answer is the
+        # closest replacement -- the share of anchors whose record ends inside EOS_HORIZON_DAYS.
         target = df.select(pl.col("answers").list.last().alias("t"))["t"]
+        record_ends = df.select(pl.col("answers").list.first().alias("e"))["e"]
         print(
-            f"{task}: {df.height} sequences; target prevalence "
-            f"{target.drop_nulls().mean():.4f} (censored {target.null_count() / df.height:.3f})"
+            f"{task}: {df.height} sequences; target prevalence {target.mean():.4f} "
+            f"(record ends within {EOS_HORIZON_DAYS:g}d for {record_ends.mean():.3f})"
         )
 
 

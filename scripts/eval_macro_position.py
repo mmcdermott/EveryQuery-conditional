@@ -26,12 +26,17 @@ import numpy as np
 import polars as pl
 from scipy import stats as sstats
 
-from eval_v2 import load_model, sample_eval_contexts, score_last
+from eval_v2 import (
+    add_context_sampling_args,
+    contexts_from_args,
+    load_model,
+    log_uniform_durations,
+    score_last,
+)
 from every_query.generate_tasks.sample_query_sequences import (
     CTX_ID_COL,
     POSITION_COL,
     label_binary_occurrence,
-    sample_log_uniform_durations,
 )
 from every_query.generate_tasks.sample_tasks import read_query_codes
 from every_query.data.schema import QuerySeqSchema
@@ -86,7 +91,7 @@ def build_triples_occurrence(ce, n_tasks, dmin, dmax, min_ctx, seed, scheme="pat
             if len(triples) >= n_tasks:
                 break
             C = codes_present[int(rng.integers(len(codes_present)))]
-            T = float(sample_log_uniform_durations(1, dmin, dmax, rng)[0])
+            T = float(log_uniform_durations(1, dmin, dmax, rng)[0])
             occ = ev.filter(pl.col(DataSchema.code_name) == C).select(sid, pl.col(time).alias("tau"))
             if occ.height > max_occ:
                 occ = occ.sample(n=max_occ, seed=int(rng.integers(1 << 31)))
@@ -144,7 +149,7 @@ def build_triples(ce, vocab, n_tasks, dmin, dmax, min_pos, min_neg, seed):
         # candidate queries for this shard
         n_cand = max(64, n_tasks // max(1, len(ce["events"])) * 4)
         codes = [vocab[int(rng.integers(len(vocab)))] for _ in range(n_cand)]
-        durs = sample_log_uniform_durations(n_cand, dmin, dmax, rng)
+        durs = log_uniform_durations(n_cand, dmin, dmax, rng)
         # build (query x context) grid, label per-row occurrence in one pass
         ctx_rows = ctx.select("subject_id", "prediction_time").to_dicts()
         rows = []
@@ -181,7 +186,7 @@ def build_position_tasks(triples, max_pos, vocab, dmin, dmax, seed):
         cid = 0
         for (code, d, ps, pt, ns, nt) in triples:
             fcodes = [vocab[int(rng.integers(len(vocab)))] for _ in range(p)]
-            fdurs = sample_log_uniform_durations(p, dmin, dmax, rng).tolist() if p else []
+            fdurs = log_uniform_durations(p, dmin, dmax, rng).tolist() if p else []
             for (subj, t) in [(ps, pt), (ns, nt)]:
                 seq = [(fcodes[j], fdurs[j]) for j in range(p)] + [(code, d)]
                 for pos, (cc, dd) in enumerate(seq):
@@ -207,7 +212,6 @@ def main():
     ap.add_argument("--split", default="held_out")
     ap.add_argument("--n-tasks", type=int, default=2000)
     ap.add_argument("--max-pos", type=int, default=5)
-    ap.add_argument("--n-per-shard", type=int, default=400)
     ap.add_argument("--sampling", choices=["patient", "pair", "context-pool"], default="patient",
                     help="positive/negative sampling scheme: 'patient' (patient-uniform, default), "
                          "'pair' (context-uniform over positive pairs), 'context-pool' (legacy random pool)")
@@ -218,11 +222,12 @@ def main():
     ap.add_argument("--dmax", type=int, default=365)
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--boot", type=int, default=3000)
+    add_context_sampling_args(ap, default_n_contexts=4096)
     args = ap.parse_args()
 
     model = load_model(args.run_dir)
     vocab = read_query_codes(args.processed)
-    ce = sample_eval_contexts(args.intermediate, args.split, args.n_per_shard, seed=21)
+    ce = contexts_from_args(args, args.out.parent, seed=21)
     print(f"sampling triples (scheme={args.sampling}) over {ce['contexts'].height} contexts...")
     if args.sampling == "context-pool":
         triples = build_triples(ce, vocab, args.n_tasks, args.dmin, args.dmax, args.min_pos, args.min_neg, seed=5)

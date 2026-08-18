@@ -110,6 +110,11 @@ addopts = [
   # test surface), so importing them at collection time only couples the suite to whatever the
   # library API looked like when a given experiment was run.  Upstream keeps research code in a
   # separate repo entirely (#186); this fork vendors it for self-containment instead.
+  #
+  # This exclusion is what hid several scripts sitting broken behind stale `every_query` imports
+  # across the sampler redesign.  `tests/test_cli_smoke.py::test_script_imports` now imports each
+  # one explicitly, which catches that drift without dragging them into doctest collection (where a
+  # missing optional dep like reportlab would be a collection *error*, not a skip).
   "--ignore=scripts",
   "--ignore=AGENTS.md",
   "--ignore=CONTRIBUTORS.md",
@@ -129,7 +134,14 @@ Issues = "https://github.com/payalchandak/EveryQuery/issues"
 [tool.ruff] # Ruff configuration for linting and formatting
 target-version = "py311"
 line-length = 110
-extend-exclude = ["docs/index.md"]
+# `scripts/` holds the conditional-model research drivers, ported verbatim from the fork
+# (CONDITIONAL_V2_INTEGRATION_PLAN.md §2, "Research artifacts: port everything as-is").  They arrived
+# with ~200 pre-existing ruff findings — long lines, single-letter stats names, unused loop vars —
+# and `ruff format` would rewrite all of them wholesale.  Since code-quality CI runs pre-commit over
+# *changed* files, that debt turns every future edit to a script into a red build unrelated to the
+# edit.  Excluded deliberately, matching the `--ignore=scripts` pytest exclusion above; the guard
+# that actually matters for these files is `tests/test_cli_smoke.py::test_script_imports`.
+extend-exclude = ["docs/index.md", "scripts"]
 
 # Enable linters
 [tool.ruff.lint]

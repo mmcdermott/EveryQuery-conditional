@@ -12,7 +12,20 @@ Produces, under ``--out-dir``:
   summary.json                          headline numbers
 
 This script imports the pipeline functions directly (no subprocess) so it can also build the
-"singleton" counterfactual (each query asked alone, i.e. [censor, q]) for the conditioning study.
+"singleton" counterfactual (each query asked alone, i.e. [EOS, q]) for the conditioning study.
+
+Status (conditional-v2): this script reads **position 0 as the censoring query** throughout —
+``censor_auroc``/``censor_prevalence``, the ``[EOS, q]`` singleton prefix, and the by-position
+figures all assume it.  That was guaranteed in v1 (every sequence began with the ``__CENSOR__``
+sentinel); it is *not* guaranteed now.  The v2 sampler draws fully random sequences and only puts
+the end-of-record query first when ``eos_first_fraction`` says so, so :func:`require_eos_first`
+below hard-fails on a tasks dir that was not generated with ``eos_first_fraction=1.0`` rather than
+silently reporting a random query's AUROC as the censoring number.
+
+Two further v1 assumptions are now inert rather than wrong: answers are non-null booleans, so every
+``*censored_frac`` reads 0.0 and ``answer.is_not_null()`` filters nothing.  Censoring is visible
+only through the EOS query itself.  ``eval_v3.py`` is the current evaluator; this script and its
+partner ``build_report.py`` are kept as the record of the v1 report.
 """
 
 import argparse
@@ -34,7 +47,7 @@ from sklearn.metrics import roc_auc_score
 
 from every_query.data.seq_dataset import (
     ANSWER_YES,
-    CENSOR_QUERY_CODE,
+    EOS_CODE,
     ConditionalQueryPytorchDataset,
 )
 from every_query.evaluate.evaluate_sequences import compute_sequence_metrics
@@ -135,11 +148,31 @@ def make_dataset(cohort_dir, tasks_dir, split, max_seq_len=256):
     return ConditionalQueryPytorchDataset(cfg, split=split)
 
 
+def require_eos_first(ds, what: str) -> None:
+    """Abort unless position 0 of every sequence in ``ds`` is the end-of-record query.
+
+    Everything below treats position 0 as "the censoring query".  In v1 that held by construction;
+    in v2 it holds only for sequences generated with ``eos_first_fraction=1.0``.  Without this check
+    the script runs to completion and reports an arbitrary query code's AUROC under the key
+    ``censor_auroc`` — a wrong number that looks right.
+    """
+    first = ds.schema_df.select(pl.col("queries").list.first().alias("q"))["q"]
+    offenders = first.filter(first != EOS_CODE)
+    if offenders.len():
+        raise SystemExit(
+            f"{what}: {offenders.len()} of {first.len()} sequences do not start with "
+            f"{EOS_CODE!r} (e.g. {offenders[0]!r}).  This script reads position 0 as the censoring "
+            "query, which the v2 sampler only guarantees when the sequences were generated with "
+            "`EQ_generate_query_sequences ... eos_first_fraction=1.0`.  Regenerate the tasks with "
+            "that setting, or use scripts/eval_v3.py, which makes no position-0 assumption."
+        )
+
+
 # ── Conditioning study: singleton vs in-context ─────────────────────────
 
 
 def build_singleton_dataset(cohort_dir, tasks_dir, split, tmp_dir, position=1, n_seq=20000):
-    """Write a tasks dir where each sequence is [censor, q_j] for the j-th query of each
+    """Write a tasks dir where each sequence is [EOS, q_j] for the j-th query of each
     original sequence — the same query, asked in isolation — so we can measure how much the
     preceding answers change the prediction for that query."""
     from every_query.data.schema import QuerySeqSchema
@@ -153,7 +186,7 @@ def build_singleton_dataset(cohort_dir, tasks_dir, split, tmp_dir, position=1, n
         "subject_id",
         "prediction_time",
         pl.concat_list(
-            pl.col("queries").list.first(),  # censor
+            pl.col("queries").list.first(),  # the end-of-record (censoring) query
             pl.col("queries").list.get(position),
         ).alias("queries"),
         pl.concat_list(
@@ -202,6 +235,7 @@ def main():
 
     # 1. Random held-out sequences ------------------------------------------------------
     ds = make_dataset(args.cohort_dir, args.tasks_dir, args.split)
+    require_eos_first(ds, f"random eval tasks ({args.tasks_dir})")
     print(f"random eval: {len(ds)} sequences")
     rnd = predict_dataset(model, ds, args.batch_size)
     rnd.write_parquet(args.out_dir / "random_predictions.parquet")
@@ -256,6 +290,7 @@ def main():
     for task_dir in sorted(p for p in args.clinical_dir.iterdir() if p.is_dir()):
         task = task_dir.name
         cds = make_dataset(args.cohort_dir, task_dir, args.split)
+        require_eos_first(cds, f"clinical task {task!r} ({task_dir})")
         preds = predict_dataset(model, cds, args.batch_size)
         preds.write_parquet(args.out_dir / "clinical" / f"{task}.predictions.parquet")
 
