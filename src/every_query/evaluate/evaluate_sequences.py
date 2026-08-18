@@ -30,7 +30,14 @@ logging.basicConfig(level=logging.INFO)
 CONFIGS = str(files("every_query") / "evaluate" / "configs")
 
 # (upper-exclusive edge in days, bucket label) pairs for the by-query table.
-DURATION_BUCKETS = [(2, "1d"), (8, "2-7d"), (31, "8-30d"), (91, "31-90d"), (181, "91-180d"), (366, "181-365d")]
+DURATION_BUCKETS = [
+    (2, "1d"),
+    (8, "2-7d"),
+    (31, "8-30d"),
+    (91, "31-90d"),
+    (181, "91-180d"),
+    (366, "181-365d"),
+]
 
 
 def _bucket_expr(col: str = "duration_days") -> pl.Expr:

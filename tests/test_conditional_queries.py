@@ -16,7 +16,6 @@ import inspect
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
 import polars as pl
 import pytest
 import torch
@@ -26,7 +25,6 @@ from every_query.data.seq_dataset import (
     ANSWERS_COL,
     EOS_CODE,
     ConditionalQueryBatch,
-    ConditionalQueryPytorchDataset,
 )
 from every_query.generate_tasks import sample_evaluation_query_sequences
 from every_query.generate_tasks.sample_evaluation_query_sequences import (
@@ -129,12 +127,12 @@ def make_batch(
     q_durations: list[list[float]] | None = None,
     q_mask: list[list[bool]] | None = None,
 ) -> ConditionalQueryBatch:
-    """Build a small ConditionalQueryBatch with sensible defaults (2 samples × 3 queries)."""
+    """Build a small ConditionalQueryBatch with sensible defaults (2 samples x 3 queries)."""
     B, L = len(q_answers), len(q_answers[0])
     if patient_codes is None:
         patient_codes = [[3, 4, 5, 6]] * B
     if q_codes is None:
-        q_codes = [[EOS_IDX] + list(range(7, 6 + L))] * B
+        q_codes = [[EOS_IDX, *range(7, 6 + L)]] * B
     if q_durations is None:
         q_durations = [[30.0] * L] * B
     if q_mask is None:
@@ -204,9 +202,7 @@ def test_own_query_changes_own_logit(tiny_model):
     """The prediction for A_j must depend on Q_j's code and duration."""
     base = make_batch([[ANSWER_YES, ANSWER_NO, ANSWER_YES]])
     diff_code = make_batch([[ANSWER_YES, ANSWER_NO, ANSWER_YES]], q_codes=[[EOS_IDX, 30, 8]])
-    diff_dur = make_batch(
-        [[ANSWER_YES, ANSWER_NO, ANSWER_YES]], q_durations=[[30.0, 300.0, 30.0]]
-    )
+    diff_dur = make_batch([[ANSWER_YES, ANSWER_NO, ANSWER_YES]], q_durations=[[30.0, 300.0, 30.0]])
     _, out = tiny_model(base)
     _, out_code = tiny_model(diff_code)
     _, out_dur = tiny_model(diff_dur)

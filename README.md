@@ -14,6 +14,16 @@ Given a MEDS dataset, EveryQuery trains a ModernBERT-style encoder to answer
 
 EveryQuery is built on the [MEDS](https://github.com/Medical-Event-Data-Standard) ecosystem leveraging [`meds-torch-data`](https://github.com/mmcdermott/meds-torch-data) for tensorization and [`MEDS-transforms`](https://github.com/mmcdermott/MEDS_transforms) for preprocessing.
 
+> [!IMPORTANT]
+> **This fork (`conditional-v2` branch) adds a conditional query-sequence model** — a
+> bidirectional patient encoder + block-autoregressive decoder that answers an ordered list of
+> queries, each conditioned on the patient state and the teacher-forced answers of all earlier
+> queries. Binary observed-occurrence labels; censoring is expressed by querying the real
+> `TIMELINE//END` code rather than via a separate head. See
+> **[CONDITIONAL_QUERIES.md](CONDITIONAL_QUERIES.md)** for the design, the new
+> `EQ_generate_query_sequences` / `EQ_predict_sequences` / `EQ_evaluate_sequences` CLIs, the macro
+> per-task evaluation methodology, and results.
+
 ## Install
 
 **As a dependency:**
@@ -65,6 +75,17 @@ and end-to-end subprocess tests that run the real script against a fixture cohor
 | `EQ_train`                      | training         | Train the ModernBERT encoder on the labeled tasks                                                                       | smoke; unit `test_training.py`; E2E `test_train_cli.py` + `test_train.py`; signal test `tests/training_validity/` (slow) |
 | `EQ_predict`                    | inference        | Consume a `TaskQuerySchema` parquet dir + checkpoint, emit a `PredictionSchema` parquet (`censor_prob`, `occurs_prob`)  | smoke; E2E `test_predict_cli.py` (row-order preserved); exercised by `tests/training_validity/` (slow)                   |
 | `EQ_evaluate`                   | metrics          | Consume a `PredictionSchema` parquet, write per-`(query, duration_days)` metrics (`occurs_auroc`, `censor_auroc`, etc.) | smoke; E2E `test_evaluate_cli.py`; exercised by `tests/training_validity/` (slow)                                        |
+
+The conditional query-sequence pipeline (this fork) adds a parallel set of CLIs that consume and
+emit `QuerySeqSchema` rather than `TaskQuerySchema` — see
+[CONDITIONAL_QUERIES.md](CONDITIONAL_QUERIES.md):
+
+| Script                                   | Stage             | Purpose                                                                                                                    | Tests                              |
+| ---------------------------------------- | ----------------- | -------------------------------------------------------------------------------------------------------------------------- | ---------------------------------- |
+| `EQ_generate_query_sequences`            | PT seq labels     | Sample `K` queries per `(subject, prediction_time)` context and label each by observed occurrence (`QuerySeqSchema` parquets) | `test_conditional_cli.py`          |
+| `EQ_generate_evaluation_query_sequences` | eval seq labels   | Label the same `N` query sequences across a supplied cohort (dense grid counterpart)                                        | `test_conditional_cli.py`          |
+| `EQ_predict_sequences`                   | inference         | Consume `QuerySeqSchema` + a conditional checkpoint, emit per-position probabilities                                        | `test_conditional_cli.py`          |
+| `EQ_evaluate_sequences`                  | metrics           | Per-position and macro per-task metrics over conditional predictions                                                        | `test_conditional_cli.py`          |
 
 The legacy four-stage evaluator (`every_query.evaluate.eval`, with `gen_index_times`, `gen_task`, `select_model` siblings) has been deleted; recover from git history if needed. [#83](https://github.com/payalchandak/EveryQuery/issues/83) tracks the cross-model leaderboard, which now lives in the `EveryQueryExperiments` repo.
 

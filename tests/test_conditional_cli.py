@@ -15,7 +15,7 @@ import pytest
 import yaml
 from meds import train_split, tuning_split
 
-from conftest import ENSURE_ENV_PLACEHOLDERS, run_and_check
+from conftest import run_and_check
 
 EVAL_V3 = Path(__file__).parent.parent / "scripts" / "eval_v3.py"
 
@@ -284,7 +284,6 @@ def cq_trained_model_dir(
             f"datamodule.config.tensorized_cohort_dir={eq_preprocessed_dataset!s}",
             f"datamodule.config.task_labels_dir={cq_sequence_tasks_dir!s}",
         ],
-        env=ENSURE_ENV_PLACEHOLDERS,
         timeout=300.0,
     )
     return output_dir
@@ -313,7 +312,6 @@ def test_conditional_predict_and_evaluate(
             f"output_parquet={predictions_fp!s}",
             f"split={tuning_split}",
         ],
-        env=ENSURE_ENV_PLACEHOLDERS,
         timeout=300.0,
     )
 
@@ -380,7 +378,6 @@ def test_dense_grid_is_scoreable_by_predict_sequences(
             f"output_parquet={predictions_fp!s}",
             f"split={tuning_split}",
         ],
-        env=ENSURE_ENV_PLACEHOLDERS,
         timeout=300.0,
     )
 
@@ -452,7 +449,6 @@ def test_eval_v3_scores_supplied_sequences(
             "--min-neg",
             "1",
         ],
-        env=ENSURE_ENV_PLACEHOLDERS,
         timeout=300.0,
     )
 
@@ -507,7 +503,6 @@ def test_eval_v3_scores_supplied_sequences(
             "--force-prior",
             "yes",
         ],
-        env=ENSURE_ENV_PLACEHOLDERS,
         timeout=300.0,
     )
     forced = pl.read_parquet(forced_dir / "predictions.parquet")
@@ -643,6 +638,5 @@ def test_eval_v3_rejects_wrong_split(
                 "--out-dir",
                 str(tmp_path / "out"),
             ],
-            env=ENSURE_ENV_PLACEHOLDERS,
             timeout=300.0,
         )

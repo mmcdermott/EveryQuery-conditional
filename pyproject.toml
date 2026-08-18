@@ -85,6 +85,13 @@ EQ_predict = "every_query.predict.predict:main"
 # EQ_gen_eval_index / EQ_gen_eval_tasks / EQ_select_model) has been deleted per
 # the #83 consolidation wave; recover from git history if needed.
 EQ_evaluate = "every_query.evaluate.evaluate:main"
+# Conditional query-sequence pipeline (block-autoregressive decoder over query/answer
+# blocks; see src/every_query/model/conditional_model.py).
+EQ_generate_query_sequences = "every_query.generate_tasks.sample_query_sequences:main"
+# Dense counterpart: labels the same N query sequences across a supplied cohort.
+EQ_generate_evaluation_query_sequences = "every_query.generate_tasks.sample_evaluation_query_sequences:main"
+EQ_predict_sequences = "every_query.predict.predict_sequences:main"
+EQ_evaluate_sequences = "every_query.evaluate.evaluate_sequences:main"
 
 [tool.coverage.run]
 # Measure coverage for EQ_* CLIs launched via subprocess in tests/test_cli_smoke.py.
@@ -98,6 +105,12 @@ addopts = [
   "--color=yes",
   "--doctest-modules", # Ensures that doctest runs
   "--ignore=docs",
+  # Research-only eval/report builders for the conditional model.  `--doctest-modules` imports
+  # every .py under the rootdir, and these are one-off scripts with hardcoded run paths (not a
+  # test surface), so importing them at collection time only couples the suite to whatever the
+  # library API looked like when a given experiment was run.  Upstream keeps research code in a
+  # separate repo entirely (#186); this fork vendors it for self-containment instead.
+  "--ignore=scripts",
   "--ignore=AGENTS.md",
   "--ignore=CONTRIBUTORS.md",
   "--doctest-glob=*.md",
@@ -140,4 +153,6 @@ select = [
 "*.ipynb" = ["E402"]  # Notebooks have imports spread across cells
 
 [tool.ruff.lint.pep8-naming]
-extend-ignore-names = ["*MEDS*", "*NRT*", "D", "M", "L", "LR*"]
+# B/S/H join the existing D/M/L: single-capital tensor-shape locals (batch, sequence, hidden),
+# the conventional notation in the model and dataset code.
+extend-ignore-names = ["*MEDS*", "*NRT*", "D", "M", "L", "LR*", "B", "S", "H"]

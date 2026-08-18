@@ -12,7 +12,8 @@ probabilities.
 ├── README.md
 ├── __init__.py
 ├── configs
-│   └── predict.yaml
+│   ├── predict.yaml
+│   └── predict_sequences.yaml
 ├── external_tasks
 │   ├── README.md
 │   ├── __init__.py
@@ -24,6 +25,7 @@ probabilities.
 │   ├── get_per_code_from_composite.py
 │   └── process_composite.py
 ├── predict.py
+├── predict_sequences.py
 └── schema.py
 
 ```
@@ -31,7 +33,13 @@ probabilities.
 Key files:
 
 - `predict.py` — `EQ_predict` (inference-only Hydra main).
+- `predict_sequences.py` — `EQ_predict_sequences`: the conditional counterpart. Consumes
+  `QuerySeqSchema` parquets plus a `ConditionalQueryLightningModule` checkpoint and runs
+  teacher-forced inference, emitting one flat row per query *position*
+  (`subject_id`, `prediction_time`, `position`, `query`, `duration_days`, `answer`, `answer_prob`).
 - `schema.py` — `PredictionSchema` (`TaskQuerySchema` + `censor_prob` + `occurs_prob`).
+- `configs/predict_sequences.yaml` — same required trio as `predict.yaml`
+  (`model_run_dir`, `tasks_dir`, `output_parquet`), pointed at a conditional training run.
 - `configs/predict.yaml` — required: `model_run_dir`, `tasks_dir`, `output_parquet`; optional: `ckpt_name`, `split` (`held_out` | `tuning`), `overwrite` (default `false` — refuses to clobber an existing `output_parquet`; pass `overwrite=true` to replace).
 - `external_tasks/` — convert + aggregate tasks outside EQ's native vocabulary (`aces_to_eq.py`, `process_composite.py`, `get_per_code_from_composite.py`).
 

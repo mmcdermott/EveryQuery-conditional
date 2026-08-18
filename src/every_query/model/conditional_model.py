@@ -279,9 +279,9 @@ class ConditionalQueryModel(torch.nn.Module):
         device = tokens.device
         block_idx = torch.arange(L, device=device).clamp(max=self.max_queries - 1)
         tokens = tokens + self.block_pos_embed(block_idx).view(1, L, 1, -1)
-        tokens = tokens + self.token_type_embed(
-            torch.arange(TOKENS_PER_QUERY, device=device)
-        ).view(1, 1, TOKENS_PER_QUERY, -1)
+        tokens = tokens + self.token_type_embed(torch.arange(TOKENS_PER_QUERY, device=device)).view(
+            1, 1, TOKENS_PER_QUERY, -1
+        )
 
         return tokens.reshape(B, L * TOKENS_PER_QUERY, -1)
 
@@ -291,7 +291,7 @@ class ConditionalQueryModel(torch.nn.Module):
         Expects a ``ConditionalQueryBatch`` with ``code`` (patient tokens), ``q_codes``,
         ``q_durations``, ``q_answers`` and ``q_mask``.
         """
-        B, L = batch.q_codes.shape
+        _, L = batch.q_codes.shape
 
         enc_attention_mask = batch.code != batch.PAD_INDEX
         memory = self.HF_model(input_ids=batch.code, attention_mask=enc_attention_mask).last_hidden_state

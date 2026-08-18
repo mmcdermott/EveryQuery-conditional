@@ -1,14 +1,25 @@
 # `generate_tasks/`
 
-Task-label generation stage of the EveryQuery pipeline. Two console scripts
-live here, each producing a `TaskQuerySchema`-conformant parquet but with
-different row distributions:
+Task-label generation stage of the EveryQuery pipeline. Console scripts live here in two
+families of (scattered-for-training, dense-for-evaluation) pairs — one per model.
+
+**Single-query model**, producing `TaskQuerySchema` rows (one scalar `boolean_value` per
+`(subject, time, code, duration)`):
 
 - **`EQ_generate_training_tasks`** — scattered shape: `num_queries` independent
     `(code, duration_days)` queries × `num_contexts_per_query` patient contexts,
     for pretraining. Runs a single-process 5-stage pipeline (see below).
 - **`EQ_generate_evaluation_tasks`** — dense-grid shape: sampled prediction
     times × `(codes × durations)`, for feeding `EQ_predict` → `EQ_evaluate`.
+
+**Conditional query-sequence model** (this fork), producing `QuerySeqSchema` rows (aligned
+`queries` / `durations` / `answers` list columns per context):
+
+- **`EQ_generate_query_sequences`** — scattered shape: every context draws its own
+    independent sequence of `Uniform{min_queries..max_queries}` queries, for pretraining.
+- **`EQ_generate_evaluation_query_sequences`** — dense-grid shape: the *same* `N` query
+    sequences labeled at every context of a supplied cohort, for feeding
+    `EQ_predict_sequences` → `EQ_evaluate_sequences`.
 
 ## What lives here
 
@@ -46,6 +57,35 @@ different row distributions:
     the optional in-training `TaskAurocTrackingCallback` — see
     `trainer.callbacks.task_auroc_tracking` in `train/configs/config.yaml`.
 
+- **`sample_query_sequences.py`** — scattered conditional-sequence generator. Per context,
+    draws `Uniform{min_queries..max_queries}` iid `(code, duration)` queries in random order
+    (the end-of-timeline code `TIMELINE//END` is an ordinary code, not a privileged censor
+    slot) and labels each with a binary observed-occurrence answer — there is no censoring
+    null, because censoring is expressed by the `TIMELINE//END` query itself. Registered as
+    `EQ_generate_query_sequences`.
+
+    > **Not yet restructured.** Contexts currently come only from a supplied
+    > `(subject_id, prediction_time)` parquet (`contexts_path=...`). The sampled-context path
+    > raises `NotImplementedError`: it needs the Stage 0/2/3 rewrite that ports this module onto
+    > the same 5-stage pipeline as `sample_tasks.py` (Phase 2 of
+    > `CONDITIONAL_V2_INTEGRATION_PLAN.md`). The fork's shard-local `sample_contexts` helper no
+    > longer exists upstream, and `sample_patient_contexts` is not a drop-in for it — it consumes
+    > a Stage 0 `_prediction_time_counts` table and returns a `prediction_time_index`, not a
+    > timestamp.
+
+- **`sample_evaluation_query_sequences.py`** — dense-grid conditional-sequence generator.
+    Takes a supplied cohort (`contexts_path`, required) and labels the same `N` sequences at
+    every context in it, so the only thing varying across a given sequence's rows is the
+    patient. The `N` sequences are either designed (`sequences_path=tasks.yaml`, a mapping of
+    `name -> [[code, duration], ...]`) or drawn once from the training query distribution
+    (`n_sequences=64`). Reuses `sample_query_sequences`'s cohort reader, cross-shard event
+    gather, and `label_binary_occurrence` labeler; only the grid build is its own. Registered
+    as `EQ_generate_evaluation_query_sequences`.
+
+- **`configs/sample_query_sequences_config.yaml`** / **`configs/sample_evaluation_query_sequences_config.yaml`**
+    — the conditional endpoints' configs. Same required-path-arg contract as the single-query
+    ones below: `data_dir` / `out_dir` / `query_codes` are all `???`, no env fallback.
+
 - **`configs/sample_training_tasks_config.yaml`** / **`configs/sample_evaluation_tasks_config.yaml`**
     / **`configs/sample_task_tracking_pairs_config.yaml`**
     — shipped Hydra configs. Path roots (`data_dir`, `out_dir`, and `query_codes` — pass the
@@ -62,9 +102,13 @@ EQ_process_data       EQ_generate_training_tasks           EQ_train       EQ_pre
                       EQ_generate_evaluation_tasks ────────────────────►  (inference input)
                       EQ_generate_evaluation_tasks(split=tuning)
                         → EQ_sample_task_tracking_pairs ──►  (in-training tracking input)
+
+                      EQ_generate_query_sequences          EQ_train       EQ_predict_sequences
+                      EQ_generate_evaluation_query_sequences ───────────►  (inference input)
+                                                                          EQ_evaluate_sequences
 ```
 
-Both endpoints consume:
+All endpoints consume:
 
 1. Event shards at `$TOKENIZED_EVENTS_DIR/data/{split}/*.parquet` (from
     [`preprocessing/`](../preprocessing/)).
@@ -80,6 +124,13 @@ own), so the two trees never nest and cleanup is a single `rm -rf` of the artifa
 
 **Evaluation-task outputs** land at `$EVAL_TASKS_DIR/eval/{split}/*.parquet`. The separate `eval/`
 subdirectory keeps the two row distributions from colliding in one directory.
+
+**Sequence outputs** follow the same two-root rule: `out_dir` holds final parquets only, with all
+intermediates in the sibling `{name}_artifacts` root. Both sequence endpoints write layouts
+directly usable as `EQ_predict_sequences tasks_dir=...` — MEDS-TorchData rglobs that directory, so
+point it at exactly the parquets you want scored. Note that adopting this layout **invalidates run
+directories produced by the fork**, and the vendored `scripts/` eval helpers still carry hardcoded
+paths from the old layout.
 
 ## Running it
 
@@ -143,6 +194,34 @@ small (2 rows per task) and fixed for the duration of a training run — point
 have `EQ_train` log a macro-averaged, per-task-sampled AUROC (`tuning/occurs_auroc_macro_sampled`)
 every validation pass, without paying the cost of scoring the full tuning split.
 
+### Conditional query sequences
+
+```bash
+# Dense evaluation grid: N designed sequences x every context of one cohort.
+# per_spec_dirs=true writes {out_dir}/{name}/{split}/tasks.parquet, so each task is
+# independently scoreable by `EQ_predict_sequences tasks_dir=...`.
+EQ_generate_evaluation_query_sequences \
+	data_dir=$TOKENIZED_EVENTS_DIR out_dir=$EVAL_TASKS_DIR query_codes=$TENSORIZED_COHORT_DIR \
+	contexts_path=cohort.parquet sequences_path=tasks.yaml \
+	split=held_out per_spec_dirs=true
+
+# Or N sequences drawn once from the training distribution, one combined parquet at
+# {out_dir}/{split}/{cohort_stem}__sampled64.parquet.  The sampling defaults mirror
+# `sample_query_sequences_config.yaml`; if the checkpoint was trained with overrides, pass the
+# same ones here (e.g. min_queries=5 max_queries=5 duration_max=365) — an out-of-distribution
+# horizon shows up as an unexplained metric shift, not as an error:
+EQ_generate_evaluation_query_sequences \
+	data_dir=$TOKENIZED_EVENTS_DIR out_dir=$EVAL_TASKS_DIR query_codes=$TENSORIZED_COHORT_DIR \
+	contexts_path=cohort.parquet n_sequences=64 split=held_out
+```
+
+A single dense run is one worker by design: the whole point is that all `N` sequences are shared
+across all contexts, so there is no task axis to shard on. Shard the *cohort* if it is too large
+to label in one pass.
+
+`EQ_generate_query_sequences` takes the same three path args plus `contexts_path=...`, which is
+currently its only supported context source (see the note above).
+
 ## Determinism & restartability
 
 All training draws derive from `seed` via `utils.seeds.derive_seed`, splitting the **query
@@ -155,6 +234,13 @@ prediction-time axis (codes and durations are caller-specified), so its seed der
 sampler derives its per-(task, class) sample key on `(seed, "task_tracking_pairs", split)`
 and writes its single output file atomically the same way; it skips work if the output
 already exists unless `overwrite=true`.
+
+`sample_evaluation_query_sequences` seeds its sequence draw on `(seed, "eval_seq_specs", split)`
+alone — deliberately independent of the cohort, so the same `(seed, split)` yields the same `N`
+sequences for any cohort you point it at, and two cohorts' metrics are comparable query-for-query.
+`sample_query_sequences` still uses the fork's per-shard seed axes; folding it onto upstream's
+`derive_seed(seed, "queries")` / `derive_seed(seed, "contexts")` convention is part of the Phase 2
+rewrite.
 
 ## Related
 
