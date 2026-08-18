@@ -6,13 +6,20 @@ separation. To measure the model's *within-query* skill and isolate the effect o
 prior answers, we want, for each curated target code C and each target position p, many
 (patient, prediction_time) examples of the sequence
 
-    [ __CENSOR__(d) ]  [ filler_1 ] ... [ filler_{p-1} ]  [ C(d) @ position p ]
+    [ TIMELINE//END(d) ]  [ filler_1 ] ... [ filler_{p-1} ]  [ C(d) @ position p ]
 
 so that per-(C, p) AUROC has enough positives, and comparing a fixed C across p=1..P varies *only*
 the number of prior teacher-forced answers the target conditions on.
 
 Output: one QuerySeqSchema parquet at ``{out_dir}/probe/tasks.parquet``; the target of every
 sequence is its last query (position = sequence length - 1).
+
+Status (conditional-v2): repaired against the 5-stage sampler and the v2 binary labels.  Position 0
+was the deleted ``__CENSOR__`` sentinel ("is there data after t+d?"); censoring is now expressed by
+querying the real ``TIMELINE//END`` code ("does the record end within d?"), which is its logical
+complement and a genuine, answerable query.  Context sampling is delegated to
+``eval_v2.sample_eval_contexts`` — read its docstring for the two semantic changes (global context
+budget; ``--min-prediction-times`` counts prediction times, not events).
 """
 
 import argparse
@@ -24,20 +31,19 @@ os.environ.setdefault("POLARS_MAX_THREADS", "8")
 import numpy as np
 import polars as pl
 
+# Sibling import (this file is run from the repo root as ``python scripts/make_position_probe.py``).
+# eval_v2 owns the shared context-sampling helpers; it pulls torch in as a side effect, which costs
+# a few seconds of import time and nothing else here.
+from eval_v2 import log_uniform_durations, sample_eval_contexts
 from every_query.data.schema import QuerySeqSchema
-from every_query.data.seq_dataset import CENSOR_QUERY_CODE
+from every_query.data.seq_dataset import EOS_CODE
 from every_query.generate_tasks.sample_query_sequences import (
     CTX_ID_COL,
     POSITION_COL,
-    label_sequence_index_df,
-    sample_log_uniform_durations,
+    label_binary_occurrence,
 )
-from every_query.generate_tasks.sample_tasks import (
-    _read_event_shard,
-    compute_max_time_per_subject,
-    read_query_codes,
-    sample_contexts,
-)
+from every_query.generate_tasks.sample_tasks import read_query_codes
+from every_query.utils.seeds import derive_seed
 
 # Curated, prevalence-spanning target codes selected by frequency within recognizable prefixes.
 CURATED_PREFIXES = [
@@ -72,10 +78,17 @@ def main():
     ap.add_argument("--processed", required=True, type=Path)
     ap.add_argument("--out-dir", required=True, type=Path)
     ap.add_argument("--split", default="held_out")
-    ap.add_argument("--n-contexts", type=int, default=1024)
+    ap.add_argument("--n-contexts", type=int, default=8192,
+                    help="Global number of contexts across the split (was per-shard before the "
+                         "5-stage sampler landed).")
     ap.add_argument("--max-position", type=int, default=4)
     ap.add_argument("--target-duration", type=float, default=90.0)
-    ap.add_argument("--min-context-per-subject", type=int, default=10)
+    ap.add_argument("--min-prediction-times", type=int, default=10,
+                    help="Minimum distinct prior prediction times per subject. Replaces "
+                         "--min-context-per-subject, which counted events.")
+    ap.add_argument("--artifacts-dir", type=Path, default=None,
+                    help="Stage 0 prediction-time map location; defaults to "
+                         "<out-dir>/_prediction_time_artifacts.")
     ap.add_argument("--seed", type=int, default=13)
     ap.add_argument("--limit-shards", type=int, default=None)
     args = ap.parse_args()
@@ -84,35 +97,34 @@ def main():
     filler_vocab = read_query_codes(args.processed)
     print(f"{len(targets)} target codes: {targets}")
 
-    shard_dir = args.data_dir / "data" / args.split
-    shards = sorted(shard_dir.glob("*.parquet"))
-    if args.limit_shards:
-        shards = shards[: args.limit_shards]
+    ce = sample_eval_contexts(
+        args.data_dir,
+        args.split,
+        args.n_contexts,
+        args.seed,
+        artifacts_dir=args.artifacts_dir or (args.out_dir / "_prediction_time_artifacts"),
+        min_prediction_times=args.min_prediction_times,
+        limit_shards=args.limit_shards,
+    )
 
     frames = []
-    for si, shard_fp in enumerate(shards):
-        events = _read_event_shard(shard_fp)
-        ctx = sample_contexts(
-            events,
-            n=args.n_contexts,
-            min_context_per_subject=args.min_context_per_subject,
-            seed=args.seed + si,
-        )
+    for si, events in ce["events"].items():
+        ctx = ce["contexts"].filter(pl.col("_shard") == si).drop("_shard")
         if ctx.height == 0:
             continue
-        maxt = compute_max_time_per_subject(events)
-        rng = np.random.default_rng(args.seed * 1000 + si)
+        # `si` is a shard *name* now, not an enumeration index -- hash it rather than adding it.
+        rng = np.random.default_rng(derive_seed(args.seed, "probe", si))
 
         rows = []
         cid = 0
         for c in ctx.iter_rows(named=True):
             for p in range(1, args.max_position + 1):
                 tcode = targets[int(rng.integers(0, len(targets)))]
-                codes = [CENSOR_QUERY_CODE]
+                codes = [EOS_CODE]
                 durs = [args.target_duration]
                 for _ in range(1, p):  # filler queries at positions 1..p-1
                     codes.append(filler_vocab[int(rng.integers(0, len(filler_vocab)))])
-                    durs.append(float(sample_log_uniform_durations(1, 1, 365, rng)[0]))
+                    durs.append(float(log_uniform_durations(1, 1, 365, rng)[0]))
                 codes.append(tcode)
                 durs.append(args.target_duration)
                 for pos, (cc, dd) in enumerate(zip(codes, durs, strict=True)):
@@ -129,7 +141,7 @@ def main():
             pl.col("prediction_time").cast(pl.Datetime("us")),
             pl.col("duration_days").cast(pl.Float32),
         )
-        frames.append(label_sequence_index_df(idf, events, maxt))
+        frames.append(label_binary_occurrence(idf, events))
 
     df = pl.concat(frames, how="vertical")
     out = args.out_dir / "probe"

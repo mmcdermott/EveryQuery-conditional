@@ -18,21 +18,29 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import polars as pl
-from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-from reportlab.lib.units import inch
-from reportlab.platypus import (
-    HRFlowable,
-    Image,
-    PageBreak,
-    Paragraph,
-    SimpleDocTemplate,
-    Spacer,
-    Table,
-    TableStyle,
-)
+
+try:  # `reportlab` is a report-only dependency, deliberately absent from pyproject.toml.
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import inch
+    from reportlab.platypus import (
+        HRFlowable,
+        Image,
+        PageBreak,
+        Paragraph,
+        SimpleDocTemplate,
+        Spacer,
+        Table,
+        TableStyle,
+    )
+except ModuleNotFoundError as e:  # pragma: no cover - depends on the active venv
+    raise ModuleNotFoundError(
+        "scripts/build_report*.py needs `reportlab`, which this project does not depend on: the "
+        "PDFs under reports/ were built in a separate venv.  Install it into the active venv with "
+        "`uv pip install reportlab` and rerun."
+    ) from e
 
 
 def _styles():
