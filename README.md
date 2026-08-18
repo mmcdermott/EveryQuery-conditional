@@ -20,9 +20,14 @@ EveryQuery is built on the [MEDS](https://github.com/Medical-Event-Data-Standard
 > queries, each conditioned on the patient state and the teacher-forced answers of all earlier
 > queries. Binary observed-occurrence labels; censoring is expressed by querying the real
 > `TIMELINE//END` code rather than via a separate head. See
-> **[CONDITIONAL_QUERIES.md](CONDITIONAL_QUERIES.md)** for the design, the new
-> `EQ_generate_query_sequences` / `EQ_predict_sequences` / `EQ_evaluate_sequences` CLIs, the macro
-> per-task evaluation methodology, and results.
+> **[CONDITIONAL_QUERIES.md](CONDITIONAL_QUERIES.md)** for the design, the macro per-task
+> evaluation methodology, and results, and
+> [**Conditional query sequences**](#conditional-query-sequences) below for the end-to-end commands.
+>
+> The conditional pipeline has been ported onto upstream's 5-stage sampler: contexts are now drawn
+> globally across a split and durations are unrounded floats, so **a checkpoint trained before the
+> port must be retrained** — see
+> [Migrating from the pre-port sampler](#migrating-from-the-pre-port-sampler).
 
 ## Install
 
@@ -80,18 +85,18 @@ The conditional query-sequence pipeline (this fork) adds a parallel set of CLIs 
 emit `QuerySeqSchema` rather than `TaskQuerySchema` — see
 [CONDITIONAL_QUERIES.md](CONDITIONAL_QUERIES.md):
 
-| Script                                   | Stage             | Purpose                                                                                                                    | Tests                              |
-| ---------------------------------------- | ----------------- | -------------------------------------------------------------------------------------------------------------------------- | ---------------------------------- |
-| `EQ_generate_query_sequences`            | PT seq labels     | Sample `K` queries per `(subject, prediction_time)` context and label each by observed occurrence (`QuerySeqSchema` parquets) | `test_conditional_cli.py`          |
-| `EQ_generate_evaluation_query_sequences` | eval seq labels   | Label the same `N` query sequences across a supplied cohort (dense grid counterpart)                                        | `test_conditional_cli.py`          |
-| `EQ_predict_sequences`                   | inference         | Consume `QuerySeqSchema` + a conditional checkpoint, emit per-position probabilities                                        | `test_conditional_cli.py`          |
-| `EQ_evaluate_sequences`                  | metrics           | Per-position and macro per-task metrics over conditional predictions                                                        | `test_conditional_cli.py`          |
+| Script                                   | Stage           | Purpose                                                                                                                                                                                       | Tests                                                                              |
+| ---------------------------------------- | --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| `EQ_generate_query_sequences`            | PT seq labels   | Sample a variable-length query sequence per `(subject, prediction_time)` context and label each query by observed occurrence; contexts come from the 5-stage sampler, or from `contexts_path` | `test_conditional_cli.py`; unit `test_conditional_queries.py`                      |
+| `EQ_generate_evaluation_query_sequences` | eval seq labels | Dense grid: label the same `N` query sequences at every context of one cohort — cohort and sequences are each either supplied (`contexts_path` / `sequences_path`) or sampled                 | `test_conditional_cli.py`; unit `tests/sampler/test_eval_grid_sampled_contexts.py` |
+| `EQ_predict_sequences`                   | inference       | Consume `QuerySeqSchema` + a conditional checkpoint, emit one row per query position with `answer_prob`                                                                                       | `test_conditional_cli.py`                                                          |
+| `EQ_evaluate_sequences`                  | metrics         | Write `<stem>.by_position.parquet` + `<stem>.by_query.parquet` from the per-position predictions                                                                                              | `test_conditional_cli.py`                                                          |
 
 The legacy four-stage evaluator (`every_query.evaluate.eval`, with `gen_index_times`, `gen_task`, `select_model` siblings) has been deleted; recover from git history if needed. [#83](https://github.com/payalchandak/EveryQuery/issues/83) tracks the cross-model leaderboard, which now lives in the `EveryQueryExperiments` repo.
 
 ## Pipeline
 
-### Current (on `dev`)
+### Single-query pipeline
 
 ```mermaid
 flowchart TD
@@ -276,6 +281,148 @@ EQ_evaluate \
 
 Per-`(query, duration_days)` metrics from the predictions parquet — `n_rows`, `n_occurs_labeled`, `n_positive`, `prevalence`, `occurs_auroc` (on non-censored rows), `censor_auroc`. See [`evaluate/README.md`](src/every_query/evaluate/README.md).
 
+### Conditional query sequences
+
+```mermaid
+flowchart TD
+    intermediate[("MEDS event shards<br/>($TOKENIZED_EVENTS_DIR)")] --> seq_tasks["EQ_generate_query_sequences<br/><i>5-stage sampler, global context budget</i>"]
+    intermediate --> eval_seq["EQ_generate_evaluation_query_sequences<br/><i>dense grid: N sequences x every context</i>"]
+
+    seq_tasks -- QuerySeqSchema parquets --> ctrain["EQ_train --config-name=conditional_config"]
+    cohort[("tensorized cohort<br/>($TENSORIZED_COHORT_DIR)")] --> ctrain
+    ctrain --> ckpt[/"best_model.ckpt (dated Hydra run dir)"/]
+
+    ckpt --> cpredict[EQ_predict_sequences]
+    eval_seq -- QuerySeqSchema parquets --> cpredict
+
+    cpredict -- per-position predictions --> ceval[EQ_evaluate_sequences]
+    ceval --> by_position[("metrics.by_position.parquet")]
+    ceval --> by_query[("metrics.by_query.parquet")]
+```
+
+Both sequence endpoints emit [`QuerySeqSchema`](src/every_query/data/schema.py) rather than `TaskQuerySchema`: one row per `(subject_id, prediction_time)` context with three aligned list columns — `queries`, `durations` (float days), `answers`. Answers are binary and never null; censoring is carried by a `TIMELINE//END` query rather than by a null label. Both take the same three mandatory path args as the single-query samplers (`data_dir`, `out_dir`, `query_codes`, all `???` with no env fallback).
+
+The examples below use `$SEQ_TASKS_DIR` / `$EVAL_SEQ_TASKS_DIR` as ad-hoc shell vars (they are not in `env.example.sh`). Keep them distinct from `$TRAINING_TASKS_DIR` / `$EVAL_TASKS_DIR` — the sequence and single-query samplers both write `{split}/{shard}.parquet`, so sharing one root would have them overwrite each other.
+
+#### 1. Generate query-sequence labels
+
+```bash
+EQ_generate_query_sequences \
+	split=train \
+	num_sequences=4000000 \
+	min_queries=1 \
+	max_queries=5 \
+	data_dir="$TOKENIZED_EVENTS_DIR" \
+	out_dir="$SEQ_TASKS_DIR" \
+	query_codes="$TENSORIZED_COHORT_DIR"
+```
+
+The same 5-stage pipeline as `EQ_generate_training_tasks` (Stages 0-3 inline in the driver, Stage 4 labeling fanned out one worker per shard, `max_workers` capping the pool), with two stages specialised: Stage 1' draws `L ~ Uniform{min_queries..max_queries}` queries per sequence instead of one, and Stage 4' reassembles them into the list columns. `num_sequences` is a **global budget across the split** — Stage 2 draws contexts over the whole split, weighted by each subject's prediction-time count — so it is the total row count, not a per-shard one.
+
+Output lands at `$SEQ_TASKS_DIR/{split}/{shard}.parquet`, named after the **data** shards. Intermediates go to the sibling `{parent}/{name}_artifacts/` tree and never nest under `out_dir`, so `out_dir` holds final task parquets and nothing else — which is what makes it directly usable as both `datamodule.config.task_labels_dir` and `EQ_predict_sequences tasks_dir=`, since each reads every parquet beneath the root and predict refuses a tree containing anything else.
+
+Setting `contexts_path=` switches to the supplied-cohort worker, which bypasses Stages 0/2/3' entirely:
+
+```bash
+EQ_generate_query_sequences \
+	contexts_path=cohort.parquet \
+	n_replicates=50 \
+	split=held_out \
+	min_queries=5 \
+	max_queries=5 \
+	duration_max=365 \
+	data_dir="$TOKENIZED_EVENTS_DIR" \
+	out_dir="$SEQ_TASKS_DIR" \
+	query_codes="$TENSORIZED_COHORT_DIR"
+```
+
+Contexts come from that parquet (repeated `n_replicates` times, one sampled sequence each), events are gathered across every shard of `split`, no `_artifacts` tree is written, and the output is named after the cohort file stem: `{out_dir}/{split}/{stem}__{task_shard:04d}.parquet`. `num_sequences`, `min_prediction_times_per_subject` and `max_workers` are unused on this path.
+
+Two sweep knobs shape sequence structure and are off by default: `eos_first_fraction` (probability a sequence is forced to start with the `TIMELINE//END` query; `0.0` = fully random, no privileged censor position) and `duration_mode` (`random` | `same` | `nondecreasing`).
+
+#### 2. Train the conditional model
+
+```bash
+EQ_train --config-name=conditional_config \
+	datamodule.config.tensorized_cohort_dir="$TENSORIZED_COHORT_DIR" \
+	datamodule.config.task_labels_dir="$SEQ_TASKS_DIR" \
+	output_dir="$TRAINING_OUTPUT_DIR"
+```
+
+Same three required args as `EQ_train`; `--config-name=conditional_config` swaps in `ConditionalQueryPytorchDataset`, `ConditionalQueryLightningModule` / `ConditionalQueryModel` (8-layer encoder at hidden size 384, 4-layer decoder), and a local `CSVLogger`. `vocab_size` / `max_position_embeddings` stay `???` on purpose — `train.py` sizes them from the tensorized cohort before the config is saved.
+
+- `max_epochs: 1` and no `max_steps`: total steps come from the data, one pass over the train set. LR warmup is a fraction of that (`warmup_ratio: 0.05`), derived at fit time from `trainer.estimated_stepping_batches`, so `num_warmup_steps` / `num_training_steps` are not declared in the config.
+- The datamodule is `ResumableDatamodule`: with one epoch a `do_resume=true` has to pick up mid-epoch, not at an epoch boundary.
+- Precision is `bf16-mixed` and the Trainer owns it — the model reads `${trainer.precision}`.
+- `trainer.default_root_dir` is `${hydra:runtime.output_dir}`, so checkpoints, `resolved_config.yaml` and the CSV logs land in the dated per-run dir, not in `output_dir` itself.
+
+#### 3. Generate an evaluation grid
+
+```bash
+EQ_generate_evaluation_query_sequences \
+	split=held_out \
+	n_contexts=512 \
+	n_sequences=64 \
+	data_dir="$TOKENIZED_EVENTS_DIR" \
+	out_dir="$EVAL_SEQ_TASKS_DIR" \
+	query_codes="$TENSORIZED_COHORT_DIR"
+```
+
+Labels the *same* `N` query sequences at every context of one cohort — the row shape per-sequence metrics need. Both axes of the grid are independently either supplied or sampled, and with all four knobs at their defaults the endpoint runs on the three path roots alone:
+
+| Grid axis         | Supplied                                                                               | Sampled                                                                            |
+| ----------------- | -------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| the cohort        | `contexts_path=` a parquet of `(subject_id, prediction_time)` rows                     | `n_contexts` drawn from `split` by the same Stages 0 + 2 the training sampler uses |
+| the `N` sequences | `sequences_path=` designed specs (YAML/JSON mapping or list, or a long-format parquet) | `n_sequences` drawn once from the training query distribution                      |
+
+Sampled contexts are drawn with replacement and then deduplicated, so `n_contexts` is a *ceiling* on the grid's width rather than an exact count; the labeled grid is up to `n_contexts x n_sequences` rows. With `sequences_path` set, nothing is sampled — the codes and durations are exactly what you wrote, and `query_codes` is used only to reject codes outside the model's vocabulary.
+
+Output is one combined parquet at `{out_dir}/{split}/{contexts_tag}__{specs_tag}.parquet`, where each tag is the corresponding file's stem or `sampled{n_contexts}ctx` / `sampled{n_sequences}`. `per_spec_dirs=true` instead writes one independently scoreable directory per sequence at `{out_dir}/{spec_name}/{split}/tasks.parquet`, which is what you want with designed, named sequences — each dir is a valid `EQ_predict_sequences tasks_dir=` on its own, so per-task metrics need no post-hoc grouping.
+
+The sampling defaults mirror `sample_query_sequences_config.yaml` (a test asserts `duration_min` / `duration_max` / `duration_distribution` stay identical) so a sampled grid is drawn from the distribution the model was pretrained on. The one deliberate difference is `min_queries: 3` / `max_queries: 3` — a fixed length keeps per-position comparisons across sequences clean. If your checkpoint was trained with overrides, pass the same overrides here: an out-of-distribution horizon shows up as an unexplained metric shift, not as an error.
+
+#### 4. Predict
+
+```bash
+EQ_predict_sequences \
+	model_run_dir="$TRAINING_OUTPUT_DIR/YYYY-MM-DD/HH-MM-SS" \
+	tasks_dir="$EVAL_SEQ_TASKS_DIR/held_out" \
+	output_parquet="$TRAINING_OUTPUT_DIR/seq_predictions.parquet" \
+	split=held_out
+```
+
+`model_run_dir` is the **dated Hydra run dir**, not the `output_dir` base you passed to `EQ_train`: `resolved_config.yaml`, `best_model.ckpt` and `checkpoints/last.ckpt` all live under `$TRAINING_OUTPUT_DIR/<date>/<time>`. Teacher-forced inference over each sequence, exploded to one row per query position — `subject_id`, `prediction_time`, `position`, `query`, `duration_days`, `answer`, `answer_prob`. `split` is `held_out` (default) or `tuning`; `train` is disallowed because its loader shuffles. `ckpt_name=` picks an explicit checkpoint stem under `checkpoints/`.
+
+#### 5. Evaluate
+
+```bash
+EQ_evaluate_sequences \
+	predictions_parquet="$TRAINING_OUTPUT_DIR/seq_predictions.parquet" \
+	metrics_stem="$TRAINING_OUTPUT_DIR/seq_metrics"
+```
+
+`metrics_stem` is a stem, not a file: two tables are written, `<stem>.by_position.parquet` (grouped by sequence position) and `<stem>.by_query.parquet` (grouped by `(query, duration_bucket)`). These are pooled tables; the macro per-task methodology behind the reported headline numbers lives in `scripts/eval_macro_position.py` — see [CONDITIONAL_QUERIES.md](CONDITIONAL_QUERIES.md).
+
+#### Migrating from the pre-port sampler
+
+The conditional pipeline was rebuilt on upstream's 5-stage sampler. Config keys carried over from the pre-port fork either fail loudly or silently change what you sample:
+
+| Pre-port                           | Now                                | Consequence                                                                                                                      |
+| ---------------------------------- | ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `n_contexts`                       | `num_sequences`                    | a **global budget across the split**, not per-shard — the old value was effectively multiplied by the shard count                |
+| `input_shard`                      | (removed)                          | the endpoint discovers and labels every shard of `split` itself                                                                  |
+| `min_context_per_subject`          | `min_prediction_times_per_subject` | counts distinct **prediction times**, not events; the shipped `50` is upstream's default, not a translation of the old threshold |
+| integer-day `duration_days`        | unrounded `float` days             | horizons are continuous draws, no day-rounding                                                                                   |
+| `{stem}__{task_shard:04d}.parquet` | `{shard}.parquet`                  | sampled outputs are named after the **data** shards (supplied-cohort mode keeps the stem-based name)                             |
+| artifacts nested under `out_dir`   | sibling `{name}_artifacts/`        | `out_dir` holds final task parquets and nothing else                                                                             |
+
+> [!IMPORTANT]
+> **Retraining is required.** Global context sampling and float durations are two independent
+> distribution shifts, so a checkpoint trained by the pre-port sampler cannot be compared against
+> data the current sampler generates. The runs described by the PDFs under `reports/` are not
+> reproducible with the current code — treat them as a record of past experiments, not a baseline
+> to diff against.
+
 ## Configuration
 
 All CLIs are `@hydra.main` entry points; every config knob is overridable on the command
@@ -332,13 +479,15 @@ tests/
 ├── test_process_data.py            (E2E: EQ_process_data output shape + metadata)
 ├── test_generate_tasks.py          (E2E: EQ_generate_training_tasks ground-truth label recompute + reproducibility)
 ├── test_generate_evaluation_tasks_cli.py  (E2E: EQ_generate_evaluation_tasks dense-grid shape + determinism)
-├── sampler/                        (unit: per-stage sampler tests — stage0-4, pure helpers, orchestration)
+├── sampler/                        (unit: per-stage sampler tests — stage0-4, pure helpers, orchestration, eval-grid context sampling)
 ├── test_sampler_dataset_integration.py  (integration: sampler output is drop-in for EveryQueryPytorchDataset)
 ├── test_train_cli.py               (E2E: EQ_train CLI, resume flow, overwrite flag)
 ├── test_train.py                   (E2E: resume-actually-loads-ckpt two-stage differential)
 ├── test_training.py                (unit: single training step, checkpoint roundtrip, demo-mode checks)
 ├── test_predict_cli.py             (E2E: EQ_predict against a trained checkpoint + row-order preservation)
 ├── test_evaluate_cli.py            (E2E: EQ_evaluate on a synthetic PredictionSchema parquet)
+├── test_conditional_queries.py     (unit: block-causal mask, ConditionalQueryModel information flow, seq dataset, sequence-sampler stages)
+├── test_conditional_cli.py         (E2E: EQ_generate_query_sequences → conditional EQ_train → EQ_predict_sequences → EQ_evaluate_sequences)
 ├── test_e2e_foundation.py          (E2E: full preprocess → generate_training_tasks → train pipeline chains)
 ├── test_dataset_logic.py           (unit: EveryQueryPytorchDataset + EveryQueryBatch)
 ├── test_lightning_logic.py         (unit: LightningModule loss wiring, mask semantics)
