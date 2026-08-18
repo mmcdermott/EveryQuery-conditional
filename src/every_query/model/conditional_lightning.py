@@ -11,7 +11,8 @@ Metric conventions:
 """
 
 import logging
-from typing import Literal
+from collections.abc import Callable, Iterator
+from typing import Any, Literal
 
 import torch
 from meds import held_out_split, train_split, tuning_split
@@ -25,10 +26,35 @@ logger = logging.getLogger(__name__)
 
 
 class ConditionalQueryLightningModule(EveryQueryLightningModule):
-    """Lightning wrapper for the conditional query-sequence model."""
+    """Lightning wrapper for the conditional query-sequence model.
 
-    def __init__(self, model: ConditionalQueryModel, optimizer=None, LR_scheduler=None):
-        super().__init__(model=model, optimizer=optimizer, LR_scheduler=LR_scheduler)
+    Shares the parent's optimizer/LR-scheduler plumbing, so ``warmup_ratio`` means exactly what it
+    means upstream: the fraction of total optimizer steps spent in LR warmup, with the step counts
+    derived from ``trainer.estimated_stepping_batches`` at fit time (see the parent's
+    ``configure_optimizers``).  It is validated by the parent and must lie in ``[0.0, 1.0]``.
+
+    ``grad_norm_log_every_n_steps`` is reinterpreted here.  Upstream it throttles two
+    ``torch.autograd.grad`` passes (one per task head), which is why its default is 1000.  The
+    conditional model has a single loss, so there is nothing to compare and no extra autograd pass:
+    :meth:`on_before_optimizer_step` just reads the ``.grad`` tensors Lightning already populated.
+    That is cheap, so the default here is every step.
+    """
+
+    def __init__(
+        self,
+        model: ConditionalQueryModel,
+        optimizer: Callable[[Iterator[torch.nn.parameter.Parameter]], torch.optim.Optimizer] | None = None,
+        LR_scheduler: Callable[..., Any] | None = None,
+        warmup_ratio: float = 0.0,
+        grad_norm_log_every_n_steps: int = 1,
+    ):
+        super().__init__(
+            model=model,
+            optimizer=optimizer,
+            LR_scheduler=LR_scheduler,
+            warmup_ratio=warmup_ratio,
+            grad_norm_log_every_n_steps=grad_norm_log_every_n_steps,
+        )
         # A single binary answer head produces every per-query logit.  Training-time AUROCs are
         # pooled (across all codes) and therefore base-rate inflated — kept only to track
         # dynamics/stability; the trustworthy within-query numbers are computed at held-out
@@ -111,7 +137,16 @@ class ConditionalQueryLightningModule(EveryQueryLightningModule):
         return loss
 
     def on_before_optimizer_step(self, optimizer):
-        """Log the total gradient L2 norm (pre-clipping) as a training-stability signal."""
+        """Log the total gradient L2 norm (pre-clipping) as a training-stability signal.
+
+        Fires every ``grad_norm_log_every_n_steps`` optimizer steps (including step 0, for an early
+        baseline).  This is the conditional model's stand-in for upstream's per-task encoder
+        gradient norms: with one answer head there is no second task to ratio against, so the total
+        pre-clipping norm is the whole signal.
+        """
+        if self.global_step % self.grad_norm_log_every_n_steps != 0:
+            return
+
         from lightning.pytorch.utilities import grad_norm
 
         norms = grad_norm(self, norm_type=2)
@@ -155,4 +190,8 @@ class ConditionalQueryLightningModule(EveryQueryLightningModule):
             model=model,
             optimizer=optimizer,
             LR_scheduler=LR_scheduler,
+            # Checkpoints predating warmup_ratio simply had no warmup.  ``grad_norm_log_every_n_steps``
+            # is deliberately absent from ``save_hyperparameters`` upstream (a logging knob only), so
+            # it is not restored here either and falls back to the constructor default.
+            warmup_ratio=hparams.get("warmup_ratio", 0.0),
         )

@@ -7,9 +7,9 @@
 #     ModernBERT-base defaults are for a 50k-token text vocab and 22 layers);
 #   - logger is a local CSVLogger (training-stability curves are read from metrics.csv).
 #
-# vocab_size must be > max code/vocab_index (index 0 is padding).  For the MIMIC-IV v0.3.0
-# cohort the max vocab index is 11958, so vocab_size is 11959.  No sentinel slot is needed —
-# the end-of-timeline code (TIMELINE//END, index 11884) is an ordinary vocabulary code.
+# `vocab_size` / `max_position_embeddings` are `???` on purpose: train.py sizes them from the
+# tensorized cohort (metadata/codes.parquet and datamodule.config.max_seq_len) before the config
+# is saved, so any value written here would be silently overwritten.
 
 defaults:
   - _self_
@@ -39,7 +39,9 @@ hydra:
           - datamodule.config.task_labels_dir
 
 datamodule:
-  _target_: meds_torchdata.extensions.lightning_datamodule.Datamodule
+  # Stateful train loader: with max_epochs=1 a `do_resume` must pick up mid-epoch (see
+  # every_query.data.datamodule.ResumableDatamodule).
+  _target_: every_query.data.datamodule.ResumableDatamodule
   data_class: every_query.data.seq_dataset.ConditionalQueryPytorchDataset
   config:
     _target_: meds_torchdata.MEDSTorchDataConfig
@@ -57,9 +59,12 @@ datamodule:
 
 lightning_module:
   _target_: every_query.model.conditional_lightning.ConditionalQueryLightningModule
+  # One answer head means one loss, so this throttles the cheap total-grad-norm log in
+  # `on_before_optimizer_step` — not upstream's two extra autograd passes.  Every step is fine.
+  grad_norm_log_every_n_steps: 1
   model:
     _target_: every_query.model.conditional_model.ConditionalQueryModel
-    precision: "bf16-mixed"
+    precision: ${trainer.precision} # single source of truth: the Trainer owns AMP
     mlp_dropout: 0.1
     num_hidden_layers: 8
     decoder_layers: 4
@@ -70,8 +75,9 @@ lightning_module:
       hidden_size: 384
       num_attention_heads: 6
       intermediate_size: 1536
-      max_position_embeddings: 512
-      vocab_size: 11959
+      # Dictated by the data — filled in by train.py from the datamodule config.
+      max_position_embeddings: ???
+      vocab_size: ???
       pad_token_id: 0
       cls_token_id: 1
       bos_token_id: 1
@@ -86,11 +92,13 @@ lightning_module:
     betas: [0.9, 0.98]
     amsgrad: false
     fused: false
+  # Fraction of total optimizer steps spent in LR warmup; the module derives the actual step
+  # counts from trainer.estimated_stepping_batches at fit time and passes them to the scheduler
+  # factory, which is why `num_warmup_steps`/`num_training_steps` are *not* declared below.
+  warmup_ratio: 0.05
   LR_scheduler:
     _target_: transformers.get_cosine_schedule_with_warmup
     _partial_: true
-    num_warmup_steps: ${int_prod:0.05,${.num_training_steps}}
-    num_training_steps: ${trainer.max_steps}
     num_cycles: 0.5
 
 trainer:
@@ -126,17 +134,16 @@ trainer:
       stopping_threshold: null
       divergence_threshold: null
       check_on_train_epoch_end: false
-  default_root_dir: ${output_dir}
-  min_epochs: 0
-  max_epochs: null
-  max_steps: 30000
+  default_root_dir: ${hydra:runtime.output_dir} # single source of truth: run.dir OR sweep.dir/subdir
+  min_epochs: 0 # prevents early stopping
+  max_epochs: 1 # total steps come from the data: one pass over the train set
   accelerator: "auto"
   devices: 1
   strategy: "auto"
   accumulate_grad_batches: 1
   log_every_n_steps: 50
-  check_val_every_n_epoch: null
-  val_check_interval: 1000
+  check_val_every_n_epoch: 1
+  val_check_interval: 0.05 # validate 20 times per epoch
   limit_val_batches: 100
   deterministic: False
   gradient_clip_val: 1.0
