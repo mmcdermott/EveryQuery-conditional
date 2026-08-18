@@ -92,7 +92,7 @@ Key source modules:
 - `src/every_query/model/conditional_lightning.py` — Lightning module; metrics = pooled
   `answer_auc` + per-position breakdowns (training-time diagnostics only).
 - `src/every_query/train/configs/conditional_config.yaml` — the training config (8-layer encoder,
-  hidden 384, 4-layer decoder, vocab 11959, bf16).
+  hidden 384, 4-layer decoder, bf16; vocab/positions are sized from the data by `train.py`).
 
 ### Helper scripts (`scripts/`)
 

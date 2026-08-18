@@ -16,13 +16,16 @@ Covers, in order of pipeline position:
 
 import inspect
 from datetime import datetime
+from functools import partial
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 import numpy as np
 import polars as pl
 import pytest
 import torch
 import yaml
+from meds import held_out_split, tuning_split
 
 from every_query.data.seq_dataset import (
     ANSWERS_COL,
@@ -763,3 +766,181 @@ def test_resolve_prediction_times_raises_on_join_key_dtype_drift(tmp_path: Path)
     drifted = _stage2_contexts([(1, "0", 0)]).with_columns(pl.col("subject_id").cast(pl.UInt32))
     with pytest.raises(ValueError, match="dtype mismatch"):
         resolve_prediction_times(drifted, artifacts, split, "0")
+
+
+# ── ConditionalQueryLightningModule: training-loop hooks ────────────────
+#
+# Every method below is either overridden by the conditional module or inherited from
+# ``EveryQueryLightningModule``.  The inherited ones were written for the two-headed single-query
+# model and reach for ``outputs.occurs_loss`` / ``outputs.censor_loss`` / ``batch.occurs`` /
+# ``batch.censor``, none of which exist on ``ConditionalQueryOutput`` / ``ConditionalQueryBatch``.
+# These tests run each hook against a real conditional batch so a re-introduced two-head assumption
+# fails here instead of at step 0 of a real training run.
+
+
+@pytest.fixture
+def tiny_lightning_module(tiny_model):
+    from every_query.model.conditional_lightning import ConditionalQueryLightningModule
+
+    return ConditionalQueryLightningModule(
+        model=tiny_model,
+        optimizer=partial(torch.optim.AdamW, lr=1e-4, weight_decay=0.01),
+    )
+
+
+@pytest.mark.parametrize("hook", ["training_step", "validation_step", "test_step", "predict_step"])
+def test_lightning_step_hooks_run_on_a_conditional_batch(tiny_lightning_module, hook):
+    """No step hook may touch a two-head-only attribute."""
+    batch = make_batch([[ANSWER_YES, ANSWER_NO, ANSWER_YES], [ANSWER_NO, ANSWER_NO, ANSWER_YES]])
+    with patch.object(tiny_lightning_module, "log"):
+        out = getattr(tiny_lightning_module, hook)(batch)
+    if hook == "predict_step":
+        assert set(out) == {"answer_probs", "q_mask", "q_answers", "q_codes", "q_durations"}
+    else:
+        assert out.isfinite()
+
+
+def test_epoch_end_hooks_compute_only_conditional_metrics(tiny_lightning_module):
+    """``_on_epoch_end`` walks ``self.metrics``; the conditional set has no occurs/censor entries."""
+    for split in (tuning_split, held_out_split):
+        names = set(tiny_lightning_module.metrics[split])
+        assert "occurs_auc" not in names and "censor_auc" not in names
+        assert names == {"answer_auc"} | {f"answer_auc_pos{j}" for j in range(8)}
+
+    batch = make_batch([[ANSWER_YES, ANSWER_NO, ANSWER_YES], [ANSWER_NO, ANSWER_NO, ANSWER_YES]])
+    logged = {}
+    with patch.object(tiny_lightning_module, "log", side_effect=lambda k, v, **kw: logged.setdefault(k, v)):
+        tiny_lightning_module.validation_step(batch)
+        tiny_lightning_module.on_validation_epoch_end()
+        tiny_lightning_module.test_step(batch)
+        tiny_lightning_module.on_test_epoch_end()
+        tiny_lightning_module.on_train_epoch_end()
+    assert f"{tuning_split}/answer_auc" in logged
+    assert f"{held_out_split}/answer_auc" in logged
+
+
+def test_grad_norm_hook_is_throttled(tiny_model):
+    """``grad_norm_log_every_n_steps`` gates the total-grad-norm log (0-indexed, so step 0 fires)."""
+    from every_query.model.conditional_lightning import ConditionalQueryLightningModule
+
+    module = ConditionalQueryLightningModule(model=tiny_model, grad_norm_log_every_n_steps=4)
+    # ``grad_norm`` reads ``.grad``; without a backward there is nothing to norm.
+    loss, _ = module.model(make_batch([[ANSWER_YES, ANSWER_NO, ANSWER_YES]]))
+    loss.backward()
+
+    fired = []
+    for step in (0, 1, 4, 5, 8):
+        with (
+            patch.object(type(module), "global_step", property(lambda _s, v=step: v)),
+            patch.object(module, "log", side_effect=lambda k, *a, **kw: fired.append(k)),
+        ):
+            module.on_before_optimizer_step(None)
+    assert fired == ["train/grad_norm", "train/grad_norm", "train/grad_norm"]
+
+
+def test_warmup_ratio_drives_the_lr_schedule(tiny_model):
+    """``warmup_ratio`` x ``estimated_stepping_batches`` -> ``num_warmup_steps`` at fit time."""
+    from transformers import get_cosine_schedule_with_warmup
+
+    from every_query.model.conditional_lightning import ConditionalQueryLightningModule
+
+    module = ConditionalQueryLightningModule(
+        model=tiny_model,
+        optimizer=partial(torch.optim.AdamW, lr=1e-4, weight_decay=0.01),
+        LR_scheduler=partial(get_cosine_schedule_with_warmup),
+        warmup_ratio=0.1,
+    )
+    module.trainer = Mock(estimated_stepping_batches=10_000)
+    result = module.configure_optimizers()
+    # 10% of 10,000 = 1,000 warmup steps, so the linear ramp is halfway done at step 500.
+    assert result["lr_scheduler"]["scheduler"].lr_lambdas[0](500) == pytest.approx(0.5)
+    assert result["lr_scheduler"]["interval"] == "step"
+
+
+def test_warmup_ratio_is_validated(tiny_model):
+    from every_query.model.conditional_lightning import ConditionalQueryLightningModule
+
+    with pytest.raises(ValueError, match=r"warmup_ratio must be in \[0.0, 1.0\]"):
+        ConditionalQueryLightningModule(model=tiny_model, warmup_ratio=1.5)
+
+
+def test_warmup_ratio_survives_checkpoint_round_trip(tiny_model, tmp_path):
+    import lightning as L
+
+    from every_query.model.conditional_lightning import ConditionalQueryLightningModule
+
+    module = ConditionalQueryLightningModule(
+        model=tiny_model,
+        optimizer=partial(torch.optim.AdamW, lr=1e-4, weight_decay=0.01),
+        warmup_ratio=0.25,
+    )
+    ckpt = tmp_path / "cq.ckpt"
+    torch.save(
+        {
+            "state_dict": module.state_dict(),
+            "hyper_parameters": dict(module.hparams),
+            "pytorch-lightning_version": L.__version__,
+        },
+        ckpt,
+    )
+    loaded = ConditionalQueryLightningModule.load_from_checkpoint(str(ckpt))
+    assert loaded.warmup_ratio == 0.25
+    assert loaded.model.hparams["max_queries"] == tiny_model.hparams["max_queries"]
+
+    # Checkpoints written before warmup_ratio existed load with no warmup rather than KeyError.
+    old_hparams = dict(module.hparams)
+    old_hparams.pop("warmup_ratio")
+    old_ckpt = tmp_path / "old.ckpt"
+    torch.save(
+        {
+            "state_dict": module.state_dict(),
+            "hyper_parameters": old_hparams,
+            "pytorch-lightning_version": L.__version__,
+        },
+        old_ckpt,
+    )
+    assert ConditionalQueryLightningModule.load_from_checkpoint(str(old_ckpt)).warmup_ratio == 0.0
+
+
+# ── conditional_config.yaml / _demo_train_conditional.yaml invariants ───
+
+
+def _train_config(name: str) -> dict:
+    from every_query.train.train import CONFIGS
+
+    return yaml.safe_load((Path(CONFIGS) / name).read_text())
+
+
+@pytest.mark.parametrize("name", ["conditional_config.yaml", "_demo_train_conditional.yaml"])
+def test_conditional_configs_leave_encoder_sizing_to_the_data(name):
+    """train.py overwrites both from the tensorized cohort; a literal here would be a lie."""
+    overrides = _train_config(name)["lightning_module"]["model"]["config_overrides"]
+    assert overrides["vocab_size"] == "???"
+    assert overrides["max_position_embeddings"] == "???"
+
+
+@pytest.mark.parametrize("name", ["conditional_config.yaml", "_demo_train_conditional.yaml"])
+def test_conditional_configs_have_one_source_of_truth_for_precision_and_steps(name):
+    cfg = _train_config(name)
+    assert cfg["lightning_module"]["model"]["precision"] == "${trainer.precision}"
+    assert cfg["trainer"]["precision"] == "bf16-mixed"
+    # Removed upstream (8f83423): total steps come from the data via max_epochs.
+    assert "max_steps" not in cfg["trainer"]
+    assert cfg["trainer"]["max_epochs"] == 1
+
+
+def test_conditional_config_writes_into_the_hydra_run_dir():
+    """``${output_dir}`` is the shared base; a second run there would raise FileExistsError."""
+    cfg = _train_config("conditional_config.yaml")
+    assert cfg["trainer"]["default_root_dir"] == "${hydra:runtime.output_dir}"
+    assert cfg["hydra"]["run"]["dir"].startswith("${output_dir}/")
+    for key in ("logger", "callbacks"):
+        assert "${trainer.default_root_dir}" in yaml.safe_dump(cfg["trainer"][key])
+
+
+def test_conditional_config_declares_warmup_ratio_not_dead_step_counts():
+    """``configure_optimizers`` overrides these as call-site kwargs, so declaring them is dead."""
+    lm = _train_config("conditional_config.yaml")["lightning_module"]
+    assert lm["warmup_ratio"] == 0.05
+    assert "num_warmup_steps" not in lm["LR_scheduler"]
+    assert "num_training_steps" not in lm["LR_scheduler"]
