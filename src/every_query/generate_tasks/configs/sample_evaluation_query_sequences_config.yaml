@@ -73,10 +73,14 @@ min_queries: 3
 max_queries: 3
 
 # Duration bounds in days.  Each query's horizon is drawn log-uniformly over the continuous
-# [min, max] interval, then rounded and clipped to whole days — so it skews short: over
+# [min, max] interval and kept as a **float** (no day-rounding) — so it skews short: over
 # 1..731 the median is ~27d and ~52% of horizons are <= 30d.
+# These three must stay byte-equal to `sample_query_sequences_config.yaml` (a test asserts it):
+# both sides feed the same `QueryDistribution`, so any drift silently makes the eval grid
+# out-of-distribution and reads as an unexplained metric shift rather than an error.
 duration_min: 1
 duration_max: 731
+duration_distribution: log-uniform # uniform | log-uniform
 
 # Codes are drawn per query (not per sequence) iid uniform over `query_codes`, with
 # replacement — a code can repeat within a sequence, and TIMELINE//END is an ordinary member,

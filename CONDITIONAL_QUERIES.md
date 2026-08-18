@@ -78,10 +78,17 @@ Key source modules:
 - `src/every_query/data/seq_dataset.py` — `ConditionalQueryPytorchDataset`, `ConditionalQueryBatch`,
   `EOS_CODE = "TIMELINE//END"`. Binary answers, no sentinel.
 - `src/every_query/data/schema.py` — `QuerySeqSchema` (`queries`, `durations`, `answers` list cols).
-- `src/every_query/generate_tasks/sample_query_sequences.py` — `build_sequence_index_df`
-  (fully-random sequences; optional default-off `eos_first_fraction` / `duration_mode` knobs) +
-  `label_binary_occurrence`. Per-shard seeding includes `input_shard`, so **queries are unique
-  across shards** (no original-EveryQuery cross-shard replication).
+- `src/every_query/generate_tasks/sample_query_sequences.py` — the 5-stage sequence sampler,
+  mirroring `sample_tasks`: Stage 0 `build_prediction_times` (reused), Stage 1'
+  `QuerySequenceDistribution` (a `QueryDistribution` subclass adding `min/max_queries` plus the
+  default-off `eos_first_fraction` / `duration_mode` knobs), Stage 2 `sample_patient_contexts`
+  (reused), Stage 3' `build_sequence_index`, Stage 4' `label_binary_occurrence` fanned out per
+  shard. Contexts are drawn **globally across the split**, not per shard, and durations are
+  continuous floats — both differ from the pre-port sampler, so the old checkpoint cannot be
+  compared against new data without retraining. Seeding uses three independent axes:
+  `derive_seed(seed, "queries")` (identical to the training sampler's draw),
+  `derive_seed(seed, "contexts")`, and `derive_seed(seed, "sequences")` for sequence structure.
+  `build_sequence_index_df` remains as the in-memory variant for supplied cohorts and the eval grid.
 - `src/every_query/model/conditional_lightning.py` — Lightning module; metrics = pooled
   `answer_auc` + per-position breakdowns (training-time diagnostics only).
 - `src/every_query/train/configs/conditional_config.yaml` — the training config (8-layer encoder,
@@ -91,7 +98,7 @@ Key source modules:
 
 | Script | What it does |
 |---|---|
-| `generate_mimic_sequences.py` | Drive `EQ_generate_query_sequences` across all MIMIC shards (spawn pool). `--min/max-queries`, `--eos-first-fraction`, `--duration-mode`. |
+| `generate_mimic_sequences.py` | **Superseded** — the sampler fans out across shards itself now. Kept as a signpost to the equivalent `EQ_generate_query_sequences` invocation. |
 | `make_clinical_task_sequences.py` | Build designed clinical conditional tasks (mortality, ICU→death, readmission) anchored 24h post-admission. |
 | `make_position_probe.py` | Matched-code position probe (a fixed code at positions 1..P). |
 | `eval_v2.py` | Query-form review eval: marginal `[C,d]`, EOS-conditioned `[END d][C d]` (P(C\|record ends) vs P(C\|data continue)), nested horizons. Counterfactual conditioning by overriding teacher-forced prior answers. |

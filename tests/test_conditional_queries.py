@@ -10,12 +10,15 @@ Covers, in order of pipeline position:
    (padding, binary answer classes, masks).
 4. ``sample_query_sequences`` — fully-random sequence sampling and binary observed-occurrence
    labeling on a hand-built events frame.
+5. ``sample_query_sequences`` Stages 1'/3' — the 5-stage pipeline's sequence-specific stages:
+   distribution parity with the training sampler, and per-shard index resolution.
 """
 
 import inspect
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import polars as pl
 import pytest
 import torch
@@ -36,8 +39,18 @@ from every_query.generate_tasks.sample_evaluation_query_sequences import (
 )
 from every_query.generate_tasks.sample_query_sequences import (
     CTX_ID_COL,
+    POSITION_COL,
+    QuerySequenceDistribution,
+    build_sequence_index,
     build_sequence_index_df,
     label_binary_occurrence,
+    resolve_prediction_times,
+)
+from every_query.generate_tasks.sample_tasks import (
+    QueryDistribution,
+    QuerySpec,
+    index_path,
+    prediction_times_path,
 )
 from every_query.model.conditional_model import (
     ANSWER_NO,
@@ -543,7 +556,13 @@ def test_eval_sampling_defaults_stay_in_training_distribution():
     train_cfg = yaml.safe_load((configs / "sample_query_sequences_config.yaml").read_text())
     eval_cfg = yaml.safe_load((configs / "sample_evaluation_query_sequences_config.yaml").read_text())
 
-    exact = ["duration_min", "duration_max", "eos_first_fraction", "duration_mode"]
+    exact = [
+        "duration_min",
+        "duration_max",
+        "duration_distribution",
+        "eos_first_fraction",
+        "duration_mode",
+    ]
     assert {k: eval_cfg[k] for k in exact} == {k: train_cfg[k] for k in exact}
 
     assert eval_cfg["min_queries"] == eval_cfg["max_queries"], "eval grid uses one fixed length"
@@ -557,3 +576,190 @@ def test_eval_sampling_defaults_stay_in_training_distribution():
     defaults = inspect.signature(sample_evaluation_query_sequences.run_worker).parameters
     for k in ("min_queries", "max_queries", "duration_min", "duration_max"):
         assert defaults[k].default == eval_cfg[k], f"run_worker default for {k} != config"
+
+
+# ── 6. Stage 1'/3': the 5-stage sequence pipeline ───────────────────────
+
+
+def _seq_dist(**overrides) -> QuerySequenceDistribution:
+    kwargs = {
+        "query_codes": ["A", "B", "C", EOS_CODE],
+        "min_duration": 1.0,
+        "max_duration": 365.0,
+        "duration_distribution": "log-uniform",
+        "min_queries": 1,
+        "max_queries": 5,
+    }
+    kwargs.update(overrides)
+    return QuerySequenceDistribution(**kwargs)
+
+
+def test_sequence_draw_is_identical_to_the_training_query_distribution():
+    """Stage 1' must draw from *exactly* the training sampler's distribution.
+
+    This is the distribution-parity anchor the integration plan calls for.  Because sequence
+    *structure* (lengths, the two sweep knobs) is drawn from a separate generator, the flattened
+    ``(code, duration)`` stream is identical to ``QueryDistribution.sample`` for the same generator
+    and total — so a future change to either sampler's draw breaks this test rather than silently
+    retraining the conditional model on a shifted distribution.
+    """
+    dist = _seq_dist()
+    seqs = dist.sample_sequences(50, np.random.default_rng(0), np.random.default_rng(1))
+    flat = [q for s in seqs for q in s]
+
+    base = QueryDistribution(dist.query_codes, 1.0, 365.0, "log-uniform")
+    assert flat == base.sample(len(flat), np.random.default_rng(0))
+
+
+def test_structure_rng_does_not_perturb_the_query_draw():
+    """Changing only the structure seed must leave the code/duration stream untouched.
+
+    The two axes are independent by construction; if they ever share a generator, a change to a
+    sweep knob would silently move the query distribution too.
+    """
+    dist = _seq_dist(min_queries=3, max_queries=3)  # fixed length => same total either way
+    a = dist.sample_sequences(20, np.random.default_rng(0), np.random.default_rng(1))
+    b = dist.sample_sequences(20, np.random.default_rng(0), np.random.default_rng(99))
+    assert [q for s in a for q in s] == [q for s in b for q in s]
+
+
+def test_sequence_durations_are_floats_not_whole_days():
+    """The fork rounded durations to integer days; ``QueryDistribution`` does not.
+
+    Guards the documented distribution shift that makes the pre-port checkpoint unusable
+    (CONDITIONAL_V2_INTEGRATION_PLAN.md §3) — a silent return to rounding would be a regression.
+    """
+    seqs = _seq_dist().sample_sequences(50, np.random.default_rng(0), np.random.default_rng(1))
+    durations = [q.duration_days for s in seqs for q in s]
+    assert any(d != round(d) for d in durations)
+
+
+def test_sequence_lengths_span_the_configured_range():
+    seqs = _seq_dist(min_queries=2, max_queries=4).sample_sequences(
+        200, np.random.default_rng(0), np.random.default_rng(1)
+    )
+    assert {len(s) for s in seqs} == {2, 3, 4}
+
+
+def test_duration_mode_nondecreasing_sorts_within_each_sequence():
+    seqs = _seq_dist(min_queries=4, max_queries=4, duration_mode="nondecreasing").sample_sequences(
+        20, np.random.default_rng(0), np.random.default_rng(1)
+    )
+    for s in seqs:
+        durations = [q.duration_days for q in s]
+        assert durations == sorted(durations)
+
+
+def test_duration_mode_same_shares_one_horizon_per_sequence():
+    seqs = _seq_dist(min_queries=4, max_queries=4, duration_mode="same").sample_sequences(
+        20, np.random.default_rng(0), np.random.default_rng(1)
+    )
+    assert all(len({q.duration_days for q in s}) == 1 for s in seqs)
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"min_queries": 0}, "min_queries must be >= 1"),
+        ({"min_queries": 3, "max_queries": 2}, "must be >= min_queries"),
+        ({"eos_first_fraction": 1.5}, r"must be in \[0, 1\]"),
+        ({"duration_mode": "sorted"}, "duration_mode must be one of"),
+        ({"query_codes": ["A"], "eos_first_fraction": 0.5}, "not in query_codes"),
+    ],
+)
+def test_sequence_distribution_rejects_bad_config(kwargs, match):
+    """Config errors must fail at construction, not three stages downstream."""
+    with pytest.raises(ValueError, match=match):
+        _seq_dist(**kwargs)
+
+
+def _write_prediction_times_map(artifacts: Path, split: str, shard: str, rows: list[tuple]) -> None:
+    """Write a Stage 0 ``_prediction_times/{shard}.parquet`` map with upstream's exact dtypes."""
+    fp = prediction_times_path(artifacts, split, shard)
+    fp.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame(
+        {
+            "subject_id": [r[0] for r in rows],
+            "prediction_time_index": [r[1] for r in rows],
+            "time": [r[2] for r in rows],
+        },
+        schema={
+            "subject_id": pl.Int64,
+            "prediction_time_index": pl.Int64,
+            "time": pl.Datetime("us"),
+        },
+    ).write_parquet(fp)
+
+
+def _stage2_contexts(rows: list[tuple]) -> pl.DataFrame:
+    """A Stage 2 output frame: ``(subject_id, shard, prediction_time_index)``."""
+    return pl.DataFrame(
+        {
+            "subject_id": [r[0] for r in rows],
+            "shard": [r[1] for r in rows],
+            "prediction_time_index": [r[2] for r in rows],
+        },
+        schema={"subject_id": pl.Int64, "shard": pl.Utf8, "prediction_time_index": pl.Int64},
+    )
+
+
+def test_build_sequence_index_partitions_by_shard_and_resolves_times(tmp_path: Path):
+    """Stage 3': one index partition per shard, ranks resolved, sequences kept intact."""
+    artifacts, split = tmp_path / "tasks_artifacts", "train"
+    _write_prediction_times_map(
+        artifacts, split, "0", [(1, 0, datetime(2024, 1, 1)), (1, 1, datetime(2024, 1, 8))]
+    )
+    _write_prediction_times_map(artifacts, split, "1", [(2, 0, datetime(2024, 2, 1))])
+
+    sequences = [
+        [QuerySpec("A", 3.0), QuerySpec("B", 7.0)],  # -> shard 0, subject 1, rank 1
+        [QuerySpec("C", 5.0)],  # -> shard 1, subject 2, rank 0
+        [QuerySpec("A", 1.0), QuerySpec(EOS_CODE, 9.0)],  # -> shard 0, subject 1, rank 0
+    ]
+    contexts = _stage2_contexts([(1, "0", 1), (2, "1", 0), (1, "0", 0)])
+
+    assert build_sequence_index(sequences, contexts, artifacts, split) == 2
+
+    shard0 = pl.read_parquet(index_path(artifacts, split, "0"))
+    shard1 = pl.read_parquet(index_path(artifacts, split, "1"))
+    assert shard0.height == 4 and shard1.height == 1
+
+    # Ranks resolved to the map's timestamps, and each sequence's queries stayed together, in
+    # order, under its own _ctx_id.
+    by_ctx = {
+        key[0]: (grp["query"].to_list(), grp["prediction_time"].to_list())
+        for key, grp in shard0.sort(CTX_ID_COL, POSITION_COL).group_by(CTX_ID_COL, maintain_order=True)
+    }
+    assert by_ctx[0] == (["A", "B"], [datetime(2024, 1, 8)] * 2)
+    assert by_ctx[2] == (["A", EOS_CODE], [datetime(2024, 1, 1)] * 2)
+    assert shard1["prediction_time"].to_list() == [datetime(2024, 2, 1)]
+
+    # _ctx_id is globally unique, so no two sequences collide when Stage 4' regroups.
+    assert len(set(shard0[CTX_ID_COL].to_list() + shard1[CTX_ID_COL].to_list())) == 3
+
+
+def test_build_sequence_index_rejects_length_mismatch(tmp_path: Path):
+    with pytest.raises(ValueError, match=r"must equal contexts\.height"):
+        build_sequence_index(
+            [[QuerySpec("A", 1.0)]],
+            _stage2_contexts([(1, "0", 0), (2, "0", 0)]),
+            tmp_path,
+            "train",
+        )
+
+
+def test_resolve_prediction_times_raises_on_unresolvable_rank(tmp_path: Path):
+    """The join is total by design — a null timestamp is a hard error, never a silent drop."""
+    artifacts, split = tmp_path / "a", "train"
+    _write_prediction_times_map(artifacts, split, "0", [(1, 0, datetime(2024, 1, 1))])
+    with pytest.raises(ValueError, match="null prediction_time"):
+        resolve_prediction_times(_stage2_contexts([(1, "0", 99)]), artifacts, split, "0")
+
+
+def test_resolve_prediction_times_raises_on_join_key_dtype_drift(tmp_path: Path):
+    """A dtype mismatch silently produces an all-null join in polars; it must fail loudly."""
+    artifacts, split = tmp_path / "a", "train"
+    _write_prediction_times_map(artifacts, split, "0", [(1, 0, datetime(2024, 1, 1))])
+    drifted = _stage2_contexts([(1, "0", 0)]).with_columns(pl.col("subject_id").cast(pl.UInt32))
+    with pytest.raises(ValueError, match="dtype mismatch"):
+        resolve_prediction_times(drifted, artifacts, split, "0")

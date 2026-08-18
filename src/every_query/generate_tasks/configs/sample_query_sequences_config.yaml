@@ -25,9 +25,11 @@ out_dir: ???
 query_codes: ???
 
 split: train
-input_shard: "0"
-task_shard: 0
 seed: 1
+
+# Output-name suffix for supplied-cohort mode only (`{stem}__{task_shard:04d}.parquet`); the
+# sampled path names its outputs after the data shards, so it ignores this.
+task_shard: 0
 
 # --- Supplied-cohort mode -------------------------------------------------
 # Path to a parquet of (subject_id, prediction_time) rows to score, e.g.
@@ -35,23 +37,31 @@ seed: 1
 #     min_queries=5 max_queries=5 duration_max=365 data_dir=... out_dir=... query_codes=...
 # When set: contexts come from that file (repeated `n_replicates`x, one sampled query sequence
 # each), events are gathered across every shard of `split`, the output is named after the file
-# stem, and `input_shard` / `n_contexts` / `min_prediction_times_per_subject` are unused.
+# stem, and `num_sequences` / `min_prediction_times_per_subject` / `max_workers` are unused.
 contexts_path: null
 n_replicates: 1
 
-# Number of patient contexts (= query sequences) sampled by this worker (contexts_path=null only).
-# NOTE: the sampled-context path is not wired up on this branch — it awaits the Stage 0/2/3
-# rewrite (Phase 2 of CONDITIONAL_V2_INTEGRATION_PLAN.md).  Only `contexts_path` mode runs today.
-n_contexts: 4096
+# Sampling budget: total query sequences drawn across the whole split (contexts_path=null only).
+# One sampled patient context = one sequence = one output row.  This is a *global* budget, not a
+# per-shard one — Stage 2 draws contexts across the whole split weighted by each subject's
+# prediction-time count — so it supersedes the fork's per-shard `n_contexts`.
+num_sequences: 4096
 
 # Each sequence is Uniform{min..max} i.i.d. queries (random code incl. TIMELINE//END, random
 # duration), fully random order — no privileged censor position.
 min_queries: 1
 max_queries: 5
 
-# Duration distribution bounds (log-uniform over integer days).
+# Duration draw (Stage 1'), delegated to `sample_tasks.QueryDistribution` so the sequence sampler
+# and the training-task sampler draw from an identical distribution.  `duration_days` is a **float**
+# (no day-rounding) — the fork's integer-day durations are gone, which is why the existing
+# conditional checkpoint must be retrained (CONDITIONAL_V2_INTEGRATION_PLAN.md §3).
+# These keep the conditional configs' `duration_min`/`duration_max` names rather than the base
+# class's `min_duration`/`max_duration`, so this file and
+# `sample_evaluation_query_sequences_config.yaml` stay key-identical (a test asserts that).
 duration_min: 1
 duration_max: 731
+duration_distribution: log-uniform # uniform | log-uniform
 
 # Minimum prior *prediction times* (distinct (subject_id, time) rows, NOT events) required before
 # a prediction time is eligible.  Supersedes the fork's event-based `min_context_per_subject`; the
@@ -59,12 +69,11 @@ duration_max: 731
 # — the two count different things, so revisit it before any real-cohort run.
 min_prediction_times_per_subject: 50
 
-# Optional cap on the labeling worker pool; null => resolve_workers() uses cores-on-node, an
-# explicit int caps that result downward only.  Named to match `sample_training_tasks_config.yaml`;
-# read once labeling fans out per shard (Phase 2), inert until then.
+# Optional cap on the Stage 4' labeling worker pool; null => resolve_workers() uses cores-on-node,
+# an explicit int caps that result downward only.  Matches `sample_training_tasks_config.yaml`.
 max_workers: null
 
-# --- Phase-2 sweep knobs (default OFF: fully random baseline) ---
+# --- Sequence-structure sweep knobs (default OFF: fully random baseline) ---
 # Probability a sequence is forced to start with the TIMELINE//END query (upweights the
 # censoring-control pattern).  0.0 = pure random.
 eos_first_fraction: 0.0

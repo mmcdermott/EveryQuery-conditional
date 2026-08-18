@@ -44,7 +44,13 @@ def test_cli_help_exits_zero(cli):
 
 @pytest.fixture(scope="session")
 def cq_sequence_tasks_dir(eq_preprocessed_dataset: Path, tmp_path_factory) -> Path:
-    """Runs ``EQ_generate_query_sequences`` for train + tuning splits on the fixture cohort."""
+    """Runs the sampled 5-stage ``EQ_generate_query_sequences`` for train + tuning splits.
+
+    Exercises the Phase-2 pipeline end to end: Stage 0 builds the prediction-time map, Stage 1'
+    draws the sequences, Stage 2 the contexts, Stage 3' the per-shard index, and Stage 4' fans out
+    the labeling.  ``min_prediction_times_per_subject=1`` because the demo cohort's subjects have
+    only a handful of distinct times each.
+    """
     intermediate = eq_preprocessed_dataset.parent / "intermediate"
     out_dir = tmp_path_factory.mktemp("cq_seq_tasks")
     for split in (train_split, tuning_split):
@@ -53,26 +59,27 @@ def cq_sequence_tasks_dir(eq_preprocessed_dataset: Path, tmp_path_factory) -> Pa
                 "EQ_generate_query_sequences",
                 f"data_dir={intermediate!s}",
                 f"out_dir={out_dir!s}",
+                f"query_codes={eq_preprocessed_dataset!s}",
                 f"split={split}",
-                "input_shard=0",
-                "task_shard=0",
-                "n_contexts=8",
+                "num_sequences=8",
                 "min_queries=1",
                 "max_queries=5",
                 "duration_min=1",
                 "duration_max=30",
-                "min_context_per_subject=1",
+                "min_prediction_times_per_subject=1",
                 "seed=1",
             ],
-            env={"PROCESSED": str(eq_preprocessed_dataset)},
             timeout=120.0,
         )
     return out_dir
 
 
 def test_generated_sequences_conform(cq_sequence_tasks_dir: Path):
-    fp = cq_sequence_tasks_dir / train_split / "0__0000.parquet"
-    assert fp.exists()
+    # Outputs are named after the data shards now (one per Stage 3' index partition), and the
+    # final root holds nothing but {shard}.parquet -- intermediates live in the _artifacts sibling.
+    shards = sorted((cq_sequence_tasks_dir / train_split).glob("*.parquet"))
+    assert shards, f"no output shards under {cq_sequence_tasks_dir / train_split}"
+    fp = shards[0]
     df = pl.read_parquet(fp)
     assert df.height > 0
     assert set(df.columns) >= {"subject_id", "prediction_time", "queries", "durations", "answers"}
@@ -85,6 +92,28 @@ def test_generated_sequences_conform(cq_sequence_tasks_dir: Path):
 
     # Binary observed-occurrence answers: every element non-null, no privileged first query.
     assert df["answers"].explode().null_count() == 0
+
+
+def test_sampled_run_writes_exactly_num_sequences_across_shards(cq_sequence_tasks_dir: Path):
+    """The global budget is honoured: one output row per sampled sequence, split-wide."""
+    for split in (train_split, tuning_split):
+        total = sum(pl.read_parquet(fp).height for fp in (cq_sequence_tasks_dir / split).glob("*.parquet"))
+        assert total == 8, f"{split}: expected num_sequences=8 rows, found {total}"
+
+
+def test_sampled_run_keeps_the_two_artifact_roots_disjoint(cq_sequence_tasks_dir: Path):
+    """Invariant 7: the final root holds only ``{shard}.parquet``; intermediates go to the sibling.
+
+    MEDS-TorchData rglobs the task-labels dir, so any stray parquet or ``_``-prefixed entry leaking
+    into the final root would be picked up as labels and break the schema-concat downstream.
+    """
+    artifacts = cq_sequence_tasks_dir.parent / f"{cq_sequence_tasks_dir.name}_artifacts"
+    assert (artifacts / train_split / "_prediction_time_counts.parquet").exists()
+    assert list((artifacts / train_split / "_index").glob("*.parquet"))
+
+    stray = [p.name for p in (cq_sequence_tasks_dir / train_split).iterdir() if p.name.startswith("_")]
+    assert not stray, f"intermediates leaked into the final output root: {stray}"
+    assert artifacts not in cq_sequence_tasks_dir.parents, "artifact roots must never nest"
 
 
 def test_supplied_contexts_mode(eq_preprocessed_dataset: Path, tmp_path: Path):
@@ -101,6 +130,7 @@ def test_supplied_contexts_mode(eq_preprocessed_dataset: Path, tmp_path: Path):
             "EQ_generate_query_sequences",
             f"data_dir={intermediate!s}",
             f"out_dir={out_dir!s}",
+            f"query_codes={eq_preprocessed_dataset!s}",
             f"split={train_split}",
             f"contexts_path={cohort_fp!s}",
             "n_replicates=4",
@@ -109,7 +139,6 @@ def test_supplied_contexts_mode(eq_preprocessed_dataset: Path, tmp_path: Path):
             "duration_min=1",
             "duration_max=365",
         ],
-        env={"PROCESSED": str(eq_preprocessed_dataset)},
         timeout=120.0,
     )
 
@@ -142,6 +171,7 @@ def test_dense_grid_sampled_sequences(eq_preprocessed_dataset: Path, cq_cohort_f
             "EQ_generate_evaluation_query_sequences",
             f"data_dir={intermediate!s}",
             f"out_dir={out_dir!s}",
+            f"query_codes={eq_preprocessed_dataset!s}",
             f"split={train_split}",
             f"contexts_path={cq_cohort_fp!s}",
             "n_sequences=3",
@@ -184,6 +214,7 @@ def test_dense_grid_skips_existing_output(eq_preprocessed_dataset: Path, cq_coho
         "EQ_generate_evaluation_query_sequences",
         f"data_dir={intermediate!s}",
         f"out_dir={out_dir!s}",
+        f"query_codes={eq_preprocessed_dataset!s}",
         f"split={train_split}",
         f"contexts_path={cq_cohort_fp!s}",
         "n_sequences=2",
@@ -229,6 +260,7 @@ def test_dense_grid_designed_sequences_per_spec_dirs(
             "EQ_generate_evaluation_query_sequences",
             f"data_dir={intermediate!s}",
             f"out_dir={out_dir!s}",
+            f"query_codes={eq_preprocessed_dataset!s}",
             f"split={train_split}",
             f"contexts_path={cq_cohort_fp!s}",
             f"sequences_path={sequences_fp!s}",
@@ -262,6 +294,7 @@ def test_dense_grid_rejects_out_of_vocab_code(
                 "EQ_generate_evaluation_query_sequences",
                 f"data_dir={intermediate!s}",
                 f"out_dir={tmp_path / 'out'!s}",
+                f"query_codes={eq_preprocessed_dataset!s}",
                 f"split={train_split}",
                 f"contexts_path={cq_cohort_fp!s}",
                 f"sequences_path={sequences_fp!s}",
@@ -300,7 +333,8 @@ def test_conditional_predict_and_evaluate(
     # Predict on the tuning split sequences (the fixture cohort has no held_out labels here).
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
-    src = cq_sequence_tasks_dir / tuning_split / "0__0000.parquet"
+    # The sampled path names outputs after the data shards; take the first one.
+    src = sorted((cq_sequence_tasks_dir / tuning_split).glob("*.parquet"))[0]
     (tasks_dir / "tasks.parquet").write_bytes(src.read_bytes())
 
     predictions_fp = tmp_path / "predictions.parquet"
@@ -354,6 +388,7 @@ def test_dense_grid_is_scoreable_by_predict_sequences(
             "EQ_generate_evaluation_query_sequences",
             f"data_dir={intermediate!s}",
             f"out_dir={tasks_dir!s}",
+            f"query_codes={eq_preprocessed_dataset!s}",
             f"split={tuning_split}",
             f"contexts_path={cohort_fp!s}",
             "n_sequences=2",
@@ -411,6 +446,7 @@ def test_eval_v3_scores_supplied_sequences(
             "EQ_generate_query_sequences",
             f"data_dir={intermediate!s}",
             f"out_dir={tasks_dir!s}",
+            f"query_codes={eq_preprocessed_dataset!s}",
             f"split={tuning_split}",
             f"contexts_path={cohort_fp!s}",
             "n_replicates=2",
@@ -618,7 +654,8 @@ def test_eval_v3_rejects_wrong_split(
     """Subjects absent from ``--split`` are dropped by the schema_df semi-join; that must not be silent."""
     tasks_dir = tmp_path / "tasks"
     (tasks_dir / train_split).mkdir(parents=True)
-    src = cq_sequence_tasks_dir / train_split / "0__0000.parquet"
+    # The sampled path names outputs after the data shards; take the first one.
+    src = sorted((cq_sequence_tasks_dir / train_split).glob("*.parquet"))[0]
     (tasks_dir / train_split / "tasks.parquet").write_bytes(src.read_bytes())
 
     script = EVAL_V3

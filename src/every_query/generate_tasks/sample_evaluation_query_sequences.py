@@ -260,11 +260,12 @@ def sample_sequence_specs(
     query_codes: list[str],
     min_queries: int,
     max_queries: int,
-    duration_low: int,
-    duration_high: int,
+    duration_low: float,
+    duration_high: float,
     seed: int,
     eos_first_fraction: float = 0.0,
     duration_mode: str = "random",
+    duration_distribution: str = "log-uniform",
 ) -> list[SequenceSpec]:
     """Draw ``n_sequences`` specs from the *training* query distribution, once.
 
@@ -315,6 +316,7 @@ def sample_sequence_specs(
         seed=seed,
         eos_first_fraction=eos_first_fraction,
         duration_mode=duration_mode,
+        duration_distribution=duration_distribution,
     )
     grouped = index_df.group_by(CTX_ID_COL, maintain_order=True).agg(
         pl.col(TaskQuerySchema.query_name),
@@ -434,11 +436,12 @@ def resolve_specs(
     n_sequences: int,
     min_queries: int,
     max_queries: int,
-    duration_min: int,
-    duration_max: int,
+    duration_min: float,
+    duration_max: float,
     seed: int,
     eos_first_fraction: float = 0.0,
     duration_mode: str = "random",
+    duration_distribution: str = "log-uniform",
 ) -> list[SequenceSpec]:
     """Read designed specs from ``sequences_path``, or sample them when it is ``None``."""
     if sequences_path is not None:
@@ -455,6 +458,7 @@ def resolve_specs(
         seed=seed,
         eos_first_fraction=eos_first_fraction,
         duration_mode=duration_mode,
+        duration_distribution=duration_distribution,
     )
     logger.info("Sampled %d query sequence(s) from the training query distribution", len(specs))
     return specs
@@ -507,8 +511,9 @@ def run_worker(
     # The duration bounds mirror ``sample_query_sequences``' defaults so horizons come from the
     # distribution the model was pretrained on.  Keep in sync with
     # ``configs/sample_query_sequences_config.yaml``.
-    duration_min: int = 1,
-    duration_max: int = 731,
+    duration_min: float = 1,
+    duration_max: float = 731,
+    duration_distribution: str = "log-uniform",
     seed: int = 1,
     eos_first_fraction: float = 0.0,
     duration_mode: str = "random",
@@ -543,20 +548,24 @@ def run_worker(
         seed=derive_seed(seed, "eval_seq_specs", split),
         eos_first_fraction=eos_first_fraction,
         duration_mode=duration_mode,
+        duration_distribution=duration_distribution,
     )
     validate_spec_codes(specs, query_codes)
 
-    non_integer = sorted({float(d) for s in specs for d in s.durations if not float(d).is_integer()})
-    if non_integer:
-        # Fractional horizons label correctly (polars' `duration(days=...)` honours the fraction),
-        # but the training sampler only ever emits whole days, so the model is being asked about a
-        # horizon shape it never saw.  Worth knowing; not worth blocking.
-        logger.warning(
-            "%d spec duration(s) are not whole days (e.g. %s); labeling honours the fraction, but "
-            "training durations are always whole days.",
-            len(non_integer),
-            non_integer[:5],
-        )
+    # Only *designed* specs get the whole-day check.  Sampled specs come from `QueryDistribution`,
+    # which draws continuous float durations by design (the training sampler does too, since the
+    # 5-stage port), so warning about them would fire on essentially every sampled grid.  A designed
+    # spec's fractional duration is still worth flagging: it labels correctly (polars'
+    # `duration(days=...)` honours the fraction) but is usually a hand-authoring slip.
+    if sequences_path is not None:
+        non_integer = sorted({float(d) for s in specs for d in s.durations if not float(d).is_integer()})
+        if non_integer:
+            logger.warning(
+                "%d designed spec duration(s) are not whole days (e.g. %s); labeling honours the "
+                "fraction — check this is intended.",
+                len(non_integer),
+                non_integer[:5],
+            )
 
     specs_tag = Path(sequences_path).stem if sequences_path else f"sampled{len(specs)}"
     stem = f"{Path(contexts_path).stem}__{specs_tag}"
@@ -656,8 +665,9 @@ def main(cfg: DictConfig) -> None:
         n_sequences=int(cfg.n_sequences),
         min_queries=int(cfg.min_queries),
         max_queries=int(cfg.max_queries),
-        duration_min=int(cfg.duration_min),
-        duration_max=int(cfg.duration_max),
+        duration_min=float(cfg.duration_min),
+        duration_max=float(cfg.duration_max),
+        duration_distribution=str(cfg.get("duration_distribution", "log-uniform")),
         seed=int(cfg.seed),
         eos_first_fraction=float(cfg.get("eos_first_fraction", 0.0)),
         duration_mode=str(cfg.get("duration_mode", "random")),

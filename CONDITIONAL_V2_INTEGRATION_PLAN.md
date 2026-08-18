@@ -150,7 +150,37 @@ package).
 
 This commit will not import cleanly. That is expected — it is the raw payload.
 
-### Phase 2 — Rebuild `sample_query_sequences.py` as a 5-stage pipeline
+### Phase 2 — Rebuild `sample_query_sequences.py` as a 5-stage pipeline — **DONE**
+
+Landed as described below, with these deviations worth recording:
+
+- **Duration config keys kept as `duration_min` / `duration_max`**, not renamed to the base class's
+  `min_duration` / `max_duration`. `QuerySequenceDistribution.from_config` adapts at the
+  `QueryDistribution` boundary. Renaming would have broken the training/eval key-equality test
+  (`test_eval_sampling_defaults_stay_in_training_distribution`) and both configs at once for no
+  functional gain. `duration_distribution` was added to **both** configs and to that test.
+- **Three seed axes, not two.** `derive_seed(seed, "queries")` and `"contexts"` are upstream's;
+  `"sequences"` is new and carries sequence length + the two sweep knobs. Keeping structure draws
+  off the query axis is what makes the flattened draw byte-identical to
+  `QueryDistribution.sample` — the distribution-parity anchor Phase 6 asked for, already tested.
+- **`resolve_prediction_times` was factored out** of Stage 3' as a reusable per-shard
+  rank→timestamp join (dtype guard + raise-on-null intact) so Phase 3's sampled-context branch can
+  call it rather than duplicating the logic.
+- **`build_sequence_index_df` survives** as the in-memory variant for supplied cohorts and the eval
+  grid; `build_sequence_index` is the new partition-writing Stage 3'. `run_worker` is now
+  supplied-cohort-only and `main` dispatches on `contexts_path`.
+- **`n_contexts` → `num_sequences`** (now a global split-wide budget, not per-shard);
+  `input_shard` removed; `task_shard` retained only for supplied-cohort output naming.
+- Out-of-phase fixes that were blocking verification: `ConditionalQueryLightningModule` now
+  overrides `training_step` (the inherited one reached for the two-headed model's `occurs_loss` /
+  `censor_loss` and crashed every conditional training run), and the `test_conditional_cli.py`
+  invocations were given the mandatory `query_codes=` that Phase 4 introduced. The full
+  conditional chain now runs on the demo cohort — Phase 7's smoke run, achieved early.
+- `scripts/generate_mimic_sequences.py` is superseded (the fan-out is in the sampler now) and was
+  replaced with a signpost to the equivalent CLI call.
+
+Original plan follows.
+
 
 **This is most of the effort.** The fork is shard-local: one `run_worker` per
 `(input_shard, task_shard)` that samples contexts from that shard's own events and does

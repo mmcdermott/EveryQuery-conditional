@@ -92,6 +92,24 @@ class ConditionalQueryLightningModule(EveryQueryLightningModule):
                     target=targets[:, j][sel_j],
                 )
 
+    def training_step(self, batch: ConditionalQueryBatch) -> torch.Tensor:
+        """Forward pass and metric logging for one training batch.
+
+        Overrides the parent rather than inheriting it: upstream's ``training_step`` logs *per-task*
+        encoder gradient norms by calling ``_encoder_grad_norm`` on ``outputs.occurs_loss`` and
+        ``outputs.censor_loss``.  That split only exists for the two-headed single-query model.  The
+        conditional model has **one** loss — every query position is a binary answer, and censoring
+        is carried by an ordinary ``TIMELINE//END`` query rather than a separate head — so
+        :class:`ConditionalQueryOutput` has neither attribute and the inherited hook raises
+        ``AttributeError`` on the first step.
+
+        The equivalent stability signal is the total pre-clipping gradient norm already logged by
+        :meth:`on_before_optimizer_step`; there is no second task to compare against.
+        """
+        loss, outputs = self.model(batch)
+        self._log_metrics(loss, outputs, batch, train_split)
+        return loss
+
     def on_before_optimizer_step(self, optimizer):
         """Log the total gradient L2 norm (pre-clipping) as a training-stability signal."""
         from lightning.pytorch.utilities import grad_norm
