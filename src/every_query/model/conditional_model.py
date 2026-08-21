@@ -256,6 +256,11 @@ class ConditionalQueryModel(torch.nn.Module):
         self.answer_embed = torch.nn.Embedding(N_ANSWER_CLASSES, H)
         self.token_type_embed = torch.nn.Embedding(TOKENS_PER_QUERY, H)
         self.block_pos_embed = torch.nn.Embedding(max_queries, H)
+        # Marks a duration slot as event-bounded.  Added to the boundary code's token embedding
+        # so the model can tell "window ends at the next X" from "is X observed" — both use the
+        # same embedding table.  Always allocated (not gated on a flag) so the parameter set does
+        # not depend on the data, which would make checkpoints silently incompatible.
+        self.bound_marker = torch.nn.Parameter(torch.randn(H) * 0.02)
         self.answer_mlp = MLP(layers=[H, 128, 1], dropout_prob=mlp_dropout)
 
         self.max_queries = max_queries
@@ -335,8 +340,25 @@ class ConditionalQueryModel(torch.nn.Module):
         A seam: features that change *what bounds the window* (an event boundary rather than a
         scalar horizon) replace this.  Note the answer for block ``j`` is read from this slot's
         output position, so whatever goes here must stay a per-query vector.
+
+        For an **event-bounded** query the window runs to the next occurrence of a boundary
+        code rather than for a fixed horizon, so the slot carries that code's token embedding
+        plus a learned marker distinguishing "this is a boundary" from "this code is being
+        asked about" (the same embedding table feeds the code slot).  The scalar-duration MLP
+        is bypassed entirely for those positions — its input there is only the sentinel.
+
+        With no bounds present this is exactly the scalar path, so a bound-free dataset trains
+        bit-identically to a model without the feature.
         """
-        return self.duration_embed((batch.q_durations / 365.0).unsqueeze(-1))
+        dur_emb = self.duration_embed((batch.q_durations / 365.0).unsqueeze(-1))
+
+        q_bounds = getattr(batch, "q_bound_codes", None)
+        if q_bounds is None:
+            return dur_emb
+
+        bound_emb = self.HF_model.embeddings.tok_embeddings(q_bounds).to(dur_emb.dtype)
+        bound_emb = bound_emb + self.bound_marker.to(dur_emb.dtype)
+        return torch.where((q_bounds > 0).unsqueeze(-1), bound_emb, dur_emb)
 
     def _decoder_tokens(self, batch) -> torch.Tensor:
         """Build the interleaved ``(B, 3L, H)`` decoder input from a ConditionalQueryBatch.

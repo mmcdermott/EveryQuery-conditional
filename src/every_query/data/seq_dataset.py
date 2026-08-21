@@ -53,6 +53,22 @@ DURATIONS_COL = "durations"
 ANSWERS_COL = "answers"
 SEQ_LABEL_COLS = (QUERIES_COL, DURATIONS_COL, ANSWERS_COL)
 
+# Event-bounded queries: a per-query boundary code replaces the scalar horizon.  Deliberately
+# NOT in SEQ_LABEL_COLS — that tuple is the *required* set, and a dataset generated before this
+# feature existed must keep loading.
+BOUND_EVENTS_COL = "bound_events"
+OPTIONAL_SEQ_LABEL_COLS = (BOUND_EVENTS_COL,)
+ALL_SEQ_LABEL_COLS = (*SEQ_LABEL_COLS, *OPTIONAL_SEQ_LABEL_COLS)
+
+# Duration written for an event-bounded query.  The window is defined by the boundary event, so
+# there is no horizon; a negative sentinel makes an accidental use as a horizon obvious rather
+# than plausible.  Downstream bucketing must special-case it (see evaluate_sequences).
+EVENT_BOUND_DURATION_SENTINEL = -1.0
+
+# Vocabulary index meaning "this query has no boundary event".  Shares PAD_INDEX = 0, which is
+# never a real query code.
+NO_BOUND_INDEX = 0
+
 
 @dataclass
 class ConditionalQueryBatch(MEDSTorchBatch):
@@ -95,12 +111,21 @@ class ConditionalQueryBatch(MEDSTorchBatch):
     q_durations: torch.FloatTensor | None = None
     q_answers: torch.LongTensor | None = None
     q_mask: torch.BoolTensor | None = None
+    # Per-query boundary-event vocab indices; ``NO_BOUND_INDEX`` (0) means "time-bounded".
+    # ``None`` for a dataset whose labels carry no ``bound_events`` column at all.
+    q_bound_codes: torch.LongTensor | None = None
     # Per-patient-token elapsed time in integer hours, for rotary position encoding.  Present
     # only when the dataset was built with ``strip_delta_tokens=True``; ``None`` leaves the
     # encoder on ordinary token-index positions.  Shape matches ``code``, not the query tensors.
     time_pos_ids: torch.LongTensor | None = None
 
-    LABEL_TENSOR_NAMES: ClassVar[tuple[str]] = ("boolean_value", "q_codes", "q_durations", "q_answers")
+    LABEL_TENSOR_NAMES: ClassVar[tuple[str]] = (
+        "boolean_value",
+        "q_codes",
+        "q_durations",
+        "q_answers",
+        "q_bound_codes",
+    )
 
     @property
     def n_queries(self) -> int | None:
@@ -111,7 +136,10 @@ class ConditionalQueryBatch(MEDSTorchBatch):
         if self.q_codes is None:
             return
         expected = (self.batch_size, self.q_codes.shape[1])
-        for name in ("q_codes", "q_durations", "q_answers", "q_mask"):
+        names = ["q_codes", "q_durations", "q_answers", "q_mask"]
+        if self.q_bound_codes is not None:
+            names.append("q_bound_codes")
+        for name in names:
             tensor = getattr(self, name)
             if tensor is None or tuple(tensor.shape) != expected:
                 got = None if tensor is None else tensor.shape
@@ -130,7 +158,7 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
         ``schema_df``), so the extras can be hstacked from a semi-filtered copy of ``label_df``.
         """
         base = super().get_task_seq_bounds_and_labels(label_df, schema_df)
-        extras = [c for c in SEQ_LABEL_COLS if c in label_df.collect_schema().names()]
+        extras = [c for c in ALL_SEQ_LABEL_COLS if c in label_df.collect_schema().names()]
         if not extras:
             return base
         sid = DataSchema.subject_id_name
@@ -163,6 +191,11 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
         self.queries = self.schema_df[QUERIES_COL]
         self.durations = self.schema_df[DURATIONS_COL]
         self.answers = self.schema_df[ANSWERS_COL]
+
+        # Event bounds are opt-in *in the data*: a labels directory generated before the feature
+        # existed simply has no such column, and the batch then carries q_bound_codes=None.
+        self.has_bound_events = BOUND_EVENTS_COL in schema_cols
+        self.bound_events = self.schema_df[BOUND_EVENTS_COL] if self.has_bound_events else None
 
         code_meta = pl.read_parquet(
             self.config.code_metadata_fp, columns=["code", "code/vocab_index"], use_pyarrow=True
@@ -208,7 +241,7 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
 
         def read_df(fp: Path) -> pl.DataFrame:
             available = pq.read_schema(fp).names
-            extras = [c for c in SEQ_LABEL_COLS if c in available]
+            extras = [c for c in ALL_SEQ_LABEL_COLS if c in available]
             return pl.read_parquet(fp, columns=[*required, *extras], use_pyarrow=True)
 
         logger.info(f"Reading query-sequence tasks from {self.config.task_labels_fps}")
@@ -229,6 +262,8 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
         out["queries"] = self.queries[idx].to_list()
         out["durations"] = self.durations[idx].to_list()
         out["answers"] = self.answers[idx].to_list()
+        if self.has_bound_events:
+            out["bound_events"] = self.bound_events[idx].to_list()
         return out
 
     def _apply_rope_time(self, out: dict) -> torch.LongTensor | None:
@@ -291,6 +326,9 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
         q_durations = torch.zeros(B, max_q, dtype=torch.float)
         q_answers = torch.full((B, max_q), ANSWER_NO, dtype=torch.long)
         q_mask = torch.zeros(B, max_q, dtype=torch.bool)
+        q_bound_codes = (
+            torch.full((B, max_q), NO_BOUND_INDEX, dtype=torch.long) if self.has_bound_events else None
+        )
 
         for i, item in enumerate(batch):
             codes = [self.encode_query(c) for c in item["queries"]]
@@ -302,6 +340,15 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
                 dtype=torch.long,
             )
             q_mask[i, :n] = True
+            if q_bound_codes is not None:
+                # A null entry is a time-bounded query.  Non-null goes through the *strict*
+                # encode_query, so a boundary code outside the vocabulary raises here rather
+                # than silently PAD-encoding into "no bound" and quietly turning the query
+                # back into an ordinary horizon query.
+                q_bound_codes[i, :n] = torch.as_tensor(
+                    [NO_BOUND_INDEX if b is None else self.encode_query(b) for b in item["bound_events"]],
+                    dtype=torch.long,
+                )
 
         return ConditionalQueryBatch(
             **out,
@@ -309,5 +356,6 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
             q_durations=q_durations,
             q_answers=q_answers,
             q_mask=q_mask,
+            q_bound_codes=q_bound_codes,
             time_pos_ids=time_pos_ids,
         )

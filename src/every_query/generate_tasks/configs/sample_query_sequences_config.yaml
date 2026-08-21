@@ -80,6 +80,27 @@ eos_first_fraction: 0.0
 # Duration coupling within a sequence: random | same | nondecreasing.
 duration_mode: random
 
+# --- Event-bounded duration queries -----------------------------------------------------------
+# Fraction of queries whose window ends at the next occurrence of a boundary EVENT rather than
+# after a fixed horizon.  0.0 = off (no `bound_events` column is written at all, and the output is
+# byte-identical to a pre-feature run).
+#
+# NOTE these fractions are a zero-sum draw on a fixed query budget: every event-bounded query is
+# one fewer ordinary horizon query.  The upstream experiment measured -0.0088 AUROC on scalar
+# tasks at a 50% diet.  Prefer running one query form at a time before mixing.
+eventbound_fraction: 0.0
+# REQUIRED when eventbound_fraction > 0: the boundary codes to draw from.  These are
+# cohort-specific strings and there is no safe default, so generation fails rather than guessing.
+# A code absent from the vocabulary is an error, not a silent drop.  The upstream MIMIC-IV set was:
+#   - TIMELINE//END
+#   - MEDS_DEATH
+#   - HOSPITAL_DISCHARGE//HOME
+#   - HOSPITAL_DISCHARGE//UNK
+#   - "HOSPITAL_ADMISSION//EW EMER.//EMERGENCY ROOM"
+#   - "ICU_DISCHARGE//Medical Intensive Care Unit (MICU)"
+#   - "ICU_ADMISSION//Medical Intensive Care Unit (MICU)"
+bound_events: null
+
 overwrite: false
 
 hydra:

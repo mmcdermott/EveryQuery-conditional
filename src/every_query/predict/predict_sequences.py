@@ -27,7 +27,7 @@ from hydra.utils import instantiate
 from meds import held_out_split, tuning_split
 from omegaconf import DictConfig
 
-from every_query.data.seq_dataset import ANSWERS_COL, DURATIONS_COL, QUERIES_COL
+from every_query.data.seq_dataset import ANSWERS_COL, BOUND_EVENTS_COL, DURATIONS_COL, QUERIES_COL
 from every_query.model.conditional_lightning import ConditionalQueryLightningModule
 from every_query.predict.predict import _validate_tasks_dir
 from every_query.utils.model_loader import setup_model
@@ -63,19 +63,40 @@ def predictions_to_df(schema_df: pl.DataFrame, predictions: list[dict[str, torch
             f"Prediction row count ({len(probs_per_row)}) != dataset row count ({schema_df.height})."
         )
 
-    out = schema_df.select(
+    # Carry boundary events through when the labels have them: an event-bounded answer cannot
+    # be interpreted (or bucketed for metrics) without knowing which boundary defined its window.
+    has_bounds = BOUND_EVENTS_COL in schema_df.columns
+    selection = [
         "subject_id",
         "prediction_time",
         pl.col(QUERIES_COL).alias("query"),
         pl.col(DURATIONS_COL).alias("duration_days"),
         pl.col(ANSWERS_COL).alias("answer"),
-    ).with_columns(pl.Series("answer_prob", probs_per_row, dtype=pl.List(pl.Float32)))
+    ]
+    if has_bounds:
+        selection.append(pl.col(BOUND_EVENTS_COL).alias("bound_event"))
+
+    out = schema_df.select(*selection).with_columns(
+        pl.Series("answer_prob", probs_per_row, dtype=pl.List(pl.Float32))
+    )
 
     n_q = pl.col("query").list.len()
     out = out.with_columns(pl.int_ranges(0, n_q).alias("position"))
-    return out.explode("position", "query", "duration_days", "answer", "answer_prob").select(
-        "subject_id", "prediction_time", "position", "query", "duration_days", "answer", "answer_prob"
-    )
+
+    exploded = ["position", "query", "duration_days", "answer", "answer_prob"]
+    columns = [
+        "subject_id",
+        "prediction_time",
+        "position",
+        "query",
+        "duration_days",
+        "answer",
+        "answer_prob",
+    ]
+    if has_bounds:
+        exploded.append("bound_event")
+        columns.append("bound_event")
+    return out.explode(*exploded).select(*columns)
 
 
 @hydra.main(version_base="1.3", config_path=CONFIGS, config_name="predict_sequences")

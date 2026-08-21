@@ -77,13 +77,16 @@ from omegaconf import DictConfig
 
 from every_query.data import query_vocab
 from every_query.data.schema import QuerySeqSchema, TaskQuerySchema
+from every_query.data.seq_dataset import EVENT_BOUND_DURATION_SENTINEL
 from every_query.generate_tasks.sample_query_sequences import (
+    BOUND_COL,
     CTX_ID_COL,
     POSITION_COL,
     build_sequence_index_df,
     label_query_sequences,
     read_events_for_subjects,
     read_supplied_contexts,
+    resolve_bound_events,
     resolve_prediction_times,
 )
 from every_query.generate_tasks.sample_tasks import (
@@ -118,7 +121,24 @@ class SequenceSpec:
 
     Examples:
         >>> SequenceSpec("mortality_30d", ("TIMELINE//END", "MEDS_DEATH"), (1.0, 30.0))
-        SequenceSpec(name='mortality_30d', queries=('TIMELINE//END', 'MEDS_DEATH'), durations=(1.0, 30.0))
+        SequenceSpec(name='mortality_30d', queries=('TIMELINE//END', 'MEDS_DEATH'),
+                     durations=(1.0, 30.0), bounds=())
+
+        A position may instead be bounded by an *event*: its window runs to the next occurrence
+        of that code, so it carries the duration sentinel rather than a horizon.
+
+        >>> spec = SequenceSpec("sepsis_before_discharge", ("SEPSIS",), (-1.0,),
+        ...                         ("HOSPITAL_DISCHARGE//HOME",))
+        >>> spec.bound_at(0)
+        'HOSPITAL_DISCHARGE//HOME'
+
+        A bounded position with a real horizon is a contradiction and is rejected:
+
+        >>> SequenceSpec("bad", ("SEPSIS",), (30.0,), ("DISCHARGE",))
+        Traceback (most recent call last):
+            ...
+        ValueError: spec 'bad' position 0 is bounded by 'DISCHARGE', so its duration must be
+        the -1.0 sentinel, got 30.0
 
         Ragged or empty specs are rejected at construction:
 
@@ -139,6 +159,7 @@ class SequenceSpec:
     name: str
     queries: tuple[str, ...]
     durations: tuple[float, ...]
+    bounds: tuple[str | None, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.queries:
@@ -150,6 +171,10 @@ class SequenceSpec:
         for i, q in enumerate(self.queries):
             if not isinstance(q, str) or not q:
                 raise ValueError(f"spec {self.name!r} query at position {i} must be a non-empty string")
+        if self.bounds and len(self.bounds) != len(self.queries):
+            raise ValueError(
+                f"spec {self.name!r} has {len(self.queries)} queries but {len(self.bounds)} bound(s)"
+            )
         for i, d in enumerate(self.durations):
             # ``bool`` is an ``int`` subclass, so ``True`` would otherwise become ``1.0`` days.
             if isinstance(d, bool) or not isinstance(d, int | float):
@@ -157,10 +182,24 @@ class SequenceSpec:
                     f"spec {self.name!r} duration at position {i} must be a number, "
                     f"got {type(d).__name__}: {d!r}"
                 )
+            # An event-bounded position has no horizon — its window ends at a boundary event —
+            # so it carries the negative sentinel instead.  That is the *only* licence for a
+            # non-positive duration; an unbounded position must still name a real horizon.
+            if self.bound_at(i) is not None:
+                if float(d) != EVENT_BOUND_DURATION_SENTINEL:
+                    raise ValueError(
+                        f"spec {self.name!r} position {i} is bounded by {self.bound_at(i)!r}, so its "
+                        f"duration must be the {EVENT_BOUND_DURATION_SENTINEL} sentinel, got {float(d)}"
+                    )
+                continue
             if not math.isfinite(d) or d <= 0:
                 raise ValueError(
                     f"spec {self.name!r} duration {float(d)} at position {i} must be a finite number > 0"
                 )
+
+    def bound_at(self, i: int) -> str | None:
+        """Boundary code at position ``i``, or ``None`` when that position is time-bounded."""
+        return self.bounds[i] if self.bounds else None
 
     def __len__(self) -> int:
         return len(self.queries)
@@ -178,7 +217,9 @@ def _sanitise_names(specs: list[SequenceSpec]) -> list[SequenceSpec]:
                 f"rename one so per-spec output directories stay distinct."
             )
         seen[safe] = spec.name
-        out.append(spec if safe == spec.name else SequenceSpec(safe, spec.queries, spec.durations))
+        out.append(
+            spec if safe == spec.name else SequenceSpec(safe, spec.queries, spec.durations, spec.bounds)
+        )
     return out
 
 
@@ -188,12 +229,30 @@ def _specs_from_pairs(name: str, pairs: object) -> SequenceSpec:
         raise ValueError(f"sequence {name!r} must be a list of [code, duration] pairs, got {pairs!r}")
     queries: list[str] = []
     durations: list[float] = []
+    bounds: list[str | None] = []
     for i, pair in enumerate(pairs):
-        if isinstance(pair, str) or not isinstance(pair, Sequence) or len(pair) != 2:
-            raise ValueError(f"sequence {name!r} entry {i} must be a [code, duration] pair, got {pair!r}")
+        if isinstance(pair, str) or not isinstance(pair, Sequence) or len(pair) not in (2, 3):
+            raise ValueError(
+                f"sequence {name!r} entry {i} must be a [code, duration] pair or a "
+                f"[code, duration, bound_event] triple, got {pair!r}"
+            )
+        bound = pair[2] if len(pair) == 3 else None
+        if bound is not None and not isinstance(bound, str):
+            # Guards the shape `[code, duration, 9]`, which would otherwise be read as a
+            # boundary rather than rejected as a malformed [code, duration] pair.
+            raise ValueError(
+                f"sequence {name!r} entry {i} must be a [code, duration] pair or a "
+                f"[code, duration, bound_event] triple with a string bound, got {pair!r}"
+            )
         queries.append(pair[0])
         durations.append(pair[1])
-    return SequenceSpec(name=name, queries=tuple(queries), durations=tuple(durations))
+        bounds.append(bound)
+    return SequenceSpec(
+        name=name,
+        queries=tuple(queries),
+        durations=tuple(durations),
+        bounds=tuple(bounds) if any(b is not None for b in bounds) else (),
+    )
 
 
 def read_sequence_specs(path: str | Path) -> list[SequenceSpec]:
@@ -282,6 +341,8 @@ def sample_sequence_specs(
     eos_first_fraction: float = 0.0,
     duration_mode: str = "random",
     duration_distribution: str = "log-uniform",
+    eventbound_fraction: float = 0.0,
+    bound_events: Sequence[str] | None = None,
 ) -> list[SequenceSpec]:
     """Draw ``n_sequences`` specs from the *training* query distribution, once.
 
@@ -333,16 +394,19 @@ def sample_sequence_specs(
         eos_first_fraction=eos_first_fraction,
         duration_mode=duration_mode,
         duration_distribution=duration_distribution,
+        eventbound_fraction=eventbound_fraction,
+        bound_events=bound_events,
     )
-    grouped = index_df.group_by(CTX_ID_COL, maintain_order=True).agg(
-        pl.col(TaskQuerySchema.query_name),
-        pl.col(TaskQuerySchema.duration_days_name),
-    )
+    agg_cols = [pl.col(TaskQuerySchema.query_name), pl.col(TaskQuerySchema.duration_days_name)]
+    if BOUND_COL in index_df.columns:
+        agg_cols.append(pl.col(BOUND_COL))
+    grouped = index_df.group_by(CTX_ID_COL, maintain_order=True).agg(*agg_cols)
     return [
         SequenceSpec(
             name=f"seq_{i:04d}",
             queries=tuple(row[TaskQuerySchema.query_name]),
             durations=tuple(float(d) for d in row[TaskQuerySchema.duration_days_name]),
+            bounds=tuple(row[BOUND_COL]) if BOUND_COL in row else (),
         )
         for i, row in enumerate(grouped.iter_rows(named=True))
     ]
@@ -401,6 +465,10 @@ def build_dense_sequence_index_df(
     q = TaskQuerySchema.query_name
     d = TaskQuerySchema.duration_days_name
 
+    # The bound column appears only when some spec is event-bounded, so a bound-free grid stays
+    # byte-identical to one built before the feature existed.
+    any_bounds = any(s.bounds for s in specs)
+
     out_schema = {
         CTX_ID_COL: pl.UInt32,
         POSITION_COL: pl.Int64,
@@ -409,6 +477,8 @@ def build_dense_sequence_index_df(
         q: pl.Utf8,
         d: pl.Float32,
     }
+    if any_bounds:
+        out_schema[BOUND_COL] = pl.Utf8
     if contexts.height == 0:
         return pl.DataFrame(schema=out_schema)
 
@@ -423,15 +493,18 @@ def build_dense_sequence_index_df(
             f"UInt32 _ctx_id range; shard the cohort across multiple runs."
         )
 
-    spec_frame = pl.DataFrame(
-        {
-            SPEC_ID_COL: [i for i, s in enumerate(specs) for _ in s.queries],
-            POSITION_COL: [p for s in specs for p in range(len(s))],
-            q: [c for s in specs for c in s.queries],
-            d: [float(dd) for s in specs for dd in s.durations],
-        },
-        schema={SPEC_ID_COL: pl.Int64, POSITION_COL: pl.Int64, q: pl.Utf8, d: pl.Float32},
-    )
+    spec_cols = {
+        SPEC_ID_COL: [i for i, s in enumerate(specs) for _ in s.queries],
+        POSITION_COL: [p for s in specs for p in range(len(s))],
+        q: [c for s in specs for c in s.queries],
+        d: [float(dd) for s in specs for dd in s.durations],
+    }
+    spec_schema = {SPEC_ID_COL: pl.Int64, POSITION_COL: pl.Int64, q: pl.Utf8, d: pl.Float32}
+    if any_bounds:
+        spec_cols[BOUND_COL] = [s.bound_at(p) for s in specs for p in range(len(s))]
+        spec_schema[BOUND_COL] = pl.Utf8
+
+    spec_frame = pl.DataFrame(spec_cols, schema=spec_schema)
 
     return (
         contexts.select(sid, pt)
@@ -458,6 +531,8 @@ def resolve_specs(
     eos_first_fraction: float = 0.0,
     duration_mode: str = "random",
     duration_distribution: str = "log-uniform",
+    eventbound_fraction: float = 0.0,
+    bound_events: Sequence[str] | None = None,
 ) -> list[SequenceSpec]:
     """Read designed specs from ``sequences_path``, or sample them when it is ``None``."""
     if sequences_path is not None:
@@ -475,6 +550,8 @@ def resolve_specs(
         eos_first_fraction=eos_first_fraction,
         duration_mode=duration_mode,
         duration_distribution=duration_distribution,
+        eventbound_fraction=eventbound_fraction,
+        bound_events=bound_events,
     )
     logger.info("Sampled %d query sequence(s) from the training query distribution", len(specs))
     return specs
@@ -489,8 +566,12 @@ def validate_spec_codes(specs: list[SequenceSpec], query_codes: list[str]) -> No
     a typo'd or wrong-vocabulary MEDS code enters.
     """
     # Check the codes each query *mentions*: an aggregate expression is not itself a code, but
-    # every component of it must be one.  Bare codes pass through unchanged.
-    unknown = query_vocab.unknown_codes((q for s in specs for q in s.queries), set(query_codes))
+    # every component of it must be one.  Bare codes pass through unchanged.  Boundary events are
+    # checked too — a boundary the encoder never saw cannot define a window, and an unchecked one
+    # would surface as a KeyError deep inside collate, after the labeling and model load.
+    mentioned = [q for s in specs for q in s.queries]
+    mentioned += [b for s in specs for b in s.bounds if b is not None]
+    unknown = query_vocab.unknown_codes(mentioned, set(query_codes))
     if unknown:
         shown = ", ".join(repr(c) for c in unknown[:10])
         more = f" (and {len(unknown) - 10} more)" if len(unknown) > 10 else ""
@@ -634,6 +715,8 @@ def run_worker(
     seed: int = 1,
     eos_first_fraction: float = 0.0,
     duration_mode: str = "random",
+    eventbound_fraction: float = 0.0,
+    bound_events: Sequence[str] | None = None,
     n_contexts: int = 512,
     min_prediction_times_per_subject: int = 50,
     per_spec_dirs: bool = False,
@@ -690,6 +773,8 @@ def run_worker(
         eos_first_fraction=eos_first_fraction,
         duration_mode=duration_mode,
         duration_distribution=duration_distribution,
+        eventbound_fraction=eventbound_fraction,
+        bound_events=bound_events,
     )
     validate_spec_codes(specs, query_codes)
 
@@ -843,6 +928,8 @@ def main(cfg: DictConfig) -> None:
         seed=int(cfg.seed),
         eos_first_fraction=float(cfg.get("eos_first_fraction", 0.0)),
         duration_mode=str(cfg.get("duration_mode", "random")),
+        eventbound_fraction=float(cfg.get("eventbound_fraction", 0.0) or 0.0),
+        bound_events=resolve_bound_events(cfg, query_codes),
         n_contexts=int(cfg.n_contexts),
         min_prediction_times_per_subject=int(cfg.min_prediction_times_per_subject),
         per_spec_dirs=bool(cfg.get("per_spec_dirs", False)),

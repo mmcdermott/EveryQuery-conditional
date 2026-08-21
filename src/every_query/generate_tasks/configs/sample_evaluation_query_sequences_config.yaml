@@ -116,6 +116,17 @@ duration_distribution: log-uniform # uniform | log-uniform
 eos_first_fraction: 0.0
 duration_mode: random
 
+# --- Event-bounded duration queries -----------------------------------------------------------
+# Must mirror sample_query_sequences_config.yaml exactly (the two are asserted key-identical on
+# every sampling knob): a knob that drifts between the training sampler and the eval grid
+# silently invalidates the grid.  See that file for the full explanation.
+#
+# Fraction of *sampled* eval queries that are event-bounded.  Designed specs set their bounds
+# explicitly instead, via the `bounds` field of each sequence spec.
+eventbound_fraction: 0.0
+# REQUIRED when eventbound_fraction > 0; cohort-specific, no default, unknown codes are an error.
+bound_events: null
+
 # Write one output dir per sequence (`{out_dir}/{spec_name}/{split}/tasks.parquet`) instead of
 # one combined parquet.  Useful with designed, named sequences: each dir is independently
 # scoreable, so per-task metrics need no post-hoc grouping.  With the combined file, sequence

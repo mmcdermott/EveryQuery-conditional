@@ -45,6 +45,7 @@ import json
 import logging
 import multiprocessing
 import shutil
+from collections.abc import Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from importlib.resources import files
@@ -56,8 +57,9 @@ import polars as pl
 from meds import DataSchema
 from omegaconf import DictConfig
 
+from every_query.data import query_vocab
 from every_query.data.schema import QuerySeqSchema, TaskQuerySchema
-from every_query.data.seq_dataset import EOS_CODE
+from every_query.data.seq_dataset import EOS_CODE, EVENT_BOUND_DURATION_SENTINEL
 from every_query.generate_tasks.sample_tasks import (
     INDEX_DIRNAME,
     LABELED_DIRNAME,
@@ -94,6 +96,23 @@ INDEX_COLUMNS = [
     TaskQuerySchema.query_name,
     TaskQuerySchema.duration_days_name,
 ]
+
+# Per-query boundary code in the flat index frame; becomes the ``bound_events`` list column.
+BOUND_COL = "bound_event"
+
+# Documented starting point for ``bound_events``, from the upstream experiment's MIMIC-IV
+# vocabulary.  NOT a silent fallback: ``eventbound_fraction > 0`` requires the caller to pass
+# ``bound_events`` explicitly, because these strings are cohort-specific and a boundary code that
+# does not exist in the vocabulary would otherwise be dropped, silently reducing the pool.
+EXAMPLE_BOUNDARY_CODES = (
+    "TIMELINE//END",
+    "MEDS_DEATH",
+    "HOSPITAL_DISCHARGE//HOME",
+    "HOSPITAL_DISCHARGE//UNK",
+    "HOSPITAL_ADMISSION//EW EMER.//EMERGENCY ROOM",
+    "ICU_DISCHARGE//Medical Intensive Care Unit (MICU)",
+    "ICU_ADMISSION//Medical Intensive Care Unit (MICU)",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -305,13 +324,60 @@ def _attach_queries_to_contexts(contexts: pl.DataFrame, per_query: pl.DataFrame)
     A row-gather by ``_ctx_id`` (which *is* the context row index) rather than a join: it is
     positional, order-preserving, and needs no join key on a frame the size of the fan-out.  Polars
     joins carry no order guarantee, so a join here would silently scramble ``_position`` order.
+
+    ``bound_event`` rides along when present, so an event-bounded draw survives the gather.
     """
-    return contexts[per_query[CTX_ID_COL].to_numpy()].with_columns(
+    attached = [
         per_query[CTX_ID_COL],
         per_query[POSITION_COL],
         per_query[TaskQuerySchema.query_name],
         per_query[TaskQuerySchema.duration_days_name],
+    ]
+    if BOUND_COL in per_query.columns:
+        attached.append(per_query[BOUND_COL])
+    return contexts[per_query[CTX_ID_COL].to_numpy()].with_columns(*attached)
+
+
+def resolve_bound_events(cfg: DictConfig, query_codes: Sequence[str]) -> list[str]:
+    """Resolve and validate the boundary-code pool for event-bounded queries.
+
+    ``bound_events`` is a **required** key once ``eventbound_fraction > 0``: the codes are
+    cohort-specific strings (see :data:`EXAMPLE_BOUNDARY_CODES` for the upstream MIMIC-IV set),
+    and there is no defensible default that works across cohorts.
+
+    A boundary code absent from ``query_codes`` is a hard error rather than a silent drop.
+    Dropping would shrink the pool without saying so — in the limit to nothing — and the
+    resulting model would look trained while never having seen the boundary you asked for.
+
+    Returns:
+        The validated boundary codes, or ``[]`` when the feature is off.
+    """
+    fraction = float(cfg.get("eventbound_fraction", 0.0) or 0.0)
+    if fraction <= 0.0:
+        return []
+
+    configured = list(cfg.get("bound_events") or ())
+    if not configured:
+        raise ValueError(
+            "eventbound_fraction > 0 requires `bound_events=[...]`, a list of boundary codes "
+            "present in this cohort's vocabulary.  These strings are cohort-specific; "
+            f"the upstream MIMIC-IV set was {list(EXAMPLE_BOUNDARY_CODES)}."
+        )
+
+    unknown = query_vocab.unknown_codes(configured, set(query_codes))
+    if unknown:
+        raise ValueError(
+            f"{len(unknown)} bound_events code(s) are not in the query vocabulary: {unknown}.  "
+            "A boundary code the encoder never saw cannot define a window; fix the spelling or "
+            "drop it explicitly rather than letting the pool shrink silently."
+        )
+    logger.info(
+        "Event bounds: %.0f%% of queries will be bounded by one of %d boundary code(s): %s",
+        100.0 * fraction,
+        len(configured),
+        configured,
     )
+    return configured
 
 
 def build_sequence_index_df(
@@ -325,6 +391,8 @@ def build_sequence_index_df(
     eos_first_fraction: float = 0.0,
     duration_mode: str = "random",
     duration_distribution: str = "log-uniform",
+    eventbound_fraction: float = 0.0,
+    bound_events: Sequence[str] | None = None,
 ) -> pl.DataFrame:
     """Expand *already-resolved* contexts into a flat per-query index frame (in-memory variant).
 
@@ -366,6 +434,23 @@ def build_sequence_index_df(
         ...     ctx, ["A", "B", EOS_CODE], 2, 2, 1, 365, 0, eos_first_fraction=1.0)
         >>> idx.filter(pl.col("_position") == 0)["query"].unique().to_list()
         ['TIMELINE//END']
+
+        ``eventbound_fraction`` converts that share of queries into event-bounded ones, which
+        carry a boundary code and the duration sentinel instead of a horizon:
+
+        >>> idx = build_sequence_index_df(
+        ...     ctx, ["A", "B"], 4, 4, 1, 365, 0,
+        ...     eventbound_fraction=1.0, bound_events=["DISCHARGE"])
+        >>> idx["bound_event"].unique().to_list()
+        ['DISCHARGE']
+        >>> idx["duration_days"].unique().to_list()
+        [-1.0]
+
+        Left at its default the column is absent entirely, so the frame is byte-identical to a
+        run from before the feature existed:
+
+        >>> "bound_event" in build_sequence_index_df(ctx, ["A"], 2, 2, 1, 365, 0).columns
+        False
     """
     dist = QuerySequenceDistribution(
         query_codes=list(query_codes),
@@ -378,8 +463,11 @@ def build_sequence_index_df(
         duration_mode=duration_mode,
     )
 
+    bounded = eventbound_fraction > 0.0
+    columns = [*INDEX_COLUMNS, BOUND_COL] if bounded else INDEX_COLUMNS
+
     if contexts.height == 0:
-        return contexts.head(0).select(
+        empty = contexts.head(0).select(
             pl.lit(0, dtype=pl.UInt32).alias(CTX_ID_COL),
             pl.lit(0, dtype=pl.Int64).alias(POSITION_COL),
             TaskQuerySchema.subject_id_name,
@@ -387,6 +475,9 @@ def build_sequence_index_df(
             pl.lit("", dtype=pl.Utf8).alias(TaskQuerySchema.query_name),
             pl.lit(0.0, dtype=pl.Float32).alias(TaskQuerySchema.duration_days_name),
         )
+        if bounded:
+            empty = empty.with_columns(pl.lit(None, dtype=pl.Utf8).alias(BOUND_COL))
+        return empty
 
     sequences = dist.sample_sequences(
         contexts.height,
@@ -394,7 +485,17 @@ def build_sequence_index_df(
         np.random.default_rng(derive_seed(seed, "sequences")),
     )
     per_query = _expand_sequences(sequences)
-    return _attach_queries_to_contexts(contexts, per_query).select(INDEX_COLUMNS)
+    if bounded:
+        # A fourth, independent seed axis.  Drawing bounds from the "queries" generator would
+        # shift every later code/duration draw and break the distribution-parity contract with
+        # sample_tasks; drawing from "sequences" would perturb eos_first_fraction/duration_mode.
+        per_query = assign_event_bounds(
+            per_query,
+            list(bound_events or ()),
+            eventbound_fraction,
+            np.random.default_rng(derive_seed(seed, "bounds")),
+        )
+    return _attach_queries_to_contexts(contexts, per_query).select(columns)
 
 
 # ---------------------------------------------------------------------------
@@ -469,6 +570,9 @@ def build_sequence_index(
     contexts: pl.DataFrame,
     training_task_artifacts_dir: Path,
     split: str,
+    eventbound_fraction: float = 0.0,
+    bound_events: Sequence[str] | None = None,
+    seed: int = 0,
 ) -> int:
     """Stage 3': zip sequences with contexts, resolve prediction times, write partitioned index.
 
@@ -511,6 +615,17 @@ def build_sequence_index(
     assert contexts.height > 0, "contexts must be non-empty"
 
     per_query = _expand_sequences(sequences)
+    bounded = eventbound_fraction > 0.0
+    if bounded:
+        # Fourth seed axis — see build_sequence_index_df for why it must not share the query or
+        # sequence generators.
+        per_query = assign_event_bounds(
+            per_query,
+            list(bound_events or ()),
+            eventbound_fraction,
+            np.random.default_rng(derive_seed(seed, "bounds")),
+        )
+    columns = [*INDEX_COLUMNS, BOUND_COL] if bounded else INDEX_COLUMNS
     combined = _attach_queries_to_contexts(contexts, per_query)
 
     index_dir = training_task_artifacts_dir / split / INDEX_DIRNAME
@@ -527,7 +642,7 @@ def build_sequence_index(
         joined = resolve_prediction_times(shard_group, training_task_artifacts_dir, split, str(shard_name))
 
         _atomic_write_parquet(
-            joined.select(INDEX_COLUMNS).sort(CTX_ID_COL, POSITION_COL),
+            joined.select(columns).sort(CTX_ID_COL, POSITION_COL),
             index_path(training_task_artifacts_dir, split, str(shard_name)),
         )
         n_shards += 1
@@ -611,6 +726,162 @@ def label_binary_occurrence(index_df: pl.DataFrame, events_df: pl.DataFrame) -> 
     )
 
 
+def _first_occurrence_after(
+    left: pl.DataFrame, events_df: pl.DataFrame, code_col: str, out_col: str
+) -> pl.DataFrame:
+    """Forward-asof each row of ``left`` to the first event whose code matches ``code_col``.
+
+    Attaches ``out_col`` — the timestamp of the first occurrence strictly after the row's
+    ``_pts`` key — or null when the code never occurs again.  Rows whose ``code_col`` is null
+    (a time-bounded query has no boundary) simply find no match.
+    """
+    sid = TaskQuerySchema.subject_id_name
+    time_col = DataSchema.time_name
+
+    right = (
+        events_df.rename({DataSchema.code_name: code_col})
+        .select(sid, code_col, time_col)
+        .sort(sid, code_col, time_col)
+    )
+    return (
+        left.sort(sid, code_col, "_pts")
+        .join_asof(right, by=[sid, code_col], left_on="_pts", right_on=time_col, strategy="forward")
+        .rename({time_col: out_col})
+    )
+
+
+def label_with_event_bounds(index_df: pl.DataFrame, events_df: pl.DataFrame) -> pl.DataFrame:
+    """Label a mixed frame of time-bounded and event-bounded queries.
+
+    A query with a null ``bound_event`` behaves exactly as
+    :func:`label_binary_occurrence` — occurrence strictly inside
+    ``(prediction_time, prediction_time + duration_days)``.
+
+    A query with a boundary code is answered over ``(prediction_time, boundary)`` instead,
+    where ``boundary`` is the **first occurrence of the boundary code strictly after the
+    prediction time**.  The bound is strict: an occurrence *at* the boundary instant is not
+    inside the window.
+
+    **When the boundary never occurs again, the window runs to the end of the record**, which
+    degenerates the query into "does this code ever occur again".  That is the upstream
+    experiment's semantics, kept deliberately so results stay comparable — but it is a real
+    trap for boundary codes that do not recur (``MEDS_DEATH`` most obviously), so
+    :func:`label_query_sequences` logs how often it fires, per boundary code.
+
+    Examples:
+        >>> from datetime import datetime
+        >>> events = pl.DataFrame({
+        ...     "subject_id": [1, 1, 1, 1],
+        ...     "time": [datetime(2024, 1, 3), datetime(2024, 1, 6), datetime(2024, 1, 9),
+        ...              datetime(2024, 1, 20)],
+        ...     "code": ["A", "DISCHARGE", "A", "TIMELINE//END"],
+        ... }).with_columns(pl.col("time").cast(pl.Datetime("us")))
+        >>> idx = pl.DataFrame({
+        ...     "_ctx_id": [0, 0],
+        ...     "_position": [0, 1],
+        ...     "subject_id": [1, 1],
+        ...     "prediction_time": [datetime(2024, 1, 1)] * 2,
+        ...     "query": ["A", "A"],
+        ...     "duration_days": [30.0, -1.0],
+        ...     "bound_event": [None, "DISCHARGE"],
+        ... }).with_columns(
+        ...     pl.col("prediction_time").cast(pl.Datetime("us")),
+        ...     pl.col("duration_days").cast(pl.Float32),
+        ...     pl.col("_ctx_id").cast(pl.UInt32))
+        >>> row = label_with_event_bounds(idx, events).row(0, named=True)
+
+        Time-bounded: A occurs on the 3rd, inside 30 days.  Event-bounded: A on the 3rd is
+        before the DISCHARGE on the 6th, so also True.
+
+        >>> row["answers"]
+        [True, True]
+        >>> row["bound_events"]
+        [None, 'DISCHARGE']
+
+        The bound is strict, and only occurrences *before* it count.  Asking about a code that
+        occurs only after the boundary answers False even though it is well inside 30 days:
+
+        >>> idx2 = idx.head(1).with_columns(
+        ...     pl.lit("LATE").alias("query"),
+        ...     pl.lit(-1.0).cast(pl.Float32).alias("duration_days"),
+        ...     pl.lit("DISCHARGE").alias("bound_event"))
+        >>> late_events = pl.concat([events, pl.DataFrame({
+        ...     "subject_id": [1], "time": [datetime(2024, 1, 8)], "code": ["LATE"],
+        ... }).with_columns(pl.col("time").cast(pl.Datetime("us")))])
+        >>> label_with_event_bounds(idx2, late_events).row(0, named=True)["answers"]
+        [False]
+    """
+    sid = TaskQuerySchema.subject_id_name
+    pt = TaskQuerySchema.prediction_time_name
+    q = TaskQuerySchema.query_name
+    d = TaskQuerySchema.duration_days_name
+
+    left = index_df.with_columns((pl.col(pt) + pl.duration(microseconds=1)).alias("_pts"))
+    joined = _first_occurrence_after(left, events_df, q, "_q_time")
+    joined = _first_occurrence_after(joined, events_df, BOUND_COL, "_b_time")
+
+    is_bounded = pl.col(BOUND_COL).is_not_null()
+    # A boundary that never recurs leaves the window open to the end of the record, so any
+    # occurrence at all counts.  Expressed as "no upper bound" rather than as a far-future
+    # sentinel date, which would need a tz-aware literal to compare against these naive columns.
+    window_open = is_bounded & pl.col("_b_time").is_null()
+    window_end = (
+        pl.when(is_bounded).then(pl.col("_b_time")).otherwise(pl.col(pt) + pl.duration(days=pl.col(d)))
+    )
+    answer = pl.col("_q_time").is_not_null() & (window_open | (pl.col("_q_time") < window_end))
+
+    flat = joined.with_columns(answer.alias("answer")).sort(CTX_ID_COL, POSITION_COL)
+    return (
+        flat.group_by(CTX_ID_COL, maintain_order=True)
+        .agg(
+            pl.col(sid).first(),
+            pl.col(pt).first(),
+            pl.col(q).alias("queries"),
+            pl.col(d).alias("durations"),
+            pl.col("answer").alias("answers"),
+            pl.col(BOUND_COL).alias("bound_events"),
+        )
+        .drop(CTX_ID_COL)
+    )
+
+
+def log_degenerate_bounds(index_df: pl.DataFrame, events_df: pl.DataFrame) -> dict[str, float]:
+    """Report, per boundary code, the fraction of event-bounded rows whose boundary never fires.
+
+    Those rows are silently relabelled "does this code ever occur again" (see
+    :func:`label_with_event_bounds`).  A boundary that degenerates most of the time is not
+    really being learned as a boundary, and the resulting AUROC would say otherwise — so the
+    rate is logged at generation time, when it is still cheap to notice.
+    """
+    if BOUND_COL not in index_df.columns:
+        return {}
+    bounded = index_df.filter(pl.col(BOUND_COL).is_not_null())
+    if bounded.height == 0:
+        return {}
+
+    left = bounded.with_columns(
+        (pl.col(TaskQuerySchema.prediction_time_name) + pl.duration(microseconds=1)).alias("_pts")
+    )
+    joined = _first_occurrence_after(left, events_df, BOUND_COL, "_b_time")
+    rates = (
+        joined.group_by(BOUND_COL)
+        .agg(pl.col("_b_time").is_null().mean().alias("degenerate_rate"), pl.len().alias("n"))
+        .sort(BOUND_COL)
+    )
+    out: dict[str, float] = {}
+    for row in rates.iter_rows(named=True):
+        out[row[BOUND_COL]] = float(row["degenerate_rate"])
+        logger.info(
+            "Event bound %r: %.1f%% of %d queries have no boundary occurrence after the "
+            "prediction time (window runs to end of record — the query degenerates to "
+            "'does this code ever occur again').",
+            row[BOUND_COL],
+            100.0 * row["degenerate_rate"],
+            row["n"],
+        )
+    return out
+
+
 def label_query_sequences(index_df: pl.DataFrame, events_df: pl.DataFrame) -> pl.DataFrame:
     """Stage 4' labeling entry point: answer every query in ``index_df`` against ``events_df``.
 
@@ -620,8 +891,11 @@ def label_query_sequences(index_df: pl.DataFrame, events_df: pl.DataFrame) -> pl
     way in training and another in evaluation produces a grid that looks fine and silently
     measures the wrong thing.
 
-    Today every query is a plain occurrence question and this delegates unchanged to
-    :func:`label_binary_occurrence`, which stays the regression anchor for that semantics.
+    Dispatch is on the *frame*, not on a config flag: an index carrying a ``bound_event``
+    column is labelled with :func:`label_with_event_bounds`, anything else with
+    :func:`label_binary_occurrence`, which stays the regression anchor for plain occurrence
+    semantics.  Keying on the data means an eval grid built with bounds is always scored with
+    bound-aware labels, even if some caller forgets to pass the flag.
 
     This must remain a **module-level function**: Stage 4' fans shards out through a
     ``ProcessPoolExecutor`` with ``mp_context="spawn"``, so a closure or a locally-defined
@@ -632,9 +906,86 @@ def label_query_sequences(index_df: pl.DataFrame, events_df: pl.DataFrame) -> pl
         events_df: The event stream to answer against.
 
     Returns:
-        One row per sequence, with the ``queries``/``durations``/``answers`` list columns.
+        One row per sequence, with the ``queries``/``durations``/``answers`` list columns
+        (plus ``bound_events`` when the index carried bounds).
     """
+    if BOUND_COL in index_df.columns:
+        log_degenerate_bounds(index_df, events_df)
+        return label_with_event_bounds(index_df, events_df)
     return label_binary_occurrence(index_df, events_df)
+
+
+def assign_event_bounds(
+    index_df: pl.DataFrame,
+    boundary_codes: Sequence[str],
+    eventbound_fraction: float,
+    rng: np.random.Generator,
+) -> pl.DataFrame:
+    """Convert a fraction of the per-query rows into event-bounded queries.
+
+    Draws i.i.d. **per query**, not per sequence, so a single sequence mixes time- and
+    event-bounded asks — which is the point: the model has to read the slot to know which
+    kind it is being given.  Chosen rows get a boundary code and the
+    ``EVENT_BOUND_DURATION_SENTINEL`` in place of their sampled horizon; the rest keep their
+    horizon and a null bound.
+
+    ``rng`` is passed in rather than a seed so the caller can keep this on its own seed axis:
+    drawing bounds from the query generator would shift every subsequent code/duration draw
+    and break the sampler's distribution-parity contract with ``sample_tasks``.
+
+    Examples:
+        >>> import numpy as np
+        >>> idx = pl.DataFrame({
+        ...     "query": ["A", "B", "C", "D"],
+        ...     "duration_days": [30.0, 30.0, 30.0, 30.0],
+        ... }).with_columns(pl.col("duration_days").cast(pl.Float32))
+
+        ``0.0`` adds the column but bounds nothing, so the frame is unchanged apart from an
+        all-null ``bound_event``:
+
+        >>> out = assign_event_bounds(idx, ["X"], 0.0, np.random.default_rng(0))
+        >>> out["bound_event"].to_list(), out["duration_days"].to_list()
+        ([None, None, None, None], [30.0, 30.0, 30.0, 30.0])
+
+        ``1.0`` bounds every row and replaces every horizon with the sentinel:
+
+        >>> out = assign_event_bounds(idx, ["X"], 1.0, np.random.default_rng(0))
+        >>> out["bound_event"].to_list(), out["duration_days"].to_list()
+        (['X', 'X', 'X', 'X'], [-1.0, -1.0, -1.0, -1.0])
+
+        Bounds are drawn from the supplied pool only:
+
+        >>> out = assign_event_bounds(idx, ["X", "Y"], 1.0, np.random.default_rng(3))
+        >>> set(out["bound_event"].to_list()) <= {"X", "Y"}
+        True
+    """
+    if not boundary_codes:
+        raise ValueError(
+            "assign_event_bounds requires at least one boundary code.  Pass `bound_events=[...]` "
+            "with codes present in the cohort vocabulary."
+        )
+    if not 0.0 <= eventbound_fraction <= 1.0:
+        raise ValueError(f"eventbound_fraction must be in [0, 1], got {eventbound_fraction}")
+
+    n = index_df.height
+    if n == 0:
+        return index_df.with_columns(pl.lit(None, dtype=pl.Utf8).alias(BOUND_COL))
+
+    chosen = rng.random(n) < eventbound_fraction
+    picks = rng.integers(0, len(boundary_codes), size=n)
+    # A plain list of ``str | None``, not a numpy object array: polars cannot cast Object to Utf8,
+    # which only shows up once the draw is actually mixed (all-None and all-bound both survive it).
+    bounds = [boundary_codes[p] if c else None for c, p in zip(chosen, picks, strict=True)]
+
+    return index_df.with_columns(
+        pl.Series(BOUND_COL, bounds, dtype=pl.Utf8),
+    ).with_columns(
+        pl.when(pl.col(BOUND_COL).is_not_null())
+        .then(pl.lit(EVENT_BOUND_DURATION_SENTINEL))
+        .otherwise(pl.col(TaskQuerySchema.duration_days_name))
+        .cast(pl.Float32)
+        .alias(TaskQuerySchema.duration_days_name)
+    )
 
 
 def label_one_sequence_shard(
@@ -797,6 +1148,9 @@ def run(cfg: DictConfig) -> None:
 
     # Stage 1': sample one variable-length query sequence per context-to-be.
     query_dist = QuerySequenceDistribution.from_config(cfg)
+    # Validate the boundary pool before any sampling work: a bad code should fail in seconds,
+    # not after Stage 0 has rebuilt the prediction-time map.
+    bound_events = resolve_bound_events(cfg, query_dist.query_codes)
     sequences = query_dist.sample_sequences(num_sequences, query_rng, structure_rng)
     n_queries = sum(len(s) for s in sequences)
     logger.info(
@@ -835,6 +1189,9 @@ def run(cfg: DictConfig) -> None:
         contexts=contexts,
         training_task_artifacts_dir=seq_task_artifacts_dir,
         split=cfg.split,
+        eventbound_fraction=float(cfg.get("eventbound_fraction", 0.0) or 0.0),
+        bound_events=bound_events,
+        seed=cfg.seed,
     )
     logger.info(
         "Stage 3': wrote partitioned index for split=%s (%s query rows across %s shard(s)).",
@@ -917,6 +1274,8 @@ def run_worker(
     duration_distribution: str = "log-uniform",
     eos_first_fraction: float = 0.0,
     duration_mode: str = "random",
+    eventbound_fraction: float = 0.0,
+    bound_events: Sequence[str] | None = None,
     n_replicates: int = 1,
     overwrite: bool = False,
 ) -> Path | None:
@@ -963,6 +1322,8 @@ def run_worker(
         eos_first_fraction=eos_first_fraction,
         duration_mode=duration_mode,
         duration_distribution=duration_distribution,
+        eventbound_fraction=eventbound_fraction,
+        bound_events=bound_events,
     )
 
     labeled = label_query_sequences(index_df, events_df)
@@ -1012,6 +1373,8 @@ def main(cfg: DictConfig) -> None:
         duration_distribution=str(cfg.get("duration_distribution", "log-uniform")),
         eos_first_fraction=float(cfg.get("eos_first_fraction", 0.0)),
         duration_mode=str(cfg.get("duration_mode", "random")),
+        eventbound_fraction=float(cfg.get("eventbound_fraction", 0.0) or 0.0),
+        bound_events=resolve_bound_events(cfg, query_codes),
         n_replicates=int(cfg.get("n_replicates", 1)),
         overwrite=bool(cfg.get("overwrite", False)),
     )
