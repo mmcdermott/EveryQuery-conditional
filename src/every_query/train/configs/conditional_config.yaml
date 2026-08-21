@@ -63,6 +63,11 @@ datamodule:
     # query vocabulary so an ancestor can be queried.  Must match `lightning_module.model
     # .ontology_dir` below — they index into the same embedding table.
     ontology_dir: null
+    # Parse each query as a possible aggregate expression and emit the op/component/gap tensors.
+    # The model picks the aggregate pathway up from the batch automatically — there is no model
+    # flag.  Leaving this off on data that DOES contain aggregates fails loudly (the expression
+    # is not a vocabulary code, so encode_query raises) rather than silently mislabelling.
+    aggregate_queries: false
   batch_size: 96
   num_workers: 8
   pin_memory: True

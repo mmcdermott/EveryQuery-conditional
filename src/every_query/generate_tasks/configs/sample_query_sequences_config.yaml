@@ -113,6 +113,18 @@ ontology_dir: null
 # its parity with sample_tasks — is untouched.  The upstream experiment used 0.30.
 ancestor_fraction: 0.0
 
+# --- Aggregate queries --------------------------------------------------------------------------
+# Fraction of queries replaced by an aggregate EXPRESSION over several component codes, drawn
+# uniformly over the operator set {ANY, ALL, SEQ, CO, WITHIN, GE2, XOR}.  0.0 = off.  Components
+# are drawn from the query vocabulary, excluding codes containing characters the grammar reserves
+# (| > & parentheses), which could not be parsed back out of the query string.
+#
+# Worth knowing before turning this on: upstream found that COMPOSING single-query predictions
+# under an independence assumption beat the native aggregate head overall (0.7568 vs 0.7396).
+# The native model won specifically on CO and WITHIN — the operators whose truth is not a
+# function of the components' marginal occurrence.
+aggregate_fraction: 0.0
+
 overwrite: false
 
 hydra:

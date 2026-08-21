@@ -41,6 +41,7 @@ import torch
 from transformers import AutoConfig, ModernBertConfig, ModernBertModel
 from transformers.modeling_outputs import BaseModelOutput
 
+from every_query.data.query_vocab import N_OPS, OP_ATOM, OP_SEQ, OP_WITHIN
 from every_query.model.model import MLP
 
 logger = logging.getLogger(__name__)
@@ -61,6 +62,11 @@ TOKEN_CODE = 0
 TOKEN_DURATION = 1
 TOKEN_ANSWER = 2
 TOKENS_PER_QUERY = 3
+
+# Aggregate queries: component slots per query, and the day scale the gap bounds are divided by
+# before the temporal MLP (keeps a 30-day gap around 1.0).
+MAX_COMPONENTS = 3
+GAP_SCALE_DAYS = 30.0
 
 
 def build_block_causal_mask(n_queries: int, device: torch.device | None = None) -> torch.Tensor:
@@ -269,6 +275,13 @@ class ConditionalQueryModel(torch.nn.Module):
         # same embedding table.  Always allocated (not gated on a flag) so the parameter set does
         # not depend on the data, which would make checkpoints silently incompatible.
         self.bound_marker = torch.nn.Parameter(torch.randn(H) * 0.02)
+        # Aggregate-query pathway.  Allocated unconditionally for the same reason as
+        # bound_marker: the parameter set must not depend on which data a run happened to see.
+        self.op_embed = torch.nn.Embedding(N_OPS, H)
+        self.comp_role_embed = torch.nn.Embedding(MAX_COMPONENTS, H)
+        # Two inputs (lo, hi) rather than one: SEQ takes a gap *range*, and WITHIN a single
+        # width, so one pathway serves both.
+        self.gap_embed = MLP(layers=[2, 32, H], dropout_prob=0)
         self.answer_mlp = MLP(layers=[H, 128, 1], dropout_prob=mlp_dropout)
 
         self.max_queries = max_queries
@@ -346,11 +359,44 @@ class ConditionalQueryModel(torch.nn.Module):
     def _query_code_embeds(self, batch) -> torch.Tensor:
         """``(B, L, H)`` content of each query block's **code** slot.
 
-        A seam: features that change *what is being asked about* (an aggregate expression over
-        several component codes, say) replace this, while the block layout, the mask and the
-        answer readout stride stay untouched.
+        A seam: features that change *what is being asked about* replace this, while the block
+        layout, the mask and the answer readout stride stay untouched.
+
+        An **aggregate** query asks about a combination of codes, so its slot carries
+
+            ``op_emb(op) + mean_k(tok_emb(comp_k) + role_emb(k)) [+ gap_mlp(lo, hi)]``
+
+        — the operator, an order-aware mean over the component codes, and, for the two temporal
+        operators only, their gap bounds.  The role embedding is what makes ``SEQ(A>B)`` differ
+        from ``SEQ(B>A)``; it is harmless for the order-blind operators.  Components go through
+        the shared token table, so they inherit ontology structure when that is enabled.
+
+        Atomic queries take the plain lookup via ``torch.where``, so a batch with no aggregates
+        in it is bit-identical to a model without the feature.
         """
-        return self.HF_model.embeddings.tok_embeddings(batch.q_codes)
+        code_emb = self.HF_model.embeddings.tok_embeddings(batch.q_codes)
+
+        q_op = getattr(batch, "q_op", None)
+        if q_op is None:
+            return code_emb
+
+        comp_emb = self.HF_model.embeddings.tok_embeddings(batch.q_comp_codes)  # (B, L, K, H)
+        k = batch.q_comp_codes.shape[-1]
+        roles = self.comp_role_embed(torch.arange(k, device=comp_emb.device))
+        comp_emb = comp_emb + roles.view(1, 1, k, -1)
+
+        # Mean over *real* components only: unused slots are PAD and must not drag the mean.
+        real = (batch.q_comp_codes > 0).unsqueeze(-1).to(comp_emb.dtype)
+        mean_comp = (comp_emb * real).sum(dim=-2) / real.sum(dim=-2).clamp(min=1.0)
+
+        agg = self.op_embed(q_op) + mean_comp
+
+        gaps = torch.stack([batch.q_gap_lo, batch.q_gap_hi], dim=-1) / GAP_SCALE_DAYS
+        gap_term = self.gap_embed(gaps.to(agg.dtype))
+        is_temporal = (q_op == OP_SEQ) | (q_op == OP_WITHIN)
+        agg = agg + gap_term * is_temporal.unsqueeze(-1).to(gap_term.dtype)
+
+        return torch.where((q_op == OP_ATOM).unsqueeze(-1), code_emb, agg)
 
     def _query_duration_embeds(self, batch) -> torch.Tensor:
         """``(B, L, H)`` content of each query block's **duration** slot.

@@ -39,6 +39,7 @@ from meds_torchdata.config import MEDSTorchDataConfig
 from meds_torchdata.types import MEDSTorchBatch
 
 from every_query.data import rope_time
+from every_query.data.query_vocab import OP_ATOM, parse_query
 from every_query.model.conditional_model import ANSWER_NO, ANSWER_YES
 
 logger = logging.getLogger(__name__)
@@ -68,6 +69,10 @@ EVENT_BOUND_DURATION_SENTINEL = -1.0
 # Vocabulary index meaning "this query has no boundary event".  Shares PAD_INDEX = 0, which is
 # never a real query code.
 NO_BOUND_INDEX = 0
+
+# Component slots per aggregate query.  Three is what the operator set needs (GE2 takes three;
+# everything else takes two), and it is fixed because it sizes a tensor axis.
+MAX_COMPONENTS = 3
 
 
 @dataclass
@@ -114,6 +119,14 @@ class ConditionalQueryBatch(MEDSTorchBatch):
     # Per-query boundary-event vocab indices; ``NO_BOUND_INDEX`` (0) means "time-bounded".
     # ``None`` for a dataset whose labels carry no ``bound_events`` column at all.
     q_bound_codes: torch.LongTensor | None = None
+    # Aggregate queries.  ``q_op`` is an ``OP_*`` code per query (``OP_ATOM`` for a bare code);
+    # ``q_comp_codes`` is (B, L, MAX_COMPONENTS) with 0 padding; ``q_gap_lo`` / ``q_gap_hi`` are
+    # the temporal bounds in days, both 0 for non-temporal operators.  All ``None`` unless the
+    # dataset was built with ``aggregate_queries=True``.
+    q_op: torch.LongTensor | None = None
+    q_comp_codes: torch.LongTensor | None = None
+    q_gap_lo: torch.FloatTensor | None = None
+    q_gap_hi: torch.FloatTensor | None = None
     # Per-patient-token elapsed time in integer hours, for rotary position encoding.  Present
     # only when the dataset was built with ``strip_delta_tokens=True``; ``None`` leaves the
     # encoder on ordinary token-index positions.  Shape matches ``code``, not the query tensors.
@@ -125,6 +138,10 @@ class ConditionalQueryBatch(MEDSTorchBatch):
         "q_durations",
         "q_answers",
         "q_bound_codes",
+        "q_op",
+        "q_comp_codes",
+        "q_gap_lo",
+        "q_gap_hi",
     )
 
     @property
@@ -137,13 +154,21 @@ class ConditionalQueryBatch(MEDSTorchBatch):
             return
         expected = (self.batch_size, self.q_codes.shape[1])
         names = ["q_codes", "q_durations", "q_answers", "q_mask"]
-        if self.q_bound_codes is not None:
-            names.append("q_bound_codes")
+        for optional in ("q_bound_codes", "q_op", "q_gap_lo", "q_gap_hi"):
+            if getattr(self, optional) is not None:
+                names.append(optional)
         for name in names:
             tensor = getattr(self, name)
             if tensor is None or tuple(tensor.shape) != expected:
                 got = None if tensor is None else tensor.shape
                 raise ValueError(f"Expected shape {expected} for {name}, but got {got}!")
+
+        # Component codes carry a third axis (one slot per aggregate component).
+        if self.q_comp_codes is not None and tuple(self.q_comp_codes.shape[:2]) != expected:
+            raise ValueError(
+                f"Expected shape {expected} + (MAX_COMPONENTS,) for q_comp_codes, "
+                f"but got {tuple(self.q_comp_codes.shape)}!"
+            )
 
 
 class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
@@ -172,6 +197,7 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
         *,
         strip_delta_tokens: bool = False,
         ontology_dir: str | None = None,
+        aggregate_queries: bool = False,
     ):
         """Build the dataset.
 
@@ -187,6 +213,12 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
                 are added to the query vocabulary, so a query may name a whole class rather
                 than one leaf code.  Must be the same directory the model was built with —
                 the indices have to agree, or a query would address the wrong embedding row.
+            aggregate_queries: When True, parse each query as a possible aggregate expression
+                and emit ``q_op`` / ``q_comp_codes`` / ``q_gap_lo`` / ``q_gap_hi``.  Pair with
+                the model, which picks the pathway up from the batch with no flag of its own.
+                Leaving it off on data that
+                *does* contain aggregates fails loudly rather than silently: the expression is
+                not a vocabulary code, so ``encode_query`` raises.
         """
         super().__init__(cfg, split)
 
@@ -240,6 +272,7 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
 
         self.eos_query_index: int | None = self.code_to_index.get(EOS_CODE)
 
+        self.aggregate_queries = aggregate_queries
         self.strip_delta_tokens = strip_delta_tokens
         self.delta_ids = rope_time.delta_vocab_ids(self.code_to_index)
         if strip_delta_tokens:
@@ -353,9 +386,29 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
         q_bound_codes = (
             torch.full((B, max_q), NO_BOUND_INDEX, dtype=torch.long) if self.has_bound_events else None
         )
+        if self.aggregate_queries:
+            q_op = torch.zeros(B, max_q, dtype=torch.long)
+            q_comp_codes = torch.zeros(B, max_q, MAX_COMPONENTS, dtype=torch.long)
+            q_gap_lo = torch.zeros(B, max_q, dtype=torch.float)
+            q_gap_hi = torch.zeros(B, max_q, dtype=torch.float)
+        else:
+            q_op = q_comp_codes = q_gap_lo = q_gap_hi = None
 
         for i, item in enumerate(batch):
-            codes = [self.encode_query(c) for c in item["queries"]]
+            if self.aggregate_queries:
+                # An aggregate expression is not a vocabulary code: its content comes from the
+                # component tensors instead, so its q_codes slot stays PAD and the model reads
+                # the aggregate pathway for that block.
+                parsed = [parse_query(c) for c in item["queries"]]
+                codes = [self.encode_query(p.components[0]) if p.op == OP_ATOM else 0 for p in parsed]
+                for j, p in enumerate(parsed):
+                    q_op[i, j] = p.op
+                    for k, comp in enumerate(p.components[:MAX_COMPONENTS]):
+                        q_comp_codes[i, j, k] = self.encode_query(comp)
+                    q_gap_lo[i, j] = p.gap_lo
+                    q_gap_hi[i, j] = p.gap_days or 0.0
+            else:
+                codes = [self.encode_query(c) for c in item["queries"]]
             n = len(codes)
             q_codes[i, :n] = torch.as_tensor(codes, dtype=torch.long)
             q_durations[i, :n] = torch.as_tensor(item["durations"], dtype=torch.float)
@@ -381,5 +434,9 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
             q_answers=q_answers,
             q_mask=q_mask,
             q_bound_codes=q_bound_codes,
+            q_op=q_op,
+            q_comp_codes=q_comp_codes,
+            q_gap_lo=q_gap_lo,
+            q_gap_hi=q_gap_hi,
             time_pos_ids=time_pos_ids,
         )

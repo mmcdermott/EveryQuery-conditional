@@ -60,6 +60,12 @@ from omegaconf import DictConfig
 from every_query.data import query_vocab
 from every_query.data.schema import QuerySeqSchema, TaskQuerySchema
 from every_query.data.seq_dataset import EOS_CODE, EVENT_BOUND_DURATION_SENTINEL
+from every_query.generate_tasks.aggregate_labeling import (
+    assign_aggregate_queries,
+    eligible_components,
+    has_aggregates,
+    label_aggregates,
+)
 from every_query.generate_tasks.sample_tasks import (
     INDEX_DIRNAME,
     LABELED_DIRNAME,
@@ -473,6 +479,8 @@ def build_sequence_index_df(
     duration_distribution: str = "log-uniform",
     eventbound_fraction: float = 0.0,
     bound_events: Sequence[str] | None = None,
+    aggregate_fraction: float = 0.0,
+    component_codes: Sequence[str] | None = None,
 ) -> pl.DataFrame:
     """Expand *already-resolved* contexts into a flat per-query index frame (in-memory variant).
 
@@ -565,6 +573,14 @@ def build_sequence_index_df(
         np.random.default_rng(derive_seed(seed, "sequences")),
     )
     per_query = _expand_sequences(sequences)
+    if aggregate_fraction > 0.0:
+        # Its own seed axis, for the same reason as bounds.
+        per_query = assign_aggregate_queries(
+            per_query,
+            list(component_codes or query_codes),
+            aggregate_fraction,
+            np.random.default_rng(derive_seed(seed, "aggregates")),
+        )
     if bounded:
         # A fourth, independent seed axis.  Drawing bounds from the "queries" generator would
         # shift every later code/duration draw and break the distribution-parity contract with
@@ -652,6 +668,8 @@ def build_sequence_index(
     split: str,
     eventbound_fraction: float = 0.0,
     bound_events: Sequence[str] | None = None,
+    aggregate_fraction: float = 0.0,
+    component_codes: Sequence[str] | None = None,
     seed: int = 0,
 ) -> int:
     """Stage 3': zip sequences with contexts, resolve prediction times, write partitioned index.
@@ -695,6 +713,13 @@ def build_sequence_index(
     assert contexts.height > 0, "contexts must be non-empty"
 
     per_query = _expand_sequences(sequences)
+    if aggregate_fraction > 0.0:
+        per_query = assign_aggregate_queries(
+            per_query,
+            list(component_codes or ()),
+            aggregate_fraction,
+            np.random.default_rng(derive_seed(seed, "aggregates")),
+        )
     bounded = eventbound_fraction > 0.0
     if bounded:
         # Fourth seed axis — see build_sequence_index_df for why it must not share the query or
@@ -1009,6 +1034,8 @@ def label_query_sequences(index_df: pl.DataFrame, events_df: pl.DataFrame) -> pl
     if BOUND_COL in index_df.columns:
         log_degenerate_bounds(index_df, events_df)
         return label_with_event_bounds(index_df, events_df)
+    if has_aggregates(index_df):
+        return label_aggregates(index_df, events_df)
     return label_binary_occurrence(index_df, events_df)
 
 
@@ -1300,6 +1327,8 @@ def run(cfg: DictConfig) -> None:
         split=cfg.split,
         eventbound_fraction=float(cfg.get("eventbound_fraction", 0.0) or 0.0),
         bound_events=bound_events,
+        aggregate_fraction=float(cfg.get("aggregate_fraction", 0.0) or 0.0),
+        component_codes=eligible_components(query_dist.query_codes),
         seed=cfg.seed,
     )
     logger.info(
@@ -1386,6 +1415,7 @@ def run_worker(
     eventbound_fraction: float = 0.0,
     bound_events: Sequence[str] | None = None,
     ontology_dir: str | None = None,
+    aggregate_fraction: float = 0.0,
     n_replicates: int = 1,
     overwrite: bool = False,
 ) -> Path | None:
@@ -1434,6 +1464,7 @@ def run_worker(
         duration_distribution=duration_distribution,
         eventbound_fraction=eventbound_fraction,
         bound_events=bound_events,
+        aggregate_fraction=aggregate_fraction,
     )
 
     labeled = label_query_sequences(index_df, maybe_explode_to_closure(events_df, ontology_dir))
@@ -1491,6 +1522,7 @@ def main(cfg: DictConfig) -> None:
         eventbound_fraction=float(cfg.get("eventbound_fraction", 0.0) or 0.0),
         bound_events=resolve_bound_events(cfg, query_codes),
         ontology_dir=cfg.get("ontology_dir"),
+        aggregate_fraction=float(cfg.get("aggregate_fraction", 0.0) or 0.0),
         n_replicates=int(cfg.get("n_replicates", 1)),
         overwrite=bool(cfg.get("overwrite", False)),
     )
