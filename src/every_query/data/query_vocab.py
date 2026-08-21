@@ -15,8 +15,11 @@ The four sites are:
 - ``every_query.generate_tasks.sample_evaluation_query_sequences.validate_spec_codes``,
 - ``every_query.generate_tasks.sample_tasks.read_query_codes`` (the sampling universe).
 
-Aggregate syntax (ops are added to the model by the aggregate-queries feature; the grammar
-lives here because vocabulary validation needs it regardless):
+The composite grammar below is **dormant on this branch**: nothing generates an expression, no
+labeler answers one, and the model has no pathway for one.  It stays because vocabulary
+validation needs it regardless — a checker that does not know the grammar cannot tell a typo'd
+component from a valid expression — and because ``RESERVED_CHARS`` derives from it, which is
+what keeps a generated ontology-ancestor name addressable as a query:
 
 - ``ANY(c1|c2|...)``       — any component occurs in the window;
 - ``ALL(c1|c2|...)``       — every component occurs;

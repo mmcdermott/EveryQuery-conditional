@@ -219,9 +219,9 @@ def test_assign_event_bounds_rejects_a_bad_fraction():
 def test_bound_events_may_be_a_yaml_path_not_only_a_literal_list(tmp_path):
     """Real boundary codes are unusable as a Hydra CLI list, so a file has to work too.
 
-    They carry spaces, periods and parentheses ("HOSPITAL_ADMISSION//EW EMER.//EMERGENCY ROOM"),
-    which Hydra's override grammar cannot parse as a bare list — so a literal-list-only knob
-    means the documented codes cannot be passed at all.
+    They carry spaces, periods and parentheses ("HOSPITAL_ADMISSION//EW EMER.//EMERGENCY ROOM"), which Hydra's
+    override grammar cannot parse as a bare list — so a literal-list-only knob means the documented codes
+    cannot be passed at all.
     """
     codes = ["HOSPITAL_ADMISSION//EW EMER.//EMERGENCY ROOM", "ICU_DISCHARGE//STAY (MICU)"]
     fp = tmp_path / "bounds.yaml"

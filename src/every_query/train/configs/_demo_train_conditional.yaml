@@ -27,6 +27,11 @@ datamodule:
     seq_sampling_strategy: to_end
     max_seq_len: 64
     batch_mode: SM
+  # Mirror production's feature-toggle surface so integration tests can switch features on with
+  # a plain Hydra override rather than a `+` append (and so the demo drifts less from real runs).
+  dataset_kwargs:
+    strip_delta_tokens: false
+    ontology_dir: null
   batch_size: 2
   num_workers: 0
   pin_memory: false
@@ -37,6 +42,8 @@ lightning_module:
     _target_: every_query.model.conditional_model.ConditionalQueryModel
     precision: ${trainer.precision}
     mlp_dropout: 0.1
+    use_rope_time: false
+    ontology_dir: null
     decoder_layers: 2
     decoder_heads: 2
     decoder_ffn_mult: 2
