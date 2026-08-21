@@ -35,12 +35,19 @@ import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
-# Characters carrying meaning in the aggregate grammar.  A component code containing one of
-# these could not be round-tripped through a query string, so it must be excluded from
-# component pools *and* from any generated ontology-ancestor names (upstream exp-6 hit the
-# first half of this as a live bug and fixed it in 5fd5acb; the ancestor half was unreachable
-# there because no fork ran ontology and aggregate together).
-RESERVED_CHARS = frozenset("|>&()")
+# Characters a code may not contain, because they are the grammar's SEPARATORS: a name carrying
+# one could not be split back out of the query string it was written into.  The live consumer is
+# ontology ancestor naming — a generated ancestor node has to stay addressable as a query — and
+# upstream exp-6 hit the same guard as a live bug on its own code pools (5fd5acb).
+#
+# Parentheses are deliberately NOT reserved even though the grammar uses them.  They are
+# structural only at the very ends of a query string, and ``_AGG_RE`` is anchored with a greedy
+# body, so a name containing parentheses round-trips correctly.  This matters enormously on real
+# data: in the MIMIC-IV vocabulary these features were built against, 10 of 13,908 codes contain
+# a separator but 7,804 (56%) contain a parenthesis — from value-bin names like
+# ``value_[4.0,6.0)`` and unit names like ``(MICU)``.  Reserving parentheses cost 56% of the
+# ontology's ancestor names to guard against 0.07% of them.
+RESERVED_CHARS = frozenset("|>&")
 
 OP_ATOM, OP_ANY, OP_ALL, OP_SEQ = 0, 1, 2, 3
 OP_CO, OP_WITHIN, OP_GE2, OP_XOR = 4, 5, 6, 7
@@ -183,6 +190,12 @@ def has_reserved_chars(code: str) -> bool:
         False
         >>> has_reserved_chars("DIAGNOSIS//A&B")
         True
+
+        Parentheses are fine — over half of a real MEDS vocabulary contains them, and an
+        ancestor name carrying one is still addressable:
+
+        >>> has_reserved_chars("INFUSION_END//220949//value_[200.0,249.3)")
+        False
     """
     return any(ch in RESERVED_CHARS for ch in code)
 

@@ -156,14 +156,14 @@ def build_ontology(codes_df: pl.DataFrame, decay: float = 0.5) -> tuple[pl.DataF
         ancestor_names.update(nxt)
         pending = sorted(set(nxt))
 
-    # An ancestor name carrying a character reserved by the aggregate-query grammar could not be
-    # round-tripped through a query string, so it must never become addressable.  Neither
-    # upstream fork could hit this: no fork ran ontology and aggregate queries together.
+    # An ancestor name carrying one of the query grammar's separators could not be round-tripped
+    # through a query string, so it must never become addressable.  Neither upstream fork could
+    # hit this: no fork generated ancestor names at all.
     reserved = {a for a in ancestor_names if query_vocab.has_reserved_chars(a)}
     if reserved:
         logger.warning(
-            "Dropping %d ancestor node(s) whose names contain characters reserved by the "
-            "aggregate-query grammar (%s): %s",
+            "Dropping %d ancestor node(s) whose names contain a character the query grammar "
+            "reserves (%s): %s",
             len(reserved),
             "".join(sorted(query_vocab.RESERVED_CHARS)),
             sorted(reserved)[:5],

@@ -101,11 +101,26 @@ def test_decay_controls_ancestor_weight():
 
 
 def test_reserved_characters_are_kept_out_of_the_ancestor_pool():
-    """An ancestor named with aggregate-grammar characters could never be queried back."""
+    """An ancestor whose name carries a grammar separator could never be queried back."""
     nodes, _ = build_ontology(_codes(["A&B//C", "PLAIN//X"]))
     ancestors = nodes.filter(~pl.col("is_leaf"))["node"].to_list()
     assert "A&B" not in ancestors
     assert "PLAIN" in ancestors
+
+
+def test_parenthesised_ancestor_names_are_not_dropped():
+    """Parentheses are not separators, and most of a real MEDS vocabulary contains them.
+
+    Reserving them cost the ancestor names of 7,804 of 13,908 MIMIC-IV codes: value-bin
+    segments like ``value_[4.0,6.0)`` and unit names like ``(MICU)`` are ordinary parts of a
+    code, not grammar, and an ancestor built from them is perfectly addressable.
+    """
+    codes = ["ICU//STAY (MICU)//LOS", "LAB//GLUCOSE//value_[4.0,6.0)"]
+    nodes, _ = build_ontology(_codes(codes))
+    ancestors = set(nodes.filter(~pl.col("is_leaf"))["node"].to_list())
+    assert "ICU//STAY (MICU)" in ancestors
+    assert "LAB//GLUCOSE//value_[4.0,6.0)" not in ancestors, "that one is a leaf, not an ancestor"
+    assert "LAB//GLUCOSE" in ancestors
 
 
 def test_mix_rows_are_normalised(tmp_path):
@@ -215,13 +230,34 @@ def test_query_universe_mixes_in_ancestors(tmp_path):
     )
     ancestors = {"A//B", "A", "D//E", "D"}
     share = sum(1 for c in universe if c in ancestors) / len(universe)
-    assert 0.4 < share < 0.6, f"expected ~50% ancestors, got {share:.2f}"
+    assert abs(share - 0.5) < 0.05, f"expected ~50% ancestors, got {share:.2f}"
+
+
+def test_query_universe_never_drops_a_leaf_code(tmp_path):
+    """A leaf missing from the universe is a code the model is never asked about.
+
+    An earlier, sampled construction lost a long tail of the vocabulary — and on the real
+    cohort it lost ``TIMELINE//END``, which is this model's entire censoring mechanism.
+    """
+    leaves = [f"LAB//{i}" for i in range(200)] + ["TIMELINE//END"]
+    _write_ontology(tmp_path, _codes(leaves))
+    for fraction in (0.05, 0.15, 0.5, 0.9):
+        universe = build_query_universe(leaves, ontology_dir=tmp_path, ancestor_fraction=fraction, seed=1)
+        assert set(leaves) <= set(universe), f"leaves dropped at ancestor_fraction={fraction}"
+
+
+def test_query_universe_rejects_an_all_ancestor_fraction(tmp_path):
+    """Every leaf stays in, so ancestors cannot be 100% of the universe."""
+    _write_ontology(tmp_path, _codes(["A//B//C"]))
+    with pytest.raises(ValueError, match=r"\[0, 1\)"):
+        build_query_universe(["A//B//C"], ontology_dir=tmp_path, ancestor_fraction=1.0, seed=1)
 
 
 def test_query_universe_excludes_tautological_timeline_ancestors(tmp_path):
     """'did any TIMELINE event occur' is free positives and teaches nothing."""
-    _write_ontology(tmp_path, _codes(["TIMELINE//END", "TIMELINE//DELTA//1d", "LAB//X"]))
-    universe = build_query_universe(["LAB//X"], ontology_dir=tmp_path, ancestor_fraction=1.0, seed=1)
+    leaves = ["TIMELINE//END", "TIMELINE//DELTA//1d", "LAB//X//Y"]
+    _write_ontology(tmp_path, _codes(leaves))
+    universe = build_query_universe(leaves, ontology_dir=tmp_path, ancestor_fraction=0.5, seed=1)
     assert "TIMELINE" not in set(universe)
 
 

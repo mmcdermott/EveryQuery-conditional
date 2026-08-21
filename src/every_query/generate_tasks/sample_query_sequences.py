@@ -346,12 +346,6 @@ def _attach_queries_to_contexts(contexts: pl.DataFrame, per_query: pl.DataFrame)
     return contexts[per_query[CTX_ID_COL].to_numpy()].with_columns(*attached)
 
 
-# How many slots the ancestor-mixed query universe gets.  The sampler draws codes *uniformly*
-# from the universe list, so a mixture is expressed by duplicating entries in the desired
-# proportion rather than by biasing the draw — which keeps the code/duration RNG stream, and
-# therefore the distribution-parity contract with sample_tasks, completely untouched.
-ANCESTOR_UNIVERSE_SLOTS = 20_000
-
 # Ancestors of the TIMELINE//* namespace are tautological as queries ("did any timeline event
 # occur"), so they teach nothing and would inflate a macro ancestor AUROC with free positives.
 _TAUTOLOGICAL_ANCESTOR_PREFIXES = ("TIMELINE",)
@@ -363,26 +357,38 @@ def build_query_universe(
     ancestor_fraction: float = 0.0,
     seed: int = 0,
 ) -> list[str]:
-    """Mix ontology ancestor nodes into the query universe, by duplication.
+    """Mix ontology ancestor nodes into the query universe, by multiplicity.
 
-    Returns ``query_codes`` unchanged when the feature is off.  Otherwise returns a list of
-    :data:`ANCESTOR_UNIVERSE_SLOTS` entries in which ancestors appear with probability
-    ``ancestor_fraction`` — so uniform sampling from it yields that mixture.
+    Returns ``query_codes`` unchanged when the feature is off.  Otherwise returns a list in which
+    **every leaf code appears exactly once** and ancestor nodes are added often enough that they
+    make up ``ancestor_fraction`` of the list — so uniform sampling from it yields that mixture.
 
-    The duplication trick is deliberate.  Biasing the draw itself would consume RNG differently
-    and desynchronise every subsequent code and duration, breaking parity with ``sample_tasks``;
-    reshaping the *universe* leaves the draw byte-identical in structure.  The cost is that a
-    leaf's marginal probability is no longer exactly ``1/|vocab|``, which is fine because the
-    universe is the thing being varied.
+    Two properties matter here and neither is negotiable:
+
+    - *No leaf is ever dropped.*  The sampler draws codes uniformly from this list, so a code
+      missing from it is a code the model never sees asked about.  An earlier version built the
+      universe by sampling a fixed number of slots, which silently lost a long tail of the
+      vocabulary — and, on a real cohort, lost ``TIMELINE//END`` itself, the code this model's
+      entire censoring mechanism runs through.
+    - *The draw is not perturbed.*  Reshaping the universe rather than biasing the draw leaves
+      the code/duration RNG stream untouched, which is what keeps parity with ``sample_tasks``.
+
+    The cost is that a leaf's marginal probability is no longer exactly ``1/|vocab|`` — which is
+    the point, since the universe is the thing being varied.
 
     Examples:
+        Off by default, and off without an ontology:
+
         >>> build_query_universe(["A", "B"]) == ["A", "B"]
         True
     """
     if not ontology_dir or ancestor_fraction <= 0.0:
         return list(query_codes)
-    if not 0.0 <= ancestor_fraction <= 1.0:
-        raise ValueError(f"ancestor_fraction must be in [0, 1], got {ancestor_fraction}")
+    if not 0.0 <= ancestor_fraction < 1.0:
+        raise ValueError(
+            f"ancestor_fraction must be in [0, 1), got {ancestor_fraction}; every leaf code stays "
+            "in the universe, so ancestors cannot be 100% of it."
+        )
 
     from every_query.data.ontology import load_nodes
 
@@ -403,17 +409,33 @@ def build_query_universe(
         return list(query_codes)
 
     leaves = list(query_codes)
+    # f = anc / (leaves + anc)  =>  anc = leaves * f / (1 - f)
+    n_anc_slots = round(len(leaves) * ancestor_fraction / (1.0 - ancestor_fraction))
+    if n_anc_slots == 0:
+        return leaves
+
     rng = np.random.default_rng(derive_seed(seed, "ancestor_universe"))
-    n = ANCESTOR_UNIVERSE_SLOTS
-    is_anc = rng.random(n) < ancestor_fraction
-    anc_draw = rng.integers(0, len(ancestors), size=n)
-    leaf_draw = rng.integers(0, len(leaves), size=n)
-    universe = [ancestors[anc_draw[i]] if is_anc[i] else leaves[leaf_draw[i]] for i in range(n)]
+    if n_anc_slots <= len(ancestors):
+        picks = sorted(rng.choice(len(ancestors), size=n_anc_slots, replace=False).tolist())
+        anc_slots = [ancestors[i] for i in picks]
+    else:
+        # More slots than ancestors: give every ancestor the same base multiplicity, then hand
+        # the remainder to a seeded subset, so the target fraction is hit exactly.
+        reps, remainder = divmod(n_anc_slots, len(ancestors))
+        anc_slots = ancestors * reps
+        if remainder:
+            extra = sorted(rng.choice(len(ancestors), size=remainder, replace=False).tolist())
+            anc_slots += [ancestors[i] for i in extra]
+
+    universe = leaves + anc_slots
     logger.info(
-        "Ontology: query universe is %d slots, %.0f%% ancestors drawn from %d ancestor node(s).",
-        n,
-        100.0 * ancestor_fraction,
+        "Ontology: query universe is %d slot(s) — %d leaf code(s) plus %d ancestor slot(s) drawn "
+        "from %d ancestor node(s), an ancestor share of %.1f%%.",
+        len(universe),
+        len(leaves),
+        len(anc_slots),
         len(ancestors),
+        100.0 * len(anc_slots) / len(universe),
     )
     return universe
 
@@ -436,13 +458,18 @@ def resolve_bound_events(cfg: DictConfig, query_codes: Sequence[str]) -> list[st
     if fraction <= 0.0:
         return []
 
-    configured = list(cfg.get("bound_events") or ())
-    if not configured:
+    raw = cfg.get("bound_events")
+    if not raw:
         raise ValueError(
-            "eventbound_fraction > 0 requires `bound_events=[...]`, a list of boundary codes "
-            "present in this cohort's vocabulary.  These strings are cohort-specific; "
-            f"the upstream MIMIC-IV set was {list(EXAMPLE_BOUNDARY_CODES)}."
+            "eventbound_fraction > 0 requires `bound_events`, either a list of boundary codes or "
+            "a path to a YAML list of them, present in this cohort's vocabulary.  These strings "
+            f"are cohort-specific; the upstream MIMIC-IV set was {list(EXAMPLE_BOUNDARY_CODES)}."
         )
+    # Accept a file path as well as a literal list.  Real boundary codes carry spaces, periods
+    # and parentheses ("HOSPITAL_ADMISSION//EW EMER.//EMERGENCY ROOM", "ICU_DISCHARGE//...(MICU)"),
+    # which Hydra's override grammar cannot parse as a bare list on the command line — so
+    # requiring a literal list would make the documented codes unusable from the CLI.
+    configured = read_query_codes(raw)
 
     unknown = query_vocab.unknown_codes(configured, set(query_codes))
     if unknown:

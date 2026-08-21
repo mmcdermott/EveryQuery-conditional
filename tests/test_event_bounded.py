@@ -20,6 +20,8 @@ import numpy as np
 import polars as pl
 import pytest
 import torch
+import yaml
+from omegaconf import OmegaConf
 
 from every_query.data.seq_dataset import (
     EVENT_BOUND_DURATION_SENTINEL,
@@ -34,6 +36,7 @@ from every_query.generate_tasks.sample_query_sequences import (
     label_query_sequences,
     label_with_event_bounds,
     log_degenerate_bounds,
+    resolve_bound_events,
 )
 from every_query.model.conditional_model import ANSWER_NO, ANSWER_YES, ConditionalQueryModel
 
@@ -211,6 +214,40 @@ def test_assign_event_bounds_rejects_a_bad_fraction():
     )
     with pytest.raises(ValueError, match=r"must be in \[0, 1\]"):
         assign_event_bounds(idx, ["X"], 1.5, np.random.default_rng(0))
+
+
+def test_bound_events_may_be_a_yaml_path_not_only_a_literal_list(tmp_path):
+    """Real boundary codes are unusable as a Hydra CLI list, so a file has to work too.
+
+    They carry spaces, periods and parentheses ("HOSPITAL_ADMISSION//EW EMER.//EMERGENCY ROOM"),
+    which Hydra's override grammar cannot parse as a bare list — so a literal-list-only knob
+    means the documented codes cannot be passed at all.
+    """
+    codes = ["HOSPITAL_ADMISSION//EW EMER.//EMERGENCY ROOM", "ICU_DISCHARGE//STAY (MICU)"]
+    fp = tmp_path / "bounds.yaml"
+    fp.write_text(yaml.safe_dump(codes))
+
+    cfg = OmegaConf.create({"eventbound_fraction": 0.3, "bound_events": str(fp)})
+    assert resolve_bound_events(cfg, [*codes, "LAB//X"]) == codes
+
+    # The literal-list form keeps working unchanged.
+    literal = OmegaConf.create({"eventbound_fraction": 0.3, "bound_events": codes})
+    assert resolve_bound_events(literal, [*codes, "LAB//X"]) == codes
+
+
+def test_bound_events_from_a_path_are_still_vocabulary_checked(tmp_path):
+    """Reading from a file must not become a way to smuggle an unknown boundary code in."""
+    fp = tmp_path / "bounds.yaml"
+    fp.write_text(yaml.safe_dump(["NOT//IN//VOCAB"]))
+    cfg = OmegaConf.create({"eventbound_fraction": 0.3, "bound_events": str(fp)})
+    with pytest.raises(ValueError, match="NOT//IN//VOCAB"):
+        resolve_bound_events(cfg, ["LAB//X"])
+
+
+def test_bound_events_is_required_when_the_fraction_is_on():
+    cfg = OmegaConf.create({"eventbound_fraction": 0.3, "bound_events": None})
+    with pytest.raises(ValueError, match="bound_events"):
+        resolve_bound_events(cfg, ["LAB//X"])
 
 
 def test_bound_draw_is_deterministic():
