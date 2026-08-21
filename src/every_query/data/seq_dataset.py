@@ -38,6 +38,7 @@ from meds_torchdata import MEDSPytorchDataset
 from meds_torchdata.config import MEDSTorchDataConfig
 from meds_torchdata.types import MEDSTorchBatch
 
+from every_query.data import rope_time
 from every_query.model.conditional_model import ANSWER_NO, ANSWER_YES
 
 logger = logging.getLogger(__name__)
@@ -94,6 +95,10 @@ class ConditionalQueryBatch(MEDSTorchBatch):
     q_durations: torch.FloatTensor | None = None
     q_answers: torch.LongTensor | None = None
     q_mask: torch.BoolTensor | None = None
+    # Per-patient-token elapsed time in integer hours, for rotary position encoding.  Present
+    # only when the dataset was built with ``strip_delta_tokens=True``; ``None`` leaves the
+    # encoder on ordinary token-index positions.  Shape matches ``code``, not the query tensors.
+    time_pos_ids: torch.LongTensor | None = None
 
     LABEL_TENSOR_NAMES: ClassVar[tuple[str]] = ("boolean_value", "q_codes", "q_durations", "q_answers")
 
@@ -132,7 +137,18 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
         surviving = label_df.join(schema_df.lazy().select(sid).unique().collect(), on=sid, how="semi")
         return base.hstack(surviving.select(extras))
 
-    def __init__(self, cfg: MEDSTorchDataConfig, split: str):
+    def __init__(self, cfg: MEDSTorchDataConfig, split: str, *, strip_delta_tokens: bool = False):
+        """Build the dataset.
+
+        Args:
+            cfg: Upstream MEDS torchdata config.
+            split: MEDS split name.
+            strip_delta_tokens: When True, drop ``TIMELINE//DELTA*`` tokens from the encoder
+                input at collate time and emit :attr:`ConditionalQueryBatch.time_pos_ids`
+                (elapsed integer hours per surviving token) for rotary position encoding.
+                Pair with ``ConditionalQueryModel(use_rope_time=True)``; see
+                :mod:`every_query.data.rope_time`.
+        """
         super().__init__(cfg, split)
 
         schema_cols = self.schema_df.collect_schema().names()
@@ -167,6 +183,21 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
             )
         self.eos_query_index: int | None = self.code_to_index.get(EOS_CODE)
 
+        self.strip_delta_tokens = strip_delta_tokens
+        self.delta_ids = rope_time.delta_vocab_ids(self.code_to_index)
+        if strip_delta_tokens:
+            if self.delta_ids.numel() == 0:
+                logger.warning(
+                    "strip_delta_tokens=True but no %s* codes are in the cohort vocabulary; "
+                    "time_pos_ids will still be emitted, but nothing is being stripped.",
+                    rope_time.DELTA_TOKEN_PREFIX,
+                )
+            else:
+                logger.info(
+                    "RoPE time: stripping %d delta-token vocab ids from the encoder input.",
+                    self.delta_ids.numel(),
+                )
+
     @property
     def labels_df(self) -> pl.DataFrame:
         """Task label rows incl. the query-sequence list columns, in MEDS Label schema order."""
@@ -200,11 +231,58 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
         out["answers"] = self.answers[idx].to_list()
         return out
 
+    def _apply_rope_time(self, out: dict) -> torch.LongTensor | None:
+        """Strip delta tokens from ``out`` in place and return the matching ``time_pos_ids``.
+
+        Every per-token field of the collated batch is compacted with the same keep mask, so
+        fields the upstream batch adds (e.g. ``static_mask``) stay aligned to ``code``.
+        Returns ``None`` when stripping is disabled.
+        """
+        if not self.strip_delta_tokens:
+            return None
+
+        code = out["code"]
+        _, n_old = code.shape
+        pad = ConditionalQueryBatch.PAD_INDEX
+
+        zeros = torch.zeros_like(code, dtype=torch.float)
+        new_code, new_nv, new_nvm, new_tdd, time_pos = rope_time.strip_delta_tokens(
+            code,
+            out.get("numeric_value") if out.get("numeric_value") is not None else zeros,
+            out.get("numeric_value_mask")
+            if out.get("numeric_value_mask") is not None
+            else torch.zeros_like(code, dtype=torch.bool),
+            out.get("time_delta_days") if out.get("time_delta_days") is not None else zeros,
+            self.delta_ids,
+            pad_index=pad,
+        )
+
+        keep = rope_time.build_keep_mask(code, self.delta_ids, pad_index=pad)
+        new_n = new_code.shape[1]
+
+        replacements = {
+            "code": new_code,
+            "numeric_value": new_nv,
+            "numeric_value_mask": new_nvm,
+            "time_delta_days": new_tdd,
+        }
+        for name, value in list(out.items()):
+            if name in replacements:
+                if value is not None:
+                    out[name] = replacements[name]
+            elif isinstance(value, torch.Tensor) and value.dim() == 2 and value.shape[1] == n_old:
+                # Any other per-token field (e.g. static_mask) must follow the same selection.
+                out[name] = rope_time.compact_by_keep(value, keep, new_n, 0)
+
+        return time_pos
+
     def collate(self, batch: list[dict]) -> ConditionalQueryBatch:
         out = dict(super().collate(batch).items())
         # The base batch type doesn't know about the seq label columns; drop anything
         # super() didn't consume and rebuild the query tensors below.
         out.pop("boolean_value", None)
+
+        time_pos_ids = self._apply_rope_time(out)
 
         max_q = max(len(item["queries"]) for item in batch)
         B = len(batch)
@@ -226,5 +304,10 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
             q_mask[i, :n] = True
 
         return ConditionalQueryBatch(
-            **out, q_codes=q_codes, q_durations=q_durations, q_answers=q_answers, q_mask=q_mask
+            **out,
+            q_codes=q_codes,
+            q_durations=q_durations,
+            q_answers=q_answers,
+            q_mask=q_mask,
+            time_pos_ids=time_pos_ids,
         )

@@ -53,6 +53,12 @@ datamodule:
     static_inclusion_mode: omit
     seq_sampling_strategy: to_end
     max_seq_len: 256
+  # Dataset-side feature toggles (see every_query.data.datamodule.ResumableDatamodule).
+  # `strip_delta_tokens` drops the quantized TIMELINE//DELTA* tokens from the encoder input and
+  # emits per-token elapsed-hour `time_pos_ids`; it must be set together with
+  # `lightning_module.model.use_rope_time` below, which is what consumes them.
+  dataset_kwargs:
+    strip_delta_tokens: false
   batch_size: 96
   num_workers: 8
   pin_memory: True
@@ -71,6 +77,11 @@ lightning_module:
     decoder_heads: 6
     decoder_ffn_mult: 4
     max_queries: 8
+    # Time representation.  false = ModernBERT's default token-index rotary positions, with
+    # elapsed time carried by the TIMELINE//DELTA* tokens in the stream.  true = rotary
+    # positions are elapsed hours and the delta tokens are stripped; requires
+    # `datamodule.dataset_kwargs.strip_delta_tokens=true` to supply them.
+    use_rope_time: false
     config_overrides:
       hidden_size: 384
       num_attention_heads: 6

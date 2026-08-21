@@ -172,6 +172,13 @@ class ConditionalQueryModel(torch.nn.Module):
         decoder_heads: Attention heads in the decoder.
         decoder_ffn_mult: Decoder feed-forward width as a multiple of ``hidden_size``.
         max_queries: Maximum query blocks per sequence (sizes the block-position embedding).
+        use_rope_time: Drive the encoder's rotary positions from ``batch.time_pos_ids``
+            (elapsed integer hours) instead of token index.  Pair with
+            ``ConditionalQueryPytorchDataset(strip_delta_tokens=True)``, which removes the
+            quantized ``TIMELINE//DELTA*`` tokens and emits those positions.  Attention then
+            sees continuous relative time rather than token distance.  No-op when the batch
+            carries no ``time_pos_ids``, so a RoPE-configured model still runs on ordinary
+            batches.
     """
 
     PRECISION_TO_MODEL_WEIGHTS_DTYPE: ClassVar[dict[str, torch.dtype]] = {
@@ -194,6 +201,7 @@ class ConditionalQueryModel(torch.nn.Module):
         decoder_heads: int | None = None,
         decoder_ffn_mult: int = 4,
         max_queries: int = 8,
+        use_rope_time: bool = False,
     ):
         super().__init__()
 
@@ -237,6 +245,7 @@ class ConditionalQueryModel(torch.nn.Module):
         self.answer_mlp = MLP(layers=[H, 128, 1], dropout_prob=mlp_dropout)
 
         self.max_queries = max_queries
+        self.use_rope_time = use_rope_time
         self.criterion = torch.nn.BCEWithLogitsLoss()
 
         self.hparams = {
@@ -249,6 +258,7 @@ class ConditionalQueryModel(torch.nn.Module):
             "decoder_heads": n_heads,
             "decoder_ffn_mult": decoder_ffn_mult,
             "max_queries": max_queries,
+            "use_rope_time": use_rope_time,
         }
 
     @property
@@ -265,6 +275,36 @@ class ConditionalQueryModel(torch.nn.Module):
         if logits.numel() == 0:
             return logits.sum() * 0.0
         return self.criterion(logits, target)
+
+    def _encoder_position_kwargs(self, batch) -> dict[str, torch.Tensor]:
+        """Extra ``HF_model`` kwargs carrying the encoder's rotary positions.
+
+        Empty when ``use_rope_time`` is off, so ModernBERT uses token-index positions.
+
+        When it is *on*, a batch without ``time_pos_ids`` is a **hard error** rather than a
+        silent fallback.  Falling back would quietly train or score a RoPE model on token-index
+        positions — indistinguishable from success until the numbers are already published.
+        The upstream experiment hit exactly this and had to issue an erratum after a full eval
+        grid had been computed against a model that never received its time positions.  The
+        misconfiguration it catches is a real one: pairing a RoPE checkpoint with a dataset
+        built without ``strip_delta_tokens=True``.
+
+        Rotary frequencies are computed from ``position_ids`` on the fly rather than looked up
+        in a table, so elapsed-hour values far exceeding ``max_position_embeddings`` are
+        well-defined.  Only the *local*-attention sliding-window mask is token-index based, and
+        it is deliberately left that way — windows are over neighbouring events, not hours.
+        """
+        if not self.use_rope_time:
+            return {}
+        time_pos = getattr(batch, "time_pos_ids", None)
+        if time_pos is None:
+            raise ValueError(
+                "use_rope_time=True but the batch carries no time_pos_ids.  Build the dataset "
+                "with ConditionalQueryPytorchDataset(..., strip_delta_tokens=True) — via "
+                "`datamodule.dataset_kwargs.strip_delta_tokens=true` — so elapsed-hour positions "
+                "are emitted.  Refusing to fall back to token-index positions silently."
+            )
+        return {"position_ids": time_pos.to(batch.code.device)}
 
     def _decoder_tokens(self, batch) -> torch.Tensor:
         """Build the interleaved ``(B, 3L, H)`` decoder input from a ConditionalQueryBatch."""
@@ -294,7 +334,9 @@ class ConditionalQueryModel(torch.nn.Module):
         _, L = batch.q_codes.shape
 
         enc_attention_mask = batch.code != batch.PAD_INDEX
-        memory = self.HF_model(input_ids=batch.code, attention_mask=enc_attention_mask).last_hidden_state
+        memory = self.HF_model(
+            input_ids=batch.code, attention_mask=enc_attention_mask, **self._encoder_position_kwargs(batch)
+        ).last_hidden_state
 
         tgt = self._decoder_tokens(batch)
         tgt_mask = build_block_causal_mask(L, device=tgt.device)
