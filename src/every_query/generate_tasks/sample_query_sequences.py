@@ -611,6 +611,32 @@ def label_binary_occurrence(index_df: pl.DataFrame, events_df: pl.DataFrame) -> 
     )
 
 
+def label_query_sequences(index_df: pl.DataFrame, events_df: pl.DataFrame) -> pl.DataFrame:
+    """Stage 4' labeling entry point: answer every query in ``index_df`` against ``events_df``.
+
+    The single seam through which *all* sequence labeling flows — both the sharded training
+    path (:func:`label_one_sequence_shard`) and the dense evaluation grid — so a query form
+    added here is answered identically in training data and eval grids.  A form that labels one
+    way in training and another in evaluation produces a grid that looks fine and silently
+    measures the wrong thing.
+
+    Today every query is a plain occurrence question and this delegates unchanged to
+    :func:`label_binary_occurrence`, which stays the regression anchor for that semantics.
+
+    This must remain a **module-level function**: Stage 4' fans shards out through a
+    ``ProcessPoolExecutor`` with ``mp_context="spawn"``, so a closure or a locally-defined
+    callable would fail to pickle.
+
+    Args:
+        index_df: Flat per-query index frame (one row per query of each sequence).
+        events_df: The event stream to answer against.
+
+    Returns:
+        One row per sequence, with the ``queries``/``durations``/``answers`` list columns.
+    """
+    return label_binary_occurrence(index_df, events_df)
+
+
 def label_one_sequence_shard(
     shard: str,
     index_dir: Path,
@@ -647,7 +673,7 @@ def label_one_sequence_shard(
 
     events_df = _read_event_shard(data_dir / f"{shard}.parquet")
 
-    labeled = label_binary_occurrence(index_df, events_df)
+    labeled = label_query_sequences(index_df, events_df)
     aligned = QuerySeqSchema.align(labeled.to_arrow())
 
     _atomic_write_parquet(pl.from_arrow(aligned), final)
@@ -939,7 +965,7 @@ def run_worker(
         duration_distribution=duration_distribution,
     )
 
-    labeled = label_binary_occurrence(index_df, events_df)
+    labeled = label_query_sequences(index_df, events_df)
 
     aligned = QuerySeqSchema.align(labeled.to_arrow())
     labels_fp.parent.mkdir(parents=True, exist_ok=True)

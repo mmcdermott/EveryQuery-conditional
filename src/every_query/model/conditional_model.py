@@ -153,10 +153,24 @@ class ConditionalQueryOutput(BaseModelOutput):
             >>> out.answer_probs
             tensor([[0.5000, 0.5000, 0.5000],
                     [0.5000, 0.5000, 0.5000]])
+
+            bf16 logits are upcast before the sigmoid, so confident predictions stay
+            distinguishable instead of all saturating to exactly 1.0:
+
+            >>> bf16 = ConditionalQueryOutput(
+            ...     last_hidden_state=None, answer_logits=torch.tensor([[8.0]], dtype=torch.bfloat16)
+            ... )
+            >>> bf16.answer_probs.dtype, bool(bf16.answer_probs < 1.0)
+            (torch.float32, True)
         """
         if self.answer_logits is None:
             return None
-        return torch.sigmoid(self.answer_logits)
+        # Upcast before the sigmoid, exactly as EveryQueryOutput.logits_to_probs does.  Training
+        # runs at bf16-mixed, where sigmoid rounds a logit of ~6 to exactly 1.0 — every confident
+        # prediction collapses into a tie, which flattens ranking metrics like AUROC.  These
+        # probabilities flow straight into the predictions parquet via predict_sequences, so the
+        # damage would show up as a quietly depressed score rather than an error.
+        return torch.sigmoid(self.answer_logits.float())
 
 
 class ConditionalQueryModel(torch.nn.Module):
@@ -306,12 +320,35 @@ class ConditionalQueryModel(torch.nn.Module):
             )
         return {"position_ids": time_pos.to(batch.code.device)}
 
+    def _query_code_embeds(self, batch) -> torch.Tensor:
+        """``(B, L, H)`` content of each query block's **code** slot.
+
+        A seam: features that change *what is being asked about* (an aggregate expression over
+        several component codes, say) replace this, while the block layout, the mask and the
+        answer readout stride stay untouched.
+        """
+        return self.HF_model.embeddings.tok_embeddings(batch.q_codes)
+
+    def _query_duration_embeds(self, batch) -> torch.Tensor:
+        """``(B, L, H)`` content of each query block's **duration** slot.
+
+        A seam: features that change *what bounds the window* (an event boundary rather than a
+        scalar horizon) replace this.  Note the answer for block ``j`` is read from this slot's
+        output position, so whatever goes here must stay a per-query vector.
+        """
+        return self.duration_embed((batch.q_durations / 365.0).unsqueeze(-1))
+
     def _decoder_tokens(self, batch) -> torch.Tensor:
-        """Build the interleaved ``(B, 3L, H)`` decoder input from a ConditionalQueryBatch."""
+        """Build the interleaved ``(B, 3L, H)`` decoder input from a ConditionalQueryBatch.
+
+        Exactly three tokens per query block.  Nothing here may add a fourth: ``TOKENS_PER_QUERY``
+        is baked into :func:`build_block_causal_mask`, the ``TOKEN_DURATION::TOKENS_PER_QUERY``
+        answer readout stride, and the mask's doctests.
+        """
         B, L = batch.q_codes.shape
 
-        code_emb = self.HF_model.embeddings.tok_embeddings(batch.q_codes)
-        dur_emb = self.duration_embed((batch.q_durations / 365.0).unsqueeze(-1))
+        code_emb = self._query_code_embeds(batch)
+        dur_emb = self._query_duration_embeds(batch)
         ans_emb = self.answer_embed(batch.q_answers)
 
         tokens = torch.stack([code_emb, dur_emb, ans_emb], dim=2)  # (B, L, 3, H)

@@ -27,7 +27,7 @@ Pipeline (every stage but the grid build is imported from ``sample_query_sequenc
     3. Cross-join cohort x specs into the flat per-query index frame
        (:func:`build_dense_sequence_index_df`).
     4. Label with
-       :func:`~every_query.generate_tasks.sample_query_sequences.label_binary_occurrence`,
+       :func:`~every_query.generate_tasks.sample_query_sequences.label_query_sequences`,
        align to ``QuerySeqSchema``, write.
 
 Both axes carry a tag into the combined file's name: ``contexts_tag`` is the cohort file's stem or
@@ -75,12 +75,13 @@ import numpy as np
 import polars as pl
 from omegaconf import DictConfig
 
+from every_query.data import query_vocab
 from every_query.data.schema import QuerySeqSchema, TaskQuerySchema
 from every_query.generate_tasks.sample_query_sequences import (
     CTX_ID_COL,
     POSITION_COL,
     build_sequence_index_df,
-    label_binary_occurrence,
+    label_query_sequences,
     read_events_for_subjects,
     read_supplied_contexts,
     resolve_prediction_times,
@@ -487,8 +488,9 @@ def validate_spec_codes(specs: list[SequenceSpec], query_codes: list[str]) -> No
     labeling and model loading this check precedes.  Hand-written designed specs are exactly where
     a typo'd or wrong-vocabulary MEDS code enters.
     """
-    vocab = set(query_codes)
-    unknown = sorted({q for s in specs for q in s.queries if q not in vocab})
+    # Check the codes each query *mentions*: an aggregate expression is not itself a code, but
+    # every component of it must be one.  Bare codes pass through unchanged.
+    unknown = query_vocab.unknown_codes((q for s in specs for q in s.queries), set(query_codes))
     if unknown:
         shown = ", ".join(repr(c) for c in unknown[:10])
         more = f" (and {len(unknown) - 10} more)" if len(unknown) > 10 else ""
@@ -771,11 +773,11 @@ def run_worker(
                 logger.info("Labels already exist at %s, skipping.", fp)
                 continue
             index_df = build_dense_sequence_index_df(contexts, [spec])
-            _write(label_binary_occurrence(index_df, events_df), fp)
+            _write(label_query_sequences(index_df, events_df), fp)
             written.append(fp)
     else:
         index_df = build_dense_sequence_index_df(contexts, specs)
-        _write(label_binary_occurrence(index_df, events_df), out_fps[0])
+        _write(label_query_sequences(index_df, events_df), out_fps[0])
         written.append(out_fps[0])
     return written
 

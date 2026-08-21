@@ -47,6 +47,7 @@ from lightning.pytorch.callbacks import BasePredictionWriter
 from meds import held_out_split, tuning_split
 from omegaconf import DictConfig
 
+from every_query.data import query_vocab
 from every_query.data.schema import TaskQuerySchema
 from every_query.predict.schema import PredictionSchema
 from every_query.utils.model_loader import setup_model
@@ -187,13 +188,16 @@ def _check_vocab(task_codes: set[str], train_cfg: DictConfig) -> None:
             f"EQ_predict needs this to validate task codes against the model's vocab."
         )
     training_vocab = set(pl.read_parquet(metadata_fp, columns=["code"])["code"].to_list())
-    missing = task_codes - training_vocab
+    # Validate the codes a query *mentions*, not the query string itself: an aggregate such as
+    # `ANY(A|B)` is never a vocabulary code, but `A` and `B` must both be.  For the bare codes
+    # this path sees today, `component_codes` returns the code unchanged.
+    missing = query_vocab.unknown_codes(task_codes, training_vocab)
     if missing:
         raise ValueError(
             f"{len(missing)} of {len(task_codes)} task-query codes are not in the model's training "
             f"vocabulary.  Out-of-vocab codes would be PAD-encoded and produce near-uniform "
             f"probabilities; refuse rather than write misleading predictions.  Missing codes: "
-            f"{sorted(missing)[:10]}{'...' if len(missing) > 10 else ''}"
+            f"{missing[:10]}{'...' if len(missing) > 10 else ''}"
         )
 
 
