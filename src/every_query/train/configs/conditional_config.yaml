@@ -59,6 +59,10 @@ datamodule:
   # `lightning_module.model.use_rope_time` below, which is what consumes them.
   dataset_kwargs:
     strip_delta_tokens: false
+    # Ontology artifacts directory (EQ_build_ontology output).  Adds ancestor node names to the
+    # query vocabulary so an ancestor can be queried.  Must match `lightning_module.model
+    # .ontology_dir` below — they index into the same embedding table.
+    ontology_dir: null
   batch_size: 96
   num_workers: 8
   pin_memory: True
@@ -82,6 +86,16 @@ lightning_module:
     # positions are elapsed hours and the delta tokens are stripped; requires
     # `datamodule.dataset_kwargs.strip_delta_tokens=true` to supply them.
     use_rope_time: false
+    # Ontology-mixed code embeddings: each code embeds as the weighted average of its own row and
+    # its ancestors' ((A @ W)[ids]).  null = ordinary embeddings.  When set, train.py sizes the
+    # encoder to the ontology's V_ext instead of the cohort vocab, since ancestor indices sit
+    # above the highest leaf index.  Pair with `datamodule.dataset_kwargs.ontology_dir`.
+    #
+    # Note on what to expect: upstream found the *embedding* effect on leaf tasks did not
+    # replicate (a second seed reversed it; the unbundling suite scored it null), while the DAG
+    # structure was worth ~+0.039 AUROC on ancestor queries.  The demonstrated value is in being
+    # able to ASK about an ancestor, not in mixing improving ordinary leaf queries.
+    ontology_dir: null
     config_overrides:
       hidden_size: 384
       num_attention_heads: 6

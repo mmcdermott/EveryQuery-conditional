@@ -225,7 +225,15 @@ class QuerySequenceDistribution(QueryDistribution):
         equality, since a training/eval mismatch in the duration draw silently invalidates eval.
         """
         return cls(
-            query_codes=read_query_codes(cfg.query_codes),
+            # When an ontology is configured, ancestor nodes are mixed into the *universe* the
+            # codes are drawn uniformly from, so the draw itself — and its parity with
+            # sample_tasks — is untouched.  See build_query_universe.
+            query_codes=build_query_universe(
+                read_query_codes(cfg.query_codes),
+                ontology_dir=cfg.get("ontology_dir"),
+                ancestor_fraction=float(cfg.get("ancestor_fraction", 0.0) or 0.0),
+                seed=int(cfg.get("seed", 0)),
+            ),
             min_duration=float(cfg.duration_min),
             max_duration=float(cfg.duration_max),
             duration_distribution=str(cfg.get("duration_distribution", "log-uniform")),
@@ -336,6 +344,78 @@ def _attach_queries_to_contexts(contexts: pl.DataFrame, per_query: pl.DataFrame)
     if BOUND_COL in per_query.columns:
         attached.append(per_query[BOUND_COL])
     return contexts[per_query[CTX_ID_COL].to_numpy()].with_columns(*attached)
+
+
+# How many slots the ancestor-mixed query universe gets.  The sampler draws codes *uniformly*
+# from the universe list, so a mixture is expressed by duplicating entries in the desired
+# proportion rather than by biasing the draw — which keeps the code/duration RNG stream, and
+# therefore the distribution-parity contract with sample_tasks, completely untouched.
+ANCESTOR_UNIVERSE_SLOTS = 20_000
+
+# Ancestors of the TIMELINE//* namespace are tautological as queries ("did any timeline event
+# occur"), so they teach nothing and would inflate a macro ancestor AUROC with free positives.
+_TAUTOLOGICAL_ANCESTOR_PREFIXES = ("TIMELINE",)
+
+
+def build_query_universe(
+    query_codes: Sequence[str],
+    ontology_dir: str | Path | None = None,
+    ancestor_fraction: float = 0.0,
+    seed: int = 0,
+) -> list[str]:
+    """Mix ontology ancestor nodes into the query universe, by duplication.
+
+    Returns ``query_codes`` unchanged when the feature is off.  Otherwise returns a list of
+    :data:`ANCESTOR_UNIVERSE_SLOTS` entries in which ancestors appear with probability
+    ``ancestor_fraction`` — so uniform sampling from it yields that mixture.
+
+    The duplication trick is deliberate.  Biasing the draw itself would consume RNG differently
+    and desynchronise every subsequent code and duration, breaking parity with ``sample_tasks``;
+    reshaping the *universe* leaves the draw byte-identical in structure.  The cost is that a
+    leaf's marginal probability is no longer exactly ``1/|vocab|``, which is fine because the
+    universe is the thing being varied.
+
+    Examples:
+        >>> build_query_universe(["A", "B"]) == ["A", "B"]
+        True
+    """
+    if not ontology_dir or ancestor_fraction <= 0.0:
+        return list(query_codes)
+    if not 0.0 <= ancestor_fraction <= 1.0:
+        raise ValueError(f"ancestor_fraction must be in [0, 1], got {ancestor_fraction}")
+
+    from every_query.data.ontology import load_nodes
+
+    nodes = load_nodes(ontology_dir)
+    ancestors = sorted(nodes.filter(~pl.col("is_leaf"))["node"].to_list())
+    ancestors = [
+        a
+        for a in ancestors
+        if not a.startswith(_TAUTOLOGICAL_ANCESTOR_PREFIXES) and not query_vocab.has_reserved_chars(a)
+    ]
+    if not ancestors:
+        logger.warning(
+            "ancestor_fraction=%g but the ontology at %s contributes no usable ancestor nodes; "
+            "the query universe is unchanged.",
+            ancestor_fraction,
+            ontology_dir,
+        )
+        return list(query_codes)
+
+    leaves = list(query_codes)
+    rng = np.random.default_rng(derive_seed(seed, "ancestor_universe"))
+    n = ANCESTOR_UNIVERSE_SLOTS
+    is_anc = rng.random(n) < ancestor_fraction
+    anc_draw = rng.integers(0, len(ancestors), size=n)
+    leaf_draw = rng.integers(0, len(leaves), size=n)
+    universe = [ancestors[anc_draw[i]] if is_anc[i] else leaves[leaf_draw[i]] for i in range(n)]
+    logger.info(
+        "Ontology: query universe is %d slots, %.0f%% ancestors drawn from %d ancestor node(s).",
+        n,
+        100.0 * ancestor_fraction,
+        len(ancestors),
+    )
+    return universe
 
 
 def resolve_bound_events(cfg: DictConfig, query_codes: Sequence[str]) -> list[str]:
@@ -882,6 +962,23 @@ def log_degenerate_bounds(index_df: pl.DataFrame, events_df: pl.DataFrame) -> di
     return out
 
 
+def maybe_explode_to_closure(events_df: pl.DataFrame, ontology_dir: str | Path | None):
+    """Repeat each event under its ancestor node names, so ancestor queries label normally.
+
+    A no-op without an ontology.  With one, "did any descendant of X occur" becomes an ordinary
+    occurrence question about X, so :func:`label_binary_occurrence` needs no ancestor awareness
+    at all — it re-sorts its own right frame, so the join-scrambled row order is irrelevant.
+
+    Note this multiplies the event frame by the mean closure size, which raises peak memory in
+    each Stage 4' worker.
+    """
+    if not ontology_dir:
+        return events_df
+    from every_query.data.ontology import explode_events_to_closure, load_closure_map
+
+    return explode_events_to_closure(events_df, load_closure_map(ontology_dir))
+
+
 def label_query_sequences(index_df: pl.DataFrame, events_df: pl.DataFrame) -> pl.DataFrame:
     """Stage 4' labeling entry point: answer every query in ``index_df`` against ``events_df``.
 
@@ -994,6 +1091,7 @@ def label_one_sequence_shard(
     data_dir: Path,
     out_dir: Path,
     overwrite: bool = False,
+    ontology_dir: str | None = None,
 ) -> tuple[str, str]:
     """Stage 4' worker: label one index partition and write the final ``QuerySeqSchema`` parquet.
 
@@ -1023,6 +1121,7 @@ def label_one_sequence_shard(
     _clean_stale_temps(out_dir, shard)
 
     events_df = _read_event_shard(data_dir / f"{shard}.parquet")
+    events_df = maybe_explode_to_closure(events_df, ontology_dir)
 
     labeled = label_query_sequences(index_df, events_df)
     aligned = QuerySeqSchema.align(labeled.to_arrow())
@@ -1041,6 +1140,7 @@ def _label_sequence_shards(
     out_dir: Path,
     overwrite: bool,
     n_workers: int,
+    ontology_dir: str | None = None,
 ) -> None:
     """Fan one :func:`label_one_sequence_shard` worker out per shard via a spawn-based pool.
 
@@ -1051,7 +1151,8 @@ def _label_sequence_shards(
     mp_context = multiprocessing.get_context("spawn")
     with ProcessPoolExecutor(max_workers=n_workers, mp_context=mp_context) as ex:
         futs = {
-            ex.submit(label_one_sequence_shard, s, index_dir, data_dir, out_dir, overwrite): s for s in shards
+            ex.submit(label_one_sequence_shard, s, index_dir, data_dir, out_dir, overwrite, ontology_dir): s
+            for s in shards
         }
         for fut in as_completed(futs):
             fut.result()  # re-raise so a failed shard aborts the run loudly
@@ -1096,7 +1197,15 @@ def label_sequence_shards(
 
     n_workers = resolve_workers(cfg.get("max_workers"))
     logger.info("Stage 4': labeling %s shard(s) across %s worker(s).", f"{len(shards):,}", f"{n_workers:,}")
-    _label_sequence_shards(shards, index_dir, data_dir, out_dir, bool(cfg.overwrite), n_workers)
+    _label_sequence_shards(
+        shards,
+        index_dir,
+        data_dir,
+        out_dir,
+        bool(cfg.overwrite),
+        n_workers,
+        ontology_dir=cfg.get("ontology_dir"),
+    )
 
     out_files = sorted(out_dir.glob("*.parquet"))
     written = _validate_sequence_count(out_files, total_sequences)
@@ -1276,6 +1385,7 @@ def run_worker(
     duration_mode: str = "random",
     eventbound_fraction: float = 0.0,
     bound_events: Sequence[str] | None = None,
+    ontology_dir: str | None = None,
     n_replicates: int = 1,
     overwrite: bool = False,
 ) -> Path | None:
@@ -1326,7 +1436,7 @@ def run_worker(
         bound_events=bound_events,
     )
 
-    labeled = label_query_sequences(index_df, events_df)
+    labeled = label_query_sequences(index_df, maybe_explode_to_closure(events_df, ontology_dir))
 
     aligned = QuerySeqSchema.align(labeled.to_arrow())
     labels_fp.parent.mkdir(parents=True, exist_ok=True)
@@ -1356,7 +1466,12 @@ def main(cfg: DictConfig) -> None:
 
     data_dir = _require_path_arg(cfg.get("data_dir"), "data_dir")
     out_dir = _require_path_arg(cfg.get("out_dir"), "out_dir")
-    query_codes = read_query_codes(cfg.get("query_codes"))
+    query_codes = build_query_universe(
+        read_query_codes(cfg.get("query_codes")),
+        ontology_dir=cfg.get("ontology_dir"),
+        ancestor_fraction=float(cfg.get("ancestor_fraction", 0.0) or 0.0),
+        seed=int(cfg.get("seed", 0)),
+    )
 
     run_worker(
         data_dir=data_dir,
@@ -1375,6 +1490,7 @@ def main(cfg: DictConfig) -> None:
         duration_mode=str(cfg.get("duration_mode", "random")),
         eventbound_fraction=float(cfg.get("eventbound_fraction", 0.0) or 0.0),
         bound_events=resolve_bound_events(cfg, query_codes),
+        ontology_dir=cfg.get("ontology_dir"),
         n_replicates=int(cfg.get("n_replicates", 1)),
         overwrite=bool(cfg.get("overwrite", False)),
     )

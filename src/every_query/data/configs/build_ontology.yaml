@@ -1,0 +1,23 @@
+# Config for EQ_build_ontology — derives an ontology DAG from a cohort's code metadata.
+#
+# Both paths are required with no env-var fallback (matching the repo's #235 policy); pass the
+# shell-expanded path variables from env.sh, e.g.
+#   EQ_build_ontology tensorized_cohort_dir=$TENSORIZED_COHORT_DIR out_dir=$ONTOLOGY_DIR
+
+defaults:
+  - _self_
+
+# Tensorized cohort root; metadata/codes.parquet is read from here (read-only).
+tensorized_cohort_dir: ???
+# Directory to write nodes.parquet / mix.parquet / closure.parquet into.
+out_dir: ???
+
+# Per-level weight decay for the embedding mix: an ancestor `d` levels up contributes
+# `decay ** d` before row normalisation.  0.0 disables mixing (each node is only itself — the
+# structure-without-mixing control); 1.0 weights every ancestor as much as the node itself.
+decay: 0.5
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null

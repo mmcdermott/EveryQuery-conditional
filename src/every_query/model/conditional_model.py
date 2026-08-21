@@ -186,6 +186,13 @@ class ConditionalQueryModel(torch.nn.Module):
         decoder_heads: Attention heads in the decoder.
         decoder_ffn_mult: Decoder feed-forward width as a multiple of ``hidden_size``.
         max_queries: Maximum query blocks per sequence (sizes the block-position embedding).
+        ontology_dir: Directory of ontology artifacts (``nodes``/``mix``/``closure`` parquets).
+            When set, ModernBERT's ``tok_embeddings`` is wrapped so every code embedding becomes
+            the ancestor-mixed average ``(A @ W)[ids]`` — see
+            :mod:`every_query.model.ontology_embedding`.  The encoder must be sized to the
+            ontology's ``V_ext``, which ``train.py`` does automatically.  Because the wrapper
+            substitutes the shared table, query codes, boundary codes and aggregate components
+            all inherit the structure too.
         use_rope_time: Drive the encoder's rotary positions from ``batch.time_pos_ids``
             (elapsed integer hours) instead of token index.  Pair with
             ``ConditionalQueryPytorchDataset(strip_delta_tokens=True)``, which removes the
@@ -216,6 +223,7 @@ class ConditionalQueryModel(torch.nn.Module):
         decoder_ffn_mult: int = 4,
         max_queries: int = 8,
         use_rope_time: bool = False,
+        ontology_dir: str | None = None,
     ):
         super().__init__()
 
@@ -265,6 +273,15 @@ class ConditionalQueryModel(torch.nn.Module):
 
         self.max_queries = max_queries
         self.use_rope_time = use_rope_time
+        self.ontology_dir = ontology_dir
+        if ontology_dir is not None:
+            # Must run after HF_model exists and before any lookup.  Substituting the module
+            # (rather than patching call sites) is what lets query codes, boundary codes and
+            # aggregate components all inherit ontology structure without further changes.
+            from every_query.data.ontology import load_mix_matrix
+            from every_query.model.ontology_embedding import wrap_tok_embeddings
+
+            wrap_tok_embeddings(self, load_mix_matrix(ontology_dir))
         self.criterion = torch.nn.BCEWithLogitsLoss()
 
         self.hparams = {
@@ -278,6 +295,7 @@ class ConditionalQueryModel(torch.nn.Module):
             "decoder_ffn_mult": decoder_ffn_mult,
             "max_queries": max_queries,
             "use_rope_time": use_rope_time,
+            "ontology_dir": ontology_dir,
         }
 
     @property

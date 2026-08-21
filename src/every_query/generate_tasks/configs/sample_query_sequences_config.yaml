@@ -101,6 +101,18 @@ eventbound_fraction: 0.0
 #   - "ICU_ADMISSION//Medical Intensive Care Unit (MICU)"
 bound_events: null
 
+# --- Ontology / hierarchical embeddings ---------------------------------------------------------
+# Directory of ontology artifacts written by EQ_build_ontology (nodes/mix/closure parquets).
+# Set it to make ancestor NODES addressable as queries, and to explode the event stream through
+# the closure so an ancestor query is labelled by ordinary occurrence ("did any descendant of X
+# occur").  null = off.  Must be the SAME directory the model is trained with — the indices have
+# to agree, or a query would address the wrong embedding row.
+ontology_dir: null
+# Fraction of the query universe made of ancestor nodes rather than leaf codes.  Implemented by
+# reshaping the universe the sampler draws uniformly from, so the code/duration RNG stream — and
+# its parity with sample_tasks — is untouched.  The upstream experiment used 0.30.
+ancestor_fraction: 0.0
+
 overwrite: false
 
 hydra:

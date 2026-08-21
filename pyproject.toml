@@ -88,6 +88,9 @@ EQ_evaluate = "every_query.evaluate.evaluate:main"
 # Conditional query-sequence pipeline (block-autoregressive decoder over query/answer
 # blocks; see src/every_query/model/conditional_model.py).
 EQ_generate_query_sequences = "every_query.generate_tasks.sample_query_sequences:main"
+# Builds the code-ontology DAG artifacts (nodes/mix/closure parquets) that ancestor queries and
+# ontology-mixed embeddings read.  Side-car: the cohort's codes.parquet is read, never written.
+EQ_build_ontology = "every_query.data.build_ontology:main"
 # Dense counterpart: labels the same N query sequences across a supplied cohort.
 EQ_generate_evaluation_query_sequences = "every_query.generate_tasks.sample_evaluation_query_sequences:main"
 EQ_predict_sequences = "every_query.predict.predict_sequences:main"

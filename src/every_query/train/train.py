@@ -277,7 +277,27 @@ def main(cfg: DictConfig) -> float | None:
     # ``validate_resume_directory`` diffs it, so the run dir records the real numbers and a
     # resumed run compares like with like.
     ds_cfg = instantiate(cfg.datamodule.config)
-    cfg.lightning_module.model.config_overrides.vocab_size = ds_cfg.vocab_size
+    vocab_size = ds_cfg.vocab_size
+
+    # With an ontology, the embedding table must cover the ancestor nodes too: they are appended
+    # above the highest leaf index, so the cohort's own vocab_size would leave every ancestor
+    # index out of range.  Read it from the ontology rather than making the user keep a hardcoded
+    # V_ext in the config in sync with a rebuilt DAG.
+    ontology_dir = cfg.lightning_module.model.get("ontology_dir")
+    if ontology_dir:
+        from every_query.data.ontology import extended_vocab_size
+
+        v_ext = extended_vocab_size(ontology_dir)
+        if v_ext < vocab_size:
+            raise ValueError(
+                f"Ontology at {ontology_dir} declares V_ext={v_ext}, smaller than the cohort's "
+                f"vocab_size={vocab_size}.  It was almost certainly built from a different "
+                f"codes.parquet than this cohort."
+            )
+        logger.info("Ontology: sizing the encoder to V_ext=%d (cohort vocab %d).", v_ext, vocab_size)
+        vocab_size = v_ext
+
+    cfg.lightning_module.model.config_overrides.vocab_size = vocab_size
     cfg.lightning_module.model.config_overrides.max_position_embeddings = ds_cfg.max_seq_len + 2
 
     if cfg.do_overwrite and cfg.do_resume:

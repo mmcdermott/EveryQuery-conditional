@@ -165,7 +165,14 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
         surviving = label_df.join(schema_df.lazy().select(sid).unique().collect(), on=sid, how="semi")
         return base.hstack(surviving.select(extras))
 
-    def __init__(self, cfg: MEDSTorchDataConfig, split: str, *, strip_delta_tokens: bool = False):
+    def __init__(
+        self,
+        cfg: MEDSTorchDataConfig,
+        split: str,
+        *,
+        strip_delta_tokens: bool = False,
+        ontology_dir: str | None = None,
+    ):
         """Build the dataset.
 
         Args:
@@ -176,6 +183,10 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
                 (elapsed integer hours per surviving token) for rotary position encoding.
                 Pair with ``ConditionalQueryModel(use_rope_time=True)``; see
                 :mod:`every_query.data.rope_time`.
+            ontology_dir: When set, ancestor node names from the ontology's ``nodes.parquet``
+                are added to the query vocabulary, so a query may name a whole class rather
+                than one leaf code.  Must be the same directory the model was built with —
+                the indices have to agree, or a query would address the wrong embedding row.
         """
         super().__init__(cfg, split)
 
@@ -214,6 +225,19 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
                 "is unavailable for this cohort.",
                 EOS_CODE,
             )
+        self.ontology_dir = ontology_dir
+        if ontology_dir is not None:
+            from every_query.data.ontology import extend_code_map
+
+            n_before = len(self.code_to_index)
+            self.code_to_index = extend_code_map(self.code_to_index, ontology_dir)
+            logger.info(
+                "Ontology: query vocabulary extended from %d codes to %d nodes (%d ancestors).",
+                n_before,
+                len(self.code_to_index),
+                len(self.code_to_index) - n_before,
+            )
+
         self.eos_query_index: int | None = self.code_to_index.get(EOS_CODE)
 
         self.strip_delta_tokens = strip_delta_tokens
