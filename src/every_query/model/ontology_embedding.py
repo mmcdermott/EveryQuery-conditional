@@ -10,9 +10,8 @@ toward its better-estimated parents, and an ancestor node — which never appear
 stream — still receives gradient through every descendant that does.
 
 Substituting the module rather than changing call sites is what makes the feature compose: the
-patient encoder, the query code slot, an event-bounded query's boundary code and an aggregate
-query's components all reach the same attribute, so each one inherits ontology structure for
-free.
+patient encoder, the query code slot and an event-bounded query's boundary code all reach the
+same attribute, so each one inherits ontology structure for free.
 """
 
 import logging
@@ -28,8 +27,8 @@ class OntologyEmbedding(torch.nn.Module):
     The mixed table is **cached per forward pass** rather than recomputed per lookup.  Each
     lookup materialises the full dense ``(V_ext, H)`` product — 25 MB at a 16k vocabulary and
     ``H=384``, plus as much again in backward — and the conditional model touches the embedding
-    table two to four times per forward (patient encoder, query codes, boundary codes, aggregate
-    components).  Recomputing it each time is cheap in FLOPs and dominant in activation memory,
+    table two to three times per forward (patient encoder, query codes, boundary codes).
+    Recomputing it each time is cheap in FLOPs and dominant in activation memory,
     so the owning model clears the cache once per forward via a pre-hook and every lookup in
     between shares one product (and one autograd node).
 
@@ -51,8 +50,8 @@ class OntologyEmbedding(torch.nn.Module):
         >>> emb(torch.tensor([1]))  # (0.5 * 1 + 0.5 * 3) = 2
         tensor([[2., 2., 2.]], grad_fn=<IndexBackward0>)
 
-        Multi-dimensional index tensors work, so an aggregate query's ``(B, L, K)`` component
-        block can be looked up in one call:
+        Multi-dimensional index tensors work, so a whole ``(B, L, K)`` block of ids can be
+        looked up in one call:
 
         >>> emb(torch.zeros(2, 2, 2, dtype=torch.long)).shape
         torch.Size([2, 2, 2, 3])

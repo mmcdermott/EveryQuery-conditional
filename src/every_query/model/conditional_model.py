@@ -191,8 +191,8 @@ class ConditionalQueryModel(torch.nn.Module):
             the ancestor-mixed average ``(A @ W)[ids]`` — see
             :mod:`every_query.model.ontology_embedding`.  The encoder must be sized to the
             ontology's ``V_ext``, which ``train.py`` does automatically.  Because the wrapper
-            substitutes the shared table, query codes, boundary codes and aggregate components
-            all inherit the structure too.
+            substitutes the shared table, both the query codes and an event-bounded query's
+            boundary codes inherit the structure too.
         use_rope_time: Drive the encoder's rotary positions from ``batch.time_pos_ids``
             (elapsed integer hours) instead of token index.  Pair with
             ``ConditionalQueryPytorchDataset(strip_delta_tokens=True)``, which removes the
@@ -276,8 +276,8 @@ class ConditionalQueryModel(torch.nn.Module):
         self.ontology_dir = ontology_dir
         if ontology_dir is not None:
             # Must run after HF_model exists and before any lookup.  Substituting the module
-            # (rather than patching call sites) is what lets query codes, boundary codes and
-            # aggregate components all inherit ontology structure without further changes.
+            # (rather than patching call sites) is what lets query codes and boundary codes
+            # alike inherit ontology structure without further changes.
             from every_query.data.ontology import load_mix_matrix
             from every_query.model.ontology_embedding import wrap_tok_embeddings
 
@@ -346,9 +346,8 @@ class ConditionalQueryModel(torch.nn.Module):
     def _query_code_embeds(self, batch) -> torch.Tensor:
         """``(B, L, H)`` content of each query block's **code** slot.
 
-        A seam: features that change *what is being asked about* (an aggregate expression over
-        several component codes, say) replace this, while the block layout, the mask and the
-        answer readout stride stay untouched.
+        A seam: a feature that changes *what is being asked about* replaces this, while the
+        block layout, the mask and the answer readout stride stay untouched.
         """
         return self.HF_model.embeddings.tok_embeddings(batch.q_codes)
 
