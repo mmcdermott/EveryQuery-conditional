@@ -107,7 +107,13 @@ class QuerySeqSchema(LabelSchema):
             the end-of-timeline code ``TIMELINE//END``, which is an ordinary code).
         durations: Per-query horizons in days (``float32``), aligned with ``queries``.
         answers: Per-query booleans aligned with ``queries`` — *"was ``queries[j]`` observed in
-            ``(prediction_time, prediction_time + durations[j]]``?"*.  Binary, never null; an
+            ``(prediction_time, prediction_time + durations[j])``?"*.  The window is **open at
+            both ends**: an occurrence exactly at ``prediction_time`` is outside it, and so is
+            one landing exactly on the horizon ``prediction_time + durations[j]``.  (This
+            documented an inclusive upper bound until 2026-08; the labellers in
+            ``generate_tasks/sample_query_sequences.py`` have always compared ``<``, so no
+            emitted label changed — but a consumer that reimplemented the closed reading would
+            flip every event landing on the horizon instant.)  Binary, never null; an
             unobservable event (record ends first) is ``False``.  Censoring is carried by a
             ``TIMELINE//END`` query rather than a null answer.
         bound_events: Optional per-query boundary-event codes.  ``bound_events[j]`` is null for

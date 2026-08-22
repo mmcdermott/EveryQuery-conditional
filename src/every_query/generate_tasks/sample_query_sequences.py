@@ -766,7 +766,10 @@ def label_binary_occurrence(index_df: pl.DataFrame, events_df: pl.DataFrame) -> 
     """Label every query with a binary *observed-occurrence* answer and reassemble into list rows.
 
     ``answer = True`` iff an event whose code equals the query occurs strictly within
-    ``(prediction_time, prediction_time + duration_days)`` **and is present in the record**.  There
+    ``(prediction_time, prediction_time + duration_days)`` **and is present in the record**.  The
+    interval is open at *both* ends: an occurrence exactly at ``prediction_time`` is outside it,
+    and so is one landing exactly on the horizon ``prediction_time + duration_days`` (the
+    comparison below is ``<``, not ``<=``).  There
     is no censoring/null: an event we cannot observe (because the record ends first) is ``False``.
     Censoring is captured separately by the ``TIMELINE//END`` query - which, being the last event
     of each record, answers ``True`` exactly when the record ends within the window.
@@ -797,7 +800,7 @@ def label_binary_occurrence(index_df: pl.DataFrame, events_df: pl.DataFrame) -> 
         ...     pl.col("duration_days").cast(pl.Float32),
         ...     pl.col("_ctx_id").cast(pl.UInt32))
         >>> row = label_binary_occurrence(idx, events).row(0, named=True)
-        >>> row["answers"]  # B in (2,12]=yes; A at day1 not >day2 =no; END at day20 not in window =no
+        >>> row["answers"]  # B in (2,12)=yes; A at day1 not >day2 =no; END at day20 not in window =no
         [True, False, False]
     """
     sid = TaskQuerySchema.subject_id_name
@@ -861,8 +864,9 @@ def label_with_event_bounds(index_df: pl.DataFrame, events_df: pl.DataFrame) -> 
     """Label a mixed frame of time-bounded and event-bounded queries.
 
     A query with a null ``bound_event`` behaves exactly as
-    :func:`label_binary_occurrence` — occurrence strictly inside
-    ``(prediction_time, prediction_time + duration_days)``.
+    :func:`label_binary_occurrence` — occurrence strictly inside the open interval
+    ``(prediction_time, prediction_time + duration_days)``, the horizon instant itself excluded,
+    matching :attr:`~every_query.data.schema.QuerySeqSchema.answers`.
 
     A query with a boundary code is answered over ``(prediction_time, boundary)`` instead,
     where ``boundary`` is the **first occurrence of the boundary code strictly after the
