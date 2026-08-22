@@ -197,9 +197,10 @@ class ConditionalQueryModel(torch.nn.Module):
             (elapsed integer hours) instead of token index.  Pair with
             ``ConditionalQueryPytorchDataset(strip_delta_tokens=True)``, which removes the
             quantized ``TIMELINE//DELTA*`` tokens and emits those positions.  Attention then
-            sees continuous relative time rather than token distance.  No-op when the batch
-            carries no ``time_pos_ids``, so a RoPE-configured model still runs on ordinary
-            batches.
+            sees continuous relative time rather than token distance.  This flag and the
+            dataset's ``strip_delta_tokens`` must be set together: a mismatch in *either*
+            direction is a hard error at the first forward pass, because either one silently
+            costs the encoder its elapsed-time signal.  See :meth:`_encoder_position_kwargs`.
     """
 
     PRECISION_TO_MODEL_WEIGHTS_DTYPE: ClassVar[dict[str, torch.dtype]] = {
@@ -316,24 +317,58 @@ class ConditionalQueryModel(torch.nn.Module):
     def _encoder_position_kwargs(self, batch) -> dict[str, torch.Tensor]:
         """Extra ``HF_model`` kwargs carrying the encoder's rotary positions.
 
-        Empty when ``use_rope_time`` is off, so ModernBERT uses token-index positions.
+        Empty when ``use_rope_time`` is off *and* the batch carries no ``time_pos_ids``, so
+        ModernBERT uses token-index positions and elapsed time reaches the encoder the ordinary
+        way — as the quantized ``TIMELINE//DELTA*`` tokens sitting in the stream.
 
-        When it is *on*, a batch without ``time_pos_ids`` is a **hard error** rather than a
-        silent fallback.  Falling back would quietly train or score a RoPE model on token-index
-        positions — indistinguishable from success until the numbers are already published.
-        The upstream experiment hit exactly this and had to issue an erratum after a full eval
-        grid had been computed against a model that never received its time positions.  The
-        misconfiguration it catches is a real one: pairing a RoPE checkpoint with a dataset
-        built without ``strip_delta_tokens=True``.
+        ``use_rope_time`` (model) and ``strip_delta_tokens`` (dataset) are two halves of one
+        setting, and **either** half-configuration is a hard error rather than a silent
+        fallback.  Both directions yield a model that trains, validates and checkpoints with
+        entirely normal-looking numbers while its encoder is missing the time signal:
+
+        * ``use_rope_time=True`` with no ``time_pos_ids`` — the model would quietly train or
+          score on token-index positions, indistinguishable from success until the numbers are
+          already published.  The upstream experiment hit exactly this and had to issue an
+          erratum after a full eval grid had been computed against a model that never received
+          its time positions.  The misconfiguration is a real one: pairing a RoPE checkpoint
+          with a dataset built without ``strip_delta_tokens=True``.
+        * ``use_rope_time=False`` with ``time_pos_ids`` present — worse, and the reason this
+          direction is checked at all.  ``time_pos_ids`` is emitted by exactly one code path,
+          ``ConditionalQueryPytorchDataset(strip_delta_tokens=True)``, so its presence on the
+          batch means the strip was **asked for**, and normally that the ``TIMELINE//DELTA*``
+          tokens have already been deleted from ``batch.code``.  Ignoring the positions then
+          leaves the encoder with **no elapsed-time information at all**: the delta tokens are
+          gone from the stream and the elapsed hours that replaced them are dropped on the
+          floor.  Nothing downstream recovers them — ``time_delta_days`` survives on the batch
+          but never reaches the encoder, which reads only ``code``, the attention mask and
+          these positions.
+
+          One case emits the positions without deleting anything: a cohort whose vocabulary has
+          no ``TIMELINE//DELTA*`` codes at all, where the dataset warns and carries on
+          (:mod:`every_query.data.seq_dataset`).  Refusing is still correct there — the strip
+          was requested deliberately, nothing is consuming the positions, and the run is
+          misconfigured in a way the user needs told about rather than smoothed over.
 
         Rotary frequencies are computed from ``position_ids`` on the fly rather than looked up
         in a table, so elapsed-hour values far exceeding ``max_position_embeddings`` are
         well-defined.  Only the *local*-attention sliding-window mask is token-index based, and
         it is deliberately left that way — windows are over neighbouring events, not hours.
         """
-        if not self.use_rope_time:
-            return {}
         time_pos = getattr(batch, "time_pos_ids", None)
+        if not self.use_rope_time:
+            if time_pos is not None:
+                raise ValueError(
+                    "use_rope_time=False but the batch carries time_pos_ids, which only "
+                    "ConditionalQueryPytorchDataset(..., strip_delta_tokens=True) emits — so the "
+                    "TIMELINE//DELTA* tokens have already been stripped from the encoder input, "
+                    "and token-index positions would leave the encoder with no elapsed-time "
+                    "information at all.  Either half of the pair fixes it: set "
+                    "`lightning_module.model.use_rope_time=true` to consume the positions (most "
+                    "likely what was meant, since the strip was switched on deliberately), or "
+                    "`datamodule.dataset_kwargs.strip_delta_tokens=false` to keep the delta "
+                    "tokens in the stream.  Refusing to silently discard elapsed time."
+                )
+            return {}
         if time_pos is None:
             raise ValueError(
                 "use_rope_time=True but the batch carries no time_pos_ids.  Build the dataset "

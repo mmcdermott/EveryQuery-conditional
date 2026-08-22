@@ -8,9 +8,21 @@ Covers, in pipeline order:
    ``strip_delta_tokens=True`` removes the delta tokens from the collated encoder input,
    emits aligned ``time_pos_ids``, and leaves the query tensors untouched.
 3. :class:`~every_query.model.conditional_model.ConditionalQueryModel` — that
-   ``use_rope_time`` actually reaches ModernBERT's rotary machinery (output moves when only
-   the times move), that it is inert when off, and that it *refuses* a batch carrying no
-   times rather than silently falling back to token-index positions.
+   ``use_rope_time`` actually reaches ModernBERT's rotary machinery *through the real
+   ``forward`` path* (the encoder output moves when only the times move), and that **both**
+   half-configurations are refused rather than silently falling back to token-index
+   positions: a RoPE model handed a batch with no times, and a non-RoPE model handed a
+   batch that carries them.  The second direction was written down here as a *desirable*
+   property once ("a non-RoPE model answers a timed batch identically") — that configuration
+   leaves the encoder with zero elapsed-time information, so the correct behaviour is a
+   refusal.  ``use_rope_time=False`` is inert only on a batch that carries no times, which is
+   the half of that claim kept below.
+
+Measurement level, throughout section 3: assertions about whether times *reached* the encoder
+read ``last_hidden_state`` and use the ``LIVE`` margin.  A randomly-initialised decoder and
+answer head squash the encoder difference to ~1e-07 at ``answer_logits``, i.e. into float32
+rounding noise, so a bare ``torch.equal`` inequality there is satisfied by one ULP and passes
+just as happily when RoPE is dead.
 """
 
 import pytest
@@ -27,6 +39,10 @@ from every_query.data.rope_time import (
 )
 from every_query.data.seq_dataset import ConditionalQueryBatch, ConditionalQueryPytorchDataset
 from every_query.model.conditional_model import ANSWER_NO, ANSWER_YES, ConditionalQueryModel
+
+# Imported rather than re-declared so the margin that separates "RoPE is live" from float32
+# rounding cannot drift between the three files that measure it.
+from tests.test_feature_liveness import LIVE
 
 DELTA_ID = 90
 
@@ -259,6 +275,42 @@ def test_dataset_strip_compacts_the_real_collated_stream(tensorized_cohort_dir, 
         assert got == kept, "surviving tokens must keep their original order"
 
 
+def test_strip_emits_times_even_when_the_cohort_has_no_delta_tokens(
+    tensorized_cohort_dir, seq_task_labels_dir
+):
+    """``time_pos_ids`` means "the strip was requested", not "delta tokens were deleted".
+
+    ``ConditionalQueryPytorchDataset`` handles the empty-``delta_ids`` cohort explicitly — it
+    warns and carries on, emitting ``time_pos_ids`` while deleting nothing — so the presence of
+    the field is not by itself proof that ``batch.code`` was rewritten.  Pinned here because
+    ``_encoder_position_kwargs``'s docstring reasons about what that presence implies, and
+    because the obvious "tidy-up" (suppressing ``time_pos_ids`` when nothing was stripped)
+    would silently turn a caught misconfiguration back into a silent one: a user who asked for
+    the strip against a cohort whose delta tokens are missing or differently named still needs
+    the mismatch reported, not smoothed over.
+    """
+    cfg = _seq_cfg(tensorized_cohort_dir, seq_task_labels_dir)
+    plain = ConditionalQueryPytorchDataset(cfg, split=train_split)
+    ds = ConditionalQueryPytorchDataset(cfg, split=train_split, strip_delta_tokens=True)
+    assert ds.delta_ids.numel() == 0, "this fixture cohort must have no TIMELINE//DELTA* codes"
+
+    before = plain.collate([plain[i] for i in range(len(plain))])
+    after = ds.collate([ds[i] for i in range(len(ds))])
+
+    assert after.time_pos_ids is not None, "the positions are emitted even with nothing to strip"
+    assert after.time_pos_ids.shape == after.code.shape
+    pad = ConditionalQueryBatch.PAD_INDEX
+    for i in range(before.code.shape[0]):
+        kept = [int(c) for c in before.code[i] if int(c) != pad]
+        got = [int(c) for c in after.code[i] if int(c) != pad]
+        assert got == kept, "no delta ids means no token may be removed from the stream"
+
+    # The guard is still right in this case — the user asked for the strip, and a
+    # use_rope_time=False model would drop the hours it produced on the floor.
+    with pytest.raises(ValueError, match="strip_delta_tokens"):
+        _tiny_model(use_rope_time=False)._encoder_position_kwargs(after)
+
+
 def test_dataset_strip_leaves_query_tensors_untouched(tensorized_cohort_dir, seq_task_labels_dir):
     """Stripping touches the encoder stream only; the decoder's query blocks are unaffected."""
     cfg = _seq_cfg(tensorized_cohort_dir, seq_task_labels_dir)
@@ -287,17 +339,36 @@ def _encode(model, batch) -> torch.Tensor:
         ).last_hidden_state
 
 
+def _record_encoder_calls(model) -> list[tuple[dict, torch.Tensor]]:
+    """Record ``(kwargs, last_hidden_state)`` for every encoder call ``forward`` itself makes.
+
+    Every other measurement in this file calls ``model.HF_model(...)`` with position kwargs the
+    test assembled, which proves the *seam* works and says nothing about whether ``forward``
+    uses it.  A ``forward`` that computed the kwargs and then dropped them — the guards firing,
+    the seam correct, RoPE stone dead in the only path training and evaluation take — would be
+    invisible to all of them.  Hooking the encoder is what closes that.
+    """
+    calls: list[tuple[dict, torch.Tensor]] = []
+
+    def hook(module, args, kwargs, output):
+        calls.append((dict(kwargs), output.last_hidden_state.detach().clone()))
+
+    model.HF_model.register_forward_hook(hook, with_kwargs=True)
+    return calls
+
+
 def test_rope_time_reaches_rotary():
     """Same tokens, different elapsed times must give a different encoder representation.
 
     Asserted on the encoder output rather than on ``answer_logits``: the randomly-initialised
     decoder and answer head attenuate the difference to ~1e-7, which would make a logit-level
-    assertion a test of initialisation luck rather than of the wiring.
+    assertion a test of initialisation luck rather than of the wiring.  The margin is ``LIVE``
+    rather than a bare inequality for the same reason — the real effect here is ~1e-4.
     """
     model = _tiny_model(use_rope_time=True)
     near = _encode(model, _rope_batch(time_pos_ids=[[0, 1, 2, 3]]))
     far = _encode(model, _rope_batch(time_pos_ids=[[0, 240, 1000, 5000]]))
-    assert not torch.allclose(near, far), (
+    assert (near - far).abs().max().item() > LIVE, (
         "time_pos_ids must change the encoder geometry when use_rope_time=True"
     )
 
@@ -310,24 +381,76 @@ def test_rope_time_is_the_only_thing_that_moved():
     assert torch.equal(once, twice)
 
 
-def test_rope_time_propagates_to_answer_logits():
-    """The encoder difference does reach the head, even if a trained head is needed to use it."""
+def test_forward_hands_the_times_to_the_encoder():
+    """The real ``forward`` path — not a hand-assembled encoder call — must use the positions.
+
+    Replaces an assertion that read ``assert not torch.equal(near.answer_logits,
+    far.answer_logits)`` after two ``model(batch)`` calls.  That was the repo's only defence
+    against ``forward`` ignoring the position kwargs, and it was a one-ULP defence: an untrained
+    head compresses this difference to ~1e-07, so *any* two non-identical float paths satisfy
+    it.  Here the batches go through ``model(batch)`` exactly as training does, and the claim is
+    measured where the effect lives — at the tensor the decoder cross-attends to.
+    """
     model = _tiny_model(use_rope_time=True)
+    calls = _record_encoder_calls(model)
+    near_batch = _rope_batch(time_pos_ids=[[0, 1, 2, 3]])
+    far_batch = _rope_batch(time_pos_ids=[[0, 240, 1000, 5000]])
+
     with torch.no_grad():
-        _, near = model(_rope_batch(time_pos_ids=[[0, 1, 2, 3]]))
-        _, far = model(_rope_batch(time_pos_ids=[[0, 240, 1000, 5000]]))
-    assert not torch.equal(near.answer_logits, far.answer_logits)
+        model(near_batch)
+        model(far_batch)
+
+    assert len(calls) == 2, "forward must call the encoder exactly once per batch"
+    for (kwargs, _), batch in zip(calls, [near_batch, far_batch], strict=True):
+        assert "position_ids" in kwargs, (
+            "forward computed the rotary positions and did not pass them to the encoder"
+        )
+        assert torch.equal(kwargs["position_ids"], batch.time_pos_ids)
+
+    (_, near), (_, far) = calls
+    assert (near - far).abs().max().item() > LIVE, (
+        "the encoder forward actually ran must move when only the elapsed times move"
+    )
 
 
-def test_rope_time_ignored_when_flag_off():
-    """A batch carrying times must be answered identically by a non-RoPE model."""
+def test_non_rope_model_refuses_a_batch_carrying_times():
+    """The mirror of ``test_rope_model_refuses_a_batch_without_times``, and just as necessary.
+
+    This test used to assert the opposite — that such a batch is "answered identically" by a
+    non-RoPE model — which wrote the defect down as intended behaviour.  ``time_pos_ids`` is
+    emitted only by the strip path, so answering that batch normally means answering with an
+    encoder that has *no* elapsed-time signal at all: the delta tokens gone from ``code`` and
+    the hours that replaced them discarded, while training, validating and checkpointing with
+    entirely normal-looking numbers.  See ``test_rope_strip_guard.py`` for the measurement
+    proving that blindness.
+    """
     model = _tiny_model(use_rope_time=False)
+    with pytest.raises(ValueError, match="time_pos_ids"):
+        model(_rope_batch(time_pos_ids=[[0, 240, 1000, 5000]]))
+
+
+def test_non_rope_model_without_times_is_unperturbed():
+    """The half of the old claim that survives: no times, no RoPE, no change and no refusal.
+
+    The guard must be narrow.  A refusal that fired on every ``use_rope_time=False`` batch, or
+    a fallback that started handing the encoder positions of its own, would both be caught
+    here: the encoder output must be bit-identical to a plain call passing no position kwargs
+    at all, and the model must still answer.
+    """
+    model = _tiny_model(use_rope_time=False)
+    batch = _rope_batch()
+    assert batch.time_pos_ids is None
+
+    assert model._encoder_position_kwargs(batch) == {}
     with torch.no_grad():
-        _, a = model(_rope_batch(time_pos_ids=[[0, 1, 2, 3]]))
-        _, b = model(_rope_batch(time_pos_ids=[[0, 240, 1000, 5000]]))
-        _, none = model(_rope_batch())
-    assert torch.allclose(a.answer_logits, b.answer_logits)
-    assert torch.allclose(a.answer_logits, none.answer_logits)
+        loss, out = model(batch)
+        plain = model.HF_model(
+            input_ids=batch.code, attention_mask=batch.code != ConditionalQueryBatch.PAD_INDEX
+        ).last_hidden_state
+    assert torch.equal(_encode(model, batch), plain), (
+        "a non-RoPE model must reach the encoder exactly as it did before the feature existed"
+    )
+    assert loss.isfinite() and out.answer_logits.isfinite().all()
 
 
 def test_rope_model_refuses_a_batch_without_times():
