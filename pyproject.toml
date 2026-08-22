@@ -104,6 +104,16 @@ EQ_evaluate_sequences = "every_query.evaluate.evaluate_sequences:main"
 patch = ["subprocess"]
 
 [tool.pytest.ini_options] # Default pytest options
+# Put *this* checkout's `src` ahead of the editable install on `sys.path`.
+#
+# The editable install is a plain `.pth` naming one absolute path — the main checkout's `src`.
+# A `git worktree` shares that venv, so `pytest` launched from a worktree imported `every_query`
+# from the *main* checkout and silently tested a different branch's code: green runs that proved
+# nothing about the branch under test, and mutation-testing runs that reported a mutation
+# "caught" when the mutated file was never imported.  Nothing about that failure is visible in
+# the output — the suite passes either way — which is the same silent-wrong-answer shape as the
+# defects this branch exists to fix.
+pythonpath = ["src"]
 addopts = [
   "--color=yes",
   "--doctest-modules", # Ensures that doctest runs
