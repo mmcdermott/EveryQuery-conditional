@@ -30,6 +30,16 @@ Pipeline (every stage but the grid build is imported from ``sample_query_sequenc
        :func:`~every_query.generate_tasks.sample_query_sequences.label_query_sequences`,
        align to ``QuerySeqSchema``, write.
 
+Ontology support mirrors the training sampler on both of its halves, because a grid that mirrors
+only one measures the wrong thing without ever failing: ``ancestor_fraction`` reshapes the query
+universe (:func:`~every_query.generate_tasks.sample_query_sequences.build_query_universe`) so
+ancestor nodes are drawn and accepted as designed-spec codes, and ``ontology_dir`` explodes the
+event stream through the closure
+(:func:`~every_query.generate_tasks.sample_query_sequences.maybe_explode_to_closure`) so an
+ancestor query is labeled by ordinary occurrence.  Without the explosion an ancestor query is
+labeled ``False`` at every context — the ancestor's *name* is in no event stream, only its
+descendants' are — which is a well-formed parquet of wrong answers, not an error.
+
 Both axes carry a tag into the combined file's name: ``contexts_tag`` is the cohort file's stem or
 ``sampled{n_contexts}ctx``, ``specs_tag`` the spec file's stem or ``sampled{N}``.
 
@@ -82,14 +92,18 @@ from every_query.generate_tasks.sample_query_sequences import (
     BOUND_COL,
     CTX_ID_COL,
     POSITION_COL,
+    build_query_universe,
     build_sequence_index_df,
     label_query_sequences,
+    maybe_explode_to_closure,
     read_events_for_subjects,
     read_supplied_contexts,
     resolve_bound_events,
     resolve_prediction_times,
 )
 from every_query.generate_tasks.sample_tasks import (
+    LABELED_DIRNAME,
+    _atomic_write_json,
     _atomic_write_parquet,
     _require_path_arg,
     build_prediction_times,
@@ -694,6 +708,80 @@ def _spec_fps(
     return [out_dir / split / f"{stem}.parquet"]
 
 
+def _frame_digest(df: pl.DataFrame) -> str:
+    """Serialization-independent digest of a frame's logical rows: ``"{height}:{hash16}"``.
+
+    The same construction :func:`~every_query.generate_tasks.sample_tasks._index_fingerprint` uses
+    for Stage 4's index partitions — polars' vectorized ``hash_rows`` summed over rows, combined
+    with the row count — so a rewritten-but-identical parquet digests the same.
+    """
+    total = int(df.hash_rows(seed=0).sum()) if df.height else 0
+    return f"{df.height}:{total & 0xFFFFFFFFFFFFFFFF:016x}"
+
+
+def _ontology_fingerprint(ontology_dir: str | Path | None, query_codes: Sequence[str]) -> str | None:
+    """Digest of the two ontology-derived inputs to a grid's labels, or ``None`` with no ontology.
+
+    Both output paths — ``{contexts_tag}__{specs_tag}.parquet`` and the ``per_spec_dirs`` tree —
+    encode the *sizes* of a run, never its ontology, so a leaf-only grid and an ancestor grid land
+    on the same file and the existence-only skip would silently keep the first one's labels.  The
+    two things that would make those labels wrong are covered here:
+
+    - the **closure**, which decides whether an ancestor query labels ``True`` at all, and
+    - the **query universe**, which is where ``ancestor_fraction`` (and the leaf vocabulary) lands
+      after :func:`~every_query.generate_tasks.sample_query_sequences.build_query_universe`; the
+      universe is digested with its slot index, since order and multiplicity both steer the draw.
+
+    ``None`` when no ontology is configured, so an output written before this sidecar existed
+    (there is no other way to have no sidecar) compares equal and is still skipped — the
+    ontology-off path is byte-for-byte and file-for-file what it was.
+    """
+    if not ontology_dir:
+        return None
+    from every_query.data.ontology import load_closure_map
+
+    universe = pl.DataFrame(
+        {"slot": list(range(len(query_codes))), "code": list(query_codes)},
+        schema={"slot": pl.Int64, "code": pl.String},
+    )
+    return f"{_frame_digest(load_closure_map(ontology_dir))}|{_frame_digest(universe)}"
+
+
+def _provenance_path(out_dir: Path, fp: Path) -> Path:
+    """Sidecar recording the ontology a written output was labeled under.
+
+    Mirrors :func:`~every_query.generate_tasks.sample_tasks.labeled_fingerprint_path`: provenance
+    lives in the ``{name}_artifacts`` sibling, never in the final-output root, so the output tree
+    keeps holding nothing but the parquets ``EQ_predict_sequences`` rglobs (invariant 7).  The
+    output's path *below* ``out_dir`` is kept as the sidecar's own, so the combined file and each
+    ``per_spec_dirs`` output get their own and cannot collide.
+
+    Examples:
+        >>> _provenance_path(Path("/x/grid"), Path("/x/grid/held_out/c__s.parquet"))
+        PosixPath('/x/grid_artifacts/_labeled/held_out/c__s.json')
+    """
+    rel = fp.relative_to(out_dir).with_suffix(".json")
+    return default_artifacts_dir(out_dir) / LABELED_DIRNAME / rel
+
+
+def _recorded_fingerprint(out_dir: Path, fp: Path) -> str | None:
+    """Read back :func:`_ontology_fingerprint` for an existing output; ``None`` if absent/unreadable."""
+    try:
+        return json.loads(_provenance_path(out_dir, fp).read_text()).get("ontology_fingerprint")
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return None
+
+
+def _output_is_current(out_dir: Path, fp: Path, fingerprint: str | None) -> bool:
+    """Whether an existing output was labeled under the ontology this run is configured with.
+
+    An unreadable or missing sidecar reads as ``None``, i.e. "no ontology", matching
+    :func:`label_one_sequence_shard`'s treatment of a missing fingerprint as stale for every case
+    but the one that is genuinely current.
+    """
+    return fp.exists() and _recorded_fingerprint(out_dir, fp) == fingerprint
+
+
 def run_worker(
     data_dir: Path,
     out_dir: Path,
@@ -717,6 +805,7 @@ def run_worker(
     duration_mode: str = "random",
     eventbound_fraction: float = 0.0,
     bound_events: Sequence[str] | None = None,
+    ontology_dir: str | None = None,
     n_contexts: int = 512,
     min_prediction_times_per_subject: int = 50,
     per_spec_dirs: bool = False,
@@ -746,7 +835,12 @@ def run_worker(
         out_dir: Output root (see the module docstring for the two layouts).
         split: Split whose shards to gather events from; must contain every cohort subject.
         query_codes: The model's query vocabulary; the sampling pool when ``sequences_path`` is
-            ``None``, and the validation set for designed specs either way.
+            ``None``, and the validation set for designed specs either way.  With an ontology, pass
+            the *extended* universe from
+            :func:`~every_query.generate_tasks.sample_query_sequences.build_query_universe` — the
+            same list the training sampler draws from, since ancestor names must be drawable,
+            validatable (:func:`validate_spec_codes`) and usable as boundary events
+            (:func:`~every_query.generate_tasks.sample_query_sequences.resolve_bound_events`) alike.
         contexts_path: Parquet with at least ``(subject_id, prediction_time)`` — the cohort.
             ``None`` samples ``n_contexts`` contexts from ``split`` instead.
         sequences_path: Designed specs (YAML/JSON/parquet).  ``None`` samples ``n_sequences``.
@@ -756,6 +850,12 @@ def run_worker(
             sampled cohort.  Unused for a supplied cohort.
         per_spec_dirs: Write one ``{out_dir}/{spec_name}/{split}/tasks.parquet`` per spec instead
             of a single combined parquet.
+        ontology_dir: Directory of ``EQ_build_ontology`` artifacts.  Explodes the event stream
+            through the closure before labeling, exactly as the training sampler's Stage 4' does,
+            so "did any descendant of X occur" is answered as an ordinary occurrence question
+            about X.  Without it an ancestor query labels all-``False`` — a well-formed parquet
+            full of wrong labels — so the eval grid must be given the same ontology the training
+            tasks were built with.  ``None`` is a no-op.
         overwrite: Regenerate outputs that already exist.
 
     Returns:
@@ -800,7 +900,10 @@ def run_worker(
     contexts_tag = Path(contexts_path).stem if contexts_path is not None else f"sampled{n_contexts}ctx"
     stem = f"{contexts_tag}__{specs_tag}"
     out_fps = _spec_fps(out_dir, split, stem, specs, per_spec_dirs)
-    if not overwrite and all(fp.exists() for fp in out_fps):
+    # Neither tag encodes the ontology, so "already exists" is not on its own "already correct":
+    # an output labeled under a different ontology (or none) has to be relabeled, not skipped.
+    fingerprint = _ontology_fingerprint(ontology_dir, query_codes)
+    if not overwrite and all(_output_is_current(out_dir, fp, fingerprint) for fp in out_fps):
         logger.info("All %d output(s) already exist (e.g. %s), skipping.", len(out_fps), out_fps[0])
         return []
 
@@ -843,35 +946,53 @@ def run_worker(
         )
 
     events_df = read_events_for_subjects(data_dir / "data" / split, contexts[TaskQuerySchema.subject_id_name])
+    n_raw_events = events_df.height
+    # Once, on the driver's single whole-cohort frame, and *before* the per-spec loop: the training
+    # sampler explodes inside each Stage 4' worker, so this is the one pass that mirrors it (and
+    # multiplies the frame by the mean closure size in a single process).  Both labeling branches
+    # below read this frame, and patching only one of them would leave the other silently wrong.
+    events_df = maybe_explode_to_closure(events_df, ontology_dir)
     logger.info(
-        "Loaded %d contexts x %d sequences = %d labeled rows to build, from %d events",
+        "Loaded %d contexts x %d sequences = %d labeled rows to build, from %d events%s",
         contexts.height,
         len(specs),
         contexts.height * len(specs),
-        events_df.height,
+        n_raw_events,
+        f" ({events_df.height:,} after ontology closure explosion)" if ontology_dir else "",
     )
 
     written: list[Path] = []
     if per_spec_dirs:
         for spec, fp in zip(specs, out_fps, strict=True):
-            if fp.exists() and not overwrite:
+            if _output_is_current(out_dir, fp, fingerprint) and not overwrite:
                 logger.info("Labels already exist at %s, skipping.", fp)
                 continue
             index_df = build_dense_sequence_index_df(contexts, [spec])
-            _write(label_query_sequences(index_df, events_df), fp)
+            _write(label_query_sequences(index_df, events_df), fp, out_dir, fingerprint)
             written.append(fp)
     else:
         index_df = build_dense_sequence_index_df(contexts, specs)
-        _write(label_query_sequences(index_df, events_df), out_fps[0])
+        _write(label_query_sequences(index_df, events_df), out_fps[0], out_dir, fingerprint)
         written.append(out_fps[0])
     return written
 
 
-def _write(labeled: pl.DataFrame, fp: Path) -> None:
-    """Align to ``QuerySeqSchema`` and atomically write one output parquet."""
+def _write(labeled: pl.DataFrame, fp: Path, out_dir: Path, fingerprint: str | None) -> None:
+    """Align to ``QuerySeqSchema``, atomically write one output parquet, and record its provenance.
+
+    The ontology sidecar is written *after* the parquet is committed, so a present sidecar always
+    describes a present output — the ordering :func:`label_one_sequence_shard` uses for the same
+    reason.  With no ontology no sidecar is written and any stale one is removed, which keeps "no
+    sidecar" meaning exactly "labeled without an ontology".
+    """
     aligned = QuerySeqSchema.align(labeled.to_arrow())
     fp.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write_parquet(pl.from_arrow(aligned), fp)
+    provenance = _provenance_path(out_dir, fp)
+    if fingerprint is None:
+        provenance.unlink(missing_ok=True)
+    else:
+        _atomic_write_json({"ontology_fingerprint": fingerprint}, provenance)
     logger.info("Wrote %d labeled query sequences to %s", labeled.height, fp)
 
 
@@ -906,7 +1027,16 @@ def main(cfg: DictConfig) -> None:
     """
     data_dir = _require_path_arg(cfg.get("data_dir"), "data_dir")
     out_dir = _require_path_arg(cfg.get("out_dir"), "out_dir")
-    query_codes = read_query_codes(cfg.get("query_codes"))
+    # The same three arguments, read the same way, as ``sample_query_sequences.main``'s
+    # supplied-cohort branch: an eval grid drawn from a *narrower* universe than training's is the
+    # drift this whole module exists to avoid, and the ancestor half of the universe is no
+    # exception.  The raw ``seed`` (not a derived axis) is what keeps the two universes identical.
+    query_codes = build_query_universe(
+        read_query_codes(cfg.get("query_codes")),
+        ontology_dir=cfg.get("ontology_dir"),
+        ancestor_fraction=float(cfg.get("ancestor_fraction", 0.0) or 0.0),
+        seed=int(cfg.get("seed", 0)),
+    )
 
     # Unset ``contexts_path`` is the sampled-cohort path (Stages 0 + 2 over the split), not an
     # error: the two sources are peers, exactly as in ``sample_query_sequences.main``.
@@ -930,6 +1060,7 @@ def main(cfg: DictConfig) -> None:
         duration_mode=str(cfg.get("duration_mode", "random")),
         eventbound_fraction=float(cfg.get("eventbound_fraction", 0.0) or 0.0),
         bound_events=resolve_bound_events(cfg, query_codes),
+        ontology_dir=cfg.get("ontology_dir"),
         n_contexts=int(cfg.n_contexts),
         min_prediction_times_per_subject=int(cfg.min_prediction_times_per_subject),
         per_spec_dirs=bool(cfg.get("per_spec_dirs", False)),
