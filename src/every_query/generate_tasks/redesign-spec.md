@@ -312,8 +312,9 @@ label is `null` regardless of any earlier occurrence. Otherwise, occurrence deci
 - **censored** — `prediction_time + duration_days > max_time[subject_id]` **and** the subject has no `MEDS_DEATH`
     row at or before the window end (the record ends before the window closes; the unobserved tail is unknown). Label
     `null`. Resolved *before* occurrence: an event observed earlier in the window does **not** override the unknown tail.
-- **occurs** — not censored, and an event with the query `code` falls strictly within
-    `(prediction_time, prediction_time + duration_days]`. Label `True`.
+- **occurs** — not censored, and an event with the query `code` falls inside
+    `(prediction_time, prediction_time + duration_days]` — strictly after `prediction_time`, at or before the
+    window end. Label `True`.
 - **does not occur** — not censored, and no matching event in the window. Label `False`. This includes a subject who is
     dead by the window end: death is terminal, so the record is complete and a non-occurrence is a genuine negative.
 

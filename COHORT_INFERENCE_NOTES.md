@@ -203,7 +203,7 @@ Two things to know:
 left  = index_df.with_columns((pl.col(pt) + pl.duration(microseconds=1)).alias("_pts")).sort(sid, q, "_pts")
 right = events_df.rename({code: q}).select(sid, q, time).sort(sid, q, time)
 joined = left.join_asof(right, by=[sid, q], left_on="_pts", right_on=time, strategy="forward")
-answer = pl.col(time).is_not_null() & (pl.col(time) < pl.col(pt) + pl.duration(days=pl.col(d)))
+answer = pl.col(time).is_not_null() & (pl.col(time) <= pl.col(pt) + pl.duration(days=pl.col(d)))
 ```
 
 **One `join_asof` labels every query regardless of how many distinct codes are in play.** No
@@ -216,9 +216,9 @@ Semantics (v2 design — this matters):
 - An event you couldn't observe because the record ends first is `False`, not null.
 - Right-truncation is expressed **as a query**: `TIMELINE//END` (`seq_dataset.py:48`) is a real MEDS
   code at each subject's last event, so `(TIMELINE//END, d)` is `True` iff the record ends within `d`.
-- Window is `(t, t+d)` — **open at both ends**. Strict lower via the `+1µs` asof shift, strict upper
-  via `<`. Several docstrings (`schema.py:110`, `seq_dataset.py:10`) and the archive README claim
-  `(t, t+d]`; the code is `<`. Minor, but don't trust the docstring on a boundary case.
+- Window is `(t, t+d]` — **open at the prediction instant, closed at the horizon**. Strict lower via
+  the `+1µs` asof shift, inclusive upper via `<=`: an event charted exactly on `t+d` counts as an
+  occurrence. The docstrings (`schema.py:110`, `seq_dataset.py:10`) state the same interval.
 
 **`_read_event_shard`** — `sample_tasks.py:392`. Mandatory before labeling. The two casts are
 correctness-critical, not cosmetic: `code → Utf8` (upstream may store Categorical *or integer vocab
