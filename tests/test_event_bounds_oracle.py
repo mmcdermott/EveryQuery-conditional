@@ -27,11 +27,12 @@ Inputs.  ``index_df`` is one row per query: ``_ctx_id``, ``_position``, ``subjec
 
 S1. A query whose ``bound_event`` is null is an ordinary time-bounded query and "behaves exactly
     as ``label_binary_occurrence``": the answer is True iff an event of the queried code occurs
-    strictly inside ``(prediction_time, prediction_time + duration_days)``.  The lower bound is
-    strict (docstring: enforced by shifting the asof key +1us).  See the AMBIGUITY note below on
-    the upper bound.
+    inside ``(prediction_time, prediction_time + duration_days]``.  The lower bound is strict
+    (docstring: enforced by shifting the asof key +1us); the upper bound is CLOSED, so an event
+    landing exactly on the horizon instant counts.  See the RESOLUTION note below -- that upper
+    bound was the one thing the sources disagreed about when this oracle was first written.
 
-S2. A query with a boundary code is answered over ``(prediction_time, boundary)`` instead, and
+S2. A query with a boundary code is answered over ``(prediction_time, boundary]`` instead, and
     ``duration_days`` is ignored -- it carries the ``EVENT_BOUND_DURATION_SENTINEL`` (-1.0), not
     a horizon.
 
@@ -40,7 +41,12 @@ S3. ``boundary`` is the FIRST occurrence of the boundary code STRICTLY AFTER the
     eligible one) and for boundary events at or before the prediction time (not eligible -- the
     search starts strictly after ``prediction_time``, so earlier occurrences are invisible).
 
-S4. The bound is STRICT: "an occurrence *at* the boundary instant is not inside the window."
+S4. The bound is CLOSED, exactly as the horizon is: "a query code occurring at the exact same
+    instant as the boundary event counts as having occurred before it."  Only an occurrence
+    strictly AFTER the boundary is outside the window.  This clause carries more weight than it
+    looks: for a bounded query the window's end IS the boundary event's own timestamp, and MEDS
+    clusters many codes onto a single timestamp, so it decides real rows rather than a
+    measure-zero edge.
 
 S5. When no occurrence of the boundary code exists strictly after the prediction time, "the
     window runs to the end of the record", degenerating the query into "does this code ever
@@ -50,43 +56,59 @@ S5. When no occurrence of the boundary code exists strictly after the prediction
 S6. Consequences the spec forces, which the oracle re-derives rather than special-cases:
     - No events for the subject at all => False for every query form.
     - Zero-length window (``duration_days == 0``) or inverted window (``duration_days < 0``) on
-      an UNBOUNDED query => the open interval is empty => always False.
+      an UNBOUNDED query => the interval is still empty even with the upper bound closed, since
+      the lower one is strict and ``(pt, pt]`` contains nothing => always False.
     - ``bound_event == query`` => the first occurrence after ``prediction_time`` is simultaneously
-      the boundary and the earliest candidate answer, and S4 excludes the boundary instant =>
-      always False, whether or not the code recurs.
+      the boundary and the earliest candidate answer, and S4 now INCLUDES the boundary instant =>
+      True iff the code recurs at all after ``prediction_time``.  (Under the old strict bound this
+      shape was always False; it is the second place the settled rule visibly changed an answer.)
 
 S7. Output: one row per ``_ctx_id`` -- ``subject_id``, ``prediction_time``, and the aligned list
     columns ``queries`` / ``durations`` / ``answers`` / ``bound_events``, each ordered by
     ``_position``.
 
-AMBIGUITY, since RECONCILED: when this oracle was written the sources disagreed on the UPPER
-bound of the time-bounded window.  Both labellers' prose said "strictly inside
-``(prediction_time, prediction_time + duration_days)``" (open), while
-``label_binary_occurrence``'s worked example annotated the same window ``(2,12]`` and
-``QuerySeqSchema.answers`` documented ``(prediction_time, prediction_time + durations[j]]``
-(closed).  The oracle implemented the OPEN reading, because that is the prose of the function
-under test and the reading consistent with S4's strict event bound -- and the code agreed: both
-labellers compare ``<``, so no emitted label was ever wrong.  The two closed-reading sources
-have since been corrected to the open reading, so all four now say the same thing.
+RESOLUTION, 2026-08-22 -- THE UPPER BOUND IS CLOSED.  When this oracle was first written the
+sources disagreed about it, and the oracle was written to the OPEN reading because that was the
+prose of the function under test.  Both of ``sample_query_sequences``'s labellers compared ``<``;
+almost everything else in the repo read closed -- ``sample_tasks.py:535`` implements ``<=``,
+``sample_tasks.py:498``, ``data/seq_dataset.py:10``, ``redesign-spec.md:64,301,316`` and
+``test_generate_tasks.py:81,169`` all document or implement it -- and even
+``label_binary_occurrence``'s own worked example annotated its window ``(2,12]``.  A brief
+detour on 2026-08-21 (commit 252bbe3) reconciled the docs the other way, onto OPEN.
 
-That reconciliation is what ``test_the_documented_upper_bound_matches_the_implemented_one``
-defends.  It does not assert fixed prose: it *measures* the code's behaviour at the horizon
-instant and then requires the docstrings' interval notation to agree with what it measured.  So
-it stays honest if the behaviour is ever deliberately changed -- the docs would then have to
-change with it -- and it goes red if either half drifts alone.  That matters more than it looks:
-the risk here was never a wrong label today, it was a downstream consumer reimplementing the
-closed reading from ``schema.py`` and flipping every event that lands exactly on the horizon.
+The repo owner has settled it in the direction the rest of the repo already went: the window is
+``(prediction_time, prediction_time + duration_days]`` -- lower bound STRICT, upper bound CLOSED
+-- and ``sample_query_sequences``'s two labellers were brought into line with ``sample_tasks``
+rather than the reverse.  Both now compare ``<=``.  This oracle moved with the decision, but only
+its two boundary comparisons did (S1's horizon and S4's event bound): it is still derived from
+the written spec and shares no code path with the implementation, which is the entire reason it
+is worth running.
 
-NOT reconciled, and out of this file's edit scope -- reported rather than silently fixed:
-``data/seq_dataset.py``, ``model/conditional_model.py``, ``generate_tasks/sample_tasks.py`` and
-``generate_tasks/redesign-spec.md`` still spell the window closed.  The doc-consistency test
-below is deliberately scoped to the sources that were reconciled, so it passes today; widen its
-``_DOC_SOURCES`` tuple once those four are corrected.
+The event-bounded half of that flip is the consequential one, and it is stated as its own clause
+in S4 above: for a bounded query the window's end IS the boundary event's timestamp, so a query
+code sharing that instant now labels True where it labelled False.  That is intended, it is one
+rule rather than a configurable flag, and exactly one test pins it --
+``test_a_query_at_the_exact_boundary_instant_counts`` -- so that reverting to an exclusive
+boundary stays a one-line change with one test to flip.
+
+``test_the_documented_upper_bound_matches_the_implemented_one`` is what keeps the docs from
+drifting away from that again.  It does not assert fixed prose: it *measures* the code's
+behaviour at the horizon instant and then requires the docstrings' interval notation to agree
+with what it measured.  So it stays honest if the behaviour is ever deliberately changed -- the
+docs would then have to change with it -- and it goes red if either half drifts alone.  The risk
+it guards was never a wrong label today; it is a downstream consumer reimplementing the wrong
+reading from ``schema.py`` and flipping every event that lands exactly on the horizon.
+
+OUT OF THIS FILE'S EDIT SCOPE -- reported rather than silently fixed:
+``QuerySeqSchema.answers`` in ``src/every_query/data/schema.py`` is the source 252bbe3 moved onto
+the open reading, and it has to move back with everything else.  It stays in ``_DOC_SOURCES``
+below precisely because it is the document a downstream reimplementation is read from, so the
+consistency test is the thing that notices if it is forgotten.
 
 RESULT: the implementation agrees with the oracle on every field of every context, across all
 seeds.  No labelling defect found -- but a green oracle is only worth what it would have caught,
 so the suite was run against ten hand-built wrong implementations of
-``label_with_event_bounds``.  All ten go red here: `<` -> `<=` at the bound; dropping
+``label_with_event_bounds``.  All ten go red here: `<=` -> `<` at the bound; dropping
 ``window_open`` so a never-recurring boundary closes the window; asof ``forward`` -> ``backward``
 (last occurrence before, instead of first after); dropping the +1us shift that makes the lower
 bound strict; falling back to the ``duration_days`` horizon for bounded queries (the feature
@@ -101,8 +123,8 @@ LATER PASS -- three thin spots closed, each proven by replaying the mutation it 
    ``label_with_event_bounds``, which two separate mutations reduced to a single failure.  It
    now gets its own twelve-seed sweep AGAINST THE ORACLE (not against the other labeller, which
    shares its conventions and would move with it).  Dropping the ``+1us`` shift now fails 9
-   seeds instead of 1; an inclusive upper bound fails 5; truncating the horizon to whole days
-   fails a seed plus a dedicated test.
+   seeds instead of 1; an EXCLUSIVE upper bound (the reading this file used to hold) fails 5;
+   truncating the horizon to whole days fails a seed plus a dedicated test.
 2. The sweep's unbounded durations were drawn from ``{0, -2, 0.25, 0.5, 1, 2, 5}``, which never
    produced an unbounded row carrying the ``EVENT_BOUND_DURATION_SENTINEL``.  That shape is the
    only one separating "is this bounded?" asked of the bound column from the same question
@@ -116,8 +138,8 @@ LATER PASS -- three thin spots closed, each proven by replaying the mutation it 
    that any mutation perturbs identically.  Five tests now cover the draw itself.
 
 Also added: ``test_the_documented_upper_bound_matches_the_implemented_one``, the only test in
-the suite that fails when the DOCS alone regress -- reverting ``QuerySeqSchema.answers`` to the
-closed reading is otherwise invisible to every test in this repo.
+the suite that fails when the DOCS alone regress -- a ``QuerySeqSchema.answers`` that spells the
+window the wrong way round is otherwise invisible to every test in this repo.
 """
 
 import inspect
@@ -146,9 +168,9 @@ from every_query.generate_tasks.sample_query_sequences import (
 def _oracle_answer(subject_events, prediction_time, query, duration_days, bound_event):
     """Answer ONE query by hand.  `subject_events` is a list of (time, code) for this subject."""
     if bound_event is None:
-        # S1: strictly inside the open horizon window.
+        # S1: inside the horizon window -- open at the bottom, closed at the top.
         window_end = prediction_time + timedelta(days=float(duration_days))
-        return any(code == query and prediction_time < t < window_end for t, code in subject_events)
+        return any(code == query and prediction_time < t <= window_end for t, code in subject_events)
 
     # S3: the boundary is the first occurrence of the bound code strictly after the pred time.
     boundary = None
@@ -160,8 +182,8 @@ def _oracle_answer(subject_events, prediction_time, query, duration_days, bound_
         # S5: no boundary ahead -> the window runs to the end of the record.
         return any(code == query and t > prediction_time for t, code in subject_events)
 
-    # S4: strict on both ends.
-    return any(code == query and prediction_time < t < boundary for t, code in subject_events)
+    # S4: strict at the prediction instant, inclusive at the boundary instant.
+    return any(code == query and prediction_time < t <= boundary for t, code in subject_events)
 
 
 def _oracle_label(index_rows, event_rows):
@@ -438,7 +460,10 @@ def _shapes_in(index_rows, event_rows):
             if horizon > 0 and horizon != int(horizon):
                 full = pt + timedelta(days=float(int(horizon)))
                 end = pt + timedelta(days=horizon)
-                if any(c == row["query"] and full <= t < end for t, c in events):
+                # Both windows are closed at the top, so truncation changes the answer for an
+                # event in (full, end] -- not [full, end): one landing exactly on `full` is
+                # inside the truncated window too.
+                if any(c == row["query"] and full < t <= end for t, c in events):
                     # Truncate the horizon to whole days and this row flips True -> False.
                     kinds.append("fractional_horizon_decides_the_answer")
             continue
@@ -546,14 +571,18 @@ def test_the_plain_labeller_honours_a_fractional_day_horizon():
     assert _plain_answer(_one("A", 1.5, None), day_and_a_quarter) == [True], (
         "a 1.5-day horizon was truncated to 1 day -- the fractional part is being discarded"
     )
-    # ...and the horizon really is being read, rather than ignored altogether: at exactly
-    # 0.25 days the 6h event lands ON the horizon instant, which the open window excludes.
-    assert _plain_answer(_one("A", 0.25, None), six_hours) == [False]
+    # At exactly 0.25 days the 6h event lands ON the horizon instant, which the closed window
+    # includes.
+    assert _plain_answer(_one("A", 0.25, None), six_hours) == [True]
+    # ...and the horizon really is being read, rather than ignored altogether: 0.125 days is 3h,
+    # which the 6h event is genuinely past, so the Trues above are the horizon doing work.
+    assert _plain_answer(_one("A", 0.125, None), six_hours) == [False]
 
     for rows, events in (
         (_one("A", 0.5, None), six_hours),
         (_one("A", 1.5, None), day_and_a_quarter),
         (_one("A", 0.25, None), six_hours),
+        (_one("A", 0.125, None), six_hours),
     ):
         _assert_plain_matches_oracle(rows, events, context="fractional horizon")
 
@@ -582,8 +611,19 @@ def test_s3_boundary_before_the_prediction_time_is_invisible():
     _assert_matches_oracle(rows, events, context="S3 past boundary")
 
 
-def test_s4_occurrence_exactly_at_the_boundary_instant_is_outside():
-    """The classic silent flip: `<` vs `<=` at the bound."""
+def test_a_query_at_the_exact_boundary_instant_counts():
+    """S4, alone in its own test: the coincident-timestamp rule for EVENT-bounded queries.
+
+    Deliberately separate from the time-bounded horizon test even though one operator decides
+    both.  For a bounded query the window's end IS the boundary event's own timestamp, so the
+    closed upper bound means a query code charted at the same instant as the boundary counts as
+    having occurred before it -- and MEDS clusters codes onto one timestamp, so that is a real
+    population of rows, not an edge case.  Keeping it here on its own is what makes reverting to
+    an exclusive boundary a one-line change with one test to flip.
+
+    The third case is what stops `<=` being confused with "no upper bound at all": 1us past the
+    boundary is still outside.
+    """
     at_bound = [
         (1, EPOCH + timedelta(days=2), "A"),
         (1, EPOCH + timedelta(days=2), "DISCHARGE"),
@@ -592,11 +632,21 @@ def test_s4_occurrence_exactly_at_the_boundary_instant_is_outside():
         (1, EPOCH + timedelta(days=2) - timedelta(microseconds=1), "A"),
         (1, EPOCH + timedelta(days=2), "DISCHARGE"),
     ]
+    just_outside = [
+        (1, EPOCH + timedelta(days=2) + timedelta(microseconds=1), "A"),
+        (1, EPOCH + timedelta(days=2), "DISCHARGE"),
+    ]
     rows = _one("A", -1.0, "DISCHARGE")
-    assert _answer(rows, at_bound) == [False], "an occurrence AT the boundary was counted"
+    assert _answer(rows, at_bound) == [True], (
+        "a query code sharing the boundary event's instant was excluded; the bound is closed"
+    )
     assert _answer(rows, just_inside) == [True], "1us inside the boundary was excluded"
+    assert _answer(rows, just_outside) == [False], (
+        "1us PAST the boundary was counted -- the bound is closed, not absent"
+    )
     _assert_matches_oracle(rows, at_bound, context="S4 at bound")
     _assert_matches_oracle(rows, just_inside, context="S4 1us inside")
+    _assert_matches_oracle(rows, just_outside, context="S4 1us outside")
 
 
 def test_lower_bound_is_strict_for_both_query_and_boundary():
@@ -671,17 +721,31 @@ def test_s6_zero_length_and_inverted_windows_are_always_false():
     _assert_matches_oracle(_one("A", -3.0, None), events, context="inverted window")
 
 
-def test_s6_bound_event_equal_to_the_query_is_always_false():
-    """Self-bounded queries are degenerate by construction; they must not label True."""
-    for events in (
+def test_s6_bound_event_equal_to_the_query_asks_whether_the_code_recurs():
+    """Self-bounded queries collapse to "does this code occur again", under the closed bound.
+
+    The first occurrence after the prediction time is simultaneously the boundary and the
+    earliest candidate answer, and S4 now includes the boundary instant, so the query answers
+    True exactly when the code recurs at all.  (Under the strict bound this shape was always
+    False.)  Degenerate either way -- the point of pinning it is that it is a shape the sampler
+    can emit whenever the query pool and the bound pool overlap, so it must not be an accident.
+    """
+    recurs = [
         [(1, EPOCH + timedelta(days=1), "A")],
         [(1, EPOCH + timedelta(days=1), "A"), (1, EPOCH + timedelta(days=2), "A")],
-        [(1, EPOCH - timedelta(days=1), "A")],
+    ]
+    never_recurs = [
+        [(1, EPOCH - timedelta(days=1), "A")],  # only before the prediction time
+        [(1, EPOCH, "A")],  # exactly AT it: the lower bound is strict, so invisible
         [],
-    ):
-        rows = _one("A", -1.0, "A")
+    ]
+    rows = _one("A", -1.0, "A")
+    for events in recurs:
+        assert _answer(rows, events) == [True], f"self-bounded query False for {events}"
+        _assert_matches_oracle(rows, events, context="self-bound, recurs")
+    for events in never_recurs:
         assert _answer(rows, events) == [False], f"self-bounded query True for {events}"
-        _assert_matches_oracle(rows, events or [(2, EPOCH, "Z")], context="self-bound")
+        _assert_matches_oracle(rows, events or [(2, EPOCH, "Z")], context="self-bound, no recurrence")
 
 
 def test_s1_null_bound_agrees_with_label_binary_occurrence_query_for_query():
@@ -727,7 +791,7 @@ def _measure_upper_bound_is_closed():
     return bounded == [True]
 
 
-# The four sources that were reconciled onto the open reading.  Each entry is
+# The four sources that must spell the labelling window the way the code labels it.  Each entry is
 # (name, docstring, pattern) where the pattern's single group captures the closing bracket of
 # the labelling window's interval notation.  Deliberately NOT the full prose: this must go red
 # on a reverted bracket, not on an unrelated reword.
@@ -758,17 +822,17 @@ _DOC_SOURCES = (
 def test_the_documented_upper_bound_matches_the_implemented_one():
     """The docs must describe the window the code actually labels.
 
-    This is the whole point of the reconciliation.  No label is wrong today -- both labellers
-    compare `<` and always have -- so nothing about this is a live bug, and a test that merely
-    pinned the behaviour would have caught nothing.  The failure mode is entirely forward
-    looking: `QuerySeqSchema` is the document a downstream consumer reads to reimplement or
-    "fix" this labelling, and it used to promise a CLOSED upper bound.  Anyone who believed it
-    would flip the answer for every event landing exactly on the horizon instant, silently, on
-    a code path this repo's tests never run.
+    The settled rule is the closed upper bound (see the RESOLUTION note at the top of this
+    file), and this is the test that keeps every source saying so.  The failure mode it guards
+    is not a wrong label today -- it is forward looking: `QuerySeqSchema` is the document a
+    downstream consumer reads to reimplement or "fix" this labelling, and a source that spells
+    the interval the wrong way round would have them flip the answer for every event landing
+    exactly on the horizon instant, silently, on a code path this repo's tests never run.
 
     So the assertion is a consistency one, not a constant one: measure what the code does, then
     require every source to say that.  Change the behaviour deliberately and this goes red until
-    the docs follow -- which is the intended workflow, not an obstacle.
+    the docs follow -- which is the intended workflow, not an obstacle.  It is also why this
+    test survived the direction of the decision changing: it never named a bracket.
     """
     closed = _measure_upper_bound_is_closed()
     expected = "]" if closed else ")"
@@ -793,24 +857,27 @@ def test_the_documented_upper_bound_matches_the_implemented_one():
     )
 
 
-def test_an_event_on_the_horizon_instant_is_outside_the_window():
-    """Pin today's convention outright, so the consistency test above cannot drift quietly.
+def test_an_event_on_the_horizon_instant_is_inside_the_window():
+    """Pin the settled rule outright, so the consistency test above cannot drift quietly.
 
     `test_the_documented_upper_bound_matches_the_implemented_one` compares docs to code, so it
     would stay green if BOTH flipped together.  This one records which reading was actually
-    chosen, and is the test a deliberate change is supposed to have to edit.
+    chosen -- CLOSED at the top -- and is the test a deliberate change is supposed to have to
+    edit.  It is the TIME-bounded half only; the event-bounded consequence of the same operator
+    has its own test, `test_a_query_at_the_exact_boundary_instant_counts`.
     """
     events = [(1, EPOCH + timedelta(days=2), "A")]
     on_horizon = _one("A", 2.0, None)
-    assert _answer(on_horizon, events) == [False], (
-        "an event landing exactly on prediction_time + duration_days was counted as inside; "
-        "the window is documented open at the top"
+    assert _answer(on_horizon, events) == [True], (
+        "an event landing exactly on prediction_time + duration_days was excluded; the window "
+        "is closed at the top -- (prediction_time, prediction_time + duration_days]"
     )
-    # ...and 1us earlier it genuinely is inside, so the False above is an edge effect rather
-    # than the query simply never matching.
-    just_inside = _one("A", 2.0, None, prediction_time=EPOCH + timedelta(microseconds=1))
-    assert _answer(just_inside, events) == [True], "1us inside the horizon was excluded too"
+    # ...and 1us later it genuinely is outside, so the True above is an edge effect rather than
+    # an unbounded window that would match anything.
+    just_outside = _one("A", 2.0, None, prediction_time=EPOCH - timedelta(microseconds=1))
+    assert _answer(just_outside, events) == [False], "1us past the horizon was counted as inside"
     _assert_matches_oracle(on_horizon, events, context="horizon instant")
+    _assert_matches_oracle(just_outside, events, context="1us past the horizon")
 
 
 # ------------------------------------------------------------------------------------------

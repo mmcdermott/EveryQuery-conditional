@@ -765,17 +765,19 @@ def build_sequence_index(
 def label_binary_occurrence(index_df: pl.DataFrame, events_df: pl.DataFrame) -> pl.DataFrame:
     """Label every query with a binary *observed-occurrence* answer and reassemble into list rows.
 
-    ``answer = True`` iff an event whose code equals the query occurs strictly within
-    ``(prediction_time, prediction_time + duration_days)`` **and is present in the record**.  The
-    interval is open at *both* ends: an occurrence exactly at ``prediction_time`` is outside it,
-    and so is one landing exactly on the horizon ``prediction_time + duration_days`` (the
-    comparison below is ``<``, not ``<=``).  There
+    ``answer = True`` iff an event whose code equals the query occurs within
+    ``(prediction_time, prediction_time + duration_days]`` **and is present in the record**.  The
+    interval is **half-open**: the lower bound is strict, so an occurrence exactly at
+    ``prediction_time`` is outside it, while the upper bound is closed, so an occurrence landing
+    exactly on the horizon ``prediction_time + duration_days`` is *inside* it (the comparison
+    below is ``<=``, not ``<``).  There
     is no censoring/null: an event we cannot observe (because the record ends first) is ``False``.
     Censoring is captured separately by the ``TIMELINE//END`` query - which, being the last event
     of each record, answers ``True`` exactly when the record ends within the window.
 
     The strict ``>`` lower bound is enforced by shifting the asof key ``+1us`` (microsecond-precision
-    datetimes), mirroring ``sample_tasks.evaluate_index_df``.
+    datetimes), and the closed ``<=`` upper bound is compared directly; both mirror
+    ``sample_tasks.evaluate_index_df``, which labels the same window the same way.
 
     Returns:
         DataFrame ``(subject_id, prediction_time, queries, durations, answers)``, one row per
@@ -800,7 +802,7 @@ def label_binary_occurrence(index_df: pl.DataFrame, events_df: pl.DataFrame) -> 
         ...     pl.col("duration_days").cast(pl.Float32),
         ...     pl.col("_ctx_id").cast(pl.UInt32))
         >>> row = label_binary_occurrence(idx, events).row(0, named=True)
-        >>> row["answers"]  # B in (2,12)=yes; A at day1 not >day2 =no; END at day20 not in window =no
+        >>> row["answers"]  # B in (2,12]=yes; A at day1 not >day2 =no; END at day20 not in window =no
         [True, False, False]
     """
     sid = TaskQuerySchema.subject_id_name
@@ -820,7 +822,7 @@ def label_binary_occurrence(index_df: pl.DataFrame, events_df: pl.DataFrame) -> 
         right, by=[sid, q], left_on="_pts", right_on=DataSchema.time_name, strategy="forward"
     )
     window_end = pl.col(pt) + pl.duration(days=pl.col(d))
-    answer = pl.col(DataSchema.time_name).is_not_null() & (pl.col(DataSchema.time_name) < window_end)
+    answer = pl.col(DataSchema.time_name).is_not_null() & (pl.col(DataSchema.time_name) <= window_end)
 
     flat = joined.with_columns(answer.alias("answer")).sort(CTX_ID_COL, POSITION_COL)
     return (
@@ -864,14 +866,23 @@ def label_with_event_bounds(index_df: pl.DataFrame, events_df: pl.DataFrame) -> 
     """Label a mixed frame of time-bounded and event-bounded queries.
 
     A query with a null ``bound_event`` behaves exactly as
-    :func:`label_binary_occurrence` — occurrence strictly inside the open interval
-    ``(prediction_time, prediction_time + duration_days)``, the horizon instant itself excluded,
-    matching :attr:`~every_query.data.schema.QuerySeqSchema.answers`.
+    :func:`label_binary_occurrence` — occurrence inside the half-open interval
+    ``(prediction_time, prediction_time + duration_days]``: the prediction instant itself is
+    excluded, the horizon instant itself is included.
 
-    A query with a boundary code is answered over ``(prediction_time, boundary)`` instead,
+    A query with a boundary code is answered over ``(prediction_time, boundary]`` instead,
     where ``boundary`` is the **first occurrence of the boundary code strictly after the
-    prediction time**.  The bound is strict: an occurrence *at* the boundary instant is not
-    inside the window.
+    prediction time**.  The search for that boundary is itself strict at the bottom: an
+    occurrence of the boundary code *at* ``prediction_time`` does not close the window.
+
+    **A query code occurring at the exact same instant as the boundary event counts as having
+    occurred before it.**  The upper bound is closed here for the same reason it is closed on the
+    horizon — one rule, not two — but the consequence is much larger, because MEDS clusters many
+    codes onto a single timestamp: a discharge and the codes charted with it routinely share an
+    instant, so this decides real rows rather than a measure-zero edge.  It is deliberately not
+    configurable; ``test_a_query_at_the_exact_boundary_instant_counts`` in
+    ``tests/test_event_bounds_oracle.py`` is the one test that pins it, so making the boundary
+    exclusive again is a one-line change with one test to flip.
 
     **When the boundary never occurs again, the window runs to the end of the record**, which
     degenerates the query into "does this code ever occur again".  That is the upstream
@@ -909,8 +920,8 @@ def label_with_event_bounds(index_df: pl.DataFrame, events_df: pl.DataFrame) -> 
         >>> row["bound_events"]
         [None, 'DISCHARGE']
 
-        The bound is strict, and only occurrences *before* it count.  Asking about a code that
-        occurs only after the boundary answers False even though it is well inside 30 days:
+        Only occurrences at or before the bound count.  Asking about a code that occurs
+        strictly *after* the boundary answers False even though it is well inside 30 days:
 
         >>> idx2 = idx.head(1).with_columns(
         ...     pl.lit("LATE").alias("query"),
@@ -939,7 +950,7 @@ def label_with_event_bounds(index_df: pl.DataFrame, events_df: pl.DataFrame) -> 
     window_end = (
         pl.when(is_bounded).then(pl.col("_b_time")).otherwise(pl.col(pt) + pl.duration(days=pl.col(d)))
     )
-    answer = pl.col("_q_time").is_not_null() & (window_open | (pl.col("_q_time") < window_end))
+    answer = pl.col("_q_time").is_not_null() & (window_open | (pl.col("_q_time") <= window_end))
 
     flat = joined.with_columns(answer.alias("answer")).sort(CTX_ID_COL, POSITION_COL)
     return (

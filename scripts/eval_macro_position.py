@@ -45,8 +45,13 @@ from meds import DataSchema
 
 def occurrence_labels(flat: pl.DataFrame, events: pl.DataFrame) -> pl.DataFrame:
     """Per-row binary occurrence: for each (subject_id, prediction_time, query, duration_days) row,
-    did the query code occur in (prediction_time, prediction_time + duration_days)?  Same strict-> asof
-    join as label_binary_occurrence, but row-wise (no per-sequence aggregation)."""
+    did the query code occur in (prediction_time, prediction_time + duration_days]?  Same asof join
+    as label_binary_occurrence, but row-wise (no per-sequence aggregation).
+
+    The window is half-open: strict at the prediction instant (the ``+1us`` shift below), closed at
+    the horizon (``<=``).  This mirrors ``label_binary_occurrence`` deliberately — a context whose
+    only occurrence lands exactly on the horizon must not be trained as a positive and scored here
+    as a negative.  See tests/test_window_bounds_contract.py for the rule this follows."""
     sid, time = DataSchema.subject_id_name, DataSchema.time_name
     left = flat.with_row_index("_row").with_columns(
         (pl.col("prediction_time") + pl.duration(microseconds=1)).alias("_pts")
@@ -55,7 +60,7 @@ def occurrence_labels(flat: pl.DataFrame, events: pl.DataFrame) -> pl.DataFrame:
     joined = left.join_asof(right, by=[sid, "query"], left_on="_pts", right_on=time, strategy="forward")
     win_end = pl.col("prediction_time") + pl.duration(days=pl.col("duration_days"))
     return joined.with_columns(
-        (pl.col(time).is_not_null() & (pl.col(time) < win_end)).alias("occurred")
+        (pl.col(time).is_not_null() & (pl.col(time) <= win_end)).alias("occurred")
     ).sort("_row")
 
 
