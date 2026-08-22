@@ -5,15 +5,19 @@ asserted here, this file wins and that prose is a bug.
 
 The rule, stated once::
 
-    answer = True   iff   prediction_time  <  event_time  <=  window_close
+    answer = True   iff   prediction_time  <  event_time  <  window_close
 
 - The **lower** bound is **STRICT / open**.  An event landing on the prediction instant itself is
   *outside* the window: it is not "in the future" relative to the prediction.
-- The **upper** bound is **CLOSED**.  An event landing exactly on the instant the window closes is
-  *inside* it.
+- The **upper** bound is **STRICT / open** too.  An event landing exactly on the instant the window
+  closes is *outside* it.
 - ``window_close`` is ``prediction_time + duration_days`` for a time-bounded query, and the
   timestamp of the first occurrence of the boundary code strictly after ``prediction_time`` for an
   event-bounded one.  Both ends follow the same rule; there is one window definition, not two.
+
+The window is therefore symmetric -- neither endpoint instant belongs to it -- and an event-bounded
+query reads as the plain English it is meant to be: *"Sepsis, strictly after the prediction time
+and strictly before discharge."*
 
 Why this file exists
 --------------------
@@ -28,6 +32,11 @@ So the defence here is deliberately shaped against that: **one** table of bounda
 (:data:`BOUNDARY_CASES`), built **once**, driving **every** window decider through **identical
 event frames** (:func:`_events_for`).  No labeller gets its own fixture, so no labeller can be
 handed subtly different inputs and quietly answer a different question.
+
+Note that the direction of the rule has changed once already (2026-08-22: the upper bound was
+briefly pinned CLOSED across every labeller, then reopened).  This file is indifferent to which
+direction is chosen -- its job is that *all* the deciders move together, and it is the thing that
+must be edited first when the direction changes again.
 
 What is covered (the inventory)
 -------------------------------
@@ -48,24 +57,27 @@ a query window:
 that decides window membership belongs in it.
 
 Two sites outside ``src/`` also decide window membership inline rather than through a labeller:
-``scripts/eval_occurs_uncensored.py`` and ``scripts/eval_macro_position.py``.  Both already read
-``(t < tau) & (tau <= t + win)``, i.e. they agree with the rule above.  They are research drivers
-excluded from collection by ``--ignore=scripts`` and are not importable without a live run
-directory, so they are not driven here -- but they are recorded so the next reader knows they exist.
+``scripts/eval_occurs_uncensored.py`` (``:82``, ``:98``) and ``scripts/eval_macro_position.py``
+(``:63``, ``:106``, ``:130``).  They are research drivers excluded from collection by
+``--ignore=scripts`` and are not importable without a live run directory, so they cannot be driven
+here -- but they produce the ground truth the conditional model is *scored* against, so a drift
+there corrupts reported numbers rather than training labels.  They are swept by hand and recorded
+here so the next reader knows they exist.  ``tests/test_cli_smoke.py::test_script_imports`` will
+catch a syntax error in them, nothing more.
 
 Where the event-bound rule is pinned
 ------------------------------------
 An event-bounded query whose query code shares the boundary event's exact timestamp answers
-``True``.  That is the consequence the repo owner may most want to revisit, because MEDS clusters
+``False``.  That is the consequence the repo owner may most want to revisit, because MEDS clusters
 many codes onto a single timestamp, so it decides real rows rather than a measure-zero edge.  It is
 pinned in exactly two places in this file, and nowhere else in it:
 
 - the ``exactly_at_the_horizon_instant`` case of the ``label_with_event_bounds_event_bounded``
   decider, in the sweep and in the agreement matrix, and
-- :func:`test_a_query_at_the_exact_instant_of_the_boundary_event_counts`, which spells the
+- :func:`test_a_query_at_the_exact_instant_of_the_boundary_event_does_not_count`, which spells the
   scenario out in clinical terms.
 
-Making the event bound exclusive again therefore means changing one comparison in
+Making the event bound inclusive again therefore means changing one comparison in
 ``label_with_event_bounds`` and flipping those two expectations -- deliberately, in the open.
 """
 
@@ -122,9 +134,9 @@ _TIME = DataSchema.time_name
 _CODE = DataSchema.code_name
 
 RULE = (
-    "    answer = True  iff  prediction_time < event_time <= window_close\n"
+    "    answer = True  iff  prediction_time < event_time < window_close\n"
     "        lower bound STRICT (an event AT prediction_time is outside)\n"
-    "        upper bound CLOSED (an event AT window_close is inside)"
+    "        upper bound STRICT (an event AT window_close is outside)"
 )
 
 
@@ -156,13 +168,24 @@ BOUNDARY_CASES: tuple[BoundaryCase, ...] = (
         why="it is after the prediction instant and before the window closes; both bounds agree",
     ),
     BoundaryCase(
+        name="one_microsecond_before_the_horizon",
+        query_event_time=WINDOW_CLOSE - TICK,
+        expected=True,
+        description="an event one microsecond before the horizon",
+        why=(
+            "the upper bound is strict but not wider than one tick -- anything before it is "
+            "inside.  Without this case a labeller that had lost its upper bound in the other "
+            "direction (answering False for everything near the top edge) would pass"
+        ),
+    ),
+    BoundaryCase(
         name="exactly_at_the_horizon_instant",
         query_event_time=WINDOW_CLOSE,
-        expected=True,
+        expected=False,
         description="an event exactly at the horizon instant",
         why=(
-            "the upper bound is CLOSED -- an event landing exactly on the instant the window "
-            "closes is INSIDE it.  A `<` here instead of `<=` is the exact defect this file "
+            "the upper bound is STRICT -- an event landing exactly on the instant the window "
+            "closes is OUTSIDE it.  A `<=` here instead of `<` is the exact defect this file "
             "exists to stop"
         ),
     ),
@@ -171,10 +194,7 @@ BOUNDARY_CASES: tuple[BoundaryCase, ...] = (
         query_event_time=WINDOW_CLOSE + TICK,
         expected=False,
         description="an event one microsecond past the horizon",
-        why=(
-            "the window is closed, not absent -- there IS still an upper bound, and one tick "
-            "past it is outside"
-        ),
+        why="past the horizon under any reading of the bound; not a boundary case at all",
     ),
     BoundaryCase(
         name="exactly_at_the_prediction_instant",
@@ -183,7 +203,7 @@ BOUNDARY_CASES: tuple[BoundaryCase, ...] = (
         description="an event exactly at the prediction instant",
         why=(
             "the lower bound is STRICT -- an event simultaneous with the prediction is not in "
-            "its future.  This bound did NOT move when the upper bound was closed"
+            "its future.  This bound has never moved; the upper one now matches it"
         ),
     ),
     BoundaryCase(
@@ -288,8 +308,8 @@ def _run_label_with_event_bounds_time_bounded(case: BoundaryCase) -> bool:
 def _run_label_with_event_bounds_event_bounded(case: BoundaryCase) -> bool:
     """Drive the event-bounded path over the *same* interval as the time-bounded ones.
 
-    ``BOUND_CODE`` sits on ``WINDOW_CLOSE``, so ``(prediction_time, boundary]`` and
-    ``(prediction_time, prediction_time + duration_days]`` are the identical interval and the
+    ``BOUND_CODE`` sits on ``WINDOW_CLOSE``, so ``(prediction_time, boundary)`` and
+    ``(prediction_time, prediction_time + duration_days)`` are the identical interval and the
     shared table's expectations apply unchanged.  That equality is the point: the two window kinds
     are meant to be one rule, not two.
     """
@@ -467,8 +487,8 @@ def test_the_window_deciders_do_not_disagree_with_each_other() -> None:
     raise AssertionError("\n".join(lines))
 
 
-def test_a_query_at_the_exact_instant_of_the_boundary_event_counts() -> None:
-    """An event-bounded query code sharing the boundary event's exact timestamp answers True.
+def test_a_query_at_the_exact_instant_of_the_boundary_event_does_not_count() -> None:
+    """An event-bounded query code sharing the boundary event's exact timestamp answers False.
 
     **This is the assertion the repo owner may most want to revisit**, and it is deliberately kept
     in its own test, apart from the time-bounded horizon cases, so that revisiting it is a small,
@@ -477,16 +497,17 @@ def test_a_query_at_the_exact_instant_of_the_boundary_event_counts() -> None:
     Why it matters more than the horizon edge: MEDS clusters many codes onto a single timestamp.  A
     discharge and everything charted with it routinely share one instant, so "at the boundary" is a
     common, real shape here -- not the measure-zero coincidence it is for a horizon computed from a
-    floating-point duration.  Closing this bound moves real label mass on event-bounded queries.
+    floating-point duration.  Opening this bound moves real label mass on event-bounded queries.
 
-    It is closed for consistency: the boundary is the window's upper end, and the upper end is
-    closed.  One rule, not two.  The scenario below is the clinical one, spelled out -- a lab
-    charted one tick before the discharge, one charted at the discharge instant itself, and one
-    charted one tick after.
+    It is open for consistency: the boundary is the window's upper end, and the upper end is open.
+    One rule, not two.  It is also what makes the query mean what it says in English -- *"Sepsis
+    before discharge, after prediction time"* -- rather than "before or simultaneous with".  The
+    scenario below is that clinical case, spelled out: a lab charted one tick before the discharge,
+    one charted at the discharge instant itself, and one charted one tick after.
 
     Both complements are load-bearing.  Without ``LAB//AFTER`` a labeller that dropped the upper
     bound entirely (``answer = does it occur at all``) would pass; without ``LAB//BEFORE`` one that
-    always answered True would.
+    always answered False would.
     """
     boundary_time = PREDICTION_TIME + timedelta(days=5)
     events = (
@@ -526,32 +547,34 @@ def test_a_query_at_the_exact_instant_of_the_boundary_event_counts() -> None:
     row = label_with_event_bounds(index_df, events).row(0, named=True)
     assert row["queries"] == queries, "adapter bug: the answer list is not in the order asked"
     got = dict(zip(queries, row["answers"], strict=True))
-    expected = {"LAB//BEFORE": True, "LAB//AT": True, "LAB//AFTER": False}
+    expected = {"LAB//BEFORE": True, "LAB//AT": False, "LAB//AFTER": False}
     if got == expected:
         return
 
     detail = []
-    if got["LAB//AT"] is not True:
+    if got["LAB//AT"] is not False:
         detail.append(
             f"  LAB//AT     : a query code AT the DISCHARGE instant answered {got['LAB//AT']!r}, "
-            "expected True.\n"
-            "                The event bound is CLOSED: an occurrence sharing the boundary\n"
-            "                event's timestamp counts as having occurred within the window.\n"
-            "                Someone has made `label_with_event_bounds` compare\n"
-            "                `_q_time < window_end` again."
+            "expected False.\n"
+            "                The event bound is STRICT: an occurrence sharing the boundary\n"
+            "                event's timestamp did NOT occur *before* it, so it is outside the\n"
+            "                window.  Someone has made `label_with_event_bounds` compare\n"
+            "                `_q_time <= window_end` again."
         )
     if got["LAB//AFTER"] is not False:
         detail.append(
             f"  LAB//AFTER  : a query code one microsecond AFTER the DISCHARGE answered "
             f"{got['LAB//AFTER']!r}, expected False.\n"
-            "                The bound is closed, not ABSENT -- there is still an upper bound."
+            "                It is past the boundary under any reading of the bound, so this is\n"
+            "                not a boundary flip -- something larger is wrong."
         )
     if got["LAB//BEFORE"] is not True:
         detail.append(
             f"  LAB//BEFORE : a query code one microsecond BEFORE the DISCHARGE answered "
             f"{got['LAB//BEFORE']!r}, expected True.\n"
             "                That one is inside the window under either reading of the bound, so\n"
-            "                this is not a boundary flip -- something larger is wrong."
+            "                this is not a boundary flip -- the upper bound has been lost\n"
+            "                entirely, or the window is empty."
         )
 
     raise AssertionError(
@@ -559,13 +582,13 @@ def test_a_query_at_the_exact_instant_of_the_boundary_event_counts() -> None:
         + "\n".join(detail)
         + "\n\n"
         + f"  prediction_time : {PREDICTION_TIME}\n"
-        + f"  DISCHARGE at    : {boundary_time}  (this instant closes the window, and is INSIDE it)"
+        + f"  DISCHARGE at    : {boundary_time}  (this instant closes the window, and is OUTSIDE it)"
         + "\n\n"
         + "THE RULE (canonical -- it lives in tests/test_window_bounds_contract.py):\n"
         + RULE
         + "\n\n"
         + "MEDS clusters codes onto shared timestamps, so this edge decides real rows.  If the\n"
-        + "owner has decided to make the event bound exclusive, flip this test and the\n"
+        + "owner has decided to make the event bound inclusive, flip this test and the\n"
         + "`label_with_event_bounds_event_bounded` rows of\n"
         + "`test_every_window_decider_agrees_on_every_boundary_case` together -- those two places\n"
         + "are the only ones in this file that pin it."

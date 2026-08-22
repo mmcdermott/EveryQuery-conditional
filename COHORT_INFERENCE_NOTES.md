@@ -216,9 +216,12 @@ Semantics (v2 design — this matters):
 - An event you couldn't observe because the record ends first is `False`, not null.
 - Right-truncation is expressed **as a query**: `TIMELINE//END` (`seq_dataset.py:48`) is a real MEDS
   code at each subject's last event, so `(TIMELINE//END, d)` is `True` iff the record ends within `d`.
-- Window is `(t, t+d]` — **open at the prediction instant, closed at the horizon**. Strict lower via
-  the `+1µs` asof shift, inclusive upper via `<=`: an event charted exactly on `t+d` counts as an
-  occurrence. The docstrings (`schema.py:110`, `seq_dataset.py:10`) state the same interval.
+- Window is `(t, t+d)` — **open at both ends**. Strict lower via the `+1µs` asof shift, strict
+  upper via `<`: an event charted exactly on `t+d` does **not** count as an occurrence. The same
+  rule applies to event-bounded queries, where the window is `(t, boundary)`, so "Sepsis before
+  discharge" excludes a Sepsis code sharing the discharge instant. The docstrings (`schema.py:110`,
+  `seq_dataset.py:10`) state the same interval; `tests/test_window_bounds_contract.py` is where the
+  rule lives and drives every labeller through one table.
 
 **`_read_event_shard`** — `sample_tasks.py:392`. Mandatory before labeling. The two casts are
 correctness-critical, not cosmetic: `code → Utf8` (upstream may store Categorical *or integer vocab

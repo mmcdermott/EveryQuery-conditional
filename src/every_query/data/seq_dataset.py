@@ -7,7 +7,7 @@ The on-disk label rows follow :class:`~every_query.data.schema.QuerySeqSchema`: 
   end-of-timeline code :data:`EOS_CODE`, which is an ordinary code, not a special sentinel);
 - ``durations``: list of float horizon lengths (days);
 - ``answers``: list of booleans.  ``answers[j]`` is simply *"was ``queries[j]`` observed in
-  ``(prediction_time, prediction_time + durations[j]]``?"* — binary, never null.  An event we
+  ``(prediction_time, prediction_time + durations[j])``?"* — binary, never null.  An event we
   could not observe (because the record ends first) is ``False``; censoring is expressed by a
   separate ``TIMELINE//END`` query rather than a null answer.
 

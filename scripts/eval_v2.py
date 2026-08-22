@@ -3,7 +3,7 @@
 
 Critically reviews the query forms the architecture makes available and measures each:
 
-A. **Marginal occurrence** ``[C, d]`` — P(C observed in (t,t+d]).  Headline = within-query AUROC
+A. **Marginal occurrence** ``[C, d]`` — P(C observed in (t,t+d)).  Headline = within-query AUROC
    (computed inside each code, macro-averaged) since pooled AUROC is base-rate inflated.
 
 B. **EOS-conditioned censoring control** ``[TIMELINE//END, d] [C, d]`` — the same target C is scored

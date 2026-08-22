@@ -385,7 +385,7 @@ def evaluate_index_df(
           ``window_end``.  The unobserved tail is unknown, so the label is unknown — this takes
           priority over an occurrence in the observed part of the window.
         - ``boolean_value = True``: not censored, and an event with matching ``query`` code fell
-          strictly within ``(prediction_time, window_end]``.
+          strictly within ``(prediction_time, window_end)`` — both bounds open.
         - ``boolean_value = False``: not censored, and no matching event in that window.
 
     A subject is observed through ``window_end`` when either ``window_end <= max_time`` (the
@@ -495,7 +495,7 @@ def evaluate_index_df(
     #     what already happened before it.
     #   - ``allow_exact_matches=False``: excludes an event landing at exactly ``prediction_time``
     #     from that forward search, turning the default ``>=`` into a strict ``>``.  Labels are
-    #     defined on the open interval ``(prediction_time, prediction_time + duration_days]`` — an
+    #     defined on the open interval ``(prediction_time, prediction_time + duration_days)`` — an
     #     event simultaneous with the prediction time isn't "in the future" relative to it — so
     #     this is how that open lower bound is enforced directly, instead of faking it by shifting
     #     the join key by ``+1µs`` before searching.
@@ -531,9 +531,16 @@ def evaluate_index_df(
     # False instead of censored. fill_null(False) means "no death row => death rescue never fires".
     observed = (pl.col("death_time") <= window_end).fill_null(False) | (window_end <= pl.col("max_time"))
     censored = ~observed
-    event_in_window = pl.col(DataSchema.time_name).is_not_null() & (
-        pl.col(DataSchema.time_name) <= window_end
-    )
+    # Strict at BOTH ends: the window is `(prediction_time, window_end)`.  The lower bound comes
+    # from `allow_exact_matches=False` on the asof join above; this is the upper one.  See
+    # tests/test_window_bounds_contract.py, which drives this labeller and the sequence labellers
+    # through one shared table so they cannot drift apart again.
+    #
+    # NOTE the `observed` expression above deliberately keeps its `<=`: it asks whether the record
+    # spans the window, which is a different question from whether an event is inside it.  Being
+    # observed *through* window_end is strictly more than is needed for an open window, so it stays
+    # conservative rather than changing censoring semantics as a side effect of this sweep.
+    event_in_window = pl.col(DataSchema.time_name).is_not_null() & (pl.col(DataSchema.time_name) < window_end)
 
     # Censoring takes priority (spec §Stage 4): an unobserved tail is null even if a matching
     # event occurred in the observed part of the window.  A subject dead by window_end is never

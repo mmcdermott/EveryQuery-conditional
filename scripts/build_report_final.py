@@ -192,7 +192,7 @@ def arch_fig(figs):
         bx += 1.62
     ax.text(4.5, 5.75, "block-autoregressive decoder (cross-attends to encoder)", fontsize=7)
     ax.annotate("", xy=(4.4, 5.0), xytext=(3.6, 5.0), arrowprops=dict(arrowstyle="->", color="#666"))
-    box(3.1, 1.5, 3.8, 0.9, "binary answer head → P(code in (t, t+d])", "#F5B7B1")
+    box(3.1, 1.5, 3.8, 0.9, "binary answer head → P(code in (t, t+d))", "#F5B7B1")
     for k in range(3):
         ax.annotate("", xy=(3.9 + k * 1.3, 2.4), xytext=(4.85 + k * 1.62, 4.45),
                     arrowprops=dict(arrowstyle="->", color="#999", lw=0.7))
@@ -269,7 +269,7 @@ def build(train_csv, macro_fp, clin_fp, uncens_fp, out):
     P("1. Task & model", "H1c")
     P(
         "<b>Task.</b> Each query is <i>(code C, horizon d)</i>; the answer is binary — was C observed in "
-        "<i>(t, t+d]</i> for a patient at prediction time t? The model answers an ordered sequence "
+        "<i>(t, t+d)</i> for a patient at prediction time t? The model answers an ordered sequence "
         "<font face='Courier'>[Q1][A1][Q2][A2]…</font>, predicting each A<sub>j</sub> from the patient "
         "state, the queries Q<sub>1..j</sub>, and the teacher-forced answers A<sub>1..j-1</sub> — never "
         "A<sub>j</sub> itself. It thus learns P(A<sub>j</sub> | patient, Q<sub>1..j</sub>, A<sub>1..j-1</sub>).",

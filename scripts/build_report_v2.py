@@ -176,7 +176,7 @@ def build(baseline_eval, baseline_csv, eos_eval, eos_csv, out):
     P("1. Task and the censoring redesign", "H1c")
     P(
         "<b>Every answer is binary</b> — for a query <i>(code C, horizon d)</i> at prediction time "
-        "<i>t</i>, the label is simply whether C is observed in <i>(t, t+d]</i>. There is no "
+        "<i>t</i>, the label is simply whether C is observed in <i>(t, t+d)</i>. There is no "
         "three-valued censored label and nothing is masked from the loss except padding.",
         "Body",
     )
@@ -208,7 +208,7 @@ def build(baseline_eval, baseline_csv, eos_eval, eos_csv, out):
       "from a single trained network. The clinically important ones:", "Body")
     qrows = [
         ["query form", "meaning", "use"],
-        ["[C, d]", "P(C observed in (t,t+d])", "marginal occurrence / screening"],
+        ["[C, d]", "P(C observed in (t,t+d))", "marginal occurrence / screening"],
         ["[END d]=NO, [C d]", "P(C | data continue past d)", "= original EveryQuery (degenerate for death)"],
         ["[END d]=YES, [C d]", "P(C | record ends within d)", "actionable terminal-event prediction (mortality)"],
         ["weighted avg of the two", "marginal P(C), decomposed", "calibration / reconciliation"],

@@ -3,9 +3,9 @@
 A query's window may end at the next occurrence of a **boundary event** rather than after a
 fixed horizon.  Covered here, in pipeline order:
 
-1. Labeling — that an occurrence after the boundary is outside the window while one sharing the
-   boundary's instant is inside it, that time- and event-bounded queries can coexist in one
-   sequence, and that the degenerate "boundary never fires" case behaves as documented
+1. Labeling — that an occurrence at or after the boundary is outside the window, that time- and
+   event-bounded queries can coexist in one sequence, and that the degenerate "boundary never
+   fires" case behaves as documented
    (window runs to the end of the record) and is *reported* rather than hidden.
 2. Sampling — that bounds are drawn on their own seed axis, so turning the feature on does not
    perturb the code/duration draw that the sampler's parity contract depends on.
@@ -101,19 +101,19 @@ def test_occurrence_before_boundary_counts():
     assert label_with_event_bounds(idx, events).row(0, named=True)["answers"] == [True]
 
 
-def test_boundary_is_inclusive():
-    """An occurrence exactly *at* the boundary instant is inside the window.
+def test_boundary_is_strict():
+    """An occurrence exactly *at* the boundary instant is outside the window.
 
-    The window is closed at the top everywhere (see the RESOLUTION note in
+    The window is open at the top everywhere (see the RESOLUTION note in
     ``tests/test_event_bounds_oracle.py``), and for a bounded query the top IS the boundary
-    event's timestamp -- so a SEPSIS charted in the same instant as the DISCHARGE counts as
-    having happened before it.  MEDS clusters codes onto one timestamp, so this is a common
-    shape rather than an edge case.
+    event's timestamp -- so a SEPSIS charted in the same instant as the DISCHARGE does NOT count
+    as having happened before it.  That is what makes the query mean "SEPSIS before DISCHARGE".
+    MEDS clusters codes onto one timestamp, so this is a common shape rather than an edge case.
     """
     same = datetime(2024, 1, 5)
     events = _events([(1, same, "SEPSIS"), (1, same, "DISCHARGE")])
     idx = _index(["SEPSIS"], [EVENT_BOUND_DURATION_SENTINEL], ["DISCHARGE"])
-    assert label_with_event_bounds(idx, events).row(0, named=True)["answers"] == [True]
+    assert label_with_event_bounds(idx, events).row(0, named=True)["answers"] == [False]
 
 
 def test_mixed_sequence_labels_each_query_by_its_own_rule():

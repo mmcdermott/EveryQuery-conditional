@@ -9,7 +9,7 @@ score_neg) (Mann-Whitney), so for one positive/negative patient pair drawn for t
 estimates macro-AUC.
 
 DESIGN (fully paired): sample T tasks = queries Q=(code, duration).  For each, draw one positive
-context (Q occurs in (t, t+d]) and one negative context.  Place Q at every position p (p random
+context (Q occurs in (t, t+d)) and one negative context.  Place Q at every position p (p random
 filler queries before it, their TRUE answers teacher-forced), scoring the SAME pos/neg pair at
 each position.  macro_AUC(p) = mean_T 1[score_pos(p) > score_neg(p)].  Bootstrap over tasks gives
 a CI on the slope (and Spearman rho) of macro_AUC vs p; the conditioning trend is "confirmed" only
@@ -45,13 +45,14 @@ from meds import DataSchema
 
 def occurrence_labels(flat: pl.DataFrame, events: pl.DataFrame) -> pl.DataFrame:
     """Per-row binary occurrence: for each (subject_id, prediction_time, query, duration_days) row,
-    did the query code occur in (prediction_time, prediction_time + duration_days]?  Same asof join
+    did the query code occur in (prediction_time, prediction_time + duration_days)?  Same asof join
     as label_binary_occurrence, but row-wise (no per-sequence aggregation).
 
-    The window is half-open: strict at the prediction instant (the ``+1us`` shift below), closed at
-    the horizon (``<=``).  This mirrors ``label_binary_occurrence`` deliberately — a context whose
-    only occurrence lands exactly on the horizon must not be trained as a positive and scored here
-    as a negative.  See tests/test_window_bounds_contract.py for the rule this follows."""
+    The window is open at BOTH ends: strict at the prediction instant (the ``+1us`` shift below) and
+    strict at the horizon (``<``).  This mirrors ``label_binary_occurrence`` deliberately — a
+    context whose only occurrence lands exactly on the horizon must not be trained as a negative and
+    scored here as a positive.  See tests/test_window_bounds_contract.py for the rule this follows;
+    this file is not collected by pytest, so that agreement is maintained by hand."""
     sid, time = DataSchema.subject_id_name, DataSchema.time_name
     left = flat.with_row_index("_row").with_columns(
         (pl.col("prediction_time") + pl.duration(microseconds=1)).alias("_pts")
@@ -60,7 +61,7 @@ def occurrence_labels(flat: pl.DataFrame, events: pl.DataFrame) -> pl.DataFrame:
     joined = left.join_asof(right, by=[sid, "query"], left_on="_pts", right_on=time, strategy="forward")
     win_end = pl.col("prediction_time") + pl.duration(days=pl.col("duration_days"))
     return joined.with_columns(
-        (pl.col(time).is_not_null() & (pl.col(time) <= win_end)).alias("occurred")
+        (pl.col(time).is_not_null() & (pl.col(time) < win_end)).alias("occurred")
     ).sort("_row")
 
 
@@ -74,7 +75,7 @@ def build_triples_occurrence(ce, n_tasks, dmin, dmax, min_ctx, seed, scheme="pat
       - ``"patient"`` (patient-level, default): pick a patient uniformly among those that permit a
         positive, then a positive prediction time for that patient uniformly — each patient counts
         once, so long-stay patients with many positive windows do not dominate.
-    The NEGATIVE uses the matching scheme over valid contexts where C does not occur in (t, t+T].
+    The NEGATIVE uses the matching scheme over valid contexts where C does not occur in (t, t+T).
     """
     rng = np.random.default_rng(seed)
     triples = []
@@ -101,9 +102,9 @@ def build_triples_occurrence(ce, n_tasks, dmin, dmax, min_ctx, seed, scheme="pat
             if occ.height > max_occ:
                 occ = occ.sample(n=max_occ, seed=int(rng.integers(1 << 31)))
             win = pl.duration(days=T)
-            # POSITIVE label-1 contexts: valid (subj, t) with a C-occurrence in (t, t+T].
+            # POSITIVE label-1 contexts: valid (subj, t) with a C-occurrence in (t, t+T).
             pos_ctx = V.join(occ, on=sid).filter(
-                (pl.col("t") < pl.col("tau")) & (pl.col("tau") <= pl.col("t") + win)
+                (pl.col("t") < pl.col("tau")) & (pl.col("tau") < pl.col("t") + win)
             ).select(sid, "t").unique()
             if pos_ctx.height == 0:
                 continue
@@ -115,7 +116,7 @@ def build_triples_occurrence(ce, n_tasks, dmin, dmax, min_ctx, seed, scheme="pat
             else:  # pair-uniform
                 pr = pos_ctx.row(int(rng.integers(pos_ctx.height)), named=True)
                 pos_subj, pos_t = pr[sid], pr["t"]
-            # NEGATIVE: valid context where C does NOT occur in (t, t+T], matching the scheme.
+            # NEGATIVE: valid context where C does NOT occur in (t, t+T), matching the scheme.
             neg = None
             for _ in range(40):
                 if scheme == "patient":
@@ -127,7 +128,7 @@ def build_triples_occurrence(ce, n_tasks, dmin, dmax, min_ctx, seed, scheme="pat
                     vr = V.row(int(rng.integers(V.height)), named=True)
                     s, s_t = vr[sid], vr["t"]
                 hit = occ.filter(
-                    (pl.col(sid) == s) & (pl.col("tau") > s_t) & (pl.col("tau") <= s_t + timedelta(days=T))
+                    (pl.col(sid) == s) & (pl.col("tau") > s_t) & (pl.col("tau") < s_t + timedelta(days=T))
                 )
                 if hit.height == 0:
                     neg = (s, s_t)
@@ -141,7 +142,7 @@ def build_triples_occurrence(ce, n_tasks, dmin, dmax, min_ctx, seed, scheme="pat
 def build_triples(ce, vocab, n_tasks, dmin, dmax, min_pos, min_neg, seed):
     """Find T tasks each with >=1 pos and >=1 neg context; return one (query, pos_ctx, neg_ctx) triple
     per task.  Occurrence is labeled per shard against that shard's contexts (a context's pos/neg for
-    a query Q is whether Q's code occurs in (t, t+d])."""
+    a query Q is whether Q's code occurs in (t, t+d))."""
     rng = np.random.default_rng(seed)
     triples = []  # (code, dur, pos_subj, pos_time, neg_subj, neg_time)
     # draw a big candidate query list; we keep those that yield a pos and a neg within a shard

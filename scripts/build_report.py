@@ -302,7 +302,7 @@ def build(train_csv: Path, eval_dir: Path, out: Path):
     P(
         "<b>Original EveryQuery task.</b> Sample a code <i>c</i>, a horizon <i>d</i> (days), a patient, and a "
         "prediction time <i>t</i>; the model receives <i>(c, d, patient history up to t)</i> and predicts "
-        "whether <i>c</i> occurs in <i>(t, t+d]</i>. A separate <i>censor</i> head predicts whether any data "
+        "whether <i>c</i> occurs in <i>(t, t+d)</i>. A separate <i>censor</i> head predicts whether any data "
         "exist after <i>t+d</i>, so that predictions are not biased by missing follow-up.",
         "Body",
     )

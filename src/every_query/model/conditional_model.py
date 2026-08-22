@@ -46,7 +46,7 @@ from every_query.model.model import MLP
 logger = logging.getLogger(__name__)
 
 # Answer-token vocabulary for teacher forcing.  Answers are binary: every query asks
-# "is this code observed in (t, t+d]?" and the answer is YES/NO.  There is no separate
+# "is this code observed in (t, t+d)?" and the answer is YES/NO.  There is no separate
 # "censored" answer class — censoring is expressed *as a query*, by asking about the
 # end-of-timeline code (TIMELINE//END): "[TIMELINE//END, d]" answered YES means the record
 # ends within d (the window is not fully observed), NO means data continue past t+d.  A

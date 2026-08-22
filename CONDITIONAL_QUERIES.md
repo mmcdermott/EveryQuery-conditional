@@ -33,7 +33,7 @@ conditional structure (see [Results](#results)).
 - **Position encoding.** The encoder uses ModernBERT's native positions. The decoder adds learned
   **block-position** embeddings (which query block) + **token-type** embeddings (code/duration/
   answer role); `nn.TransformerDecoder` adds none itself.
-- **Binary answers.** Every query asks *"is `code` observed in `(t, t+d]`?"* and the answer is
+- **Binary answers.** Every query asks *"is `code` observed in `(t, t+d)`?"* and the answer is
   binary YES/NO. There is no separate "censored" answer class and nothing is masked from the loss
   except padding. Loss is one BCE over all real query positions.
 

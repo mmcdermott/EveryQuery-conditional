@@ -6,7 +6,7 @@ fully observed).  We replicate that exactly: for a random task (code C, duration
 sequence ``[TIMELINE//END, D]=0  [C, D]`` — telling the model, via the teacher-forced EOS=NO prior,
 that the record does NOT end within D (uncensored) — and evaluate the C-prediction ONLY on contexts
 where that is actually true (the subject has data past t+D).  Positives are uncensored contexts
-where C occurs in (t, t+D]; negatives are uncensored contexts where it does not.  We report the
+where C occurs in (t, t+D); negatives are uncensored contexts where it does not.  We report the
 within-task AUROC, macro-averaged over tasks (patient-uniform), with a bootstrap CI.
 
 We also report the marginal ``[C, D]`` (no EOS prefix) on the same uncensored cohort, to isolate
@@ -47,8 +47,8 @@ def build_uncensored_triples(ce, n_tasks, dmin, dmax, min_ctx, seed, max_valid=8
     """Patient-uniform (query, uncensored pos-ctx, uncensored neg-ctx) triples.
 
     A context (subj, t) is UNCENSORED for horizon D iff the subject has data past t+D
-    (max_time > t+D).  Positive: uncensored context with C in (t, t+D].  Negative: uncensored
-    context with no C in (t, t+D].  Patient-uniform within each.
+    (max_time > t+D).  Positive: uncensored context with C in (t, t+D).  Negative: uncensored
+    context with no C in (t, t+D).  Patient-uniform within each.
     """
     rng = np.random.default_rng(seed)
     triples = []
@@ -77,9 +77,9 @@ def build_uncensored_triples(ce, n_tasks, dmin, dmax, min_ctx, seed, max_valid=8
             Vu = V.filter(pl.col("mt") > pl.col("t") + win)
             if Vu.height == 0:
                 continue
-            # positive: uncensored ctx with C in (t, t+D]
+            # positive: uncensored ctx with C in (t, t+D)
             pos = Vu.join(occ, on=SID).filter(
-                (pl.col("t") < pl.col("tau")) & (pl.col("tau") <= pl.col("t") + win)
+                (pl.col("t") < pl.col("tau")) & (pl.col("tau") < pl.col("t") + win)
             ).select(SID, "t").unique()
             if pos.height == 0:
                 continue
@@ -95,7 +95,7 @@ def build_uncensored_triples(ce, n_tasks, dmin, dmax, min_ctx, seed, max_valid=8
                 tv = Vu.filter(pl.col(SID) == s)["t"]
                 s_t = tv[int(rng.integers(tv.len()))]
                 hit = occ.filter(
-                    (pl.col(SID) == s) & (pl.col("tau") > s_t) & (pl.col("tau") <= s_t + timedelta(days=D))
+                    (pl.col(SID) == s) & (pl.col("tau") > s_t) & (pl.col("tau") < s_t + timedelta(days=D))
                 )
                 if hit.height == 0:
                     neg = (s, s_t)

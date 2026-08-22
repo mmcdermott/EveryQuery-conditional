@@ -27,12 +27,12 @@ Inputs.  ``index_df`` is one row per query: ``_ctx_id``, ``_position``, ``subjec
 
 S1. A query whose ``bound_event`` is null is an ordinary time-bounded query and "behaves exactly
     as ``label_binary_occurrence``": the answer is True iff an event of the queried code occurs
-    inside ``(prediction_time, prediction_time + duration_days]``.  The lower bound is strict
-    (docstring: enforced by shifting the asof key +1us); the upper bound is CLOSED, so an event
-    landing exactly on the horizon instant counts.  See the RESOLUTION note below -- that upper
-    bound was the one thing the sources disagreed about when this oracle was first written.
+    inside ``(prediction_time, prediction_time + duration_days)``.  The lower bound is strict
+    (docstring: enforced by shifting the asof key +1us); the upper bound is OPEN too, so an event
+    landing exactly on the horizon instant does NOT count.  See the RESOLUTION note below -- that
+    upper bound is the one thing the sources have repeatedly disagreed about.
 
-S2. A query with a boundary code is answered over ``(prediction_time, boundary]`` instead, and
+S2. A query with a boundary code is answered over ``(prediction_time, boundary)`` instead, and
     ``duration_days`` is ignored -- it carries the ``EVENT_BOUND_DURATION_SENTINEL`` (-1.0), not
     a horizon.
 
@@ -41,12 +41,13 @@ S3. ``boundary`` is the FIRST occurrence of the boundary code STRICTLY AFTER the
     eligible one) and for boundary events at or before the prediction time (not eligible -- the
     search starts strictly after ``prediction_time``, so earlier occurrences are invisible).
 
-S4. The bound is CLOSED, exactly as the horizon is: "a query code occurring at the exact same
-    instant as the boundary event counts as having occurred before it."  Only an occurrence
-    strictly AFTER the boundary is outside the window.  This clause carries more weight than it
-    looks: for a bounded query the window's end IS the boundary event's own timestamp, and MEDS
-    clusters many codes onto a single timestamp, so it decides real rows rather than a
-    measure-zero edge.
+S4. The bound is OPEN, exactly as the horizon is: "a query code occurring at the exact same
+    instant as the boundary event does NOT count as having occurred before it."  Only an
+    occurrence strictly BEFORE the boundary is inside the window, which is what makes an
+    event-bounded query read as "the query code, strictly after the prediction time and strictly
+    before the boundary".  This clause carries more weight than it looks: for a bounded query the
+    window's end IS the boundary event's own timestamp, and MEDS clusters many codes onto a single
+    timestamp, so it decides real rows rather than a measure-zero edge.
 
 S5. When no occurrence of the boundary code exists strictly after the prediction time, "the
     window runs to the end of the record", degenerating the query into "does this code ever
@@ -56,39 +57,36 @@ S5. When no occurrence of the boundary code exists strictly after the prediction
 S6. Consequences the spec forces, which the oracle re-derives rather than special-cases:
     - No events for the subject at all => False for every query form.
     - Zero-length window (``duration_days == 0``) or inverted window (``duration_days < 0``) on
-      an UNBOUNDED query => the interval is still empty even with the upper bound closed, since
-      the lower one is strict and ``(pt, pt]`` contains nothing => always False.
+      an UNBOUNDED query => the interval ``(pt, pt)`` is empty with both bounds strict => always
+      False.
     - ``bound_event == query`` => the first occurrence after ``prediction_time`` is simultaneously
-      the boundary and the earliest candidate answer, and S4 now INCLUDES the boundary instant =>
-      True iff the code recurs at all after ``prediction_time``.  (Under the old strict bound this
-      shape was always False; it is the second place the settled rule visibly changed an answer.)
+      the boundary and the earliest candidate answer, and S4 EXCLUDES the boundary instant =>
+      always False, since nothing can fall strictly before itself.
 
 S7. Output: one row per ``_ctx_id`` -- ``subject_id``, ``prediction_time``, and the aligned list
     columns ``queries`` / ``durations`` / ``answers`` / ``bound_events``, each ordered by
     ``_position``.
 
-RESOLUTION, 2026-08-22 -- THE UPPER BOUND IS CLOSED.  When this oracle was first written the
-sources disagreed about it, and the oracle was written to the OPEN reading because that was the
-prose of the function under test.  Both of ``sample_query_sequences``'s labellers compared ``<``;
-almost everything else in the repo read closed -- ``sample_tasks.py:535`` implements ``<=``,
-``sample_tasks.py:498``, ``data/seq_dataset.py:10``, ``redesign-spec.md:64,301,316`` and
-``test_generate_tasks.py:81,169`` all document or implement it -- and even
-``label_binary_occurrence``'s own worked example annotated its window ``(2,12]``.  A brief
-detour on 2026-08-21 (commit 252bbe3) reconciled the docs the other way, onto OPEN.
+RESOLUTION, 2026-08-22 -- THE UPPER BOUND IS OPEN, AT BOTH ENDS AND FOR BOTH WINDOW KINDS.
+The window is ``(prediction_time, prediction_time + duration_days)`` for a time-bounded query and
+``(prediction_time, boundary)`` for an event-bounded one: neither endpoint instant belongs to the
+window.  This is the repo owner's settled decision and it supersedes an earlier same-day pass
+(commits d6d0b5d / 7d57ba2 / eff24ab) that had pinned the upper bound CLOSED across every
+labeller.  Every window decider in the repo was moved onto the open reading together, so the
+"one rule, not two" property that pass established is preserved -- only the direction changed.
 
-The repo owner has settled it in the direction the rest of the repo already went: the window is
-``(prediction_time, prediction_time + duration_days]`` -- lower bound STRICT, upper bound CLOSED
--- and ``sample_query_sequences``'s two labellers were brought into line with ``sample_tasks``
-rather than the reverse.  Both now compare ``<=``.  This oracle moved with the decision, but only
-its two boundary comparisons did (S1's horizon and S4's event bound): it is still derived from
-the written spec and shares no code path with the implementation, which is the entire reason it
-is worth running.
+This oracle moved with the decision, but only its two boundary comparisons did (S1's horizon and
+S4's event bound): it is still derived from the written spec and shares no code path with the
+implementation, which is the entire reason it is worth running.
 
-The event-bounded half of that flip is the consequential one, and it is stated as its own clause
-in S4 above: for a bounded query the window's end IS the boundary event's timestamp, so a query
-code sharing that instant now labels True where it labelled False.  That is intended, it is one
-rule rather than a configurable flag, and exactly one test pins it --
-``test_a_query_at_the_exact_boundary_instant_counts`` -- so that reverting to an exclusive
+The event-bounded half is the consequential one, and it is stated as its own clause in S4 above:
+for a bounded query the window's end IS the boundary event's timestamp, so a query code sharing
+that instant labels False.  MEDS clusters many codes onto a single timestamp -- a discharge and
+the codes charted with it routinely share an instant -- so this decides a real population of
+rows, not a measure-zero edge.  It is what makes an event-bounded query mean "the query code,
+strictly after the prediction time and strictly before the boundary": *Sepsis before discharge,
+after prediction time*.  Exactly one test pins it --
+``test_a_query_at_the_exact_boundary_instant_does_not_count`` -- so reverting to an inclusive
 boundary stays a one-line change with one test to flip.
 
 ``test_the_documented_upper_bound_matches_the_implemented_one`` is what keeps the docs from
@@ -168,9 +166,9 @@ from every_query.generate_tasks.sample_query_sequences import (
 def _oracle_answer(subject_events, prediction_time, query, duration_days, bound_event):
     """Answer ONE query by hand.  `subject_events` is a list of (time, code) for this subject."""
     if bound_event is None:
-        # S1: inside the horizon window -- open at the bottom, closed at the top.
+        # S1: inside the horizon window -- open at BOTH ends.
         window_end = prediction_time + timedelta(days=float(duration_days))
-        return any(code == query and prediction_time < t <= window_end for t, code in subject_events)
+        return any(code == query and prediction_time < t < window_end for t, code in subject_events)
 
     # S3: the boundary is the first occurrence of the bound code strictly after the pred time.
     boundary = None
@@ -182,8 +180,8 @@ def _oracle_answer(subject_events, prediction_time, query, duration_days, bound_
         # S5: no boundary ahead -> the window runs to the end of the record.
         return any(code == query and t > prediction_time for t, code in subject_events)
 
-    # S4: strict at the prediction instant, inclusive at the boundary instant.
-    return any(code == query and prediction_time < t <= boundary for t, code in subject_events)
+    # S4: strict at the prediction instant AND strict at the boundary instant.
+    return any(code == query and prediction_time < t < boundary for t, code in subject_events)
 
 
 def _oracle_label(index_rows, event_rows):
@@ -571,9 +569,15 @@ def test_the_plain_labeller_honours_a_fractional_day_horizon():
     assert _plain_answer(_one("A", 1.5, None), day_and_a_quarter) == [True], (
         "a 1.5-day horizon was truncated to 1 day -- the fractional part is being discarded"
     )
-    # At exactly 0.25 days the 6h event lands ON the horizon instant, which the closed window
-    # includes.
-    assert _plain_answer(_one("A", 0.25, None), six_hours) == [True]
+    # A fractional horizon just ABOVE the event, to keep a sub-day probe that discriminates
+    # between "the fraction is read" and "the window is empty": 0.3 days is 7.2h, and the 6h
+    # event is strictly inside it.
+    assert _plain_answer(_one("A", 0.3, None), six_hours) == [True], (
+        "a 0.3-day horizon excluded an event at 6h -- the fractional part is being discarded"
+    )
+    # At exactly 0.25 days the 6h event lands ON the horizon instant, which the open window
+    # excludes.
+    assert _plain_answer(_one("A", 0.25, None), six_hours) == [False]
     # ...and the horizon really is being read, rather than ignored altogether: 0.125 days is 3h,
     # which the 6h event is genuinely past, so the Trues above are the horizon doing work.
     assert _plain_answer(_one("A", 0.125, None), six_hours) == [False]
@@ -581,6 +585,7 @@ def test_the_plain_labeller_honours_a_fractional_day_horizon():
     for rows, events in (
         (_one("A", 0.5, None), six_hours),
         (_one("A", 1.5, None), day_and_a_quarter),
+        (_one("A", 0.3, None), six_hours),
         (_one("A", 0.25, None), six_hours),
         (_one("A", 0.125, None), six_hours),
     ):
@@ -611,18 +616,20 @@ def test_s3_boundary_before_the_prediction_time_is_invisible():
     _assert_matches_oracle(rows, events, context="S3 past boundary")
 
 
-def test_a_query_at_the_exact_boundary_instant_counts():
+def test_a_query_at_the_exact_boundary_instant_does_not_count():
     """S4, alone in its own test: the coincident-timestamp rule for EVENT-bounded queries.
 
     Deliberately separate from the time-bounded horizon test even though one operator decides
     both.  For a bounded query the window's end IS the boundary event's own timestamp, so the
-    closed upper bound means a query code charted at the same instant as the boundary counts as
-    having occurred before it -- and MEDS clusters codes onto one timestamp, so that is a real
-    population of rows, not an edge case.  Keeping it here on its own is what makes reverting to
-    an exclusive boundary a one-line change with one test to flip.
+    open upper bound means a query code charted at the same instant as the boundary does NOT
+    count as having occurred before it -- and MEDS clusters codes onto one timestamp, so that is
+    a real population of rows, not an edge case.  This is what makes an event-bounded query mean
+    "strictly before the boundary": *Sepsis before discharge, after prediction time*.  Keeping it
+    here on its own is what makes reverting to an inclusive boundary a one-line change with one
+    test to flip.
 
-    The third case is what stops `<=` being confused with "no upper bound at all": 1us past the
-    boundary is still outside.
+    The second case is what stops `<` being confused with "an empty window": 1us inside the
+    boundary still counts.
     """
     at_bound = [
         (1, EPOCH + timedelta(days=2), "A"),
@@ -637,13 +644,13 @@ def test_a_query_at_the_exact_boundary_instant_counts():
         (1, EPOCH + timedelta(days=2), "DISCHARGE"),
     ]
     rows = _one("A", -1.0, "DISCHARGE")
-    assert _answer(rows, at_bound) == [True], (
-        "a query code sharing the boundary event's instant was excluded; the bound is closed"
+    assert _answer(rows, at_bound) == [False], (
+        "a query code sharing the boundary event's instant was counted; the bound is strict"
     )
-    assert _answer(rows, just_inside) == [True], "1us inside the boundary was excluded"
-    assert _answer(rows, just_outside) == [False], (
-        "1us PAST the boundary was counted -- the bound is closed, not absent"
+    assert _answer(rows, just_inside) == [True], (
+        "1us inside the boundary was excluded -- the bound is strict, not an empty window"
     )
+    assert _answer(rows, just_outside) == [False], "1us PAST the boundary was counted"
     _assert_matches_oracle(rows, at_bound, context="S4 at bound")
     _assert_matches_oracle(rows, just_inside, context="S4 1us inside")
     _assert_matches_oracle(rows, just_outside, context="S4 1us outside")
@@ -721,31 +728,27 @@ def test_s6_zero_length_and_inverted_windows_are_always_false():
     _assert_matches_oracle(_one("A", -3.0, None), events, context="inverted window")
 
 
-def test_s6_bound_event_equal_to_the_query_asks_whether_the_code_recurs():
-    """Self-bounded queries collapse to "does this code occur again", under the closed bound.
+def test_s6_bound_event_equal_to_the_query_is_always_false():
+    """Self-bounded queries are unconditionally False, under the strict bound.
 
     The first occurrence after the prediction time is simultaneously the boundary and the
-    earliest candidate answer, and S4 now includes the boundary instant, so the query answers
-    True exactly when the code recurs at all.  (Under the strict bound this shape was always
-    False.)  Degenerate either way -- the point of pinning it is that it is a shape the sampler
-    can emit whenever the query pool and the bound pool overlap, so it must not be an accident.
+    earliest candidate answer, and S4 excludes the boundary instant, so nothing can fall strictly
+    inside the window -- an occurrence cannot precede itself.  (Under the closed bound this shape
+    instead asked "does this code recur at all".)  Degenerate either way -- the point of pinning
+    it is that it is a shape the sampler can emit whenever the query pool and the bound pool
+    overlap, so it must not be an accident.
     """
-    recurs = [
-        [(1, EPOCH + timedelta(days=1), "A")],
-        [(1, EPOCH + timedelta(days=1), "A"), (1, EPOCH + timedelta(days=2), "A")],
-    ]
-    never_recurs = [
+    always_false = [
+        [(1, EPOCH + timedelta(days=1), "A")],  # boundary and candidate are the same event
+        [(1, EPOCH + timedelta(days=1), "A"), (1, EPOCH + timedelta(days=2), "A")],  # recurs
         [(1, EPOCH - timedelta(days=1), "A")],  # only before the prediction time
         [(1, EPOCH, "A")],  # exactly AT it: the lower bound is strict, so invisible
         [],
     ]
     rows = _one("A", -1.0, "A")
-    for events in recurs:
-        assert _answer(rows, events) == [True], f"self-bounded query False for {events}"
-        _assert_matches_oracle(rows, events, context="self-bound, recurs")
-    for events in never_recurs:
+    for events in always_false:
         assert _answer(rows, events) == [False], f"self-bounded query True for {events}"
-        _assert_matches_oracle(rows, events or [(2, EPOCH, "Z")], context="self-bound, no recurrence")
+        _assert_matches_oracle(rows, events or [(2, EPOCH, "Z")], context="self-bound")
 
 
 def test_s1_null_bound_agrees_with_label_binary_occurrence_query_for_query():
@@ -822,7 +825,7 @@ _DOC_SOURCES = (
 def test_the_documented_upper_bound_matches_the_implemented_one():
     """The docs must describe the window the code actually labels.
 
-    The settled rule is the closed upper bound (see the RESOLUTION note at the top of this
+    The settled rule is the open upper bound (see the RESOLUTION note at the top of this
     file), and this is the test that keeps every source saying so.  The failure mode it guards
     is not a wrong label today -- it is forward looking: `QuerySeqSchema` is the document a
     downstream consumer reads to reimplement or "fix" this labelling, and a source that spells
@@ -857,27 +860,27 @@ def test_the_documented_upper_bound_matches_the_implemented_one():
     )
 
 
-def test_an_event_on_the_horizon_instant_is_inside_the_window():
+def test_an_event_on_the_horizon_instant_is_outside_the_window():
     """Pin the settled rule outright, so the consistency test above cannot drift quietly.
 
     `test_the_documented_upper_bound_matches_the_implemented_one` compares docs to code, so it
     would stay green if BOTH flipped together.  This one records which reading was actually
-    chosen -- CLOSED at the top -- and is the test a deliberate change is supposed to have to
+    chosen -- OPEN at the top -- and is the test a deliberate change is supposed to have to
     edit.  It is the TIME-bounded half only; the event-bounded consequence of the same operator
-    has its own test, `test_a_query_at_the_exact_boundary_instant_counts`.
+    has its own test, `test_a_query_at_the_exact_boundary_instant_does_not_count`.
     """
     events = [(1, EPOCH + timedelta(days=2), "A")]
     on_horizon = _one("A", 2.0, None)
-    assert _answer(on_horizon, events) == [True], (
-        "an event landing exactly on prediction_time + duration_days was excluded; the window "
-        "is closed at the top -- (prediction_time, prediction_time + duration_days]"
+    assert _answer(on_horizon, events) == [False], (
+        "an event landing exactly on prediction_time + duration_days was counted; the window "
+        "is open at the top -- (prediction_time, prediction_time + duration_days)"
     )
-    # ...and 1us later it genuinely is outside, so the True above is an edge effect rather than
-    # an unbounded window that would match anything.
-    just_outside = _one("A", 2.0, None, prediction_time=EPOCH - timedelta(microseconds=1))
-    assert _answer(just_outside, events) == [False], "1us past the horizon was counted as inside"
+    # ...and 1us earlier it genuinely is inside, so the False above is an edge effect rather than
+    # an empty window that would match nothing.
+    just_inside = _one("A", 2.0, None, prediction_time=EPOCH + timedelta(microseconds=1))
+    assert _answer(just_inside, events) == [True], "1us inside the horizon was excluded"
     _assert_matches_oracle(on_horizon, events, context="horizon instant")
-    _assert_matches_oracle(just_outside, events, context="1us past the horizon")
+    _assert_matches_oracle(just_inside, events, context="1us inside the horizon")
 
 
 # ------------------------------------------------------------------------------------------

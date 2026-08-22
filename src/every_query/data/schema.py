@@ -107,16 +107,17 @@ class QuerySeqSchema(LabelSchema):
             the end-of-timeline code ``TIMELINE//END``, which is an ordinary code).
         durations: Per-query horizons in days (``float32``), aligned with ``queries``.
         answers: Per-query booleans aligned with ``queries`` — *"was ``queries[j]`` observed in
-            ``(prediction_time, prediction_time + durations[j]]``?"*.  The window is **open at
-            the prediction instant and closed at the horizon**: an occurrence exactly at
-            ``prediction_time`` is outside it, while one landing exactly on the horizon
-            ``prediction_time + durations[j]`` is inside it and answers ``True``.  Binary, never
+            ``(prediction_time, prediction_time + durations[j])``?"*.  The window is **open at
+            both ends**: an occurrence exactly at ``prediction_time`` is outside it, and so is one
+            landing exactly on the horizon ``prediction_time + durations[j]``.  Binary, never
             null; an unobservable event (record ends first) is ``False``.  Censoring is carried
             by a ``TIMELINE//END`` query rather than a null answer.
         bound_events: Optional per-query boundary-event codes.  ``bound_events[j]`` is null for
             an ordinary time-bounded query (``durations[j]`` is the horizon), and a vocabulary
-            code for an **event-bounded** one — the window then runs from ``prediction_time`` to
-            the next occurrence of that code, and ``durations[j]`` holds the
+            code for an **event-bounded** one — the window is then ``(prediction_time, boundary)``
+            where ``boundary`` is the next occurrence of that code, open at both ends exactly as
+            the time-bounded window is, so a query code sharing the boundary event's instant does
+            NOT count.  ``durations[j]`` holds the
             ``EVENT_BOUND_DURATION_SENTINEL`` (-1.0) rather than a horizon.  The whole column is
             absent from bound-free parquets, which stay valid.
 
