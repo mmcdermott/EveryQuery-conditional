@@ -394,7 +394,7 @@ def sample_batch(demo_dataset: EveryQueryPytorchDataset) -> EveryQueryBatch:
 def seq_task_labels_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """Hand-built ``QuerySeqSchema``-shaped query-sequence labels for train + tuning splits.
 
-    Layout matches ``sample_query_sequences.run_worker`` output::
+    Layout matches ``sample_query_sequences.run`` output::
 
         {seq_task_labels_dir}/{split}/{shard}.parquet
 

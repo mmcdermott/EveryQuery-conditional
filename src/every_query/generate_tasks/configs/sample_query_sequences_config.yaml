@@ -27,21 +27,7 @@ query_codes: ???
 split: train
 seed: 1
 
-# Output-name suffix for supplied-cohort mode only (`{stem}__{task_shard:04d}.parquet`); the
-# sampled path names its outputs after the data shards, so it ignores this.
-task_shard: 0
-
-# --- Supplied-cohort mode -------------------------------------------------
-# Path to a parquet of (subject_id, prediction_time) rows to score, e.g.
-#   EQ_generate_query_sequences contexts_path=cohort.parquet n_replicates=50 split=held_out \
-#     min_queries=5 max_queries=5 duration_max=365 data_dir=... out_dir=... query_codes=...
-# When set: contexts come from that file (repeated `n_replicates`x, one sampled query sequence
-# each), events are gathered across every shard of `split`, the output is named after the file
-# stem, and `num_sequences` / `min_prediction_times_per_subject` / `max_workers` are unused.
-contexts_path: null
-n_replicates: 1
-
-# Sampling budget: total query sequences drawn across the whole split (contexts_path=null only).
+# Sampling budget: total query sequences drawn across the whole split.
 # One sampled patient context = one sequence = one output row.  This is a *global* budget, not a
 # per-shard one — Stage 2 draws contexts across the whole split weighted by each subject's
 # prediction-time count — so it supersedes the fork's per-shard `n_contexts`.

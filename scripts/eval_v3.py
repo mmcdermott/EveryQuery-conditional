@@ -5,8 +5,8 @@
 constructs designed ``[C,d]`` / ``[EOS,d][C,d]`` / ``[C,7d][C,30d]`` specs).  This script does the
 same *inference* — teacher-forced scoring of the **last** query of each sequence, with the optional
 counterfactual override of all prior answers — but takes the sequences as input instead of
-generating them.  Build them however you like; ``EQ_generate_query_sequences contexts_path=...``
-is the supported path for a user-supplied cohort.
+generating them.  Build them however you like; ``EQ_generate_evaluation_query_sequences
+contexts_path=...`` is the supported path for a user-supplied cohort.
 
 The model is fed ``q_1..q_K`` plus the ground-truth answers to ``q_1..q_{K-1}``; the reported
 ``prob`` is its predicted probability for ``q_K``.  (Inference here is teacher-forced, not

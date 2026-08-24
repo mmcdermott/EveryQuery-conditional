@@ -222,7 +222,7 @@ def _run_eval(**overrides) -> None:
 
 
 def _run_train(**overrides) -> None:
-    """Same, for the training sampler's supplied-cohort branch (``contexts_path`` set)."""
+    """Same, for the training sampler (which only samples: its contexts come from the split)."""
     with initialize_config_dir(config_dir=train_seq.CONFIGS, version_base=None):
         cfg = compose(
             config_name="sample_query_sequences_config",
@@ -238,6 +238,15 @@ def _answers_by_subject_and_query(fp: Path) -> dict[tuple[int, str], bool]:
     for row in df.iter_rows(named=True):
         for q, a in zip(row["queries"], row["answers"], strict=True):
             out[(int(row["subject_id"]), q)] = bool(a)
+    return out
+
+
+def _answers_by_context_and_query(df: pl.DataFrame) -> dict[tuple[int, datetime, str], bool]:
+    """Flatten ``QuerySeqSchema`` rows to ``(subject, prediction_time, query) -> answer``."""
+    out: dict[tuple[int, datetime, str], bool] = {}
+    for row in df.iter_rows(named=True):
+        for q, a in zip(row["queries"], row["answers"], strict=True):
+            out[(int(row["subject_id"]), row["prediction_time"], q)] = bool(a)
     return out
 
 
@@ -448,48 +457,55 @@ def test_leaf_labels_are_untouched_by_the_explosion(
 
 
 def test_eval_and_training_paths_agree_on_the_same_ancestor_query(
-    tmp_path: Path, data_dir: Path, cohort: Path, ontology_dir: Path
+    tmp_path: Path, data_dir: Path, ontology_dir: Path
 ):
-    """One cohort, one ontology, one ancestor query, one horizon — two samplers, one answer.
+    """One split, one ontology, one ancestor query, one horizon — two samplers, one answer.
 
-    The training sampler is driven so every context draws the single query ``ICD//CIRC`` at a
-    fixed horizon (``duration_min == duration_max``), and the eval grid is then handed *that
-    emitted horizon back* as a designed spec, so the two paths answer a literally identical
-    question about literally identical contexts.
+    The training sampler is driven so every sampled context draws the single query ``MED//STATIN``
+    at a fixed horizon (``duration_min == duration_max``); the contexts it sampled and the horizon it
+    emitted are then handed back to the eval grid as ``contexts_path`` / a designed spec, so the two
+    paths answer a literally identical question about literally identical contexts.
 
     Divergence here **is** the defect: before the fix the training path exploded the events and
-    answered ``True`` for subject 1 while the eval path did not and answered ``False``, so one
-    experiment would report the ancestor feature as working in training and dead in evaluation.
-    The agreed answers are pinned to the hand-derived truth as well, so the two paths agreeing on
-    a wrong label is not a pass either.
+    the eval path did not.  The agreed answers are pinned to the hand-derived truth as well, so the
+    two paths agreeing on a wrong label is not a pass either.  Sampled contexts are a subject's
+    non-first event times, so the query is the prefix-only node ``MED//STATIN``: subject 1's
+    ``ATORVA`` (2020-06-10) lies inside the 30-day window only from its 2020-06-06 context, and
+    subject 2 has no statin at all.
     """
     ancestor_codes = tmp_path / "ancestor_only.yaml"
-    ancestor_codes.write_text(yaml.safe_dump([ANCESTOR]))
+    ancestor_codes.write_text(yaml.safe_dump([ANCESTOR_ONLY_NODE]))
+    horizon = HORIZON
 
     train_out = tmp_path / "train_tasks"
     _run_train(
         data_dir=data_dir,
         out_dir=train_out,
         query_codes=ancestor_codes,
-        contexts_path=cohort,
         split=SPLIT,
+        num_sequences=64,
+        min_prediction_times_per_subject=1,
         min_queries=1,
         max_queries=1,
-        duration_min=HORIZON,
-        duration_max=HORIZON,
+        duration_min=horizon,
+        duration_max=horizon,
         ontology_dir=ontology_dir,
     )
-    train_fp = train_out / SPLIT / "cohort__0000.parquet"
-    train_answers = _answers_by_subject_and_query(train_fp)
+    train_df = pl.concat([pl.read_parquet(fp) for fp in sorted((train_out / SPLIT).glob("*.parquet"))])
+    train_answers = _answers_by_context_and_query(train_df)
+    key = (1, datetime(2020, 6, 6), ANCESTOR_ONLY_NODE)
+    assert key in train_answers, "the one context whose answer is True was not sampled; raise num_sequences"
 
     # Take the horizon the training path actually emitted (post float32 round-trip) so the eval
     # spec cannot differ from it by an epsilon at the window boundary.
-    horizons = {float(d) for row in pl.read_parquet(train_fp)["durations"].to_list() for d in row}
+    horizons = {float(d) for row in train_df["durations"].to_list() for d in row}
     assert len(horizons) == 1, f"expected one fixed horizon from the training draw, got {horizons}"
     horizon = horizons.pop()
 
+    cohort = tmp_path / "sampled_cohort.parquet"
+    train_df.select("subject_id", "prediction_time").unique().write_parquet(cohort)
     specs = tmp_path / "ancestor_spec.yaml"
-    specs.write_text(yaml.safe_dump({"circ": [[ANCESTOR, horizon]]}))
+    specs.write_text(yaml.safe_dump({"statin": [[ANCESTOR_ONLY_NODE, horizon]]}))
     eval_out = tmp_path / "eval_grid"
     _run_eval(
         data_dir=data_dir,
@@ -500,13 +516,15 @@ def test_eval_and_training_paths_agree_on_the_same_ancestor_query(
         split=SPLIT,
         ontology_dir=ontology_dir,
     )
-    eval_answers = _answers_by_subject_and_query(eval_out / SPLIT / "cohort__ancestor_spec.parquet")
+    eval_answers = _answers_by_context_and_query(
+        pl.read_parquet(eval_out / SPLIT / "sampled_cohort__ancestor_spec.parquet")
+    )
 
     assert eval_answers == train_answers, (
-        "the two samplers disagree about the same ancestor query on the same cohort: "
+        "the two samplers disagree about the same ancestor query on the same contexts: "
         f"eval={eval_answers}, training={train_answers}"
     )
-    assert eval_answers == {(1, ANCESTOR): True, (2, ANCESTOR): False}
+    assert eval_answers == {k: k == key for k in eval_answers}
 
 
 # ── 4. backward compatibility: the ontology-off path is untouched ───────

@@ -908,7 +908,7 @@ def run_worker(
         return []
 
     if contexts_path is not None:
-        contexts = read_supplied_contexts(contexts_path, n_replicates=1)
+        contexts = read_supplied_contexts(contexts_path)
         n_raw = contexts.height
         contexts = contexts.unique(maintain_order=True)
         if contexts.height < n_raw:

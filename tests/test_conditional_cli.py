@@ -116,40 +116,6 @@ def test_sampled_run_keeps_the_two_artifact_roots_disjoint(cq_sequence_tasks_dir
     assert artifacts not in cq_sequence_tasks_dir.parents, "artifact roots must never nest"
 
 
-def test_supplied_contexts_mode(eq_preprocessed_dataset: Path, tmp_path: Path):
-    """``contexts_path`` scores a user-supplied index df: N sequences per row, K queries each."""
-    intermediate = eq_preprocessed_dataset.parent / "intermediate"
-    shard = pl.read_parquet(next((intermediate / "data" / train_split).rglob("*.parquet")))
-    cohort = shard.group_by("subject_id").agg(pl.col("time").max().alias("prediction_time")).head(3)
-    cohort_fp = tmp_path / "cohort.parquet"
-    cohort.write_parquet(cohort_fp)
-
-    out_dir = tmp_path / "out"
-    run_and_check(
-        [
-            "EQ_generate_query_sequences",
-            f"data_dir={intermediate!s}",
-            f"out_dir={out_dir!s}",
-            f"query_codes={eq_preprocessed_dataset!s}",
-            f"split={train_split}",
-            f"contexts_path={cohort_fp!s}",
-            "n_replicates=4",
-            "min_queries=5",
-            "max_queries=5",
-            "duration_min=1",
-            "duration_max=365",
-        ],
-        timeout=120.0,
-    )
-
-    df = pl.read_parquet(out_dir / train_split / "cohort__0000.parquet")
-    assert df.height == cohort.height * 4
-    assert (df["queries"].list.len() == 5).all()
-    # Every supplied context is present, each replicated exactly 4x.
-    counts = df.group_by("subject_id", "prediction_time").len()
-    assert counts.height == cohort.height and (counts["len"] == 4).all()
-
-
 @pytest.fixture
 def cq_cohort_fp(eq_preprocessed_dataset: Path, tmp_path: Path) -> Path:
     """A small supplied cohort index df: one prediction time per subject, on the train split."""
@@ -431,14 +397,11 @@ def test_eval_v3_scores_supplied_sequences(
 ):
     """``scripts/eval_v3.py`` score-last inference over a supplied QuerySeqSchema parquet.
 
-    Uses ``contexts_path`` mode so the tasks carry replicates, exercising the alignment check and
-    the extra-column passthrough that make positional attachment of probabilities sound.
+    Tasks come from the sampled training pipeline (fixed length 3), so the parquet carries repeated
+    ``(subject_id, prediction_time)`` keys the way any sampled split does, exercising the alignment
+    check and the extra-column passthrough that make positional attachment of probabilities sound.
     """
     intermediate = eq_preprocessed_dataset.parent / "intermediate"
-    shard = pl.read_parquet(next((intermediate / "data" / tuning_split).rglob("*.parquet")))
-    cohort = shard.group_by("subject_id").agg(pl.col("time").max().alias("prediction_time")).head(3)
-    cohort_fp = tmp_path / "cohort.parquet"
-    cohort.write_parquet(cohort_fp)
 
     tasks_dir = tmp_path / "tasks"
     run_and_check(
@@ -448,18 +411,17 @@ def test_eval_v3_scores_supplied_sequences(
             f"out_dir={tasks_dir!s}",
             f"query_codes={eq_preprocessed_dataset!s}",
             f"split={tuning_split}",
-            f"contexts_path={cohort_fp!s}",
-            "n_replicates=2",
+            "num_sequences=6",
             "min_queries=3",
             "max_queries=3",
             "duration_min=1",
             "duration_max=30",
+            "min_prediction_times_per_subject=1",
         ],
         env={"PROCESSED": str(eq_preprocessed_dataset)},
         timeout=120.0,
     )
-    tasks_fp = tasks_dir / tuning_split / "cohort__0000.parquet"
-    n_seqs = pl.read_parquet(tasks_fp).height
+    n_seqs = sum(pl.read_parquet(fp).height for fp in (tasks_dir / tuning_split).glob("*.parquet"))
 
     out_dir = tmp_path / "eval_v3_out"
     script = EVAL_V3

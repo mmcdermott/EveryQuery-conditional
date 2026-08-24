@@ -28,9 +28,9 @@ Two optional, default-off sweep knobs reweight sequence *structure* without touc
 code/duration draw: ``eos_first_fraction`` (force position 0 to ``TIMELINE//END``) and
 ``duration_mode`` (``random`` | ``same`` | ``nondecreasing``).
 
-A second, independent entry path labels a **supplied** ``(subject_id, prediction_time)`` cohort -
-see :func:`run_worker`.  It bypasses Stages 0/2/3' entirely (the contexts are given, not sampled)
-and is selected by passing ``contexts_path=`` on the CLI.
+Labeling a **supplied** ``(subject_id, prediction_time)`` cohort is the eval sampler's job
+(:mod:`~every_query.generate_tasks.sample_evaluation_query_sequences`, ``contexts_path=``); this
+module only samples.
 """
 
 import os
@@ -1364,22 +1364,17 @@ def run(cfg: DictConfig) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Supplied-cohort path (contexts are given, not sampled)
+# Supplied-cohort helpers (used by the eval-grid sampler)
 # ---------------------------------------------------------------------------
 
 
-def read_supplied_contexts(contexts_path: str | Path, n_replicates: int) -> pl.DataFrame:
-    """Read a supplied ``(subject_id, prediction_time)`` index parquet, repeated ``n_replicates`` times.
+def read_supplied_contexts(contexts_path: str | Path) -> pl.DataFrame:
+    """Read a supplied ``(subject_id, prediction_time)`` index parquet.
 
     Extra columns are dropped; ``prediction_time`` is cast to ``Datetime("us")`` for the same reason
     ``_read_event_shard`` casts event times (the ``+1us`` strict-``>`` shift in
     :func:`label_binary_occurrence` rounds to zero at millisecond precision).
-
-    Each output row becomes one independently-sampled query sequence, so ``n_replicates=N`` yields
-    ``N`` sequences per supplied row.  Replicate ``r`` of supplied row ``i`` is at row ``r*W + i``.
     """
-    if n_replicates < 1:
-        raise ValueError(f"n_replicates must be >= 1 (got {n_replicates})")
     sid = TaskQuerySchema.subject_id_name
     pt = TaskQuerySchema.prediction_time_name
 
@@ -1387,8 +1382,7 @@ def read_supplied_contexts(contexts_path: str | Path, n_replicates: int) -> pl.D
     missing = {sid, pt} - set(df.columns)
     if missing:
         raise ValueError(f"{contexts_path} is missing required column(s) {sorted(missing)}")
-    df = df.select(pl.col(sid).cast(pl.Int64), pl.col(pt).cast(pl.Datetime("us")))
-    return pl.concat([df] * n_replicates) if n_replicates > 1 else df
+    return df.select(pl.col(sid).cast(pl.Int64), pl.col(pt).cast(pl.Datetime("us")))
 
 
 def read_events_for_subjects(split_dir: Path, subjects: pl.Series) -> pl.DataFrame:
@@ -1418,132 +1412,19 @@ def read_events_for_subjects(split_dir: Path, subjects: pl.Series) -> pl.DataFra
     return events_df
 
 
-def run_worker(
-    data_dir: Path,
-    out_dir: Path,
-    query_codes: list[str],
-    split: str,
-    contexts_path: str | Path,
-    task_shard: int = 0,
-    seed: int = 1,
-    min_queries: int = 1,
-    max_queries: int = 5,
-    duration_min: float = 1,
-    duration_max: float = 731,
-    duration_distribution: str = "log-uniform",
-    eos_first_fraction: float = 0.0,
-    duration_mode: str = "random",
-    eventbound_fraction: float = 0.0,
-    bound_events: Sequence[str] | None = None,
-    ontology_dir: str | None = None,
-    n_replicates: int = 1,
-    overwrite: bool = False,
-) -> Path | None:
-    """Label a **supplied** ``(subject_id, prediction_time)`` cohort with sampled query sequences.
-
-    The non-sampled entry path: contexts come from ``contexts_path`` (repeated ``n_replicates``
-    times, one sampled sequence each) rather than from Stages 0/2, so no prediction-time map is
-    built and no ``_artifacts`` tree is written.  Events are gathered across every shard of
-    ``split`` because a supplied cohort is an arbitrary subject set.  The output is a single parquet
-    named after the cohort file stem: ``{out_dir}/{split}/{stem}__{task_shard:04d}.parquet``.
-
-    For the sampled path - the 5-stage pipeline over a whole split - call :func:`run` instead.
-
-    Returns:
-        The written path, or ``None`` if the output already existed and ``overwrite`` is false.
-    """
-    stem = Path(contexts_path).stem
-    labels_fp = Path(out_dir) / split / f"{stem}__{task_shard:04d}.parquet"
-    if labels_fp.exists() and not overwrite:
-        logger.info("Labels already exist at %s, skipping.", labels_fp)
-        return None
-
-    contexts = read_supplied_contexts(contexts_path, n_replicates)
-    subjects = contexts[TaskQuerySchema.subject_id_name]
-    events_df = read_events_for_subjects(Path(data_dir) / "data" / split, subjects)
-    logger.info(
-        "Loaded %d contexts from %s (x%d) and %d events from %s/data/%s",
-        contexts.height,
-        contexts_path,
-        n_replicates,
-        events_df.height,
-        data_dir,
-        split,
-    )
-
-    index_df = build_sequence_index_df(
-        contexts=contexts,
-        query_codes=query_codes,
-        min_queries=min_queries,
-        max_queries=max_queries,
-        duration_low=duration_min,
-        duration_high=duration_max,
-        seed=derive_seed(seed, stem, task_shard),
-        eos_first_fraction=eos_first_fraction,
-        duration_mode=duration_mode,
-        duration_distribution=duration_distribution,
-        eventbound_fraction=eventbound_fraction,
-        bound_events=bound_events,
-    )
-
-    labeled = label_query_sequences(index_df, maybe_explode_to_closure(events_df, ontology_dir))
-
-    aligned = QuerySeqSchema.align(labeled.to_arrow())
-    labels_fp.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write_parquet(pl.from_arrow(aligned), labels_fp)
-    logger.info("Wrote %d labeled query sequences to %s", labeled.height, labels_fp)
-    return labels_fp
-
-
 CONFIGS = str(files("every_query") / "generate_tasks" / "configs")
 
 
 @hydra.main(version_base=None, config_path=CONFIGS, config_name="sample_query_sequences_config")
 def main(cfg: DictConfig) -> None:
-    """Hydra entry point (``EQ_generate_query_sequences``); dispatches on ``contexts_path``.
-
-    ``contexts_path`` unset (the default) runs the sampled 5-stage pipeline over the whole split via
-    :func:`run`.  ``contexts_path=<parquet>`` labels that supplied cohort via :func:`run_worker`.
+    """Hydra entry point (``EQ_generate_query_sequences``): the sampled 5-stage pipeline via :func:`run`.
 
     Path roots are required args with no ``.env``/env-var fallback (removed upstream in #235):
     ``data_dir``, ``out_dir``, and ``query_codes`` are mandatory, resolved through the same
     :func:`~every_query.generate_tasks.sample_tasks._require_path_arg` guard the training sampler
     uses so an unexported ``$VAR`` fails with one clear message instead of a literal ``None`` path.
     """
-    if cfg.get("contexts_path") is None:
-        run(cfg)
-        return
-
-    data_dir = _require_path_arg(cfg.get("data_dir"), "data_dir")
-    out_dir = _require_path_arg(cfg.get("out_dir"), "out_dir")
-    query_codes = build_query_universe(
-        read_query_codes(cfg.get("query_codes")),
-        ontology_dir=cfg.get("ontology_dir"),
-        ancestor_fraction=float(cfg.get("ancestor_fraction", 0.0) or 0.0),
-        seed=int(cfg.get("seed", 0)),
-    )
-
-    run_worker(
-        data_dir=data_dir,
-        out_dir=out_dir,
-        query_codes=query_codes,
-        split=str(cfg.split),
-        contexts_path=cfg.contexts_path,
-        task_shard=int(cfg.task_shard),
-        seed=int(cfg.seed),
-        min_queries=int(cfg.min_queries),
-        max_queries=int(cfg.max_queries),
-        duration_min=float(cfg.duration_min),
-        duration_max=float(cfg.duration_max),
-        duration_distribution=str(cfg.get("duration_distribution", "log-uniform")),
-        eos_first_fraction=float(cfg.get("eos_first_fraction", 0.0)),
-        duration_mode=str(cfg.get("duration_mode", "random")),
-        eventbound_fraction=float(cfg.get("eventbound_fraction", 0.0) or 0.0),
-        bound_events=resolve_bound_events(cfg, query_codes),
-        ontology_dir=cfg.get("ontology_dir"),
-        n_replicates=int(cfg.get("n_replicates", 1)),
-        overwrite=bool(cfg.get("overwrite", False)),
-    )
+    run(cfg)
 
 
 if __name__ == "__main__":

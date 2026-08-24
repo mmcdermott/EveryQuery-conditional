@@ -64,15 +64,6 @@ families of (scattered-for-training, dense-for-evaluation) pairs — one per mod
     null, because censoring is expressed by the `TIMELINE//END` query itself. Registered as
     `EQ_generate_query_sequences`.
 
-    > **Not yet restructured.** Contexts currently come only from a supplied
-    > `(subject_id, prediction_time)` parquet (`contexts_path=...`). The sampled-context path
-    > raises `NotImplementedError`: it needs the Stage 0/2/3 rewrite that ports this module onto
-    > the same 5-stage pipeline as `sample_tasks.py` (Phase 2 of
-    > `CONDITIONAL_V2_INTEGRATION_PLAN.md`). The fork's shard-local `sample_contexts` helper no
-    > longer exists upstream, and `sample_patient_contexts` is not a drop-in for it — it consumes
-    > a Stage 0 `_prediction_time_counts` table and returns a `prediction_time_index`, not a
-    > timestamp.
-
 - **`sample_evaluation_query_sequences.py`** — dense-grid conditional-sequence generator.
     Labels the same `N` sequences at every context of one cohort, so the only thing varying
     across a given sequence's rows is the patient. Both axes of that grid are supplied or
@@ -221,8 +212,8 @@ A single dense run is one worker by design: the whole point is that all `N` sequ
 across all contexts, so there is no task axis to shard on. Shard the *cohort* if it is too large
 to label in one pass.
 
-`EQ_generate_query_sequences` takes the same three path args plus `contexts_path=...`, which is
-currently its only supported context source (see the note above).
+`EQ_generate_query_sequences` takes the same three path args and only ever samples its contexts;
+to label a supplied cohort use `EQ_generate_evaluation_query_sequences contexts_path=...`.
 
 ## Determinism & restartability
 
