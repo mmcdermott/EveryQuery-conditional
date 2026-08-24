@@ -41,7 +41,7 @@ max_queries: 5
 # Duration draw (Stage 1'), delegated to `sample_tasks.QueryDistribution` so the sequence sampler
 # and the training-task sampler draw from an identical distribution.  `duration_days` is a **float**
 # (no day-rounding) — the fork's integer-day durations are gone, which is why the existing
-# conditional checkpoint must be retrained (CONDITIONAL_V2_INTEGRATION_PLAN.md §3).
+# conditional checkpoint must be retrained (docs/history/2026-08-18-conditional-v2-integration-plan.md §3).
 # These keep the conditional configs' `duration_min`/`duration_max` names rather than the base
 # class's `min_duration`/`max_duration`, so this file and
 # `sample_evaluation_query_sequences_config.yaml` stay key-identical (a test asserts that).

@@ -27,7 +27,7 @@ draws contexts shard-locally — see its docstring for the two semantic changes 
 budget; ``min_prediction_times`` counts prediction times, not events).  The numbers in
 ``EveryQuery_Conditional_Report_v2.pdf`` were produced by the *old* sampler and by a checkpoint
 trained on integer-day durations; they cannot be reproduced from this file (see
-``CONDITIONAL_V2_INTEGRATION_PLAN.md`` §3).  ``eval_v3.py`` supersedes this script's coarse
+``docs/history/2026-08-18-conditional-v2-integration-plan.md`` §3).  ``eval_v3.py`` supersedes this script's coarse
 per-query view with dense per-conditional grids.
 """
 
@@ -112,7 +112,7 @@ def log_uniform_durations(n: int, lo: float, hi: float, rng: np.random.Generator
     Replaces ``sample_query_sequences.sample_log_uniform_durations``, removed in the Phase 2
     rewrite.  That function returned ``round(exp(U(log lo, log hi)))`` — *integer* days; the
     5-stage sampler's ``QueryDistribution.sample`` draws continuous floats and no longer rounds
-    (``CONDITIONAL_V2_INTEGRATION_PLAN.md`` §3), so this matches what the current sampler puts in
+    (``docs/history/2026-08-18-conditional-v2-integration-plan.md`` §3), so this matches what the current sampler puts in
     the training distribution.  Kept here as a plain draw rather than routed through
     ``QueryDistribution.sample`` because that also draws a *code* per duration, which would fork the
     rng stream these scripts pair with their own code draws.

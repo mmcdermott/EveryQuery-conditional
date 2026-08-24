@@ -302,7 +302,7 @@ def macro_auroc(df: pl.DataFrame, group_cols, prob_col="prob", min_pos=10, min_n
     """Per-group AUROC, macro-averaged over groups with enough of both classes.
 
     Pooled AUROC is base-rate inflated (≈0.91 vs an honest macro ≈0.77 on ``big_v2``); see
-    ``CONDITIONAL_QUERIES.md:127-152``.  ``group_cols`` chooses the estimand: ``["target_query"]``
+    ``docs/CONDITIONAL_QUERIES.md:127-152``.  ``group_cols`` chooses the estimand: ``["target_query"]``
     reproduces eval_v2's view, ``CONDITIONAL_KEYS`` scores each conditioning context separately.
 
     Returns ``(table, macro, n_groups_total)`` — the total counts *all* groups, so the caller can

@@ -5,7 +5,7 @@ This script existed because the fork's sampler was **shard-local** — one ``run
 ``(input_shard, task_shard)``, each drawing its own contexts from that shard's own events — so
 covering a split meant driving a pool of workers from outside.
 
-The 5-stage rewrite (Phase 2 of ``CONDITIONAL_V2_INTEGRATION_PLAN.md``) moved that fan-out inside
+The 5-stage rewrite (Phase 2 of ``docs/history/2026-08-18-conditional-v2-integration-plan.md``) moved that fan-out inside
 ``EQ_generate_query_sequences``: Stage 0 scans the split once, Stages 1'-3' run in the driver, and
 Stage 4' fans one labeling worker out per shard via a ``ProcessPoolExecutor`` sized by
 ``max_workers``.  One invocation now covers the whole split.

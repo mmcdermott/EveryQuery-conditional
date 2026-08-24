@@ -1,7 +1,7 @@
 """Differential test: `label_with_event_bounds` against a naive per-query oracle.
 
 Companion to ``tests/test_rope_strip_oracle.py``, for the second of the two coverage gaps that
-``THREE_FEATURES_VERIFICATION.md`` records: event-bounded labelling was asserted only against
+``docs/history/2026-08-21-three-features-verification.md`` records: event-bounded labelling was asserted only against
 hand-written expectations written by the author of the code, which proves the code matches the
 author's belief, not that the belief is right.  Every defect this branch found produced a
 silently wrong *label*, never a crash, so a shape assertion buys nothing here.

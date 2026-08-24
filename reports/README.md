@@ -29,4 +29,4 @@ EXP=../../experiments
 ```
 
 The three summary JSONs are produced by `eval_macro_position.py`, `eval_clinical.py`, and
-`eval_occurs_uncensored.py` respectively (see `../CONDITIONAL_QUERIES.md`).
+`eval_occurs_uncensored.py` respectively (see `../docs/CONDITIONAL_QUERIES.md`).

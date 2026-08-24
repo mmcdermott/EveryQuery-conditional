@@ -471,7 +471,7 @@ def build(train_csv, macro_fp, clin_fp, uncens_fp, out):
     P(
         "Code & docs: github.com/mmcdermott/EveryQuery-conditional (main). CLIs: EQ_generate_query_sequences, "
         "EQ_predict_sequences, EQ_evaluate_sequences. Evaluation: scripts/eval_macro_position.py (per-task), "
-        "scripts/eval_clinical.py (clinical). See CONDITIONAL_QUERIES.md.",
+        "scripts/eval_clinical.py (clinical). See docs/CONDITIONAL_QUERIES.md.",
         "Small",
     )
 

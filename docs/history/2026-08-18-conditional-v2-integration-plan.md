@@ -124,7 +124,7 @@ That lists all 46 files the fork changed. Subtract the 8 overlapping files named
 (handled in Phases 4 and 5, not here) to get the 38 additive ones, and drop `sample_tasks.py`.
 
 The 38 include `scripts/` (~10 eval + report builders), the 3 PDFs (~1.2MB), `reports/`,
-`CONDITIONAL_QUERIES.md`, `COHORT_INFERENCE_NOTES.md`, and `HANDOFF.md`.
+`docs/CONDITIONAL_QUERIES.md`, `docs/COHORT_INFERENCE_NOTES.md`, and `HANDOFF.md` (since deleted).
 
 Key source files:
 

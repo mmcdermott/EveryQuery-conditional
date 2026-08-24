@@ -20,7 +20,7 @@ EveryQuery is built on the [MEDS](https://github.com/Medical-Event-Data-Standard
 > queries, each conditioned on the patient state and the teacher-forced answers of all earlier
 > queries. Binary observed-occurrence labels; censoring is expressed by querying the real
 > `TIMELINE//END` code rather than via a separate head. See
-> **[CONDITIONAL_QUERIES.md](CONDITIONAL_QUERIES.md)** for the design, the new
+> **[docs/CONDITIONAL_QUERIES.md](docs/CONDITIONAL_QUERIES.md)** for the design, the new
 > `EQ_generate_query_sequences` / `EQ_predict_sequences` / `EQ_evaluate_sequences` CLIs, the macro
 > per-task evaluation methodology, and results.
 
@@ -78,7 +78,7 @@ and end-to-end subprocess tests that run the real script against a fixture cohor
 
 The conditional query-sequence pipeline (this fork) adds a parallel set of CLIs that consume and
 emit `QuerySeqSchema` rather than `TaskQuerySchema` — see
-[CONDITIONAL_QUERIES.md](CONDITIONAL_QUERIES.md):
+[docs/CONDITIONAL_QUERIES.md](docs/CONDITIONAL_QUERIES.md):
 
 | Script                                   | Stage             | Purpose                                                                                                                    | Tests                              |
 | ---------------------------------------- | ----------------- | -------------------------------------------------------------------------------------------------------------------------- | ---------------------------------- |
