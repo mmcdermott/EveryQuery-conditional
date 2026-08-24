@@ -203,7 +203,7 @@ Two things to know:
 left  = index_df.with_columns((pl.col(pt) + pl.duration(microseconds=1)).alias("_pts")).sort(sid, q, "_pts")
 right = events_df.rename({code: q}).select(sid, q, time).sort(sid, q, time)
 joined = left.join_asof(right, by=[sid, q], left_on="_pts", right_on=time, strategy="forward")
-answer = pl.col(time).is_not_null() & (pl.col(time) <= pl.col(pt) + pl.duration(days=pl.col(d)))
+answer = pl.col(time).is_not_null() & (pl.col(time) < pl.col(pt) + pl.duration(days=pl.col(d)))
 ```
 
 **One `join_asof` labels every query regardless of how many distinct codes are in play.** No
