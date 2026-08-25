@@ -3,7 +3,8 @@
 This module is the *reference* semantics.  It is written from the prose contract, not from the
 production implementation, and it must never import one:
 
-* no :mod:`every_query.data.ontology` (no ``build_closure``, no ``explode_events_to_closure``);
+* no :mod:`every_query.data.ontology` (no ``build_event_to_query_nodes``, no
+  ``expand_events_to_query_nodes``);
 * no :mod:`every_query.generate_tasks.sample_query_sequences` labelers.
 
 Everything is plain Python over a list of ``Event`` tuples.  It is O(n) per query on purpose --

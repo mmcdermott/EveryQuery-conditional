@@ -1012,7 +1012,7 @@ def log_degenerate_bounds(index_df: pl.DataFrame, events_df: pl.DataFrame) -> di
     return out
 
 
-def maybe_explode_to_closure(events_df: pl.DataFrame, ontology_dir: str | Path | None):
+def maybe_expand_to_matching_query_nodes(events_df: pl.DataFrame, ontology_dir: str | Path | None):
     """Repeat each event under its ancestor node names, so ancestor queries label normally.
 
     A no-op without an ontology.  With one, "did any descendant of X occur" becomes an ordinary
@@ -1024,9 +1024,9 @@ def maybe_explode_to_closure(events_df: pl.DataFrame, ontology_dir: str | Path |
     """
     if not ontology_dir:
         return events_df
-    from every_query.data.ontology import explode_events_to_closure, load_closure_map
+    from every_query.data.ontology import expand_events_to_query_nodes, load_event_to_query_nodes
 
-    return explode_events_to_closure(events_df, load_closure_map(ontology_dir))
+    return expand_events_to_query_nodes(events_df, load_event_to_query_nodes(ontology_dir))
 
 
 def label_query_sequences(index_df: pl.DataFrame, events_df: pl.DataFrame) -> pl.DataFrame:
@@ -1171,7 +1171,7 @@ def label_one_sequence_shard(
     _clean_stale_temps(out_dir, shard)
 
     events_df = _read_event_shard(data_dir / f"{shard}.parquet")
-    events_df = maybe_explode_to_closure(events_df, ontology_dir)
+    events_df = maybe_expand_to_matching_query_nodes(events_df, ontology_dir)
 
     labeled = label_query_sequences(index_df, events_df)
     aligned = QuerySeqSchema.align(labeled.to_arrow())

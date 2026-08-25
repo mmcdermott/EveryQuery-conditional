@@ -35,7 +35,7 @@ only one measures the wrong thing without ever failing: ``ancestor_fraction`` re
 universe (:func:`~every_query.generate_tasks.sample_query_sequences.build_query_universe`) so
 ancestor nodes are drawn and accepted as designed-spec codes, and ``ontology_dir`` explodes the
 event stream through the closure
-(:func:`~every_query.generate_tasks.sample_query_sequences.maybe_explode_to_closure`) so an
+(:func:`~every_query.generate_tasks.sample_query_sequences.maybe_expand_to_matching_query_nodes`) so an
 ancestor query is labeled by ordinary occurrence.  Without the explosion an ancestor query is
 labeled ``False`` at every context — the ancestor's *name* is in no event stream, only its
 descendants' are — which is a well-formed parquet of wrong answers, not an error.
@@ -95,7 +95,7 @@ from every_query.generate_tasks.sample_query_sequences import (
     build_query_universe,
     build_sequence_index_df,
     label_query_sequences,
-    maybe_explode_to_closure,
+    maybe_expand_to_matching_query_nodes,
     read_events_for_subjects,
     read_supplied_contexts,
     resolve_bound_events,
@@ -764,13 +764,13 @@ def _ontology_fingerprint(ontology_dir: str | Path | None, query_codes: Sequence
     """
     if not ontology_dir:
         return None
-    from every_query.data.ontology import load_closure_map
+    from every_query.data.ontology import load_event_to_query_nodes
 
     universe = pl.DataFrame(
         {"slot": list(range(len(query_codes))), "code": list(query_codes)},
         schema={"slot": pl.Int64, "code": pl.String},
     )
-    return f"{_frame_digest(load_closure_map(ontology_dir))}|{_frame_digest(universe)}"
+    return f"{_frame_digest(load_event_to_query_nodes(ontology_dir))}|{_frame_digest(universe)}"
 
 
 def _provenance_path(out_dir: Path, fp: Path) -> Path:
@@ -977,7 +977,7 @@ def run_worker(
     # sampler explodes inside each Stage 4' worker, so this is the one pass that mirrors it (and
     # multiplies the frame by the mean closure size in a single process).  Both labeling branches
     # below read this frame, and patching only one of them would leave the other silently wrong.
-    events_df = maybe_explode_to_closure(events_df, ontology_dir)
+    events_df = maybe_expand_to_matching_query_nodes(events_df, ontology_dir)
     logger.info(
         "Loaded %d contexts x %d sequences = %d labeled rows to build, from %d events%s",
         contexts.height,

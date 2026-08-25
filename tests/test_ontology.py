@@ -21,9 +21,9 @@ from every_query.data.ontology import (
     EMBEDDING_MIX_FILE,
     EVENT_TO_QUERY_NODES_FILE,
     ONTOLOGY_VOCAB_FILE,
-    build_closure,
+    build_event_to_query_nodes,
     build_ontology,
-    explode_events_to_closure,
+    expand_events_to_query_nodes,
     extend_code_map,
     extended_vocab_size,
     load_mix_matrix,
@@ -43,7 +43,7 @@ def _codes(codes, parents=None) -> pl.DataFrame:
 
 def _write_ontology(tmp_path, codes_df, decay: float = 0.5):
     nodes, mix = build_ontology(codes_df, decay=decay)
-    closure = build_closure(nodes, mix)
+    closure = build_event_to_query_nodes(nodes, mix)
     nodes.write_parquet(tmp_path / ONTOLOGY_VOCAB_FILE)
     mix.write_parquet(tmp_path / EMBEDDING_MIX_FILE)
     closure.write_parquet(tmp_path / EVENT_TO_QUERY_NODES_FILE)
@@ -147,7 +147,7 @@ def test_explode_keeps_events_the_ontology_does_not_know():
         {"subject_id": [1, 1], "time": [datetime(2024, 1, 1)] * 2, "code": ["A//B", "ORPHAN"]}
     )
     closure = pl.DataFrame({"event_code": ["A//B", "A//B"], "query_node": ["A//B", "A"]})
-    out = explode_events_to_closure(events, closure)
+    out = expand_events_to_query_nodes(events, closure)
     assert "ORPHAN" in out["code"].to_list(), "an unknown code must survive, not vanish"
     assert set(out["code"].to_list()) == {"A//B", "A", "ORPHAN"}
 

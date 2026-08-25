@@ -22,7 +22,7 @@ from every_query.data.ontology import (
     EMBEDDING_MIX_FILE,
     EVENT_TO_QUERY_NODES_FILE,
     ONTOLOGY_VOCAB_FILE,
-    build_closure,
+    build_event_to_query_nodes,
     build_ontology,
     extended_vocab_size,
 )
@@ -42,7 +42,7 @@ def _write_ontology(tmp_path):
     nodes, mix = build_ontology(codes_df)
     nodes.write_parquet(tmp_path / ONTOLOGY_VOCAB_FILE)
     mix.write_parquet(tmp_path / EMBEDDING_MIX_FILE)
-    build_closure(nodes, mix).write_parquet(tmp_path / EVENT_TO_QUERY_NODES_FILE)
+    build_event_to_query_nodes(nodes, mix).write_parquet(tmp_path / EVENT_TO_QUERY_NODES_FILE)
     return extended_vocab_size(tmp_path)
 
 

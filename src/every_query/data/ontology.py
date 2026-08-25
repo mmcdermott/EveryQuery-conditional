@@ -131,7 +131,7 @@ def build_ontology(
         ``INF//220949`` stays a leaf (it names 365k real events in the real cohort), while
         ``INF//220949//ANY`` is the node that means "the drug, valued or not":
 
-        >>> closure = build_closure(nodes, mix)
+        >>> closure = build_event_to_query_nodes(nodes, mix)
         >>> sorted(closure.filter(pl.col("query_node") == "INF//220949//ANY")["event_code"].to_list())
         ['INF//220949', 'INF//220949//value_hi', 'INF//220949//value_lo']
 
@@ -189,7 +189,7 @@ def build_ontology(
         multi-level DAG that ``parent_codes`` exists to express.
 
         Note the walk passes *through* a leaf when a leaf is someone's declared parent.  That is
-        deliberate and is not in tension with :func:`build_closure` refusing to make that leaf
+        deliberate and is not in tension with :func:`build_event_to_query_nodes` refusing to make that leaf
         addressable as a subtree query: traversal and addressability are different questions.
 
         ``parent_codes`` is caller-supplied data, so cycles are possible.  ``start`` is never
@@ -340,7 +340,7 @@ def build_ontology(
     return nodes_df, pl.DataFrame(mix_rows)
 
 
-def build_closure(nodes_df: pl.DataFrame, mix_df: pl.DataFrame) -> pl.DataFrame:
+def build_event_to_query_nodes(nodes_df: pl.DataFrame, mix_df: pl.DataFrame) -> pl.DataFrame:
     """``(event_code, query_node)`` rows: every leaf paired with itself and each ancestor *node* above it.
 
     This is what lets an ancestor query be answered by the ordinary occurrence labeler — explode
@@ -366,7 +366,7 @@ def build_closure(nodes_df: pl.DataFrame, mix_df: pl.DataFrame) -> pl.DataFrame:
         >>> mix = pl.DataFrame({
         ...     "target_token_id": [1, 1, 2], "component_token_id": [1, 2, 2],
         ...     "unnormalized_weight": [1.0, 0.5, 1.0]})
-        >>> build_closure(nodes, mix).sort("query_node")["query_node"].to_list()
+        >>> build_event_to_query_nodes(nodes, mix).sort("query_node")["query_node"].to_list()
         ['A', 'A//B']
 
         A leaf that prefixes another leaf keeps its exact meaning — ``A//B`` is a real code here,
@@ -379,7 +379,7 @@ def build_closure(nodes_df: pl.DataFrame, mix_df: pl.DataFrame) -> pl.DataFrame:
         ...     "target_token_id": [1, 1, 2, 2, 2, 3],
         ...     "component_token_id": [1, 3, 2, 1, 3, 3],
         ...     "unnormalized_weight": [1.0, 0.5, 1.0, 0.5, 0.25, 1.0]})
-        >>> cl = build_closure(nodes, mix).sort("event_code", "query_node")
+        >>> cl = build_event_to_query_nodes(nodes, mix).sort("event_code", "query_node")
         >>> list(zip(cl["event_code"], cl["query_node"]))
         [('A//B', 'A'), ('A//B', 'A//B'), ('A//B//C', 'A'), ('A//B//C', 'A//B//C')]
     """
@@ -454,15 +454,17 @@ def load_mix_matrix(ontology_dir: str | Path, normalize: bool = True) -> torch.T
     return A
 
 
-def load_closure_map(ontology_dir: str | Path) -> pl.DataFrame:
+def load_event_to_query_nodes(ontology_dir: str | Path) -> pl.DataFrame:
     """Read ``event_to_query_nodes.parquet`` — ``(event_code, query_node)`` rows for event explosion."""
     return pl.read_parquet(Path(ontology_dir) / EVENT_TO_QUERY_NODES_FILE)
 
 
-def explode_events_to_closure(events_df: pl.DataFrame, closure_df: pl.DataFrame) -> pl.DataFrame:
+def expand_events_to_query_nodes(
+    events_df: pl.DataFrame, event_to_query_nodes_df: pl.DataFrame
+) -> pl.DataFrame:
     """Repeat each event under every ancestor node name, so ancestor queries label normally.
 
-    Codes absent from ``closure_df`` would be **dropped** by the inner join, silently deleting
+    Codes absent from ``event_to_query_nodes_df`` would be **dropped** by the inner join, silently deleting
     events — which happens whenever the ontology was built from a different ``codes.parquet``
     than the cohort.  Those codes are passed through unchanged instead, and the mismatch is
     reported.
@@ -471,17 +473,17 @@ def explode_events_to_closure(events_df: pl.DataFrame, closure_df: pl.DataFrame)
         >>> from datetime import datetime
         >>> ev = pl.DataFrame({"subject_id": [1], "time": [datetime(2024, 1, 1)], "code": ["A//B"]})
         >>> cl = pl.DataFrame({"event_code": ["A//B", "A//B"], "query_node": ["A//B", "A"]})
-        >>> sorted(explode_events_to_closure(ev, cl)["code"].to_list())
+        >>> sorted(expand_events_to_query_nodes(ev, cl)["code"].to_list())
         ['A', 'A//B']
 
         An event whose code the ontology does not know survives as itself:
 
         >>> ev2 = pl.DataFrame({"subject_id": [1, 1], "time": [datetime(2024, 1, 1)] * 2,
         ...                     "code": ["A//B", "UNKNOWN"]})
-        >>> sorted(explode_events_to_closure(ev2, cl)["code"].to_list())
+        >>> sorted(expand_events_to_query_nodes(ev2, cl)["code"].to_list())
         ['A', 'A//B', 'UNKNOWN']
     """
-    known = set(closure_df["event_code"].to_list())
+    known = set(event_to_query_nodes_df["event_code"].to_list())
     present = set(events_df["code"].to_list())
     missing = present - known
     if missing:
@@ -493,7 +495,7 @@ def explode_events_to_closure(events_df: pl.DataFrame, closure_df: pl.DataFrame)
         )
 
     exploded = (
-        events_df.join(closure_df, left_on="code", right_on="event_code", how="inner")
+        events_df.join(event_to_query_nodes_df, left_on="code", right_on="event_code", how="inner")
         .drop("code")
         .rename({"query_node": "code"})
         .select(events_df.columns)

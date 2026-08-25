@@ -18,7 +18,7 @@ from every_query.data.ontology import (
     EMBEDDING_MIX_FILE,
     EVENT_TO_QUERY_NODES_FILE,
     ONTOLOGY_VOCAB_FILE,
-    build_closure,
+    build_event_to_query_nodes,
     build_ontology,
     load_mix_matrix,
 )
@@ -60,7 +60,7 @@ def _write_ontology(out, codes: list[str]):
     nodes, mix = build_ontology(frame)
     nodes.write_parquet(out / ONTOLOGY_VOCAB_FILE)
     mix.write_parquet(out / EMBEDDING_MIX_FILE)
-    build_closure(nodes, mix).write_parquet(out / EVENT_TO_QUERY_NODES_FILE)
+    build_event_to_query_nodes(nodes, mix).write_parquet(out / EVENT_TO_QUERY_NODES_FILE)
     return out
 
 

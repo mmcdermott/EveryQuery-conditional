@@ -25,7 +25,7 @@ from every_query.data.ontology import (
     EMBEDDING_MIX_FILE,
     EVENT_TO_QUERY_NODES_FILE,
     ONTOLOGY_VOCAB_FILE,
-    build_closure,
+    build_event_to_query_nodes,
     build_ontology,
 )
 
@@ -59,7 +59,7 @@ def run(
     codes_df = pl.read_parquet(codes_fp, columns=wanted)
 
     nodes_df, mix_df = build_ontology(codes_df, decay=decay, subtree_suffix=subtree_suffix)
-    closure_df = build_closure(nodes_df, mix_df)
+    closure_df = build_event_to_query_nodes(nodes_df, mix_df)
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

@@ -10,7 +10,7 @@ from collections.abc import Sequence
 
 import polars as pl
 
-from every_query.data.ontology import build_closure, build_ontology, explode_events_to_closure
+from every_query.data.ontology import build_event_to_query_nodes, build_ontology, expand_events_to_query_nodes
 from every_query.generate_tasks.sample_query_sequences import label_query_sequences
 
 from .oracle import Event
@@ -45,7 +45,7 @@ def codes_frame(leaves: Sequence[str], declared_parents: dict[str, list[str]]) -
 def build_artifacts(leaves: Sequence[str], declared_parents: dict[str, list[str]], decay: float = 0.5):
     """`(nodes_df, mix_df, closure_df)` straight from the production builder."""
     nodes_df, mix_df = build_ontology(codes_frame(leaves, declared_parents), decay=decay)
-    return nodes_df, mix_df, build_closure(nodes_df, mix_df)
+    return nodes_df, mix_df, build_event_to_query_nodes(nodes_df, mix_df)
 
 
 def index_frame(rows: Sequence[tuple], *, with_bounds: bool) -> pl.DataFrame:
@@ -91,6 +91,6 @@ def label(
         return []
     events_df = events_to_frame(events)
     if closure_df is not None:
-        events_df = explode_events_to_closure(events_df, closure_df)
+        events_df = expand_events_to_query_nodes(events_df, closure_df)
     out = label_query_sequences(index_frame(rows, with_bounds=with_bounds), events_df)
     return [a[0] for a in out["answers"].to_list()]
