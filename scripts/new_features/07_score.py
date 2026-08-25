@@ -16,7 +16,6 @@ Prints spec NAMES (dur_00 ... anc_19) and metrics only; never code strings.
 import argparse
 import json
 import math
-import os
 import sys
 from pathlib import Path
 
@@ -40,7 +39,7 @@ def auroc_ci(y: np.ndarray, s: np.ndarray) -> tuple[float, float, float]:
     return a, a - 1.96 * se, a + 1.96 * se
 
 
-def score_one(tag: str, preds_path: Path, spec_path: Path, manifest: pl.DataFrame, out_dir: Path) -> dict:
+def score_one(tag: str, preds_path: Path, spec_path: Path, out_dir: Path) -> dict:
     specs: dict[str, list] = yaml.safe_load(spec_path.read_text())
     names = sorted(specs)
     n_specs = len(names)
@@ -68,7 +67,8 @@ def score_one(tag: str, preds_path: Path, spec_path: Path, manifest: pl.DataFram
         }
     )
     chk = p.join(expected, on=["spec_idx", "position"], how="left")
-    match_rate = float((chk["query"] == chk["expected_query"]).mean())
+    agree = (chk["query"] == chk["expected_query"]).fill_null(False)
+    match_rate = float(agree.sum()) / chk.height if chk.height else 0.0
     print(f"spec-reconstruction match rate: {match_rate:.6f}  (must be 1.0)")
     if match_rate < 1.0:
         print("  !! ABORTING scoring for this file — row identity is not trustworthy")
@@ -172,15 +172,13 @@ def main() -> int:
 
     pred_dir, spec_dir, out_dir = Path(args.pred_dir), Path(args.spec_dir), Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    manifest = pl.read_parquet(spec_dir / "task_manifest.parquet")
-
     results = []
     for tag in ("len1", "len3"):
         pp = pred_dir / f"preds_{tag}.parquet"
         if not pp.exists():
             print(f"{tag}: MISSING {pp}")
             continue
-        results.append(score_one(tag, pp, spec_dir / f"designed_{tag}.yaml", manifest, out_dir))
+        results.append(score_one(tag, pp, spec_dir / f"designed_{tag}.yaml", out_dir))
 
     (out_dir / "summary.json").write_text(json.dumps(results, indent=2))
 

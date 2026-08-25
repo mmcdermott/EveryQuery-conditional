@@ -36,6 +36,15 @@ export RUN_NAME="${2:-cq-tiny-allfeat}"
 LOG="${NF_LOG_DIR}/04_train.log"
 OUT_BASE="${NF_TRAIN_OUT_DIR}/${RUN_NAME}"
 
+# SMOKE=1: a few steps, same overrides (fast_dev_run would disable the logger and prove nothing).
+SMOKE_ARGS=()
+if [[ -n "${SMOKE:-}" ]]; then
+    RUN_NAME="${RUN_NAME}-smoke"
+    OUT_BASE="${NF_TRAIN_OUT_DIR}/${RUN_NAME}"
+    LOG="${NF_LOG_DIR}/04_train_smoke.log"
+    SMOKE_ARGS=(+trainer.limit_train_batches=6 trainer.val_check_interval=5 trainer.limit_val_batches=2)
+fi
+
 echo "run_name : $RUN_NAME"
 echo "max_time : $MAX_TIME"
 echo "out_base : $OUT_BASE"
@@ -74,6 +83,7 @@ STATUS=0
     +trainer.logger.entity="$WANDB_ENTITY" \
     +trainer.logger.offline=false \
     +trainer.logger.log_model=false \
+    "${SMOKE_ARGS[@]}" \
     > "$LOG" 2>&1 || STATUS=$?
 
 echo "elapsed: $((SECONDS - START))s   exit=$STATUS"
