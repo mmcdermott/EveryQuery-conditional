@@ -29,7 +29,12 @@ logging.basicConfig(level=logging.INFO)
 CONFIGS = str(files("every_query") / "data" / "configs")
 
 
-def run(tensorized_cohort_dir: Path, out_dir: Path, decay: float = 0.5) -> Path:
+def run(
+    tensorized_cohort_dir: Path,
+    out_dir: Path,
+    decay: float = 0.5,
+    subtree_suffix: str | None = "ANY",
+) -> Path:
     """Build and write the ontology artifacts; returns ``out_dir``."""
     codes_fp = Path(tensorized_cohort_dir) / "metadata" / "codes.parquet"
     if not codes_fp.is_file():
@@ -47,7 +52,7 @@ def run(tensorized_cohort_dir: Path, out_dir: Path, decay: float = 0.5) -> Path:
         )
     codes_df = pl.read_parquet(codes_fp, columns=wanted)
 
-    nodes_df, mix_df = build_ontology(codes_df, decay=decay)
+    nodes_df, mix_df = build_ontology(codes_df, decay=decay, subtree_suffix=subtree_suffix)
     closure_df = build_closure(nodes_df, mix_df)
 
     out_dir = Path(out_dir)
@@ -57,16 +62,23 @@ def run(tensorized_cohort_dir: Path, out_dir: Path, decay: float = 0.5) -> Path:
     closure_df.write_parquet(out_dir / CLOSURE_FILE)
 
     n_leaves = int(nodes_df["is_leaf"].sum())
+    n_subtree = (
+        0
+        if not subtree_suffix
+        else int(nodes_df.filter(pl.col("node").str.ends_with(f"//{subtree_suffix}")).height)
+    )
     logger.info(
-        "Wrote ontology to %s: %d nodes (%d leaves + %d ancestors), %d mix entries, "
-        "%d closure rows, decay=%g.",
+        "Wrote ontology to %s: %d nodes (%d leaves + %d ancestors, of which %d are dual-role "
+        "subtree nodes), %d mix entries, %d closure rows, decay=%g, subtree_suffix=%r.",
         out_dir,
         nodes_df.height,
         n_leaves,
         nodes_df.height - n_leaves,
+        n_subtree,
         mix_df.height,
         closure_df.height,
         decay,
+        subtree_suffix,
     )
     return out_dir
 
@@ -77,10 +89,12 @@ def main(cfg: DictConfig) -> None:
         raise ValueError("`tensorized_cohort_dir=` is required (pass $TENSORIZED_COHORT_DIR).")
     if not cfg.get("out_dir"):
         raise ValueError("`out_dir=` is required — the directory to write the artifacts into.")
+    suffix = cfg.get("subtree_suffix", "ANY")
     run(
         tensorized_cohort_dir=Path(cfg.tensorized_cohort_dir),
         out_dir=Path(cfg.out_dir),
         decay=float(cfg.get("decay", 0.5)),
+        subtree_suffix=None if suffix in (None, "", "null") else str(suffix),
     )
 
 

@@ -110,8 +110,10 @@ class Ontology:
         self,
         leaves: Iterable[str],
         declared_parents: Mapping[str, Sequence[str]] | None = None,
+        subtree_suffix: str | None = "ANY",
     ):
         self.leaves: set[str] = set(leaves)
+        self.subtree_suffix = subtree_suffix
         self._declared: dict[str, list[str]] = {
             k: list(v) for k, v in (declared_parents or {}).items()
         }
@@ -132,6 +134,22 @@ class Ontology:
             self.direct[name] = parents
             frontier.extend(parents)
 
+        # Dual-role names -- a real code that is also somebody's ancestor -- get a distinct
+        # subtree node, so "exactly this code" and "this code or any descendant" stay separate
+        # questions.  Written as a rewrite of the direct-parent map: every edge that pointed at
+        # the leaf now points at its subtree node, and the leaf itself gains an edge up to it.
+        self.subtree_of: dict[str, str] = {}
+        if subtree_suffix:
+            dual = {p for parents in self.direct.values() for p in parents if p in self.leaves}
+            self.subtree_of = {leaf: f"{leaf}{SEP}{subtree_suffix}" for leaf in dual}
+            rewritten: dict[str, set[str]] = {}
+            for name, parents in self.direct.items():
+                rewritten[name] = {self.subtree_of.get(p, p) for p in parents}
+            for leaf, sub in self.subtree_of.items():
+                rewritten[sub] = set(rewritten[leaf])
+                rewritten[leaf] = set(rewritten[leaf]) | {sub}
+            self.direct = rewritten
+
         self.nodes: set[str] = set(self.direct)
         self.ancestors: set[str] = self.nodes - self.leaves
 
@@ -141,13 +159,23 @@ class Ontology:
         >>> o = Ontology(["A//B//C"])
         >>> sorted(o.strict_ancestors("A//B//C"))
         ['A', 'A//B']
+
+        A declared chain closes transitively.  ``P`` is a real code, so what sits above ``X`` is
+        its *subtree node* ``P//ANY`` rather than the leaf ``P`` itself:
+
         >>> o2 = Ontology(["X", "P"], {"X": ["P"], "P": ["GRP//G"]})
         >>> sorted(o2.strict_ancestors("X"))
+        ['GRP', 'GRP//G', 'P//ANY']
+
+        With subtree nodes switched off the leaf is used directly:
+
+        >>> o2b = Ontology(["X", "P"], {"X": ["P"], "P": ["GRP//G"]}, subtree_suffix=None)
+        >>> sorted(o2b.strict_ancestors("X"))
         ['GRP', 'GRP//G', 'P']
 
         A declared cycle terminates and does not make a node its own ancestor:
 
-        >>> o3 = Ontology(["A", "B"], {"A": ["B"], "B": ["A"]})
+        >>> o3 = Ontology(["A", "B"], {"A": ["B"], "B": ["A"]}, subtree_suffix=None)
         >>> sorted(o3.strict_ancestors("A"))
         ['B']
         """
@@ -186,6 +214,12 @@ class Ontology:
         True
         >>> o.matches("A", "A//B//C")      # `A` is a pure ancestor node
         True
+
+        ``A//B`` is dual-role, so its subtree meaning lives under a separate name and covers
+        both the leaf itself and its descendants:
+
+        >>> o.matches("A//B//ANY", "A//B//C"), o.matches("A//B//ANY", "A//B")
+        (True, True)
         """
         if query in self.leaves:
             return event_code == query

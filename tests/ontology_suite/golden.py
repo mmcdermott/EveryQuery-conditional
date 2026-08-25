@@ -176,6 +176,13 @@ TRUTH_TABLE: list[Case] = [
     Case("S1-ancestor-rolls-up", 1, "PROC", 30.0, None, True, False, True,
          "CONTROL for the two cases above: PROC is a pure ancestor, so PROC//X//SUB does roll "
          "up. If this were False the fixture would pass by the closure simply being empty."),
+    Case("S1-dual-role-subtree-node", 1, "PROC//X//ANY", 30.0, None, True, False, True,
+         "PROC//X is dual-role -- a real code AND the prefix of PROC//X//SUB -- so its subtree "
+         "meaning lives under the minted node PROC//X//ANY, which PROC//X//SUB rolls up to. "
+         "This is the rung that would be missing if dual-role names were left purely exact."),
+    Case("S1-dual-role-subtree-node-d7", 1, "PROC//X//ANY", 7.0, None, False, False, True,
+         "Same node, but PROC//X//SUB lands exactly on the 7-day horizon, so the window rule "
+         "still applies to the minted node like any other."),
     Case("S1-readmission-outside", 1, "READMISSION", 7.0, None, False, False, True,
          "The only descendant (CHILD_A, 03-09) is outside the 7-day window."),
     Case("S1-readmission-inside-d30", 1, "READMISSION", 30.0, None, True, False, True,
@@ -227,6 +234,9 @@ TRUTH_TABLE: list[Case] = [
     Case("S3-declared-leaf-stays-narrow", 3, "MED//WARFARIN", 7.0, None, False, True, False,
          "MED//WARFARIN is a REAL leaf and no raw MED//WARFARIN event occurs. The event is "
          "MED//WARFARIN_SODIUM, which merely DECLARES it as a parent."),
+    Case("S3-declared-leaf-subtree-node", 3, "MED//WARFARIN//ANY", 7.0, None, True, True, True,
+         "MED//WARFARIN is dual-role by the OTHER route -- a real code named as another code's "
+         "declared parent -- so it too gets a subtree node, and WARFARIN_SODIUM rolls up to it."),
     Case("S3-two-hop-declared-ancestor", 3, "ATC//B01AA", 7.0, None, True, True, True,
          "TWO declared hops above the event: WARFARIN_SODIUM -> MED//WARFARIN -> ATC//B01AA. "
          "Losing the second hop is the transitive-closure defect."),

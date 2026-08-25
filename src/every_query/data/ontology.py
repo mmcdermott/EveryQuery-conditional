@@ -62,7 +62,9 @@ def string_ancestors(code: str) -> list[str]:
     return [SEP.join(parts[:i]) for i in range(len(parts) - 1, 0, -1)]
 
 
-def build_ontology(codes_df: pl.DataFrame, decay: float = 0.5) -> tuple[pl.DataFrame, pl.DataFrame]:
+def build_ontology(
+    codes_df: pl.DataFrame, decay: float = 0.5, subtree_suffix: str | None = "ANY"
+) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Build ``(nodes_df, mix_df)`` from a ``codes.parquet``-shaped frame.
 
     Args:
@@ -70,6 +72,11 @@ def build_ontology(codes_df: pl.DataFrame, decay: float = 0.5) -> tuple[pl.DataF
         decay: Per-level weight decay.  An ancestor ``d`` levels up contributes ``decay ** d``
             before row normalisation, so ``0.0`` disables mixing entirely and ``1.0`` weights
             every ancestor as much as the node itself.
+        subtree_suffix: Name suffix for the *subtree node* minted beside every name that is both
+            a real code and someone's ancestor (see the dual-role section in the body).  ``None``
+            skips minting them, leaving such names purely exact and their subtree meaning
+            unaskable.  Changing this changes ``V_ext``, so an ontology and the encoder sized
+            from it must be built with the same value.
 
     Returns:
         ``nodes_df`` ``(node, vocab_index, is_leaf)`` — leaves keep their original indices,
@@ -106,6 +113,36 @@ def build_ontology(codes_df: pl.DataFrame, decay: float = 0.5) -> tuple[pl.DataF
 
         >>> set(nodes["vocab_index"]) == set(mix["node_index"].unique())
         True
+
+        A **dual-role** name -- both a real code and the prefix of another code -- keeps its
+        exact meaning and gains a separate subtree node, so both questions stay askable:
+
+        >>> df = pl.DataFrame({
+        ...     "code": ["INF//220949", "INF//220949//value_lo", "INF//220949//value_hi"],
+        ...     "code/vocab_index": [1, 2, 3],
+        ... })
+        >>> nodes, mix = build_ontology(df)
+        >>> sorted(nodes.filter(~pl.col("is_leaf"))["node"].to_list())
+        ['INF', 'INF//220949//ANY']
+
+        ``INF//220949`` stays a leaf (it names 365k real events in the real cohort), while
+        ``INF//220949//ANY`` is the node that means "the drug, valued or not":
+
+        >>> closure = build_closure(nodes, mix)
+        >>> sorted(closure.filter(pl.col("node") == "INF//220949//ANY")["code"].to_list())
+        ['INF//220949', 'INF//220949//value_hi', 'INF//220949//value_lo']
+
+        Nothing rolls up to the leaf itself except the leaf, which is what keeps its ordinary
+        query exact:
+
+        >>> sorted(closure.filter(pl.col("node") == "INF//220949")["code"].to_list())
+        ['INF//220949']
+
+        With ``subtree_suffix=None`` the extra node is not minted at all:
+
+        >>> nodes2, _ = build_ontology(df, subtree_suffix=None)
+        >>> sorted(nodes2.filter(~pl.col("is_leaf"))["node"].to_list())
+        ['INF']
     """
     if not 0.0 <= decay <= 1.0:
         raise ValueError(f"decay must be in [0, 1], got {decay}")
@@ -114,47 +151,135 @@ def build_ontology(codes_df: pl.DataFrame, decay: float = 0.5) -> tuple[pl.DataF
     leaves = codes_df.select(pl.col("code"), pl.col("code/vocab_index").cast(pl.Int64).alias("vocab_index"))
     leaf_names = set(leaves["code"].to_list())
 
+    # Declared `parent_codes` edges, keyed by the code that declares them.
+    declared: dict[str, list[str]] = {}
+    if has_parents:
+        for row in codes_df.iter_rows(named=True):
+            code = row["code"]
+            pcs = row.get("parent_codes")
+            if pcs:
+                kept = [pc for pc in pcs if pc and pc != code]
+                if kept:
+                    declared[code] = kept
+
+    def direct_parents(name: str) -> list[str]:
+        """One hop up: the immediate ``//``-prefix parent, plus any declared groupers.
+
+        Both edge kinds cost exactly one hop, which is what reproduces the historical distance
+        scale — ``A//B//C`` reaches ``A//B`` at 1 and ``A`` at 2, and a declared grouper sits at
+        1 with its own prefixes at 2, 3, ...  Since ``decay ** dist`` sets the mix weights,
+        changing this scale would silently reweight every embedding.
+        """
+        out: list[str] = []
+        if SEP in name:
+            out.append(name.rsplit(SEP, 1)[0])
+        out.extend(declared.get(name, ()))
+        return out
+
+    def ancestors_with_distance(start: str) -> dict[str, int]:
+        """Every strict ancestor of ``start`` and its minimum hop count.
+
+        A breadth-first walk over the *union* of prefix and declared edges.  Walking both kinds
+        with one traversal is the whole point: the previous implementation followed a declared
+        edge exactly one hop and then only string prefixes, so a chain ``X -> P -> GRP//G``
+        stopped at ``P`` and ``GRP//G`` never became an ancestor of ``X`` — precisely the
+        multi-level DAG that ``parent_codes`` exists to express.
+
+        Note the walk passes *through* a leaf when a leaf is someone's declared parent.  That is
+        deliberate and is not in tension with :func:`build_closure` refusing to make that leaf
+        addressable as a subtree query: traversal and addressability are different questions.
+
+        ``parent_codes`` is caller-supplied data, so cycles are possible.  ``start`` is never
+        admitted to its own ancestor set, and a name already seen at an equal-or-shorter
+        distance is not re-expanded, which bounds the walk.
+        """
+        dist: dict[str, int] = {}
+        frontier = [(p, 1) for p in direct_parents(start)]
+        while frontier:
+            name, d = frontier.pop()
+            if name == start:
+                continue
+            if name in dist and dist[name] <= d:
+                continue
+            dist[name] = d
+            frontier.extend((p, d + 1) for p in direct_parents(name))
+        return dist
+
     node_ancestors: dict[str, dict[str, int]] = {}
     ancestor_names: set[str] = set()
-
-    for row in codes_df.iter_rows(named=True):
-        code = row["code"]
-        amap: dict[str, int] = {}
-        for dist, anc in enumerate(string_ancestors(code), start=1):
-            if anc != code:
-                amap[anc] = min(amap.get(anc, 10**9), dist)
-        if has_parents and row.get("parent_codes"):
-            for pc in row["parent_codes"]:
-                if not pc or pc == code:
-                    continue
-                # A declared grouper edge is one level up by definition, and the grouper's own
-                # name prefixes hang above it.
-                amap[pc] = min(amap.get(pc, 10**9), 1)
-                for d2, anc2 in enumerate(string_ancestors(pc), start=2):
-                    amap[anc2] = min(amap.get(anc2, 10**9), d2)
+    for code in leaves["code"].to_list():
+        amap = ancestors_with_distance(code)
         node_ancestors[code] = amap
         ancestor_names.update(a for a in amap if a not in leaf_names)
 
-    # Close the ancestor set to a fixed point.  `parent_codes` can introduce a grouper name whose
-    # own prefixes are new, and those prefixes can have prefixes; the upstream implementation ran
-    # exactly one extra pass and then re-widened the name set afterwards, which could hand a name
-    # an index but no mix row — an all-zero, permanently dead embedding.  Iterating instead makes
-    # "every indexed node has a mix row" true by construction rather than by luck.
+    # Every *indexed* node also needs its own mix row, or it embeds to the zero vector.  The walk
+    # above is already transitive, so one pass over the ancestor set normally suffices; the loop
+    # is kept so "every indexed node has a mix row" holds by construction rather than by luck.
     pending = sorted(ancestor_names)
     while pending:
         nxt: list[str] = []
         for anc in pending:
             if anc in node_ancestors:
                 continue
-            amap = {}
-            for dist, higher in enumerate(string_ancestors(anc), start=1):
-                if higher != anc:
-                    amap[higher] = dist
-                    if higher not in leaf_names and higher not in ancestor_names:
-                        nxt.append(higher)
+            amap = ancestors_with_distance(anc)
             node_ancestors[anc] = amap
+            nxt.extend(a for a in amap if a not in leaf_names and a not in ancestor_names)
         ancestor_names.update(nxt)
         pending = sorted(set(nxt))
+
+    # ---- Dual-role names get a distinct subtree node ----------------------------------------
+    #
+    # A name can be both a real code and something else's ancestor: `INFUSION_START//220949` is
+    # 365,723 unvalued infusion events *and* the prefix of ten `//value_[lo,hi)` variants.  One
+    # string cannot mean both "exactly this code" and "this code or any descendant" without one
+    # of the two meanings becoming unaskable, and the labeler has to pick one.
+    #
+    # So mint a second name.  The leaf keeps its exact meaning; a fresh ancestor node
+    # `<name>//<suffix>` means the subtree, and every reference to the leaf *as an ancestor* is
+    # rewritten to it.  Both rungs of the ladder stay addressable:
+    #
+    #     INFUSION_START                        all 635 infusion-start codes
+    #     INFUSION_START//220949//ANY           the drug, valued or not
+    #     INFUSION_START//220949                the 365,723 unvalued events
+    #     INFUSION_START//220949//value_[...]   one rate bin
+    #
+    # `subtree_suffix=None` disables this and leaves dual-role names purely exact -- the subtree
+    # meaning is then simply not expressible, which is the cheaper option when a cohort has no
+    # dual-role names to begin with.
+    if subtree_suffix:
+        # Both shapes of dual role are caught by asking which *leaves* turned up as an ancestor:
+        # `//`-prefix collisions and a declared `parent_codes` edge pointing at a real code.
+        dual_role = {a for amap in node_ancestors.values() for a in amap if a in leaf_names}
+        subtree_name = {leaf: f"{leaf}{SEP}{subtree_suffix}" for leaf in dual_role}
+
+        clashes = sorted(n for n in subtree_name.values() if n in leaf_names)
+        if clashes:
+            raise ValueError(
+                f"{len(clashes)} subtree node name(s) collide with real codes (e.g. {clashes[:3]}). "
+                f"Pass a different `subtree_suffix` than {subtree_suffix!r}."
+            )
+
+        # Rewrite every ancestor reference to a dual-role leaf into its subtree node.  Distances
+        # are preserved: the subtree node sits exactly where the leaf used to sit, so the
+        # `decay ** dist` mix weights are unchanged for every descendant.
+        def rewrite(amap: dict[str, int]) -> dict[str, int]:
+            out: dict[str, int] = {}
+            for name, dist in amap.items():
+                key = subtree_name.get(name, name)
+                out[key] = min(out.get(key, 10**9), dist)
+            return out
+
+        node_ancestors = {node: rewrite(amap) for node, amap in node_ancestors.items()}
+
+        for leaf, sub in subtree_name.items():
+            # The subtree node generalises the leaf, so it inherits the leaf's own ancestors...
+            node_ancestors[sub] = dict(node_ancestors[leaf])
+            # ...and sits one hop above the leaf itself, which is a member of its own subtree.
+            node_ancestors[leaf] = dict(node_ancestors[leaf]) | {sub: 1}
+
+    ancestor_names = (
+        set(node_ancestors) | {a for amap in node_ancestors.values() for a in amap}
+    ) - leaf_names
 
     # An ancestor name carrying one of the query grammar's separators could not be round-tripped
     # through a query string, so it must never become addressable.  Neither upstream fork could
@@ -215,10 +340,24 @@ def build_ontology(codes_df: pl.DataFrame, decay: float = 0.5) -> tuple[pl.DataF
 
 
 def build_closure(nodes_df: pl.DataFrame, mix_df: pl.DataFrame) -> pl.DataFrame:
-    """``(code, node)`` rows: every leaf paired with itself and each of its ancestor names.
+    """``(code, node)`` rows: every leaf paired with itself and each ancestor *node* above it.
 
     This is what lets an ancestor query be answered by the ordinary occurrence labeler — explode
     the event stream through it and "did any descendant of X occur" becomes "did X occur".
+
+    **Only non-leaf components survive, plus the self-pair.**  A name that is itself a real code
+    is never addressable as a subtree query — ``build_query_universe`` draws ancestor slots from
+    non-leaf nodes only — so emitting ``(A//B//C -> A//B)`` for a leaf ``A//B`` could not widen
+    anything the sampler would ask; it could only corrupt the ordinary leaf query ``A//B``,
+    silently changing its meaning from "this exact code occurred" to "this code **or any
+    descendant** occurred".  That flipped labels False -> True with no crash and no warning.
+
+    The self-pair must survive the filter: ``(code=A//B, node=A//B)`` is what makes a leaf query
+    answerable at all.  Dropping rows by ``component_index == node_index`` instead would break
+    every leaf query, so the two conditions are deliberately spelled out separately below.
+
+    ``mix_df`` is left alone.  Embedding *sharing* between ``A//B//C`` and ``A//B`` is desirable
+    and is not what was broken — only the labeling closure is narrowed here.
 
     Examples:
         >>> nodes = pl.DataFrame({
@@ -227,11 +366,32 @@ def build_closure(nodes_df: pl.DataFrame, mix_df: pl.DataFrame) -> pl.DataFrame:
         ...     "node_index": [1, 1, 2], "component_index": [1, 2, 2], "weight": [1.0, 0.5, 1.0]})
         >>> build_closure(nodes, mix).sort("node")["node"].to_list()
         ['A', 'A//B']
+
+        A leaf that prefixes another leaf keeps its exact meaning — ``A//B`` is a real code here,
+        so it is not emitted as a node above ``A//B//C``:
+
+        >>> nodes = pl.DataFrame({
+        ...     "node": ["A//B", "A//B//C", "A"], "vocab_index": [1, 2, 3],
+        ...     "is_leaf": [True, True, False]})
+        >>> mix = pl.DataFrame({
+        ...     "node_index": [1, 1, 2, 2, 2, 3],
+        ...     "component_index": [1, 3, 2, 1, 3, 3],
+        ...     "weight": [1.0, 0.5, 1.0, 0.5, 0.25, 1.0]})
+        >>> cl = build_closure(nodes, mix).sort("code", "node")
+        >>> list(zip(cl["code"], cl["node"]))
+        [('A//B', 'A'), ('A//B', 'A//B'), ('A//B//C', 'A'), ('A//B//C', 'A//B//C')]
     """
     index_to_name = dict(zip(nodes_df["vocab_index"], nodes_df["node"], strict=True))
     leaf_indices = set(nodes_df.filter(pl.col("is_leaf"))["vocab_index"].to_list())
 
-    rows = mix_df.filter(pl.col("node_index").is_in(list(leaf_indices)))
+    leaf_list = list(leaf_indices)
+    rows = mix_df.filter(
+        pl.col("node_index").is_in(leaf_list)
+        & (
+            (pl.col("component_index") == pl.col("node_index"))
+            | ~pl.col("component_index").is_in(leaf_list)
+        )
+    )
     return pl.DataFrame(
         {
             "code": [index_to_name[i] for i in rows["node_index"].to_list()],
