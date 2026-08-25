@@ -36,8 +36,6 @@ from pathlib import Path
 import polars as pl
 import torch
 
-from every_query.data import query_vocab
-
 logger = logging.getLogger(__name__)
 
 SEP = "//"
@@ -283,25 +281,6 @@ def build_ontology(
     ancestor_names = (
         set(node_ancestors) | {a for amap in node_ancestors.values() for a in amap}
     ) - leaf_names
-
-    # An ancestor name carrying one of the query grammar's separators could not be round-tripped
-    # through a query string, so it must never become addressable.  Neither upstream fork could
-    # hit this: no fork generated ancestor names at all.
-    reserved = {a for a in ancestor_names if query_vocab.has_reserved_chars(a)}
-    if reserved:
-        logger.warning(
-            "Dropping %d ancestor node(s) whose names contain a character the query grammar "
-            "reserves (%s): %s",
-            len(reserved),
-            "".join(sorted(query_vocab.RESERVED_CHARS)),
-            sorted(reserved)[:5],
-        )
-        ancestor_names -= reserved
-        for name in reserved:
-            node_ancestors.pop(name, None)
-        for amap in node_ancestors.values():
-            for name in reserved:
-                amap.pop(name, None)
 
     max_leaf = int(leaves["token_id"].max())
     anc_sorted = sorted(ancestor_names)

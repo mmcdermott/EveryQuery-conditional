@@ -4,7 +4,7 @@ Covered in pipeline order:
 
 1. DAG construction — prefix semantics, index layout (leaves untouched, ancestors appended),
    the "every indexed node has a mix row" invariant, decay, and the two hazards this port fixes
-   (reserved characters in ancestor names, unknown codes silently dropped by the closure join).
+   (unknown codes silently dropped by the closure join).
 2. Embedding wrapper — the mix arithmetic, gradient reaching ancestor rows, and the per-forward
    cache actually being a cache.
 3. Query addressing — ancestors becoming queryable, and the universe mixing that keeps the
@@ -100,12 +100,11 @@ def test_decay_controls_ancestor_weight():
     assert len(leaf_components(mix_half)) == 3
 
 
-def test_reserved_characters_are_kept_out_of_the_ancestor_pool():
-    """An ancestor whose name carries a grammar separator could never be queried back."""
-    nodes, _ = build_ontology(_codes(["A&B//C", "PLAIN//X"]))
-    ancestors = nodes.filter(~pl.col("is_observed_code"))["node_name"].to_list()
-    assert "A&B" not in ancestors
-    assert "PLAIN" in ancestors
+def test_separator_like_characters_do_not_drop_ancestors():
+    """Queries are bare codes, so ``|``, ``>`` and ``&`` in a name are just characters."""
+    nodes, _ = build_ontology(_codes(["A&B//C", "X|Y//Z", "P>Q//R", "PLAIN//X"]))
+    ancestors = set(nodes.filter(~pl.col("is_observed_code"))["node_name"].to_list())
+    assert {"A&B", "X|Y", "P>Q", "PLAIN"} <= ancestors
 
 
 def test_parenthesised_ancestor_names_are_not_dropped():

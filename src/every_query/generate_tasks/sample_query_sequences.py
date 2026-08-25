@@ -57,7 +57,6 @@ import polars as pl
 from meds import DataSchema
 from omegaconf import DictConfig
 
-from every_query.data import query_vocab
 from every_query.data.schema import QuerySeqSchema, TaskQuerySchema
 from every_query.data.seq_dataset import EOS_CODE, EVENT_BOUND_DURATION_SENTINEL
 from every_query.generate_tasks.sample_tasks import (
@@ -394,11 +393,7 @@ def build_query_universe(
 
     nodes = load_nodes(ontology_dir)
     ancestors = sorted(nodes.filter(~pl.col("is_observed_code"))["node_name"].to_list())
-    ancestors = [
-        a
-        for a in ancestors
-        if not a.startswith(_TAUTOLOGICAL_ANCESTOR_PREFIXES) and not query_vocab.has_reserved_chars(a)
-    ]
+    ancestors = [a for a in ancestors if not a.startswith(_TAUTOLOGICAL_ANCESTOR_PREFIXES)]
     if not ancestors:
         logger.warning(
             "ancestor_fraction=%g but the ontology at %s contributes no usable ancestor nodes; "
@@ -471,7 +466,7 @@ def resolve_bound_events(cfg: DictConfig, query_codes: Sequence[str]) -> list[st
     # requiring a literal list would make the documented codes unusable from the CLI.
     configured = read_query_codes(raw)
 
-    unknown = query_vocab.unknown_codes(configured, set(query_codes))
+    unknown = sorted(set(configured) - set(query_codes))
     if unknown:
         raise ValueError(
             f"{len(unknown)} bound_events code(s) are not in the query vocabulary: {unknown}.  "

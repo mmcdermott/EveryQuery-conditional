@@ -85,7 +85,6 @@ import numpy as np
 import polars as pl
 from omegaconf import DictConfig
 
-from every_query.data import query_vocab
 from every_query.data.schema import QuerySeqSchema, TaskQuerySchema
 from every_query.data.seq_dataset import EVENT_BOUND_DURATION_SENTINEL
 from every_query.generate_tasks.sample_query_sequences import (
@@ -605,13 +604,12 @@ def validate_spec_codes(specs: list[SequenceSpec], query_codes: list[str]) -> No
     labeling and model loading this check precedes.  Hand-written designed specs are exactly where
     a typo'd or wrong-vocabulary MEDS code enters.
     """
-    # Check the codes each query *mentions*: an aggregate expression is not itself a code, but
-    # every component of it must be one.  Bare codes pass through unchanged.  Boundary events are
-    # checked too — a boundary the encoder never saw cannot define a window, and an unchecked one
-    # would surface as a KeyError deep inside collate, after the labeling and model load.
+    # Boundary events are checked too — a boundary the encoder never saw cannot define a window,
+    # and an unchecked one would surface as a KeyError deep inside collate, after the labeling
+    # and model load.
     mentioned = [q for s in specs for q in s.queries]
     mentioned += [b for s in specs for b in s.bounds if b is not None]
-    unknown = query_vocab.unknown_codes(mentioned, set(query_codes))
+    unknown = sorted(set(mentioned) - set(query_codes))
     if unknown:
         shown = ", ".join(repr(c) for c in unknown[:10])
         more = f" (and {len(unknown) - 10} more)" if len(unknown) > 10 else ""

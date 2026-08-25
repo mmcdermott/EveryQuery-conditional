@@ -29,7 +29,7 @@ BASE = datetime(2024, 6, 1)
 N_WORLDS = 120
 
 #: Code-name atoms chosen so `//`-prefix collisions are common: `A//B` is both a code in its own
-#: right and a prefix of `A//B//C`.  `RESERVED_CHARS` (`|>&`) are avoided.
+#: right and a prefix of `A//B//C`. 
 LEAF_POOL = [
     "A",
     "A//B",
