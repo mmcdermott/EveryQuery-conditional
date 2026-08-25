@@ -187,12 +187,12 @@ class ConditionalQueryModel(torch.nn.Module):
         decoder_ffn_mult: Decoder feed-forward width as a multiple of ``hidden_size``.
         max_queries: Maximum query blocks per sequence (sizes the block-position embedding).
         ontology_dir: Directory of ontology artifacts (``nodes``/``mix``/``closure`` parquets).
-            When set, ModernBERT's ``tok_embeddings`` is wrapped so every code embedding becomes
-            the ancestor-mixed average ``(A @ W)[ids]`` — see
-            :mod:`every_query.model.ontology_embedding`.  The encoder must be sized to the
-            ontology's ``V_ext``, which ``train.py`` does automatically.  Because the wrapper
-            substitutes the shared table, both the query codes and an event-bounded query's
-            boundary codes inherit the structure too.
+            When set, the encoder's input-embedding module is replaced — through
+            ``set_input_embeddings`` — so every code embedding becomes the ancestor-mixed
+            average ``(A @ W)[ids]``; see :mod:`every_query.model.ontology_embedding`.  The
+            encoder must be sized to the ontology's ``V_ext``, which ``train.py`` does
+            automatically.  Because the wrapper substitutes the shared table, both the query
+            codes and an event-bounded query's boundary codes inherit the structure too.
         use_rope_time: Drive the encoder's rotary positions from ``batch.time_pos_ids``
             (elapsed integer hours) instead of token index.  Pair with
             ``ConditionalQueryPytorchDataset(strip_delta_tokens=True)``, which removes the
@@ -384,7 +384,7 @@ class ConditionalQueryModel(torch.nn.Module):
         A seam: a feature that changes *what is being asked about* replaces this, while the
         block layout, the mask and the answer readout stride stay untouched.
         """
-        return self.HF_model.embeddings.tok_embeddings(batch.q_codes)
+        return self.HF_model.get_input_embeddings()(batch.q_codes)
 
     def _query_duration_embeds(self, batch) -> torch.Tensor:
         """``(B, L, H)`` content of each query block's **duration** slot.
@@ -408,7 +408,7 @@ class ConditionalQueryModel(torch.nn.Module):
         if q_bounds is None:
             return dur_emb
 
-        bound_emb = self.HF_model.embeddings.tok_embeddings(q_bounds).to(dur_emb.dtype)
+        bound_emb = self.HF_model.get_input_embeddings()(q_bounds).to(dur_emb.dtype)
         bound_emb = bound_emb + self.bound_marker.to(dur_emb.dtype)
         return torch.where((q_bounds > 0).unsqueeze(-1), bound_emb, dur_emb)
 

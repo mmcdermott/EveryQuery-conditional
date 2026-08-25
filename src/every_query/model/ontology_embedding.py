@@ -1,6 +1,6 @@
 """Embedding table whose rows are ontology-mixed averages of a raw table's rows.
 
-Substituted for ModernBERT's ``tok_embeddings``, this makes every lookup return
+Installed as the encoder's input-embedding module, this makes every lookup return
 
     ``(A @ W)[ids]``
 
@@ -11,7 +11,8 @@ stream — still receives gradient through every descendant that does.
 
 Substituting the module rather than changing call sites is what makes the feature compose: the
 patient encoder, the query code slot and an event-bounded query's boundary code all reach the
-same attribute, so each one inherits ontology structure for free.
+same module through Hugging Face's ``get_input_embeddings()``, so each one inherits ontology
+structure for free.
 """
 
 import logging
@@ -74,7 +75,13 @@ class OntologyEmbedding(torch.nn.Module):
 
     @property
     def weight(self) -> torch.Tensor:
-        """The raw table's weight — kept for code that introspects ``.weight`` (e.g. tying)."""
+        """The underlying **raw** table ``W`` — kept for code that introspects ``.weight``.
+
+        Deliberately not the effective table: every lookup returns a row of
+        ``mixed_weight() == A @ W``.  Reach for ``.weight`` to touch the learned parameter
+        itself (an optimizer parameter group, a gradient check); call :meth:`mixed_weight`
+        for the values the model actually sees.
+        """
         return self.tok.weight
 
     @property
@@ -88,8 +95,8 @@ class OntologyEmbedding(torch.nn.Module):
     def clear_cache(self, *_args) -> None:
         """Drop the cached mixed table.  Called once per forward by the owning model's pre-hook.
 
-        Also drops the autograd graph the cached tensor holds, so a cached product never
-        survives into a second backward pass.
+        Also drops the autograd graph the cached tensor holds, so a cached product never survives into a
+        second backward pass.
         """
         self._mixed = None
 
@@ -107,24 +114,36 @@ class OntologyEmbedding(torch.nn.Module):
 
 
 def wrap_tok_embeddings(model: torch.nn.Module, mix: torch.Tensor) -> OntologyEmbedding:
-    """Replace ``model.HF_model.embeddings.tok_embeddings`` with an :class:`OntologyEmbedding`.
+    """Install an :class:`OntologyEmbedding` as the encoder's input-embedding module.
+
+    Goes through Hugging Face's public ``get_input_embeddings`` / ``set_input_embeddings``
+    contract rather than reaching into ModernBERT's ``embeddings.tok_embeddings``, so the
+    shared-table claim is stated in terms every consumer can ask about: the patient encoder,
+    the query code slot and an event-bounded query's boundary code all read whatever module
+    is installed here.
 
     Registers a forward pre-hook on ``model`` that clears the per-forward cache, and returns the
-    wrapper.  Raises if the raw table is smaller than the mix matrix — that means the encoder was
-    sized from the cohort vocabulary ``V`` rather than the ontology's extended ``V_ext``, and
-    every ancestor index would be out of range.
+    wrapper.  One outer forward contains every patient, query-code and boundary-code lookup, so
+    clearing once before it is what lets them share a single mixed table.
+
+    Raises unless the raw table has exactly ``V_ext`` rows: the sparse product
+    ``(V_ext, V_ext) @ (V_model, H)`` is defined only when ``V_model == V_ext``.  Too few rows
+    means the encoder was sized from the cohort vocabulary ``V``, leaving every ancestor index
+    out of range; too many means it was never sized from the data at all — ModernBERT's own
+    50k default, say — and ``torch.sparse.mm`` would fail later and less legibly.
     """
-    raw = model.HF_model.embeddings.tok_embeddings
+    encoder = model.HF_model
+    raw = encoder.get_input_embeddings()
     v_ext = mix.shape[0]
-    if raw.num_embeddings < v_ext:
+    if raw.num_embeddings != v_ext:
         raise ValueError(
-            f"Embedding table has {raw.num_embeddings} rows but the ontology needs {v_ext} "
-            f"(V_ext).  Size the encoder from the ontology: train.py does this automatically "
-            f"when `lightning_module.model.ontology_dir` is set."
+            f"Embedding table has {raw.num_embeddings} rows but the ontology needs exactly "
+            f"{v_ext} (V_ext).  Size the encoder from the ontology: train.py does this "
+            f"automatically when `lightning_module.model.ontology_dir` is set."
         )
 
     wrapper = OntologyEmbedding(raw, mix)
-    model.HF_model.embeddings.tok_embeddings = wrapper
+    encoder.set_input_embeddings(wrapper)
     model.register_forward_pre_hook(wrapper.clear_cache)
     logger.info("Ontology embeddings active: %d nodes, %d mix entries.", v_ext, mix._nnz())
     return wrapper

@@ -87,7 +87,7 @@ def test_parent_codes_prefixes_are_closed_to_a_fixed_point():
 
 
 def test_decay_controls_ancestor_weight():
-    """decay=0 is the structure-without-mixing control: each node is only itself."""
+    """Decay=0 is the structure-without-mixing control: each node is only itself."""
     _, mix_half = build_ontology(_codes(["A//B//C"]), decay=0.5)
     _, mix_zero = build_ontology(_codes(["A//B//C"]), decay=0.0)
 
@@ -190,12 +190,26 @@ def test_cache_is_reused_within_a_forward_and_cleared_between():
     assert emb.mixed_weight() is not first, "clear_cache must drop the cached product"
 
 
+def _identity_mix(v_ext: int) -> torch.Tensor:
+    return torch.sparse_coo_tensor(torch.tensor([[0], [0]]), torch.tensor([1.0]), (v_ext, v_ext)).coalesce()
+
+
 def test_wrap_rejects_an_undersized_table():
     """Sizing the encoder to V rather than V_ext puts every ancestor index out of range."""
     model = _tiny_model(vocab_size=4)
-    mix = torch.sparse_coo_tensor(torch.tensor([[0], [0]]), torch.tensor([1.0]), (99, 99)).coalesce()
     with pytest.raises(ValueError, match="V_ext"):
-        wrap_tok_embeddings(model, mix)
+        wrap_tok_embeddings(model, _identity_mix(16))
+
+
+def test_wrap_rejects_an_oversized_table():
+    """``(V_ext, V_ext) @ (V_model, H)`` needs equality, not just enough rows.
+
+    An encoder left at ModernBERT's own 50k vocabulary satisfies "big enough" while being just
+    as wrong as an undersized one — and would fail deep inside ``torch.sparse.mm`` instead.
+    """
+    model = _tiny_model(vocab_size=99)
+    with pytest.raises(ValueError, match="V_ext"):
+        wrap_tok_embeddings(model, _identity_mix(16))
 
 
 # ── 3. query addressing ─────────────────────────────────────────────────
@@ -310,10 +324,10 @@ def test_ontology_dir_is_recorded_in_hparams(tmp_path):
 
 
 def test_wrapper_is_installed_on_the_shared_table(tmp_path):
-    """It must sit on tok_embeddings, which is what the query slots also read."""
+    """It must be the encoder's input embedding, which is what the query slots also read."""
     _write_ontology(tmp_path, _codes([f"G//{i}" for i in range(1, 15)]))
     model = _tiny_model(vocab_size=extended_vocab_size(tmp_path), ontology_dir=str(tmp_path))
-    assert isinstance(model.HF_model.embeddings.tok_embeddings, OntologyEmbedding)
+    assert isinstance(model.HF_model.get_input_embeddings(), OntologyEmbedding)
 
 
 def test_ontology_model_runs_and_trains(tmp_path):
@@ -323,7 +337,7 @@ def test_ontology_model_runs_and_trains(tmp_path):
     loss, out = model(_batch())
     assert loss.isfinite() and out.answer_logits.shape == (1, 2)
     loss.backward()
-    raw = model.HF_model.embeddings.tok_embeddings.tok
+    raw = model.HF_model.get_input_embeddings().tok
     assert raw.weight.grad is not None and torch.isfinite(raw.weight.grad).all()
 
 

@@ -108,7 +108,7 @@ def test_bound_marker_separates_bounding_from_being_asked_about():
     ids = torch.tensor([[3, 0], [0, 5]])
     with torch.no_grad():
         bounded = model._query_duration_embeds(_batch(q_bound_codes=ids))
-        plain = model.HF_model.embeddings.tok_embeddings(ids)
+        plain = model.HF_model.get_input_embeddings()(ids)
     assert (bounded[0, 0] - plain[0, 0]).abs().max().item() > LIVE
 
 
