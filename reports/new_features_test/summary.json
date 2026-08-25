@@ -10,17 +10,17 @@
         "position": 0,
         "n": 238740,
         "prevalence": 0.12438636173242858,
-        "pooled_auroc": 0.6938905248603463
+        "pooled_auroc": 0.7206914054948175
       }
     ],
     "by_category": {
       "dur": {
         "n_total": 20,
         "n_scored": 20,
-        "macro_auroc": 0.8147705616659439,
-        "median_auroc": 0.8627285366262027,
-        "min_auroc": 0.5974668673718101,
-        "max_auroc": 0.953562963241657,
+        "macro_auroc": 0.825906082825241,
+        "median_auroc": 0.8591770515769884,
+        "min_auroc": 0.6247923942078772,
+        "max_auroc": 0.9575257505202198,
         "n_above_0.5": 20,
         "sign_test_p": 1.9073486328125e-06,
         "n_ci_excludes_0.5": 20,
@@ -29,22 +29,22 @@
       "evt": {
         "n_total": 20,
         "n_scored": 20,
-        "macro_auroc": 0.7676340989224546,
-        "median_auroc": 0.869774463058423,
-        "min_auroc": 0.3468479170182944,
-        "max_auroc": 0.9640963323022537,
-        "n_above_0.5": 17,
-        "sign_test_p": 0.0025768280029296875,
+        "macro_auroc": 0.769654514029583,
+        "median_auroc": 0.8727675019181078,
+        "min_auroc": 0.35514755523919256,
+        "max_auroc": 0.9664899101487701,
+        "n_above_0.5": 16,
+        "sign_test_p": 0.01181793212890625,
         "n_ci_excludes_0.5": 17,
         "mean_prevalence": 0.07627544609198292
       },
       "anc": {
         "n_total": 20,
         "n_scored": 20,
-        "macro_auroc": 0.7759645675111112,
-        "median_auroc": 0.8834002105345087,
-        "min_auroc": 0.46066183963529095,
-        "max_auroc": 0.954745841732143,
+        "macro_auroc": 0.7875631251251877,
+        "median_auroc": 0.8937525830902154,
+        "min_auroc": 0.45813730222579774,
+        "max_auroc": 0.9695346030962471,
         "n_above_0.5": 18,
         "sign_test_p": 0.0004024505615234375,
         "n_ci_excludes_0.5": 18,
@@ -63,29 +63,29 @@
         "position": 0,
         "n": 238740,
         "prevalence": 0.15009633911368014,
-        "pooled_auroc": 0.6588492690078485
+        "pooled_auroc": 0.6866300627822375
       },
       {
         "position": 1,
         "n": 238740,
         "prevalence": 0.1663608946971601,
-        "pooled_auroc": 0.6955614438080493
+        "pooled_auroc": 0.7113863492466032
       },
       {
         "position": 2,
         "n": 238740,
         "prevalence": 0.12438636173242858,
-        "pooled_auroc": 0.7031954524259175
+        "pooled_auroc": 0.729031922749084
       }
     ],
     "by_category": {
       "dur": {
         "n_total": 20,
         "n_scored": 20,
-        "macro_auroc": 0.8205394076302645,
-        "median_auroc": 0.8674710909250307,
-        "min_auroc": 0.6084036823538231,
-        "max_auroc": 0.9475705567477719,
+        "macro_auroc": 0.8310597440532907,
+        "median_auroc": 0.8579084169285268,
+        "min_auroc": 0.6240452940231285,
+        "max_auroc": 0.9563642373310374,
         "n_above_0.5": 20,
         "sign_test_p": 1.9073486328125e-06,
         "n_ci_excludes_0.5": 20,
@@ -94,10 +94,10 @@
       "evt": {
         "n_total": 20,
         "n_scored": 20,
-        "macro_auroc": 0.7772978926599594,
-        "median_auroc": 0.8751779370129376,
-        "min_auroc": 0.36358662151154686,
-        "max_auroc": 0.9646627247157518,
+        "macro_auroc": 0.7780892076371453,
+        "median_auroc": 0.873574199673931,
+        "min_auroc": 0.38290979005070774,
+        "max_auroc": 0.9686485140528446,
         "n_above_0.5": 17,
         "sign_test_p": 0.0025768280029296875,
         "n_ci_excludes_0.5": 17,
@@ -106,13 +106,13 @@
       "anc": {
         "n_total": 20,
         "n_scored": 20,
-        "macro_auroc": 0.782549209043248,
-        "median_auroc": 0.8920358516142912,
-        "min_auroc": 0.45677017967283456,
-        "max_auroc": 0.9534964152513064,
+        "macro_auroc": 0.7948194078861482,
+        "median_auroc": 0.9036184985080559,
+        "min_auroc": 0.46460123357468497,
+        "max_auroc": 0.9581808919340817,
         "n_above_0.5": 18,
         "sign_test_p": 0.0004024505615234375,
-        "n_ci_excludes_0.5": 18,
+        "n_ci_excludes_0.5": 17,
         "mean_prevalence": 0.17106056798190497
       }
     }
