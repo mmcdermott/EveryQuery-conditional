@@ -21,7 +21,13 @@ import hydra
 import polars as pl
 from omegaconf import DictConfig
 
-from every_query.data.ontology import CLOSURE_FILE, MIX_FILE, NODES_FILE, build_closure, build_ontology
+from every_query.data.ontology import (
+    EMBEDDING_MIX_FILE,
+    EVENT_TO_QUERY_NODES_FILE,
+    ONTOLOGY_VOCAB_FILE,
+    build_closure,
+    build_ontology,
+)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -57,15 +63,15 @@ def run(
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    nodes_df.write_parquet(out_dir / NODES_FILE)
-    mix_df.write_parquet(out_dir / MIX_FILE)
-    closure_df.write_parquet(out_dir / CLOSURE_FILE)
+    nodes_df.write_parquet(out_dir / ONTOLOGY_VOCAB_FILE)
+    mix_df.write_parquet(out_dir / EMBEDDING_MIX_FILE)
+    closure_df.write_parquet(out_dir / EVENT_TO_QUERY_NODES_FILE)
 
-    n_leaves = int(nodes_df["is_leaf"].sum())
+    n_leaves = int(nodes_df["is_observed_code"].sum())
     n_subtree = (
         0
         if not subtree_suffix
-        else int(nodes_df.filter(pl.col("node").str.ends_with(f"//{subtree_suffix}")).height)
+        else int(nodes_df.filter(pl.col("node_name").str.ends_with(f"//{subtree_suffix}")).height)
     )
     logger.info(
         "Wrote ontology to %s: %d nodes (%d leaves + %d ancestors, of which %d are dual-role "

@@ -2,9 +2,9 @@
 #
 # Build the ontology artifacts for the tensorized cohort.
 #
-#   nodes.parquet    (node, vocab_index, is_leaf)  — the extended vocabulary, V_ext
-#   mix.parquet      (node_index, component_index, weight)  — the embedding mix, unnormalised
-#   closure.parquet  (code, node)  — what the labeller explodes events through
+#   ontology_vocab.parquet         (node_name, token_id, is_observed_code)  — the extended vocabulary, V_ext
+#   embedding_mix.parquet          (target_token_id, component_token_id, unnormalized_weight)  — the embedding mix
+#   event_to_query_nodes.parquet   (event_code, query_node)  — what the labeller explodes events through
 #
 # Reads only $TENSORIZED_COHORT_DIR/metadata/codes.parquet; the cohort is never written.
 #

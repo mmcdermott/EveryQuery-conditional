@@ -393,7 +393,7 @@ def build_query_universe(
     from every_query.data.ontology import load_nodes
 
     nodes = load_nodes(ontology_dir)
-    ancestors = sorted(nodes.filter(~pl.col("is_leaf"))["node"].to_list())
+    ancestors = sorted(nodes.filter(~pl.col("is_observed_code"))["node_name"].to_list())
     ancestors = [
         a
         for a in ancestors

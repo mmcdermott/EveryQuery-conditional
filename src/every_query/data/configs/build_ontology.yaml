@@ -9,7 +9,7 @@ defaults:
 
 # Tensorized cohort root; metadata/codes.parquet is read from here (read-only).
 tensorized_cohort_dir: ???
-# Directory to write nodes.parquet / mix.parquet / closure.parquet into.
+# Directory to write ontology_vocab.parquet / embedding_mix.parquet / event_to_query_nodes.parquet into.
 out_dir: ???
 
 # Per-level weight decay for the embedding mix: an ancestor `d` levels up contributes

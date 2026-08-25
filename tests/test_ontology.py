@@ -18,9 +18,9 @@ import pytest
 import torch
 
 from every_query.data.ontology import (
-    CLOSURE_FILE,
-    MIX_FILE,
-    NODES_FILE,
+    EMBEDDING_MIX_FILE,
+    EVENT_TO_QUERY_NODES_FILE,
+    ONTOLOGY_VOCAB_FILE,
     build_closure,
     build_ontology,
     explode_events_to_closure,
@@ -44,9 +44,9 @@ def _codes(codes, parents=None) -> pl.DataFrame:
 def _write_ontology(tmp_path, codes_df, decay: float = 0.5):
     nodes, mix = build_ontology(codes_df, decay=decay)
     closure = build_closure(nodes, mix)
-    nodes.write_parquet(tmp_path / NODES_FILE)
-    mix.write_parquet(tmp_path / MIX_FILE)
-    closure.write_parquet(tmp_path / CLOSURE_FILE)
+    nodes.write_parquet(tmp_path / ONTOLOGY_VOCAB_FILE)
+    mix.write_parquet(tmp_path / EMBEDDING_MIX_FILE)
+    closure.write_parquet(tmp_path / EVENT_TO_QUERY_NODES_FILE)
     return nodes, mix, closure
 
 
@@ -62,27 +62,27 @@ def test_single_slash_is_not_a_separator():
 def test_leaf_indices_are_preserved():
     """An ontology must be droppable onto an existing cohort without renumbering it."""
     nodes, _ = build_ontology(_codes(["A//B//C", "A//B//D", "E"]))
-    leaves = nodes.filter(pl.col("is_leaf")).sort("vocab_index")
-    assert leaves["node"].to_list() == ["A//B//C", "A//B//D", "E"]
-    assert leaves["vocab_index"].to_list() == [1, 2, 3]
+    leaves = nodes.filter(pl.col("is_observed_code")).sort("token_id")
+    assert leaves["node_name"].to_list() == ["A//B//C", "A//B//D", "E"]
+    assert leaves["token_id"].to_list() == [1, 2, 3]
 
 
 def test_ancestors_are_appended_above_the_highest_leaf():
     nodes, _ = build_ontology(_codes(["A//B//C", "E"]))
-    max_leaf = nodes.filter(pl.col("is_leaf"))["vocab_index"].max()
-    assert (nodes.filter(~pl.col("is_leaf"))["vocab_index"] > max_leaf).all()
+    max_leaf = nodes.filter(pl.col("is_observed_code"))["token_id"].max()
+    assert (nodes.filter(~pl.col("is_observed_code"))["token_id"] > max_leaf).all()
 
 
 def test_every_indexed_node_has_a_mix_row():
     """Otherwise the node embeds to the zero vector, permanently and silently."""
     nodes, mix = build_ontology(_codes(["A//B//C", "X//Y"], parents=[["G//H//I"], None]))
-    assert set(nodes["vocab_index"].to_list()) == set(mix["node_index"].unique().to_list())
+    assert set(nodes["token_id"].to_list()) == set(mix["target_token_id"].unique().to_list())
 
 
 def test_parent_codes_prefixes_are_closed_to_a_fixed_point():
     """A grouper's own prefixes, and their prefixes, must all become nodes."""
     nodes, _ = build_ontology(_codes(["LEAF"], parents=[["G//H//I"]]))
-    ancestors = set(nodes.filter(~pl.col("is_leaf"))["node"].to_list())
+    ancestors = set(nodes.filter(~pl.col("is_observed_code"))["node_name"].to_list())
     assert {"G//H//I", "G//H", "G"} <= ancestors
 
 
@@ -92,8 +92,8 @@ def test_decay_controls_ancestor_weight():
     _, mix_zero = build_ontology(_codes(["A//B//C"]), decay=0.0)
 
     def leaf_components(mix):
-        rows = mix.filter((pl.col("node_index") == 1) & (pl.col("weight") > 0))
-        return set(rows["component_index"].to_list())
+        rows = mix.filter((pl.col("target_token_id") == 1) & (pl.col("unnormalized_weight") > 0))
+        return set(rows["component_token_id"].to_list())
 
     assert leaf_components(mix_zero) == {1}, "no ancestor may carry weight at decay=0"
     # At decay=0.5 the leaf mixes itself plus both prefixes (A//B, A).
@@ -103,7 +103,7 @@ def test_decay_controls_ancestor_weight():
 def test_reserved_characters_are_kept_out_of_the_ancestor_pool():
     """An ancestor whose name carries a grammar separator could never be queried back."""
     nodes, _ = build_ontology(_codes(["A&B//C", "PLAIN//X"]))
-    ancestors = nodes.filter(~pl.col("is_leaf"))["node"].to_list()
+    ancestors = nodes.filter(~pl.col("is_observed_code"))["node_name"].to_list()
     assert "A&B" not in ancestors
     assert "PLAIN" in ancestors
 
@@ -117,7 +117,7 @@ def test_parenthesised_ancestor_names_are_not_dropped():
     """
     codes = ["ICU//STAY (MICU)//LOS", "LAB//GLUCOSE//value_[4.0,6.0)"]
     nodes, _ = build_ontology(_codes(codes))
-    ancestors = set(nodes.filter(~pl.col("is_leaf"))["node"].to_list())
+    ancestors = set(nodes.filter(~pl.col("is_observed_code"))["node_name"].to_list())
     assert "ICU//STAY (MICU)" in ancestors
     assert "LAB//GLUCOSE//value_[4.0,6.0)" not in ancestors, "that one is a leaf, not an ancestor"
     assert "LAB//GLUCOSE" in ancestors
@@ -133,7 +133,7 @@ def test_mix_rows_are_normalised(tmp_path):
 
 def test_closure_pairs_each_leaf_with_itself_and_its_ancestors(tmp_path):
     _, _, closure = _write_ontology(tmp_path, _codes(["A//B//C"]))
-    pairs = set(zip(closure["code"].to_list(), closure["node"].to_list(), strict=True))
+    pairs = set(zip(closure["event_code"].to_list(), closure["query_node"].to_list(), strict=True))
     assert ("A//B//C", "A//B//C") in pairs
     assert ("A//B//C", "A//B") in pairs
     assert ("A//B//C", "A") in pairs
@@ -146,7 +146,7 @@ def test_explode_keeps_events_the_ontology_does_not_know():
     events = pl.DataFrame(
         {"subject_id": [1, 1], "time": [datetime(2024, 1, 1)] * 2, "code": ["A//B", "ORPHAN"]}
     )
-    closure = pl.DataFrame({"code": ["A//B", "A//B"], "node": ["A//B", "A"]})
+    closure = pl.DataFrame({"event_code": ["A//B", "A//B"], "query_node": ["A//B", "A"]})
     out = explode_events_to_closure(events, closure)
     assert "ORPHAN" in out["code"].to_list(), "an unknown code must survive, not vanish"
     assert set(out["code"].to_list()) == {"A//B", "A", "ORPHAN"}
@@ -229,7 +229,7 @@ def test_a_name_that_is_both_code_and_prefix_keeps_its_leaf_index(tmp_path):
 
 def test_extended_vocab_size_covers_every_node(tmp_path):
     nodes, _, _ = _write_ontology(tmp_path, _codes(["A//B//C", "D//E"]))
-    assert extended_vocab_size(tmp_path) == int(nodes["vocab_index"].max()) + 1
+    assert extended_vocab_size(tmp_path) == int(nodes["token_id"].max()) + 1
 
 
 def test_query_universe_is_untouched_when_the_feature_is_off():

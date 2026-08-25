@@ -48,11 +48,11 @@ def ontology_dir(eq_preprocessed_dataset: Path, tmp_path_factory) -> Path:
 
 @pytest.mark.slow
 def test_build_ontology_writes_its_three_artifacts(ontology_dir: Path):
-    for name in ("nodes.parquet", "mix.parquet", "closure.parquet"):
+    for name in ("ontology_vocab.parquet", "embedding_mix.parquet", "event_to_query_nodes.parquet"):
         assert (ontology_dir / name).is_file(), f"{name} missing"
-    nodes = pl.read_parquet(ontology_dir / "nodes.parquet")
+    nodes = pl.read_parquet(ontology_dir / "ontology_vocab.parquet")
     assert nodes.height > 0
-    assert set(nodes.columns) == {"node", "vocab_index", "is_leaf"}
+    assert set(nodes.columns) == {"node_name", "token_id", "is_observed_code"}
 
 
 @pytest.fixture(scope="module")
@@ -103,8 +103,8 @@ def test_generation_emits_every_query_form(featured_tasks_dir: Path, ontology_di
     )
 
     # Ancestor queries name a node that is not a leaf of the cohort vocabulary.
-    nodes = pl.read_parquet(ontology_dir / "nodes.parquet")
-    ancestors = set(nodes.filter(~pl.col("is_leaf"))["node"].to_list())
+    nodes = pl.read_parquet(ontology_dir / "ontology_vocab.parquet")
+    ancestors = set(nodes.filter(~pl.col("is_observed_code"))["node_name"].to_list())
     queries = df["queries"].explode().to_list()
     assert ancestors, "the fixture ontology produced no ancestor nodes"
     assert any(q in ancestors for q in queries), "no ancestor query was generated"

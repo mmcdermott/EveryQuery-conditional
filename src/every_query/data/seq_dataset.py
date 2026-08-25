@@ -183,7 +183,7 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
                 (elapsed integer hours per surviving token) for rotary position encoding.
                 Pair with ``ConditionalQueryModel(use_rope_time=True)``; see
                 :mod:`every_query.data.rope_time`.
-            ontology_dir: When set, ancestor node names from the ontology's ``nodes.parquet``
+            ontology_dir: When set, ancestor node names from the ontology's ``ontology_vocab.parquet``
                 are added to the query vocabulary, so a query may name a whole class rather
                 than one leaf code.  Must be the same directory the model was built with —
                 the indices have to agree, or a query would address the wrong embedding row.

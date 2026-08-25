@@ -15,9 +15,9 @@ import pytest
 import torch
 
 from every_query.data.ontology import (
-    CLOSURE_FILE,
-    MIX_FILE,
-    NODES_FILE,
+    EMBEDDING_MIX_FILE,
+    EVENT_TO_QUERY_NODES_FILE,
+    ONTOLOGY_VOCAB_FILE,
     build_closure,
     build_ontology,
     load_mix_matrix,
@@ -58,9 +58,9 @@ def _write_ontology(out, codes: list[str]):
     out.mkdir(parents=True, exist_ok=True)
     frame = pl.DataFrame({"code": codes, "code/vocab_index": list(range(1, len(codes) + 1))})
     nodes, mix = build_ontology(frame)
-    nodes.write_parquet(out / NODES_FILE)
-    mix.write_parquet(out / MIX_FILE)
-    build_closure(nodes, mix).write_parquet(out / CLOSURE_FILE)
+    nodes.write_parquet(out / ONTOLOGY_VOCAB_FILE)
+    mix.write_parquet(out / EMBEDDING_MIX_FILE)
+    build_closure(nodes, mix).write_parquet(out / EVENT_TO_QUERY_NODES_FILE)
     return out
 
 
@@ -251,7 +251,7 @@ def test_the_model_pre_hook_clears_the_cache_once_per_forward(tmp_path):
     stand-in: the registration itself is half of what could break.
     """
     _write_ontology(tmp_path, [f"G//{i}" for i in range(1, 15)])
-    v_ext = int(pl.read_parquet(tmp_path / NODES_FILE)["vocab_index"].max()) + 1
+    v_ext = int(pl.read_parquet(tmp_path / ONTOLOGY_VOCAB_FILE)["token_id"].max()) + 1
     model = _tiny_model(vocab_size=v_ext, ontology_dir=str(tmp_path))
     table = model.HF_model.get_input_embeddings()
 
@@ -286,7 +286,7 @@ def test_two_backward_passes_do_not_reuse_one_graph():
 
 def test_wrap_installs_through_get_and_set_input_embeddings(tmp_path):
     _write_ontology(tmp_path, [f"G//{i}" for i in range(1, 15)])
-    v_ext = int(pl.read_parquet(tmp_path / NODES_FILE)["vocab_index"].max()) + 1
+    v_ext = int(pl.read_parquet(tmp_path / ONTOLOGY_VOCAB_FILE)["token_id"].max()) + 1
     model = _tiny_model(vocab_size=v_ext)
 
     wrapper = wrap_tok_embeddings(model, load_mix_matrix(tmp_path))
@@ -311,7 +311,7 @@ def test_patient_query_and_boundary_codes_share_one_mixed_table(tmp_path):
     vector whichever slot it is read through.
     """
     _write_ontology(tmp_path, [f"G//{i}" for i in range(1, 15)])
-    v_ext = int(pl.read_parquet(tmp_path / NODES_FILE)["vocab_index"].max()) + 1
+    v_ext = int(pl.read_parquet(tmp_path / ONTOLOGY_VOCAB_FILE)["token_id"].max()) + 1
     model = _tiny_model(vocab_size=v_ext, ontology_dir=str(tmp_path))
 
     table = model.HF_model.get_input_embeddings()
@@ -333,16 +333,12 @@ def test_the_answer_head_does_not_tie_to_the_raw_table(tmp_path):
     Stated as a test so the assumption is checked rather than remembered.
     """
     _write_ontology(tmp_path, [f"G//{i}" for i in range(1, 15)])
-    v_ext = int(pl.read_parquet(tmp_path / NODES_FILE)["vocab_index"].max()) + 1
+    v_ext = int(pl.read_parquet(tmp_path / ONTOLOGY_VOCAB_FILE)["token_id"].max()) + 1
     model = _tiny_model(vocab_size=v_ext, ontology_dir=str(tmp_path))
 
     table = model.HF_model.get_input_embeddings()
     raw_w = table.weight  # the underlying learned parameter
-    tied = [
-        name
-        for name, p in model.named_parameters()
-        if p is raw_w and not name.startswith("HF_model.")
-    ]
+    tied = [name for name, p in model.named_parameters() if p is raw_w and not name.startswith("HF_model.")]
     assert not tied, f"a non-encoder parameter is tied to the raw embedding table: {tied}"
 
 
@@ -352,7 +348,7 @@ def test_the_answer_head_does_not_tie_to_the_raw_table(tmp_path):
 def test_checkpoint_round_trip_preserves_predictions(tmp_path):
     """The wrapper changes state-dict keys, so a silent key mismatch is the failure mode."""
     _write_ontology(tmp_path, [f"G//{i}" for i in range(1, 15)])
-    v_ext = int(pl.read_parquet(tmp_path / NODES_FILE)["vocab_index"].max()) + 1
+    v_ext = int(pl.read_parquet(tmp_path / ONTOLOGY_VOCAB_FILE)["token_id"].max()) + 1
     model = _tiny_model(vocab_size=v_ext, ontology_dir=str(tmp_path))
 
     batch = _batch()
@@ -377,7 +373,7 @@ def test_the_sparse_mix_is_not_persisted_but_is_rebuilt(tmp_path):
     persisted nor rebuilt, the model would load with no mixing at all and look fine.
     """
     _write_ontology(tmp_path, [f"G//{i}" for i in range(1, 15)])
-    v_ext = int(pl.read_parquet(tmp_path / NODES_FILE)["vocab_index"].max()) + 1
+    v_ext = int(pl.read_parquet(tmp_path / ONTOLOGY_VOCAB_FILE)["token_id"].max()) + 1
     model = _tiny_model(vocab_size=v_ext, ontology_dir=str(tmp_path))
 
     keys = [k for k in model.state_dict() if k.endswith(".mix")]
@@ -398,9 +394,7 @@ def test_mixing_survives_dtype_changes(dtype, tmp_path):
     out = emb(torch.tensor([2]))
     assert out.dtype == dtype
     expected = 0.5 * 2.0 + 0.5 * 1.0
-    torch.testing.assert_close(
-        out.float(), torch.full((1, h), expected), rtol=1e-2, atol=1e-2
-    )
+    torch.testing.assert_close(out.float(), torch.full((1, h), expected), rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no GPU")
@@ -422,7 +416,7 @@ def test_cpu_and_gpu_agree_within_tolerance():
 def test_lookup_is_deterministic_across_repeated_calls(tmp_path):
     """Single-device determinism is the precondition for any DDP-equality claim."""
     _write_ontology(tmp_path, [f"G//{i}" for i in range(1, 15)])
-    v_ext = int(pl.read_parquet(tmp_path / NODES_FILE)["vocab_index"].max()) + 1
+    v_ext = int(pl.read_parquet(tmp_path / ONTOLOGY_VOCAB_FILE)["token_id"].max()) + 1
     model = _tiny_model(vocab_size=v_ext, ontology_dir=str(tmp_path))
     batch = _batch()
 

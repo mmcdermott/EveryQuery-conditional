@@ -593,7 +593,7 @@ def addressable_codes(query_codes: Sequence[str], ontology_dir: str | Path | Non
 
     from every_query.data.ontology import load_nodes
 
-    nodes = load_nodes(ontology_dir)["node"].to_list()
+    nodes = load_nodes(ontology_dir)["node_name"].to_list()
     return list(dict.fromkeys([*query_codes, *nodes]))
 
 

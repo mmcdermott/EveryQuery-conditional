@@ -44,9 +44,9 @@ from hydra import compose, initialize_config_dir
 from hydra.errors import ConfigCompositionException
 
 from every_query.data.ontology import (
-    CLOSURE_FILE,
-    MIX_FILE,
-    NODES_FILE,
+    EMBEDDING_MIX_FILE,
+    EVENT_TO_QUERY_NODES_FILE,
+    ONTOLOGY_VOCAB_FILE,
     build_closure,
     build_ontology,
 )
@@ -141,9 +141,9 @@ def _write_ontology(out: Path, codes: list[str]) -> Path:
     out.mkdir(parents=True, exist_ok=True)
     frame = pl.DataFrame({"code": codes, "code/vocab_index": list(range(1, len(codes) + 1))})
     nodes, mix = build_ontology(frame)
-    nodes.write_parquet(out / NODES_FILE)
-    mix.write_parquet(out / MIX_FILE)
-    build_closure(nodes, mix).write_parquet(out / CLOSURE_FILE)
+    nodes.write_parquet(out / ONTOLOGY_VOCAB_FILE)
+    mix.write_parquet(out / EMBEDDING_MIX_FILE)
+    build_closure(nodes, mix).write_parquet(out / EVENT_TO_QUERY_NODES_FILE)
     return out
 
 

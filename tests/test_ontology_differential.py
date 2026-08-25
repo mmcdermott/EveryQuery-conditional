@@ -87,9 +87,7 @@ class World:
                     Event(sid, BASE + timedelta(days=rng.randint(0, 10)), rng.choice(emitters))
                 )
             if rng.random() < 0.8:  # most, not all, records have an explicit end
-                self.events.append(
-                    Event(sid, BASE + timedelta(days=rng.randint(0, 12)), "TIMELINE//END")
-                )
+                self.events.append(Event(sid, BASE + timedelta(days=rng.randint(0, 12)), "TIMELINE//END"))
 
         self.nodes = sorted(self.onto.nodes)
 
@@ -123,8 +121,7 @@ def _describe(world: World, row: tuple, got: bool, want: bool) -> str:
         f"seed          : {world.seed}",
         f"leaves        : {world.leaves}",
         f"declared      : {world.declared}",
-        f"query         : node={q!r} "
-        + (f"duration={dur}" if bound is None else f"bound={bound!r}"),
+        f"query         : node={q!r} " + (f"duration={dur}" if bound is None else f"bound={bound!r}"),
         f"subject       : {sid}   prediction_time={t:%Y-%m-%d}",
         f"production    : {got}",
         f"oracle        : {want}",
@@ -166,7 +163,7 @@ def test_production_agrees_with_oracle(seed: int):
 
     # The two implementations must first agree on WHAT the vocabulary is; otherwise a label
     # comparison is meaningless.
-    prod_nodes = set(_nodes_df["node"].to_list())
+    prod_nodes = set(_nodes_df["node_name"].to_list())
     assert prod_nodes == set(world.nodes), (
         f"seed {seed}: node sets disagree.\n"
         f"  only in production: {sorted(prod_nodes - set(world.nodes))}\n"
@@ -197,7 +194,7 @@ def test_ontology_off_matches_identity_ontology():
 
     for seed in range(30):
         world = World(seed)
-        identity = pl.DataFrame({"code": world.leaves, "node": world.leaves})
+        identity = pl.DataFrame({"event_code": world.leaves, "query_node": world.leaves})
         rows = [r for r in world.queries(20) if r[2] in world.onto.leaves]
         if not rows:
             continue

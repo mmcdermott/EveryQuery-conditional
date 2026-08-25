@@ -15,10 +15,13 @@ carry an explicit ``parent_codes`` column.  This module turns that structure int
 
 Three artifacts are written by ``EQ_build_ontology`` into one directory:
 
-- ``nodes.parquet``   ``(node, vocab_index, is_leaf)`` — the extended vocabulary; ``V_ext``.
-- ``mix.parquet``     ``(node_index, component_index, weight)`` — unnormalised COO entries.
-- ``closure.parquet`` ``(code, node)`` — every leaf paired with itself and each ancestor NAME,
-  used to explode an event stream so ancestor queries can be labelled by ordinary occurrence.
+- ``ontology_vocab.parquet``  ``(node_name, token_id, is_observed_code)`` — the extended vocabulary;
+  ``V_ext``.  ``is_observed_code`` means "can appear directly in the event stream".
+- ``embedding_mix.parquet``  ``(target_token_id, component_token_id, unnormalized_weight)`` — COO
+  entries of ``A`` before row normalisation.
+- ``event_to_query_nodes.parquet``  ``(event_code, query_node)`` — every observed code paired with
+  itself and each query node it satisfies, used to explode an event stream so ancestor queries can
+  be labelled by ordinary occurrence.
 
 The upstream experiment's own verdict is worth stating plainly, because it bears on whether to
 turn this on: the **embedding** effect on leaf tasks did not replicate (a seed-2 run reversed it,
@@ -39,9 +42,9 @@ logger = logging.getLogger(__name__)
 
 SEP = "//"
 
-NODES_FILE = "nodes.parquet"
-MIX_FILE = "mix.parquet"
-CLOSURE_FILE = "closure.parquet"
+ONTOLOGY_VOCAB_FILE = "ontology_vocab.parquet"
+EMBEDDING_MIX_FILE = "embedding_mix.parquet"
+EVENT_TO_QUERY_NODES_FILE = "event_to_query_nodes.parquet"
 
 
 def string_ancestors(code: str) -> list[str]:
@@ -79,9 +82,9 @@ def build_ontology(
             from it must be built with the same value.
 
     Returns:
-        ``nodes_df`` ``(node, vocab_index, is_leaf)`` — leaves keep their original indices,
+        ``nodes_df`` ``(node_name, token_id, is_observed_code)`` — leaves keep their original indices,
         ancestors get fresh ones from ``max_leaf_index + 1`` upward, sorted by name — and
-        ``mix_df`` ``(node_index, component_index, weight)``, unnormalised, with a
+        ``mix_df`` ``(target_token_id, component_token_id, unnormalized_weight)``, unnormalised, with a
         weight-1 self-loop for every node.
 
     Examples:
@@ -91,27 +94,27 @@ def build_ontology(
         ...     "parent_codes": [["G/x"], None, None],
         ... })
         >>> nodes, mix = build_ontology(df)
-        >>> sorted(nodes.filter(~pl.col("is_leaf"))["node"].to_list())
+        >>> sorted(nodes.filter(~pl.col("is_observed_code"))["node_name"].to_list())
         ['A', 'A//B', 'G/x']
 
         Leaf indices are untouched, so an ontology can be dropped onto an existing cohort:
 
-        >>> nodes.filter(pl.col("is_leaf")).sort("vocab_index")["vocab_index"].to_list()
+        >>> nodes.filter(pl.col("is_observed_code")).sort("token_id")["token_id"].to_list()
         [1, 2, 3]
 
         ``A//B//C`` mixes itself (1.0), ``A//B`` (0.5), ``A`` (0.25) and its declared parent
         ``G/x`` (0.5, a grouper edge counts as distance 1):
 
-        >>> m = {r["component_index"]: r["weight"]
-        ...      for r in mix.filter(pl.col("node_index") == 1).iter_rows(named=True)}
-        >>> idx = dict(zip(nodes["node"], nodes["vocab_index"]))
+        >>> m = {r["component_token_id"]: r["unnormalized_weight"]
+        ...      for r in mix.filter(pl.col("target_token_id") == 1).iter_rows(named=True)}
+        >>> idx = dict(zip(nodes["node_name"], nodes["token_id"]))
         >>> m[idx["A//B//C"]], m[idx["A//B"]], m[idx["A"]], m[idx["G/x"]]
         (1.0, 0.5, 0.25, 0.5)
 
         Every node reachable in the index has a mix row, so no node can end up with an
         all-zero embedding:
 
-        >>> set(nodes["vocab_index"]) == set(mix["node_index"].unique())
+        >>> set(nodes["token_id"]) == set(mix["target_token_id"].unique())
         True
 
         A **dual-role** name -- both a real code and the prefix of another code -- keeps its
@@ -122,33 +125,33 @@ def build_ontology(
         ...     "code/vocab_index": [1, 2, 3],
         ... })
         >>> nodes, mix = build_ontology(df)
-        >>> sorted(nodes.filter(~pl.col("is_leaf"))["node"].to_list())
+        >>> sorted(nodes.filter(~pl.col("is_observed_code"))["node_name"].to_list())
         ['INF', 'INF//220949//ANY']
 
         ``INF//220949`` stays a leaf (it names 365k real events in the real cohort), while
         ``INF//220949//ANY`` is the node that means "the drug, valued or not":
 
         >>> closure = build_closure(nodes, mix)
-        >>> sorted(closure.filter(pl.col("node") == "INF//220949//ANY")["code"].to_list())
+        >>> sorted(closure.filter(pl.col("query_node") == "INF//220949//ANY")["event_code"].to_list())
         ['INF//220949', 'INF//220949//value_hi', 'INF//220949//value_lo']
 
         Nothing rolls up to the leaf itself except the leaf, which is what keeps its ordinary
         query exact:
 
-        >>> sorted(closure.filter(pl.col("node") == "INF//220949")["code"].to_list())
+        >>> sorted(closure.filter(pl.col("query_node") == "INF//220949")["event_code"].to_list())
         ['INF//220949']
 
         With ``subtree_suffix=None`` the extra node is not minted at all:
 
         >>> nodes2, _ = build_ontology(df, subtree_suffix=None)
-        >>> sorted(nodes2.filter(~pl.col("is_leaf"))["node"].to_list())
+        >>> sorted(nodes2.filter(~pl.col("is_observed_code"))["node_name"].to_list())
         ['INF']
     """
     if not 0.0 <= decay <= 1.0:
         raise ValueError(f"decay must be in [0, 1], got {decay}")
 
     has_parents = "parent_codes" in codes_df.columns
-    leaves = codes_df.select(pl.col("code"), pl.col("code/vocab_index").cast(pl.Int64).alias("vocab_index"))
+    leaves = codes_df.select(pl.col("code"), pl.col("code/vocab_index").cast(pl.Int64).alias("token_id"))
     leaf_names = set(leaves["code"].to_list())
 
     # Declared `parent_codes` edges, keyed by the code that declares them.
@@ -300,12 +303,10 @@ def build_ontology(
             for name in reserved:
                 amap.pop(name, None)
 
-    max_leaf = int(leaves["vocab_index"].max())
+    max_leaf = int(leaves["token_id"].max())
     anc_sorted = sorted(ancestor_names)
     anc_index = {a: max_leaf + 1 + i for i, a in enumerate(anc_sorted)}
-    name_to_index = (
-        dict(zip(leaves["code"].to_list(), leaves["vocab_index"].to_list(), strict=True)) | anc_index
-    )
+    name_to_index = dict(zip(leaves["code"].to_list(), leaves["token_id"].to_list(), strict=True)) | anc_index
 
     assert set(ancestor_names) <= node_ancestors.keys(), (
         "every indexed ancestor must have a mix row; otherwise it embeds to the zero vector"
@@ -313,34 +314,34 @@ def build_ontology(
 
     nodes_df = pl.concat(
         [
-            leaves.with_columns(pl.lit(True).alias("is_leaf")).rename({"code": "node"}),
+            leaves.with_columns(pl.lit(True).alias("is_observed_code")).rename({"code": "node_name"}),
             pl.DataFrame(
                 {
-                    "node": anc_sorted,
-                    "vocab_index": [anc_index[a] for a in anc_sorted],
-                    "is_leaf": [False] * len(anc_sorted),
+                    "node_name": anc_sorted,
+                    "token_id": [anc_index[a] for a in anc_sorted],
+                    "is_observed_code": [False] * len(anc_sorted),
                 }
             ),
         ],
         how="vertical_relaxed",
     )
 
-    mix_rows: dict[str, list] = {"node_index": [], "component_index": [], "weight": []}
+    mix_rows: dict[str, list] = {"target_token_id": [], "component_token_id": [], "unnormalized_weight": []}
     for node, amap in node_ancestors.items():
         ni = name_to_index[node]
-        mix_rows["node_index"].append(ni)
-        mix_rows["component_index"].append(ni)
-        mix_rows["weight"].append(1.0)
+        mix_rows["target_token_id"].append(ni)
+        mix_rows["component_token_id"].append(ni)
+        mix_rows["unnormalized_weight"].append(1.0)
         for anc, dist in amap.items():
-            mix_rows["node_index"].append(ni)
-            mix_rows["component_index"].append(name_to_index[anc])
-            mix_rows["weight"].append(decay**dist)
+            mix_rows["target_token_id"].append(ni)
+            mix_rows["component_token_id"].append(name_to_index[anc])
+            mix_rows["unnormalized_weight"].append(decay**dist)
 
     return nodes_df, pl.DataFrame(mix_rows)
 
 
 def build_closure(nodes_df: pl.DataFrame, mix_df: pl.DataFrame) -> pl.DataFrame:
-    """``(code, node)`` rows: every leaf paired with itself and each ancestor *node* above it.
+    """``(event_code, query_node)`` rows: every leaf paired with itself and each ancestor *node* above it.
 
     This is what lets an ancestor query be answered by the ordinary occurrence labeler — explode
     the event stream through it and "did any descendant of X occur" becomes "did X occur".
@@ -352,8 +353,8 @@ def build_closure(nodes_df: pl.DataFrame, mix_df: pl.DataFrame) -> pl.DataFrame:
     silently changing its meaning from "this exact code occurred" to "this code **or any
     descendant** occurred".  That flipped labels False -> True with no crash and no warning.
 
-    The self-pair must survive the filter: ``(code=A//B, node=A//B)`` is what makes a leaf query
-    answerable at all.  Dropping rows by ``component_index == node_index`` instead would break
+    The self-pair must survive the filter: ``(event_code=A//B, query_node=A//B)`` is what makes a leaf query
+    answerable at all.  Dropping rows by ``component_token_id == target_token_id`` instead would break
     every leaf query, so the two conditions are deliberately spelled out separately below.
 
     ``mix_df`` is left alone.  Embedding *sharing* between ``A//B//C`` and ``A//B`` is desirable
@@ -361,53 +362,54 @@ def build_closure(nodes_df: pl.DataFrame, mix_df: pl.DataFrame) -> pl.DataFrame:
 
     Examples:
         >>> nodes = pl.DataFrame({
-        ...     "node": ["A//B", "A"], "vocab_index": [1, 2], "is_leaf": [True, False]})
+        ...     "node_name": ["A//B", "A"], "token_id": [1, 2], "is_observed_code": [True, False]})
         >>> mix = pl.DataFrame({
-        ...     "node_index": [1, 1, 2], "component_index": [1, 2, 2], "weight": [1.0, 0.5, 1.0]})
-        >>> build_closure(nodes, mix).sort("node")["node"].to_list()
+        ...     "target_token_id": [1, 1, 2], "component_token_id": [1, 2, 2],
+        ...     "unnormalized_weight": [1.0, 0.5, 1.0]})
+        >>> build_closure(nodes, mix).sort("query_node")["query_node"].to_list()
         ['A', 'A//B']
 
         A leaf that prefixes another leaf keeps its exact meaning — ``A//B`` is a real code here,
         so it is not emitted as a node above ``A//B//C``:
 
         >>> nodes = pl.DataFrame({
-        ...     "node": ["A//B", "A//B//C", "A"], "vocab_index": [1, 2, 3],
-        ...     "is_leaf": [True, True, False]})
+        ...     "node_name": ["A//B", "A//B//C", "A"], "token_id": [1, 2, 3],
+        ...     "is_observed_code": [True, True, False]})
         >>> mix = pl.DataFrame({
-        ...     "node_index": [1, 1, 2, 2, 2, 3],
-        ...     "component_index": [1, 3, 2, 1, 3, 3],
-        ...     "weight": [1.0, 0.5, 1.0, 0.5, 0.25, 1.0]})
-        >>> cl = build_closure(nodes, mix).sort("code", "node")
-        >>> list(zip(cl["code"], cl["node"]))
+        ...     "target_token_id": [1, 1, 2, 2, 2, 3],
+        ...     "component_token_id": [1, 3, 2, 1, 3, 3],
+        ...     "unnormalized_weight": [1.0, 0.5, 1.0, 0.5, 0.25, 1.0]})
+        >>> cl = build_closure(nodes, mix).sort("event_code", "query_node")
+        >>> list(zip(cl["event_code"], cl["query_node"]))
         [('A//B', 'A'), ('A//B', 'A//B'), ('A//B//C', 'A'), ('A//B//C', 'A//B//C')]
     """
-    index_to_name = dict(zip(nodes_df["vocab_index"], nodes_df["node"], strict=True))
-    leaf_indices = set(nodes_df.filter(pl.col("is_leaf"))["vocab_index"].to_list())
+    index_to_name = dict(zip(nodes_df["token_id"], nodes_df["node_name"], strict=True))
+    leaf_indices = set(nodes_df.filter(pl.col("is_observed_code"))["token_id"].to_list())
 
     leaf_list = list(leaf_indices)
     rows = mix_df.filter(
-        pl.col("node_index").is_in(leaf_list)
+        pl.col("target_token_id").is_in(leaf_list)
         & (
-            (pl.col("component_index") == pl.col("node_index"))
-            | ~pl.col("component_index").is_in(leaf_list)
+            (pl.col("component_token_id") == pl.col("target_token_id"))
+            | ~pl.col("component_token_id").is_in(leaf_list)
         )
     )
     return pl.DataFrame(
         {
-            "code": [index_to_name[i] for i in rows["node_index"].to_list()],
-            "node": [index_to_name[i] for i in rows["component_index"].to_list()],
+            "event_code": [index_to_name[i] for i in rows["target_token_id"].to_list()],
+            "query_node": [index_to_name[i] for i in rows["component_token_id"].to_list()],
         }
     )
 
 
 def load_nodes(ontology_dir: str | Path) -> pl.DataFrame:
-    """Read ``nodes.parquet`` — the extended vocabulary."""
-    return pl.read_parquet(Path(ontology_dir) / NODES_FILE)
+    """Read ``ontology_vocab.parquet`` — the extended vocabulary."""
+    return pl.read_parquet(Path(ontology_dir) / ONTOLOGY_VOCAB_FILE)
 
 
 def extended_vocab_size(ontology_dir: str | Path) -> int:
     """``V_ext``: one past the highest node index, i.e. the embedding table's required height."""
-    return int(load_nodes(ontology_dir)["vocab_index"].max()) + 1
+    return int(load_nodes(ontology_dir)["token_id"].max()) + 1
 
 
 def extend_code_map(code_to_index: dict[str, int], ontology_dir: str | Path) -> dict[str, int]:
@@ -419,14 +421,15 @@ def extend_code_map(code_to_index: dict[str, int], ontology_dir: str | Path) -> 
     Examples:
         >>> import tempfile, polars as pl
         >>> with tempfile.TemporaryDirectory() as d:
-        ...     _ = pl.DataFrame({"node": ["A//B", "A"], "vocab_index": [1, 7],
-        ...                       "is_leaf": [True, False]}).write_parquet(Path(d) / NODES_FILE)
+        ...     nodes = pl.DataFrame({"node_name": ["A//B", "A"], "token_id": [1, 7],
+        ...                           "is_observed_code": [True, False]})
+        ...     _ = nodes.write_parquet(Path(d) / ONTOLOGY_VOCAB_FILE)
         ...     extend_code_map({"A//B": 1}, d)
         {'A//B': 1, 'A': 7}
     """
     extended = dict(code_to_index)
     nodes = load_nodes(ontology_dir)
-    for node, idx in zip(nodes["node"], nodes["vocab_index"], strict=True):
+    for node, idx in zip(nodes["node_name"], nodes["token_id"], strict=True):
         extended.setdefault(node, int(idx))
     return extended
 
@@ -434,11 +437,13 @@ def extend_code_map(code_to_index: dict[str, int], ontology_dir: str | Path) -> 
 def load_mix_matrix(ontology_dir: str | Path, normalize: bool = True) -> torch.Tensor:
     """Load the sparse ``(V_ext, V_ext)`` embedding-mix matrix; rows sum to 1 when normalised."""
     ontology_dir = Path(ontology_dir)
-    mix = pl.read_parquet(ontology_dir / MIX_FILE)
+    mix = pl.read_parquet(ontology_dir / EMBEDDING_MIX_FILE)
     v_ext = extended_vocab_size(ontology_dir)
 
-    idx = torch.tensor([mix["node_index"].to_list(), mix["component_index"].to_list()], dtype=torch.long)
-    w = torch.tensor(mix["weight"].to_list(), dtype=torch.float32)
+    idx = torch.tensor(
+        [mix["target_token_id"].to_list(), mix["component_token_id"].to_list()], dtype=torch.long
+    )
+    w = torch.tensor(mix["unnormalized_weight"].to_list(), dtype=torch.float32)
     A = torch.sparse_coo_tensor(idx, w, size=(v_ext, v_ext)).coalesce()  # noqa: N806 — `A` is the mix matrix throughout the docs
 
     if normalize:
@@ -450,8 +455,8 @@ def load_mix_matrix(ontology_dir: str | Path, normalize: bool = True) -> torch.T
 
 
 def load_closure_map(ontology_dir: str | Path) -> pl.DataFrame:
-    """Read ``closure.parquet`` — ``(code, node)`` rows for event explosion."""
-    return pl.read_parquet(Path(ontology_dir) / CLOSURE_FILE)
+    """Read ``event_to_query_nodes.parquet`` — ``(event_code, query_node)`` rows for event explosion."""
+    return pl.read_parquet(Path(ontology_dir) / EVENT_TO_QUERY_NODES_FILE)
 
 
 def explode_events_to_closure(events_df: pl.DataFrame, closure_df: pl.DataFrame) -> pl.DataFrame:
@@ -465,7 +470,7 @@ def explode_events_to_closure(events_df: pl.DataFrame, closure_df: pl.DataFrame)
     Examples:
         >>> from datetime import datetime
         >>> ev = pl.DataFrame({"subject_id": [1], "time": [datetime(2024, 1, 1)], "code": ["A//B"]})
-        >>> cl = pl.DataFrame({"code": ["A//B", "A//B"], "node": ["A//B", "A"]})
+        >>> cl = pl.DataFrame({"event_code": ["A//B", "A//B"], "query_node": ["A//B", "A"]})
         >>> sorted(explode_events_to_closure(ev, cl)["code"].to_list())
         ['A', 'A//B']
 
@@ -476,7 +481,7 @@ def explode_events_to_closure(events_df: pl.DataFrame, closure_df: pl.DataFrame)
         >>> sorted(explode_events_to_closure(ev2, cl)["code"].to_list())
         ['A', 'A//B', 'UNKNOWN']
     """
-    known = set(closure_df["code"].to_list())
+    known = set(closure_df["event_code"].to_list())
     present = set(events_df["code"].to_list())
     missing = present - known
     if missing:
@@ -488,9 +493,9 @@ def explode_events_to_closure(events_df: pl.DataFrame, closure_df: pl.DataFrame)
         )
 
     exploded = (
-        events_df.join(closure_df, on="code", how="inner")
+        events_df.join(closure_df, left_on="code", right_on="event_code", how="inner")
         .drop("code")
-        .rename({"node": "code"})
+        .rename({"query_node": "code"})
         .select(events_df.columns)
     )
     if not missing:
