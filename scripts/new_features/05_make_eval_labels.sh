@@ -48,7 +48,7 @@ STATUS=0
 echo "elapsed: $((SECONDS - START))s   exit=$STATUS"
 echo
 echo "--- summary ---"
-grep -E 'Ontology|contexts|Wrote|complete|never fires|degenerate' "$LOG" | tail -15 || true
+grep -E 'Ontology|contexts|Wrote|complete|Event bounds:' "$LOG" | grep -v 'never fires' | tail -15 || true
 echo
 echo "--- errors ---"
 grep -E 'Error|Traceback|CRITICAL' "$LOG" | head -20 || true

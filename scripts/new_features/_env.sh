@@ -31,8 +31,12 @@ export NF_LOG_DIR="${NF_ROOT}/logs"
 mkdir -p "$NF_ROOT" "$NF_LOG_DIR" "$NF_PRED_DIR" "$NF_METRICS_DIR"
 
 # --- W&B --------------------------------------------------------------------------------
+# env.sh exports WANDB_MODE=offline and an EMPTY WANDB_ENTITY.  Both have to be overridden
+# unconditionally, not with `:-` defaults: `${WANDB_MODE:-online}` keeps env.sh's "offline"
+# (it is set, just not to what we want), and train.py raises on an empty entity.
 export WANDB_PROJECT="EQ-conditional-new-features-test"
-export WANDB_MODE="${WANDB_MODE:-online}"
+export WANDB_MODE="online"
+export WANDB_ENTITY="${NF_WANDB_ENTITY:-gregkondas9-columbia-university}"
 
 # --- Interpreter / import path -----------------------------------------------------------
 EQ_VENV="${EQ_VENV:-/home/gkondas/EveryQuery-conditional/.venv}"

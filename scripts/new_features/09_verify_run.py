@@ -13,6 +13,7 @@ so this checks the run three ways:
 Usage: 09_verify_run.py <run_dir>
 """
 
+import dataclasses
 import os
 import sys
 from pathlib import Path
@@ -96,10 +97,13 @@ def main() -> int:
         tp = batch.time_pos_ids
         check("batch: time_pos_ids shape == code shape",
               tuple(tp.shape) == tuple(batch.code.shape), f"{tuple(tp.shape)} vs {tuple(batch.code.shape)}")
-        row = tp[0]
-        check("batch: time_pos_ids nondecreasing and start at 0",
+        # Rows are left-packed and zero-padded on the right, so check only real tokens.
+        keep = batch.code[0] != 0
+        row = tp[0][keep]
+        check("batch: time_pos_ids nondecreasing over real tokens, starting at 0",
               bool((row[1:] >= row[:-1]).all()) and int(row[0]) == 0,
-              f"first={int(row[0])} max={int(tp.max())} (elapsed hours)")
+              f"n_real={int(keep.sum())} first={int(row[0])} last={int(row[-1])} "
+              f"max_in_batch={int(tp.max())} (elapsed hours)")
 
     check("batch: q_bound_codes present (event bounds)", batch.q_bound_codes is not None, "")
     if batch.q_bound_codes is not None:
@@ -119,8 +123,18 @@ def main() -> int:
     check("batch: some queries are ANCESTOR nodes (DAG-aware)", n_anc > 0,
           f"{n_anc}/{len(qc)} = {n_anc / max(len(qc), 1):.3f}")
 
-    # a forward pass must actually run with all of it wired together
+    # A forward pass must actually run with all of it wired together.  `load_from_checkpoint`
+    # restores the module onto cuda:0 while the dataloader yields CPU tensors, and
+    # MEDSTorchBatch has no `.to()` -- so move every tensor field by hand.  (In training,
+    # Lightning's own transfer_batch_to_device does this generically.)
     M.eval()
+    dev = next(M.parameters()).device
+    # Mutate in place rather than dataclasses.replace: __post_init__ asserts each field is a
+    # `torch.LongTensor`, and a CUDA long tensor fails that isinstance check.
+    for f in dataclasses.fields(batch):
+        v = getattr(batch, f.name)
+        if torch.is_tensor(v):
+            object.__setattr__(batch, f.name, v.to(dev))
     with torch.no_grad():
         _loss, out = M.model(batch)
     check("forward: runs end-to-end with all features on",
