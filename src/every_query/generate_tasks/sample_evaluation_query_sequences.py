@@ -571,6 +571,32 @@ def resolve_specs(
     return specs
 
 
+def addressable_codes(query_codes: Sequence[str], ontology_dir: str | Path | None) -> list[str]:
+    """Every name a designed spec may legally mention: the vocabulary plus ontology nodes.
+
+    *Addressability* and *sampling rate* are different questions, and fusing them was a bug.
+    ``build_query_universe`` reshapes the pool the sampler draws from, and it deliberately
+    returns the vocabulary unchanged when ``ancestor_fraction`` is 0 — so at the default 0 an
+    ontology could be fully loaded and labeling correctly while every hand-written spec naming
+    an ancestor was rejected as an unknown code.  The only ancestor queries that got through
+    were the ones whose names happened to *also* be real codes, which is to say the ones the
+    prefix-absorption defect was silently widening.
+
+    A designed grid does not sample at all; it needs the name to resolve, nothing more.  So
+    validation asks the ontology what exists, independently of how often the sampler would draw
+    it.
+
+    Returns ``query_codes`` unchanged when there is no ontology.
+    """
+    if not ontology_dir:
+        return list(query_codes)
+
+    from every_query.data.ontology import load_nodes
+
+    nodes = load_nodes(ontology_dir)["node"].to_list()
+    return list(dict.fromkeys([*query_codes, *nodes]))
+
+
 def validate_spec_codes(specs: list[SequenceSpec], query_codes: list[str]) -> None:
     """Fail fast on spec codes outside the model's query vocabulary.
 
@@ -876,7 +902,7 @@ def run_worker(
         eventbound_fraction=eventbound_fraction,
         bound_events=bound_events,
     )
-    validate_spec_codes(specs, query_codes)
+    validate_spec_codes(specs, addressable_codes(query_codes, ontology_dir))
 
     # Only *designed* specs get the whole-day check.  Sampled specs come from `QueryDistribution`,
     # which draws continuous float durations by design (the training sampler does too, since the

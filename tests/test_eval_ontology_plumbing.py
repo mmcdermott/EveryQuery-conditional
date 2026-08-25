@@ -74,11 +74,19 @@ HORIZON = 30.0
 #: The cohort vocabulary.  ``//`` is the MEDS hierarchy separator, so these codes also induce the
 #: interior nodes ``ICD``, ``MED``, ``MED//STATIN`` and ``TIMELINE``.
 #:
-#: ``ICD//CIRC`` and ``ICD//RESP`` are deliberately **both** real codes and the parent prefixes of
-#: other codes — the ordinary situation in a MEDS ``codes.parquet``, and the one that makes the
-#: labeling defect silent rather than loud: being in ``query_codes`` they sail through
-#: ``validate_spec_codes``, and being in no patient's event stream they then label ``False``
-#: everywhere unless the closure explosion runs.
+#: ``ICD//CIRC`` and ``ICD//RESP`` are deliberately **dual-role**: real codes AND the parent
+#: prefixes of other codes — the ordinary situation in a MEDS ``codes.parquet`` (399 of MIMIC-IV's
+#: 13,908 codes look like this) and the one that makes the labeling defect silent rather than
+#: loud.
+#:
+#: Because one string cannot mean both "exactly this code" and "this code or any descendant",
+#: ``build_ontology`` mints a separate subtree node beside each of them.  The leaf keeps its exact
+#: meaning; the ``//ANY`` node is what rolls descendants up.  So the ancestor under test here is
+#: ``ICD//CIRC//ANY``, not ``ICD//CIRC``.
+#:
+#: Note ``ICD//CIRC//ANY`` is in no ``codes.parquet``, so a designed spec naming it can only
+#: validate if addressability is resolved against the ontology rather than the sampling universe
+#: — which is exactly what ``addressable_codes`` restores.
 LEAVES = [
     "ICD//CIRC",
     "ICD//CIRC//I21",
@@ -88,14 +96,14 @@ LEAVES = [
     "MED//STATIN//ATORVA",
     "TIMELINE//END",
 ]
-ANCESTOR = "ICD//CIRC"
-CONTROL_ANCESTOR = "ICD//RESP"
+ANCESTOR = "ICD//CIRC//ANY"
+CONTROL_ANCESTOR = "ICD//RESP//ANY"
 #: A node that is *only* a prefix, never a code: addressable as a query solely through
 #: ``ancestor_fraction``.  ``MED//STATIN`` occurs (via ``ATORVA``) for subject 1 and never for 2.
 ANCESTOR_ONLY_NODE = "MED//STATIN"
 #: What ``build_query_universe`` may draw from: every non-leaf node except the ``TIMELINE``
 #: namespace, which it drops as tautological.
-USABLE_ANCESTORS = ["ICD", "MED", "MED//STATIN"]
+USABLE_ANCESTORS = ["ICD", "ICD//CIRC//ANY", "ICD//RESP//ANY", "MED", "MED//STATIN"]
 
 #: Subject 1 has an ``ICD//CIRC`` descendant inside the horizon and no ``ICD//RESP`` event at all;
 #: subject 2 is the mirror image, and its one ``ICD//CIRC`` descendant sits *before* the
@@ -278,12 +286,12 @@ def test_ancestor_fraction_puts_ancestor_nodes_in_the_sampled_query_universe(
         query_codes=codes_yaml,
         contexts_path=cohort,
         split=SPLIT,
-        n_sequences=24,
+        n_sequences=96,
         ontology_dir=ontology_dir,
         ancestor_fraction=0.5,
     )
 
-    queries = _all_queries(out_dir / SPLIT / "cohort__sampled24.parquet")
+    queries = _all_queries(out_dir / SPLIT / "cohort__sampled96.parquet")
     drawn_ancestors = [q for q in queries if q in USABLE_ANCESTORS]
 
     assert drawn_ancestors, (
@@ -317,12 +325,12 @@ def test_ancestor_fraction_zero_keeps_the_universe_leaf_only(
         query_codes=codes_yaml,
         contexts_path=cohort,
         split=SPLIT,
-        n_sequences=24,
+        n_sequences=96,
         ontology_dir=ontology_dir,
         ancestor_fraction=0.0,
     )
 
-    queries = set(_all_queries(out_dir / SPLIT / "cohort__sampled24.parquet"))
+    queries = set(_all_queries(out_dir / SPLIT / "cohort__sampled96.parquet"))
     assert queries <= set(LEAVES), (
         f"non-leaf codes {sorted(queries - set(LEAVES))} were drawn at ancestor_fraction=0"
     )
@@ -690,21 +698,30 @@ def test_turning_the_ontology_off_relabels_and_clears_the_provenance(
 
 
 @pytest.mark.parametrize("per_spec_dirs", [False, True])
-def test_a_grid_labeled_with_no_ontology_is_relabeled_when_one_is_turned_on(
+def test_a_sidecar_less_grid_is_relabeled_when_an_ontology_is_turned_on(
     tmp_path: Path,
     data_dir: Path,
     cohort: Path,
     codes_yaml: Path,
     ontology_dir: Path,
+    stale_ontology_dir: Path,
     per_spec_dirs: bool,
 ):
     """A sidecar-less output is the *pre-fix* on-disk state, and it is stale for an ontology run.
 
-    "No sidecar" is not "unknown, assume fine": it means precisely "labeled with no ontology", so
-    an ancestor query in that parquet is all-``False``.  Every grid written before this branch
-    existed is in that state, so a guard that read a missing sidecar as current would skip exactly
-    the outputs the branch was written to correct — turning the ontology on would leave the
-    all-``False`` labels in place and change nothing but the log line.
+    "No sidecar" is not "unknown, assume fine": it means precisely "labeled under some ontology we
+    can no longer identify".  Every grid written before this branch existed is in that state, so a
+    guard that read a missing sidecar as current would skip exactly the outputs the branch was
+    written to correct — turning the ontology on would leave the wrong labels in place and change
+    nothing but the log line.
+
+    The sidecar-less state is produced here by labeling under the *stale* ontology and then
+    deleting the sidecar.  It used to be produced by labeling with no ontology at all, which is no
+    longer reachable for this spec: the ancestor under test is now the minted subtree node
+    ``ICD//CIRC//ANY``, which exists only in an ontology, so an ontology-less run rejects the spec
+    outright rather than labeling it all-``False``.  That rejection is the intended behaviour — a
+    grid cannot silently measure an ancestor the run knows nothing about — so the staleness claim
+    is exercised through the reachable path instead.
     """
     out_dir = tmp_path / "grid"
     specs = _specs_yaml(tmp_path, circ_30d=ANCESTOR)
@@ -719,11 +736,11 @@ def test_a_grid_labeled_with_no_ontology_is_relabeled_when_one_is_turned_on(
     }
     (fp,) = _grid_fps(out_dir, per_spec_dirs, ["circ_30d"], "cohort__specs")
 
-    _run_eval(**common)
+    _run_eval(**common, ontology_dir=stale_ontology_dir)
     assert _answers_by_subject_and_query(fp) == CIRC_UNDER_STALE_CLOSURE, (
-        "with no ontology the ancestor's own name is in no event stream, so all-False is right here"
+        "the stale closure is missing the one code that links subject 1's in-window event"
     )
-    assert not eval_seq._provenance_path(out_dir, fp).exists()
+    eval_seq._provenance_path(out_dir, fp).unlink()
 
     _run_eval(**common, ontology_dir=ontology_dir)
     assert _answers_by_subject_and_query(fp) == CIRC_TRUTH, (
@@ -941,10 +958,10 @@ def test_changing_only_ancestor_fraction_relabels_the_grid(
         "query_codes": codes_yaml,
         "contexts_path": cohort,
         "split": SPLIT,
-        "n_sequences": 24,
+        "n_sequences": 96,
         "ontology_dir": ontology_dir,
     }
-    fp = out_dir / SPLIT / "cohort__sampled24.parquet"
+    fp = out_dir / SPLIT / "cohort__sampled96.parquet"
 
     _run_eval(**common, ancestor_fraction=0.0)
     leaf_only = _all_queries(fp)
@@ -963,7 +980,7 @@ def test_changing_only_the_ancestor_multiplicity_relabels_the_grid(
 ):
     """The universe half must be digested by multiplicity, not by membership.
 
-    ``ancestor_fraction`` 0.3 and 0.5 both put all three usable ancestors in the universe; what
+    ``ancestor_fraction`` 0.5 and 0.7 both put all five usable ancestors in the universe; what
     differs is how many *slots* each one holds, which is exactly how ``build_query_universe``
     encodes the mixture the grid is supposed to measure.  A set-valued digest sees the two runs as
     identical, and a 50%-ancestor grid silently keeps a 30%-ancestor one's queries — a
@@ -976,14 +993,14 @@ def test_changing_only_the_ancestor_multiplicity_relabels_the_grid(
         "query_codes": codes_yaml,
         "contexts_path": cohort,
         "split": SPLIT,
-        "n_sequences": 24,
+        "n_sequences": 96,
         "ontology_dir": ontology_dir,
     }
-    fp = out_dir / SPLIT / "cohort__sampled24.parquet"
+    fp = out_dir / SPLIT / "cohort__sampled96.parquet"
 
-    _run_eval(**common, ancestor_fraction=0.3)
-    thin = Counter(_all_queries(fp))
     _run_eval(**common, ancestor_fraction=0.5)
+    thin = Counter(_all_queries(fp))
+    _run_eval(**common, ancestor_fraction=0.7)
     thick = Counter(_all_queries(fp))
 
     assert set(thin) == set(thick), (
@@ -991,7 +1008,7 @@ def test_changing_only_the_ancestor_multiplicity_relabels_the_grid(
         f"and only the mixture moves. thin={sorted(thin)} thick={sorted(thick)}"
     )
     assert thin != thick, (
-        "the 0.5 grid was skipped in favour of the 0.3 grid: the universe is digested by "
+        "the 0.7 grid was skipped in favour of the 0.5 grid: the universe is digested by "
         f"membership only. counts={dict(thick)}"
     )
     assert thick[ANCESTOR_ONLY_NODE] > thin[ANCESTOR_ONLY_NODE], (
@@ -1020,11 +1037,11 @@ def test_reordering_the_query_universe_relabels_the_grid(
         "out_dir": out_dir,
         "contexts_path": cohort,
         "split": SPLIT,
-        "n_sequences": 24,
+        "n_sequences": 96,
         "ontology_dir": ontology_dir,
         "ancestor_fraction": 0.0,
     }
-    fp = out_dir / SPLIT / "cohort__sampled24.parquet"
+    fp = out_dir / SPLIT / "cohort__sampled96.parquet"
 
     _run_eval(**common, query_codes=straight)
     first = Counter(_all_queries(fp))
@@ -1072,8 +1089,8 @@ def test_ontology_fingerprint_separates_both_of_its_halves(ontology_dir: Path, s
     )
 
     # Two universes that a set-valued digest cannot tell apart, from the real builder.
-    thin = train_seq.build_query_universe(LEAVES, ontology_dir=ontology_dir, ancestor_fraction=0.3)
-    thick = train_seq.build_query_universe(LEAVES, ontology_dir=ontology_dir, ancestor_fraction=0.5)
+    thin = train_seq.build_query_universe(LEAVES, ontology_dir=ontology_dir, ancestor_fraction=0.5)
+    thick = train_seq.build_query_universe(LEAVES, ontology_dir=ontology_dir, ancestor_fraction=0.7)
     assert set(thin) == set(thick) and Counter(thin) != Counter(thick), "fixture drift"
     assert fingerprint(ontology_dir, thin) != fingerprint(ontology_dir, thick)
 
