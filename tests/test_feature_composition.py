@@ -102,7 +102,7 @@ def test_all_three_features_train_together(tmp_path):
     loss.backward()
 
     # Every feature's own parameters must receive gradient in the combined configuration.
-    raw = model.HF_model.embeddings.tok_embeddings.tok
+    raw = model.HF_model.get_input_embeddings().tok
     for name, param in (
         ("ontology raw table", raw.weight),
         ("bound_marker", model.bound_marker),
@@ -114,10 +114,10 @@ def test_all_three_features_train_together(tmp_path):
 def test_ontology_wrapper_covers_the_query_slots_too(tmp_path):
     """A query's boundary code must go through the mixed table, not around it."""
     model = _all_features_model(tmp_path)
-    assert isinstance(model.HF_model.embeddings.tok_embeddings, OntologyEmbedding)
+    assert isinstance(model.HF_model.get_input_embeddings(), OntologyEmbedding)
 
     batch = _all_features_batch()
-    wrapper = model.HF_model.embeddings.tok_embeddings
+    wrapper = model.HF_model.get_input_embeddings()
 
     # Record the id tensors themselves, not their shapes: q_codes and q_bound_codes are both
     # (B, L), so a shape alone cannot tell which of them reached the wrapper.
@@ -181,7 +181,7 @@ def test_event_bounds_own_the_duration_slot_and_leave_the_code_slot_alone(tmp_pa
     with torch.no_grad():
         code_slot = model._query_code_embeds(batch)
         dur_slot = model._query_duration_embeds(batch)
-        plain_code = model.HF_model.embeddings.tok_embeddings(batch.q_codes)
+        plain_code = model.HF_model.get_input_embeddings()(batch.q_codes)
         plain_dur = model.duration_embed((batch.q_durations / 365.0).unsqueeze(-1))
 
     assert code_slot.shape == dur_slot.shape == (1, 2, 32)

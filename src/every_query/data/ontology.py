@@ -10,7 +10,7 @@ carry an explicit ``parent_codes`` column.  This module turns that structure int
    about a whole drug class rather than one specific product.
 2. **A mix matrix** ``A`` (row-normalised, sparse, ``V_ext x V_ext``).  A node's embedding
    becomes the weighted average of its own raw row and its ancestors', with weight
-   ``decay ** distance``.  Substituted for ModernBERT's ``tok_embeddings``, this ties a rare
+   ``decay ** distance``.  Installed as the encoder's input-embedding module, this ties a rare
    leaf's representation to its better-estimated parents — the actual hypothesis under test.
 
 Three artifacts are written by ``EQ_build_ontology`` into one directory:
