@@ -129,11 +129,12 @@ LATER PASS -- three thin spots closed, each proven by replaying the mutation it 
    asked of the duration, so that confusion rested on one hand-built row: with the sentinel
    removed from the pool, the mutation fails ONLY ``test_s2_...``; with it added, 7 of 12 seeds
    catch it.
-3. ``assign_event_bounds`` had no coverage outside its own module doctest -- dropping the
-   sentinel duration and inverting the bounded fraction both left this file and
-   ``tests/test_event_bounded.py`` fully green (47 passed under each, replayed and confirmed).
-   ``test_bound_draw_is_deterministic`` there cannot see the inversion: it compares two calls
-   that any mutation perturbs identically.  Five tests now cover the draw itself.
+3. The bound draw (then ``assign_event_bounds``, now the last step of
+   ``QuerySequenceDistribution.sample_sequences``) had no coverage outside its own module
+   doctest -- dropping the sentinel duration and inverting the bounded fraction both left this
+   file and ``tests/test_event_bounded.py`` fully green (47 passed under each, replayed and
+   confirmed).  ``test_bound_draw_is_deterministic`` there cannot see the inversion: it compares
+   two calls that any mutation perturbs identically.  Five tests now cover the draw itself.
 
 Also added: ``test_the_documented_upper_bound_matches_the_implemented_one``, the only test in
 the suite that fails when the DOCS alone regress -- a ``QuerySeqSchema.answers`` that spells the
@@ -153,7 +154,7 @@ import pytest
 from every_query.data.schema import QuerySeqSchema
 from every_query.generate_tasks.sample_query_sequences import (
     EVENT_BOUND_DURATION_SENTINEL,
-    assign_event_bounds,
+    QuerySequenceDistribution,
     label_binary_occurrence,
     label_with_event_bounds,
 )
@@ -164,7 +165,10 @@ from every_query.generate_tasks.sample_query_sequences import (
 
 
 def _oracle_answer(subject_events, prediction_time, query, duration_days, bound_event):
-    """Answer ONE query by hand.  `subject_events` is a list of (time, code) for this subject."""
+    """Answer ONE query by hand.
+
+    `subject_events` is a list of (time, code) for this subject.
+    """
     if bound_event is None:
         # S1: inside the horizon window -- open at BOTH ends.
         window_end = prediction_time + timedelta(days=float(duration_days))
@@ -185,7 +189,10 @@ def _oracle_answer(subject_events, prediction_time, query, duration_days, bound_
 
 
 def _oracle_label(index_rows, event_rows):
-    """Whole-frame oracle.  Returns {ctx_id: dict of the row S7 describes}, plain Python."""
+    """Whole-frame oracle.
+
+    Returns {ctx_id: dict of the row S7 describes}, plain Python.
+    """
     by_subject: dict[int, list[tuple[datetime, str]]] = {}
     for subject_id, time, code in event_rows:
         by_subject.setdefault(subject_id, []).append((time, code))
@@ -619,17 +626,16 @@ def test_s3_boundary_before_the_prediction_time_is_invisible():
 def test_a_query_at_the_exact_boundary_instant_does_not_count():
     """S4, alone in its own test: the coincident-timestamp rule for EVENT-bounded queries.
 
-    Deliberately separate from the time-bounded horizon test even though one operator decides
-    both.  For a bounded query the window's end IS the boundary event's own timestamp, so the
-    open upper bound means a query code charted at the same instant as the boundary does NOT
-    count as having occurred before it -- and MEDS clusters codes onto one timestamp, so that is
-    a real population of rows, not an edge case.  This is what makes an event-bounded query mean
-    "strictly before the boundary": *Sepsis before discharge, after prediction time*.  Keeping it
-    here on its own is what makes reverting to an inclusive boundary a one-line change with one
-    test to flip.
+    Deliberately separate from the time-bounded horizon test even though one operator decides both.  For a
+    bounded query the window's end IS the boundary event's own timestamp, so the open upper bound means a
+    query code charted at the same instant as the boundary does NOT count as having occurred before it -- and
+    MEDS clusters codes onto one timestamp, so that is a real population of rows, not an edge case.  This is
+    what makes an event-bounded query mean "strictly before the boundary": *Sepsis before discharge, after
+    prediction time*.  Keeping it here on its own is what makes reverting to an inclusive boundary a one-line
+    change with one test to flip.
 
-    The second case is what stops `<` being confused with "an empty window": 1us inside the
-    boundary still counts.
+    The second case is what stops `<` being confused with "an empty window": 1us inside the boundary still
+    counts.
     """
     at_bound = [
         (1, EPOCH + timedelta(days=2), "A"),
@@ -731,12 +737,11 @@ def test_s6_zero_length_and_inverted_windows_are_always_false():
 def test_s6_bound_event_equal_to_the_query_is_always_false():
     """Self-bounded queries are unconditionally False, under the strict bound.
 
-    The first occurrence after the prediction time is simultaneously the boundary and the
-    earliest candidate answer, and S4 excludes the boundary instant, so nothing can fall strictly
-    inside the window -- an occurrence cannot precede itself.  (Under the closed bound this shape
-    instead asked "does this code recur at all".)  Degenerate either way -- the point of pinning
-    it is that it is a shape the sampler can emit whenever the query pool and the bound pool
-    overlap, so it must not be an accident.
+    The first occurrence after the prediction time is simultaneously the boundary and the earliest candidate
+    answer, and S4 excludes the boundary instant, so nothing can fall strictly inside the window -- an
+    occurrence cannot precede itself.  (Under the closed bound this shape instead asked "does this code recur
+    at all".)  Degenerate either way -- the point of pinning it is that it is a shape the sampler can emit
+    whenever the query pool and the bound pool overlap, so it must not be an accident.
     """
     always_false = [
         [(1, EPOCH + timedelta(days=1), "A")],  # boundary and candidate are the same event
@@ -778,8 +783,8 @@ def test_s1_null_bound_agrees_with_label_binary_occurrence_query_for_query():
 def _measure_upper_bound_is_closed():
     """Ask the CODE, not the docs, whether an event on the horizon instant counts.
 
-    Returns True if the window is closed at the top (`<=`), False if open (`<`).  Also checks
-    the two labellers answer alike, since a drift between them is its own defect.
+    Returns True if the window is closed at the top (`<=`), False if open (`<`).  Also checks the two
+    labellers answer alike, since a drift between them is its own defect.
     """
     events = [(1, EPOCH + timedelta(days=2), "A")]
     rows = _one("A", 2.0, None)  # the event lands exactly on prediction_time + duration
@@ -884,10 +889,11 @@ def test_an_event_on_the_horizon_instant_is_outside_the_window():
 
 
 # ------------------------------------------------------------------------------------------
-# `assign_event_bounds`: the draw that decides WHICH queries become event-bounded.
+# The bound draw in `QuerySequenceDistribution.sample_sequences`: WHICH queries become
+# event-bounded, and by what.
 # ------------------------------------------------------------------------------------------
 #
-# Phase-1 verification found this function guarded by nothing but its own module doctest:
+# Phase-1 verification found this draw guarded by nothing but its own module doctest:
 # dropping the sentinel duration, and inverting the bounded fraction, both survived the whole
 # of `tests/test_event_bounds_oracle.py` and `tests/test_event_bounded.py` (replayed and
 # confirmed -- 47 passed under each).  `test_bound_draw_is_deterministic` in the other file is
@@ -902,44 +908,57 @@ def test_an_event_on_the_horizon_instant_is_outside_the_window():
 # queries: the run converges and reports on a query diet nobody chose.
 
 
-def _bounds_frame(n):
-    """`n` query rows, each with a DISTINCT horizon.
+def _bound_dist(universe, fraction, queries_per_sequence=1):
+    return QuerySequenceDistribution(
+        query_codes=list(universe),
+        min_duration=1.0,
+        max_duration=365.0,
+        duration_distribution="log-uniform",
+        min_queries=queries_per_sequence,
+        max_queries=queries_per_sequence,
+        eventbound_fraction=fraction,
+    )
 
-    Distinct on purpose: with a constant horizon, an implementation that overwrote every
-    duration with the same value -- or shuffled them -- would be indistinguishable from one
-    that correctly left the unbounded rows alone.
+
+def _flat_draw(dist, n_sequences, bound_seed):
+    """Flattened `(code, duration, bound)` rows from one draw on fixed query/structure seeds.
+
+    The query and structure seeds are held fixed across every call, so two distributions that
+    differ only in `eventbound_fraction` draw the same codes and the same horizons -- which is
+    what lets the sentinel test compare a bounded draw against its unbounded twin row by row.
     """
-    return pl.DataFrame(
-        {
-            "query": [f"Q{i}" for i in range(n)],
-            "duration_days": [float(i + 1) for i in range(n)],
-        }
-    ).with_columns(pl.col("duration_days").cast(pl.Float32))
+    seqs = dist.sample_sequences(
+        n_sequences,
+        np.random.default_rng(0),
+        np.random.default_rng(1),
+        np.random.default_rng(bound_seed),
+    )
+    return [(q.code, q.duration_days, q.bound_event) for s in seqs for q in s]
 
 
 def test_the_sentinel_lands_on_exactly_the_bounded_rows():
-    """Bounded rows get the sentinel; unbounded rows keep the horizon they came in with.
+    """Bounded rows get the sentinel; unbounded rows keep the horizon they were drawn with.
 
-    Goes red if the sentinel is dropped (bounded rows keep a horizon), if it is written to the
-    wrong side of the `when/otherwise` (unbounded rows get -1.0), or if the durations are
-    rebuilt in a way that loses the row-to-horizon correspondence.
+    Compared against the unbounded twin (same query/structure seeds, fraction 0), whose horizons are
+    continuous log-uniform floats and therefore all distinct -- so an implementation that overwrote every
+    duration with one value, or shuffled them, would be caught as surely as one that dropped the sentinel or
+    wrote it to the wrong rows.
     """
     n = 400
-    idx = _bounds_frame(n)
-    out = assign_event_bounds(idx, ["X", "Y"], 0.5, np.random.default_rng(0))
+    plain = _flat_draw(_bound_dist("ABC", 0.0), n, bound_seed=0)
+    out = _flat_draw(_bound_dist("ABC", 0.5), n, bound_seed=0)
 
-    assert out.height == n, "rows were added or dropped"
-    assert out["query"].to_list() == idx["query"].to_list(), "the query column was disturbed"
+    assert len(out) == n, "rows were added or dropped"
+    assert [c for c, _, _ in out] == [c for c, _, _ in plain], "the code draw was disturbed"
+    assert len({d for _, d, _ in plain}) == n, "fixture drift: horizons are meant to be distinct"
 
-    bounds = out["bound_event"].to_list()
-    durations = out["duration_days"].to_list()
-    originals = idx["duration_days"].to_list()
+    bounds = [b for _, _, b in out]
     # A mixed draw is the only one that can tell the two sides apart: all-bound and all-null
     # both survive a sentinel written to the wrong branch.
     assert any(b is not None for b in bounds), "no row was bounded -- this proves nothing"
     assert any(b is None for b in bounds), "every row was bounded -- this proves nothing"
 
-    for i, (bound, got, want) in enumerate(zip(bounds, durations, originals, strict=True)):
+    for i, ((_, got, bound), (_, want, _)) in enumerate(zip(out, plain, strict=True)):
         if bound is None:
             assert got == pytest.approx(want), (
                 f"row {i} is unbounded but its horizon changed {want} -> {got}; an unbounded "
@@ -964,8 +983,8 @@ def test_the_bounded_fraction_is_the_one_that_was_asked_for(fraction):
     ~4 sigma of slack while still far tighter than the smallest error it must catch.
     """
     n = 4000
-    out = assign_event_bounds(_bounds_frame(n), ["X"], fraction, np.random.default_rng(7))
-    observed = sum(b is not None for b in out["bound_event"].to_list()) / n
+    out = _flat_draw(_bound_dist("ABC", fraction), n, bound_seed=7)
+    observed = sum(b is not None for _, _, b in out) / n
     inverted = abs(observed - (1.0 - fraction)) < 0.03
     assert observed == pytest.approx(fraction, abs=0.03), (
         f"asked for {fraction:.0%} event-bounded queries, got {observed:.1%}"
@@ -978,35 +997,34 @@ def test_the_draw_is_per_query_not_per_sequence():
 
     "Draws i.i.d. per query, not per sequence, so a single sequence mixes time- and
     event-bounded asks -- which is the point: the model has to read the slot to know which kind
-    it is being given."  One draw broadcast over the frame would make every slot agree, and the
-    model could then infer the kind once per sequence instead of per query.
+    it is being given."  One draw broadcast over each sequence would make every slot agree, and
+    the model could then infer the kind once per sequence instead of per query.
     """
-    out = assign_event_bounds(_bounds_frame(400), ["X"], 0.5, np.random.default_rng(3))
-    flags = [b is not None for b in out["bound_event"].to_list()]
-    assert 0 < sum(flags) < len(flags), "the whole frame shared one draw -- it is per sequence"
+    out = _flat_draw(_bound_dist("ABC", 0.5, queries_per_sequence=5), 80, bound_seed=3)
+    flags = [b is not None for _, _, b in out]
+    assert 0 < sum(flags) < len(flags), "the whole draw shared one flag"
     # Independent fair draws switch on ~half of adjacent pairs; any per-block scheme (one draw
-    # broadcast, or runs) collapses this toward zero.
+    # broadcast per sequence, or runs) collapses this toward zero.
     switches = sum(a != b for a, b in itertools.pairwise(flags))
     assert switches > 0.3 * len(flags), (
         f"only {switches} of {len(flags) - 1} adjacent slots differ; the draw is correlated "
-        "along the frame rather than i.i.d. per query"
+        "along the stream rather than i.i.d. per query"
     )
 
 
-def test_bounds_are_drawn_from_across_the_whole_pool():
-    """Every supplied boundary code must actually be reachable, not just the first one.
+def test_bounds_are_drawn_from_across_the_whole_universe():
+    """Every node of the universe must actually be reachable as a boundary, not just the first.
 
-    The module doctest only asserts the drawn codes are a SUBSET of the pool, which a constant
-    "always pick pool[0]" satisfies -- and that would quietly train a whole run on a single
-    boundary code while the config advertised several.
+    The module doctest only asserts the drawn boundaries are a SUBSET of the universe, which a constant
+    "always pick universe[0]" satisfies -- and that would quietly train a whole run on a single boundary code
+    while the config advertised the whole vocabulary.
     """
     pool = ["W", "X", "Y", "Z"]
     n = 600
-    out = assign_event_bounds(_bounds_frame(n), pool, 1.0, np.random.default_rng(11))
-    drawn = out["bound_event"].to_list()
+    drawn = [b for _, _, b in _flat_draw(_bound_dist(pool, 1.0), n, bound_seed=11)]
 
     assert set(drawn) == set(pool), (
-        f"only {sorted(set(drawn))} were ever drawn from the pool {pool}; the rest of the pool is unreachable"
+        f"only {sorted(set(drawn))} were ever drawn from the universe {pool}; the rest is unreachable"
     )
     # Roughly uniform, not merely present once: a 597/1/1/1 split is still "all reachable".
     per_code = {c: drawn.count(c) for c in pool}

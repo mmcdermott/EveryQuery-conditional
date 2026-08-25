@@ -78,7 +78,7 @@ def test_mask_no_self_answer_leakage(n_queries):
 
 @pytest.mark.parametrize("n_queries", [2, 3, 5])
 def test_mask_full_visibility_of_prior_blocks(n_queries):
-    """Every token sees *all* tokens (incl. answers) of strictly earlier blocks."""
+    """Every token sees *all* tokens (including answers) of strictly earlier blocks."""
     allowed = ~build_block_causal_mask(n_queries)
     for j in range(1, n_queries):
         for tok in range(TOKENS_PER_QUERY):
@@ -617,8 +617,8 @@ def test_sequence_draw_is_identical_to_the_training_query_distribution():
 def test_structure_rng_does_not_perturb_the_query_draw():
     """Changing only the structure seed must leave the code/duration stream untouched.
 
-    The two axes are independent by construction; if they ever share a generator, a change to a
-    sweep knob would silently move the query distribution too.
+    The two axes are independent by construction; if they ever share a generator, a change to a sweep knob
+    would silently move the query distribution too.
     """
     dist = _seq_dist(min_queries=3, max_queries=3)  # fixed length => same total either way
     a = dist.sample_sequences(20, np.random.default_rng(0), np.random.default_rng(1))
@@ -715,7 +715,7 @@ def test_build_sequence_index_partitions_by_shard_and_resolves_times(tmp_path: P
     _write_prediction_times_map(artifacts, split, "1", [(2, 0, datetime(2024, 2, 1))])
 
     sequences = [
-        [QuerySpec("A", 3.0), QuerySpec("B", 7.0)],  # -> shard 0, subject 1, rank 1
+        [QuerySpec("A", 3.0), QuerySpec("B", -1.0, "DISCHARGE")],  # -> shard 0, subject 1, rank 1
         [QuerySpec("C", 5.0)],  # -> shard 1, subject 2, rank 0
         [QuerySpec("A", 1.0), QuerySpec(EOS_CODE, 9.0)],  # -> shard 0, subject 1, rank 0
     ]
@@ -739,6 +739,13 @@ def test_build_sequence_index_partitions_by_shard_and_resolves_times(tmp_path: P
 
     # _ctx_id is globally unique, so no two sequences collide when Stage 4' regroups.
     assert len(set(shard0[CTX_ID_COL].to_list() + shard1[CTX_ID_COL].to_list())) == 3
+
+    # Stage 3' samples nothing: the bound Stage 1' put on a spec is carried into the index as-is,
+    # and every shard of the run agrees on the column, bounded rows or not.
+    ordered = shard0.sort(CTX_ID_COL, POSITION_COL)
+    assert ordered["bound_event"].to_list() == [None, "DISCHARGE", None, None]
+    assert ordered["duration_days"].to_list()[1] == -1.0
+    assert shard1["bound_event"].to_list() == [None]
 
 
 def test_build_sequence_index_rejects_length_mismatch(tmp_path: Path):

@@ -8,7 +8,8 @@ fixed horizon.  Covered here, in pipeline order:
    fires" case behaves as documented
    (window runs to the end of the record) and is *reported* rather than hidden.
 2. Sampling — that bounds are drawn on their own seed axis, so turning the feature on does not
-   perturb the code/duration draw that the sampler's parity contract depends on.
+   perturb the code/duration draw that the sampler's parity contract depends on, and that the
+   boundary pool is the query universe itself.
 3. Dataset/batch — that ``bound_events`` is optional on disk, and that an unknown boundary code
    raises instead of silently decaying into an unbounded query.
 4. Model — that the boundary reaches the duration slot, that it is block-local, and that a
@@ -21,8 +22,6 @@ import numpy as np
 import polars as pl
 import pytest
 import torch
-import yaml
-from omegaconf import OmegaConf
 
 from every_query.data.seq_dataset import (
     EVENT_BOUND_DURATION_SENTINEL,
@@ -31,13 +30,12 @@ from every_query.data.seq_dataset import (
 )
 from every_query.generate_tasks.sample_query_sequences import (
     BOUND_COL,
-    assign_event_bounds,
+    QuerySequenceDistribution,
     build_sequence_index_df,
     label_binary_occurrence,
     label_query_sequences,
     label_with_event_bounds,
     log_degenerate_bounds,
-    resolve_bound_events,
 )
 from every_query.model.conditional_model import ANSWER_NO, ANSWER_YES, ConditionalQueryModel
 
@@ -194,9 +192,7 @@ def test_bounds_do_not_perturb_the_code_duration_draw():
         schema={"subject_id": pl.Int64, "prediction_time": pl.Datetime("us")},
     )
     plain = build_sequence_index_df(ctx, ["A", "B", "C"], 3, 3, 1, 365, seed=11)
-    bounded = build_sequence_index_df(
-        ctx, ["A", "B", "C"], 3, 3, 1, 365, seed=11, eventbound_fraction=0.5, bound_events=["X"]
-    )
+    bounded = build_sequence_index_df(ctx, ["A", "B", "C"], 3, 3, 1, 365, seed=11, eventbound_fraction=0.5)
     assert plain["query"].to_list() == bounded["query"].to_list(), (
         "turning bounds on must not change which codes were drawn"
     )
@@ -208,63 +204,51 @@ def test_bounds_do_not_perturb_the_code_duration_draw():
     )
 
 
-def test_assign_event_bounds_requires_a_pool():
-    idx = pl.DataFrame({"query": ["A"], "duration_days": [30.0]}).with_columns(
-        pl.col("duration_days").cast(pl.Float32)
-    )
-    with pytest.raises(ValueError, match="at least one boundary code"):
-        assign_event_bounds(idx, [], 0.5, np.random.default_rng(0))
+def _dist(**overrides) -> QuerySequenceDistribution:
+    kwargs = {
+        "query_codes": ["A", "B", "C"],
+        "min_duration": 1.0,
+        "max_duration": 365.0,
+        "duration_distribution": "log-uniform",
+        "min_queries": 1,
+        "max_queries": 1,
+    }
+    kwargs.update(overrides)
+    return QuerySequenceDistribution(**kwargs)
 
 
-def test_assign_event_bounds_rejects_a_bad_fraction():
-    idx = pl.DataFrame({"query": ["A"], "duration_days": [30.0]}).with_columns(
-        pl.col("duration_days").cast(pl.Float32)
+def _draw(dist: QuerySequenceDistribution, n: int, bound_seed: int | None = 7):
+    return dist.sample_sequences(
+        n,
+        np.random.default_rng(0),
+        np.random.default_rng(1),
+        None if bound_seed is None else np.random.default_rng(bound_seed),
     )
+
+
+def test_distribution_rejects_a_bad_bound_fraction():
     with pytest.raises(ValueError, match=r"must be in \[0, 1\]"):
-        assign_event_bounds(idx, ["X"], 1.5, np.random.default_rng(0))
+        _dist(eventbound_fraction=1.5)
 
 
-def test_bound_events_may_be_a_yaml_path_not_only_a_literal_list(tmp_path):
-    """Real boundary codes are unusable as a Hydra CLI list, so a file has to work too.
-
-    They carry spaces, periods and parentheses ("HOSPITAL_ADMISSION//EW EMER.//EMERGENCY ROOM"), which Hydra's
-    override grammar cannot parse as a bare list — so a literal-list-only knob means the documented codes
-    cannot be passed at all.
-    """
-    codes = ["HOSPITAL_ADMISSION//EW EMER.//EMERGENCY ROOM", "ICU_DISCHARGE//STAY (MICU)"]
-    fp = tmp_path / "bounds.yaml"
-    fp.write_text(yaml.safe_dump(codes))
-
-    cfg = OmegaConf.create({"eventbound_fraction": 0.3, "bound_events": str(fp)})
-    assert resolve_bound_events(cfg, [*codes, "LAB//X"]) == codes
-
-    # The literal-list form keeps working unchanged.
-    literal = OmegaConf.create({"eventbound_fraction": 0.3, "bound_events": codes})
-    assert resolve_bound_events(literal, [*codes, "LAB//X"]) == codes
-
-
-def test_bound_events_from_a_path_are_still_vocabulary_checked(tmp_path):
-    """Reading from a file must not become a way to smuggle an unknown boundary code in."""
-    fp = tmp_path / "bounds.yaml"
-    fp.write_text(yaml.safe_dump(["NOT//IN//VOCAB"]))
-    cfg = OmegaConf.create({"eventbound_fraction": 0.3, "bound_events": str(fp)})
-    with pytest.raises(ValueError, match="NOT//IN//VOCAB"):
-        resolve_bound_events(cfg, ["LAB//X"])
-
-
-def test_bound_events_is_required_when_the_fraction_is_on():
-    cfg = OmegaConf.create({"eventbound_fraction": 0.3, "bound_events": None})
-    with pytest.raises(ValueError, match="bound_events"):
-        resolve_bound_events(cfg, ["LAB//X"])
+def test_bound_rng_is_required_when_bounds_are_on():
+    """Silently drawing bounds from another axis would perturb the query or structure stream."""
+    with pytest.raises(ValueError, match="bound_rng"):
+        _draw(_dist(eventbound_fraction=0.5), 4, bound_seed=None)
+    assert len(_draw(_dist(), 4, bound_seed=None)) == 4, "no bounds, no generator needed"
 
 
 def test_bound_draw_is_deterministic():
-    idx = pl.DataFrame({"query": list("ABCDEFGH"), "duration_days": [30.0] * 8}).with_columns(
-        pl.col("duration_days").cast(pl.Float32)
-    )
-    a = assign_event_bounds(idx, ["X", "Y"], 0.5, np.random.default_rng(4))
-    b = assign_event_bounds(idx, ["X", "Y"], 0.5, np.random.default_rng(4))
-    assert a[BOUND_COL].to_list() == b[BOUND_COL].to_list()
+    dist = _dist(eventbound_fraction=0.5)
+    a = [q.bound_event for s in _draw(dist, 8) for q in s]
+    b = [q.bound_event for s in _draw(dist, 8) for q in s]
+    assert a == b
+
+
+def test_boundaries_are_drawn_from_the_query_universe():
+    """No separate pool: every node a query can be, a boundary can be too."""
+    bounds = {q.bound_event for s in _draw(_dist(eventbound_fraction=1.0), 300) for q in s}
+    assert bounds == {"A", "B", "C"}
 
 
 # ── 3. dataset / batch ──────────────────────────────────────────────────

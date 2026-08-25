@@ -326,8 +326,8 @@ def build_event_to_query_nodes(nodes_df: pl.DataFrame, mix_df: pl.DataFrame) -> 
     the event stream through it and "did any descendant of X occur" becomes "did X occur".
 
     **Only non-leaf components survive, plus the self-pair.**  A name that is itself a real code
-    is never addressable as a subtree query — ``build_query_universe`` draws ancestor slots from
-    non-leaf nodes only — so emitting ``(A//B//C -> A//B)`` for a leaf ``A//B`` could not widen
+    is never addressable as a subtree query — ``build_query_universe`` adds only non-leaf nodes
+    to the universe — so emitting ``(A//B//C -> A//B)`` for a leaf ``A//B`` could not widen
     anything the sampler would ask; it could only corrupt the ordinary leaf query ``A//B``,
     silently changing its meaning from "this exact code occurred" to "this code **or any
     descendant** occurred".  That flipped labels False -> True with no crash and no warning.

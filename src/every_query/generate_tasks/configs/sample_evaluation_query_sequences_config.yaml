@@ -121,23 +121,19 @@ duration_mode: random
 # every sampling knob): a knob that drifts between the training sampler and the eval grid
 # silently invalidates the grid.  See that file for the full explanation.
 #
-# Fraction of *sampled* eval queries that are event-bounded.  Designed specs set their bounds
-# explicitly instead, via the `bounds` field of each sequence spec.
+# Fraction of *sampled* eval queries that are event-bounded; the boundary is drawn uniformly from
+# the query universe (leaves plus, with `ontology_dir`, ancestor nodes).  Designed specs set their
+# bounds explicitly instead, via a `[code, -1, bound_event]` triple.
 eventbound_fraction: 0.0
-# REQUIRED when eventbound_fraction > 0; cohort-specific, no default, unknown codes are an error.
-bound_events: null
 
 # --- Ontology / hierarchical embeddings ---------------------------------------------------------
 # Directory of ontology artifacts written by EQ_build_ontology (nodes/mix/closure parquets).
-# Set it to make ancestor NODES addressable as queries, and to explode the event stream through
-# the closure so an ancestor query is labelled by ordinary occurrence ("did any descendant of X
-# occur").  null = off.  Must be the SAME directory the model is trained with — the indices have
-# to agree, or a query would address the wrong embedding row.
+# Set it to put every ancestor NODE into the query universe — each leaf and each ancestor is then
+# drawn with equal probability, as a query and as an event boundary — and to explode the event
+# stream through the closure so an ancestor query is labelled by ordinary occurrence ("did any
+# descendant of X occur").  null = off (leaf codes only).  Must be the SAME directory the model is
+# trained with — the indices have to agree, or a query would address the wrong embedding row.
 ontology_dir: null
-# Fraction of the query universe made of ancestor nodes rather than leaf codes.  Implemented by
-# reshaping the universe the sampler draws uniformly from, so the code/duration RNG stream — and
-# its parity with sample_tasks — is untouched.  The upstream experiment used 0.30.
-ancestor_fraction: 0.0
 
 # Write one output dir per sequence (`{out_dir}/{spec_name}/{split}/tasks.parquet`) instead of
 # one combined parquet.  Useful with designed, named sequences: each dir is independently

@@ -31,10 +31,10 @@ Pipeline (every stage but the grid build is imported from ``sample_query_sequenc
        align to ``QuerySeqSchema``, write.
 
 Ontology support mirrors the training sampler on both of its halves, because a grid that mirrors
-only one measures the wrong thing without ever failing: ``ancestor_fraction`` reshapes the query
+only one measures the wrong thing without ever failing: ``ontology_dir`` extends the query
 universe (:func:`~every_query.generate_tasks.sample_query_sequences.build_query_universe`) so
-ancestor nodes are drawn and accepted as designed-spec codes, and ``ontology_dir`` explodes the
-event stream through the closure
+ancestor nodes are drawn - as queries and as boundaries - and accepted as designed-spec codes, and
+it explodes the event stream through the closure
 (:func:`~every_query.generate_tasks.sample_query_sequences.maybe_expand_to_matching_query_nodes`) so an
 ancestor query is labeled by ordinary occurrence.  Without the explosion an ancestor query is
 labeled ``False`` at every context — the ancestor's *name* is in no event stream, only its
@@ -97,7 +97,6 @@ from every_query.generate_tasks.sample_query_sequences import (
     maybe_expand_to_matching_query_nodes,
     read_events_for_subjects,
     read_supplied_contexts,
-    resolve_bound_events,
     resolve_prediction_times,
 )
 from every_query.generate_tasks.sample_tasks import (
@@ -355,7 +354,6 @@ def sample_sequence_specs(
     duration_mode: str = "random",
     duration_distribution: str = "log-uniform",
     eventbound_fraction: float = 0.0,
-    bound_events: Sequence[str] | None = None,
 ) -> list[SequenceSpec]:
     """Draw ``n_sequences`` specs from the *training* query distribution, once.
 
@@ -408,7 +406,6 @@ def sample_sequence_specs(
         duration_mode=duration_mode,
         duration_distribution=duration_distribution,
         eventbound_fraction=eventbound_fraction,
-        bound_events=bound_events,
     )
     agg_cols = [pl.col(TaskQuerySchema.query_name), pl.col(TaskQuerySchema.duration_days_name)]
     if BOUND_COL in index_df.columns:
@@ -545,7 +542,6 @@ def resolve_specs(
     duration_mode: str = "random",
     duration_distribution: str = "log-uniform",
     eventbound_fraction: float = 0.0,
-    bound_events: Sequence[str] | None = None,
 ) -> list[SequenceSpec]:
     """Read designed specs from ``sequences_path``, or sample them when it is ``None``."""
     if sequences_path is not None:
@@ -564,7 +560,6 @@ def resolve_specs(
         duration_mode=duration_mode,
         duration_distribution=duration_distribution,
         eventbound_fraction=eventbound_fraction,
-        bound_events=bound_events,
     )
     logger.info("Sampled %d query sequence(s) from the training query distribution", len(specs))
     return specs
@@ -573,17 +568,16 @@ def resolve_specs(
 def addressable_codes(query_codes: Sequence[str], ontology_dir: str | Path | None) -> list[str]:
     """Every name a designed spec may legally mention: the vocabulary plus ontology nodes.
 
-    *Addressability* and *sampling rate* are different questions, and fusing them was a bug.
-    ``build_query_universe`` reshapes the pool the sampler draws from, and it deliberately
-    returns the vocabulary unchanged when ``ancestor_fraction`` is 0 — so at the default 0 an
-    ontology could be fully loaded and labeling correctly while every hand-written spec naming
-    an ancestor was rejected as an unknown code.  The only ancestor queries that got through
-    were the ones whose names happened to *also* be real codes, which is to say the ones the
-    prefix-absorption defect was silently widening.
+    *Addressability* and *sampling* are different questions, and fusing them was a bug: an
+    earlier ``build_query_universe`` returned the vocabulary unchanged unless an ancestor share
+    was configured, so an ontology could be fully loaded and labeling correctly while every
+    hand-written spec naming an ancestor was rejected as an unknown code.  The only ancestor
+    queries that got through were the ones whose names happened to *also* be real codes, which
+    is to say the ones the prefix-absorption defect was silently widening.
 
     A designed grid does not sample at all; it needs the name to resolve, nothing more.  So
-    validation asks the ontology what exists, independently of how often the sampler would draw
-    it.
+    validation asks the ontology what exists - including the ``TIMELINE`` ancestors the sampler
+    deliberately leaves out of its universe.
 
     Returns ``query_codes`` unchanged when there is no ontology.
     """
@@ -752,9 +746,10 @@ def _ontology_fingerprint(ontology_dir: str | Path | None, query_codes: Sequence
     two things that would make those labels wrong are covered here:
 
     - the **closure**, which decides whether an ancestor query labels ``True`` at all, and
-    - the **query universe**, which is where ``ancestor_fraction`` (and the leaf vocabulary) lands
-      after :func:`~every_query.generate_tasks.sample_query_sequences.build_query_universe`; the
-      universe is digested with its slot index, since order and multiplicity both steer the draw.
+    - the **query universe**, which is where the ontology's ancestor nodes (and the leaf
+      vocabulary) land after
+      :func:`~every_query.generate_tasks.sample_query_sequences.build_query_universe`; the
+      universe is digested with its slot index, since order steers the draw.
 
     ``None`` when no ontology is configured, so an output written before this sidecar existed
     (there is no other way to have no sidecar) compares equal and is still skipped — the
@@ -828,7 +823,6 @@ def run_worker(
     eos_first_fraction: float = 0.0,
     duration_mode: str = "random",
     eventbound_fraction: float = 0.0,
-    bound_events: Sequence[str] | None = None,
     ontology_dir: str | None = None,
     n_contexts: int = 512,
     min_prediction_times_per_subject: int = 50,
@@ -862,9 +856,8 @@ def run_worker(
             ``None``, and the validation set for designed specs either way.  With an ontology, pass
             the *extended* universe from
             :func:`~every_query.generate_tasks.sample_query_sequences.build_query_universe` — the
-            same list the training sampler draws from, since ancestor names must be drawable,
-            validatable (:func:`validate_spec_codes`) and usable as boundary events
-            (:func:`~every_query.generate_tasks.sample_query_sequences.resolve_bound_events`) alike.
+            same list the training sampler draws queries and boundaries from, since ancestor
+            names must be drawable and validatable (:func:`validate_spec_codes`) alike.
         contexts_path: Parquet with at least ``(subject_id, prediction_time)`` — the cohort.
             ``None`` samples ``n_contexts`` contexts from ``split`` instead.
         sequences_path: Designed specs (YAML/JSON/parquet).  ``None`` samples ``n_sequences``.
@@ -898,7 +891,6 @@ def run_worker(
         duration_mode=duration_mode,
         duration_distribution=duration_distribution,
         eventbound_fraction=eventbound_fraction,
-        bound_events=bound_events,
     )
     validate_spec_codes(specs, addressable_codes(query_codes, ontology_dir))
 
@@ -1051,15 +1043,11 @@ def main(cfg: DictConfig) -> None:
     """
     data_dir = _require_path_arg(cfg.get("data_dir"), "data_dir")
     out_dir = _require_path_arg(cfg.get("out_dir"), "out_dir")
-    # The same three arguments, read the same way, as ``sample_query_sequences.main``'s
-    # supplied-cohort branch: an eval grid drawn from a *narrower* universe than training's is the
-    # drift this whole module exists to avoid, and the ancestor half of the universe is no
-    # exception.  The raw ``seed`` (not a derived axis) is what keeps the two universes identical.
+    # The same two arguments, read the same way, as ``QuerySequenceDistribution.from_config``: an
+    # eval grid drawn from a *narrower* universe than training's is the drift this whole module
+    # exists to avoid, and the ancestor half of the universe is no exception.
     query_codes = build_query_universe(
-        read_query_codes(cfg.get("query_codes")),
-        ontology_dir=cfg.get("ontology_dir"),
-        ancestor_fraction=float(cfg.get("ancestor_fraction", 0.0) or 0.0),
-        seed=int(cfg.get("seed", 0)),
+        read_query_codes(cfg.get("query_codes")), ontology_dir=cfg.get("ontology_dir")
     )
 
     # Unset ``contexts_path`` is the sampled-cohort path (Stages 0 + 2 over the split), not an
@@ -1083,7 +1071,6 @@ def main(cfg: DictConfig) -> None:
         eos_first_fraction=float(cfg.get("eos_first_fraction", 0.0)),
         duration_mode=str(cfg.get("duration_mode", "random")),
         eventbound_fraction=float(cfg.get("eventbound_fraction", 0.0) or 0.0),
-        bound_events=resolve_bound_events(cfg, query_codes),
         ontology_dir=cfg.get("ontology_dir"),
         n_contexts=int(cfg.n_contexts),
         min_prediction_times_per_subject=int(cfg.min_prediction_times_per_subject),

@@ -1,9 +1,9 @@
-"""Eval-path ontology plumbing: the two knobs the eval config documents must actually do something.
+"""Eval-path ontology plumbing: the knob the eval config documents must actually do something.
 
-``sample_evaluation_query_sequences`` shipped ``ontology_dir`` and ``ancestor_fraction`` in its
-config — comment block, rationale and all — while ``grep -n 'ontology' `` over the module returned
-nothing.  Hydra accepted both overrides and discarded them, which made every ancestor claim
-unmeasurable in two independent ways:
+``sample_evaluation_query_sequences`` shipped ``ontology_dir`` (and, at the time, an ancestor-share
+knob) in its config — comment block, rationale and all — while ``grep -n 'ontology' `` over the
+module returned nothing.  Hydra accepted the overrides and discarded them, which made every
+ancestor claim unmeasurable in two independent ways:
 
 - the sampled query **universe** never contained an ancestor node, so an "ancestor" eval grid
   scored leaf skill under an ancestor headline, and
@@ -98,8 +98,8 @@ LEAVES = [
 ]
 ANCESTOR = "ICD//CIRC//ANY"
 CONTROL_ANCESTOR = "ICD//RESP//ANY"
-#: A node that is *only* a prefix, never a code: addressable as a query solely through
-#: ``ancestor_fraction``.  ``MED//STATIN`` occurs (via ``ATORVA``) for subject 1 and never for 2.
+#: A node that is *only* a prefix, never a code: addressable as a query solely through the
+#: ontology.  ``MED//STATIN`` occurs (via ``ATORVA``) for subject 1 and never for 2.
 ANCESTOR_ONLY_NODE = "MED//STATIN"
 #: What ``build_query_universe`` may draw from: every non-leaf node except the ``TIMELINE``
 #: namespace, which it drops as tautological.
@@ -218,8 +218,8 @@ def _run_eval(**overrides) -> None:
     """Compose the *real* eval config and run ``main`` on it, the way the CLI does.
 
     Going through Hydra rather than calling ``run_worker`` directly is the point: defect #3 was
-    that Hydra accepted ``ontology_dir=``/``ancestor_fraction=`` and ``main`` dropped them on the
-    floor, which no call made straight to ``run_worker`` would ever notice.
+    that Hydra accepted ``ontology_dir=`` and ``main`` dropped it on the floor, which no call made
+    straight to ``run_worker`` would ever notice.
     """
     with initialize_config_dir(config_dir=eval_seq.CONFIGS, version_base=None):
         cfg = compose(
@@ -266,18 +266,18 @@ def _all_queries(fp: Path) -> list[str]:
 # ── 1. defect #3: the universe ──────────────────────────────────────────
 
 
-def test_ancestor_fraction_puts_ancestor_nodes_in_the_sampled_query_universe(
+def test_an_ontology_puts_every_ancestor_node_in_the_sampled_query_universe(
     tmp_path: Path, data_dir: Path, cohort: Path, codes_yaml: Path, ontology_dir: Path
 ):
-    """``ancestor_fraction`` must reshape the pool the eval grid draws its queries from.
+    """``ontology_dir`` must extend the pool the eval grid draws its queries from.
 
     Red before the fix: ``main`` never called ``build_query_universe``, so the universe was the
     five leaf codes and no ancestor node could ever be drawn — an "ancestor" eval grid that
     measured leaf skill, with nothing in the output to say so.
 
-    The share is asserted, not merely the presence of one ancestor: the documented contract is
-    that ancestors make up ``ancestor_fraction`` *of the pool* the sampler draws uniformly from,
-    which a mirror that appended a single ancestor node would also satisfy at "presence" strength.
+    The share is asserted, not merely the presence of one ancestor: the contract is that every
+    node — leaf or ancestor — is one equally likely slot of the pool, which a mirror that appended
+    a single ancestor node would also satisfy at "presence" strength.
     """
     out_dir = tmp_path / "grid"
     _run_eval(
@@ -288,20 +288,19 @@ def test_ancestor_fraction_puts_ancestor_nodes_in_the_sampled_query_universe(
         split=SPLIT,
         n_sequences=96,
         ontology_dir=ontology_dir,
-        ancestor_fraction=0.5,
     )
 
     queries = _all_queries(out_dir / SPLIT / "cohort__sampled96.parquet")
     drawn_ancestors = [q for q in queries if q in USABLE_ANCESTORS]
 
     assert drawn_ancestors, (
-        "ancestor_fraction=0.5 drew no ancestor node at all; the eval query universe is still "
-        f"leaf-only. Queries drawn: {sorted(set(queries))}"
+        "an ontology was configured but no ancestor node was drawn; the eval query universe is "
+        f"still leaf-only. Queries drawn: {sorted(set(queries))}"
     )
-    # 7 leaves buy 7 ancestor slots, shared out over the 3 ancestor nodes by multiplicity: a 50%
-    # pool, drawn 24 sequences x 3 positions = 72 times.
+    # 7 leaves + 5 usable ancestors, each one slot: an ancestor share of 5/12, drawn
+    # 32 sequences x 3 positions = 96 times.
     share = len(drawn_ancestors) / len(queries)
-    assert 0.3 <= share <= 0.7, f"ancestor share {share:.3f} is nowhere near the configured 0.5"
+    assert 0.25 <= share <= 0.6, f"ancestor share {share:.3f} is nowhere near 5/12"
     assert len(set(drawn_ancestors)) >= 3, (
         f"only {sorted(set(drawn_ancestors))} were drawable; the whole ancestor set should be in play"
     )
@@ -309,15 +308,10 @@ def test_ancestor_fraction_puts_ancestor_nodes_in_the_sampled_query_universe(
     assert "TIMELINE" not in queries
 
 
-def test_ancestor_fraction_zero_keeps_the_universe_leaf_only(
-    tmp_path: Path, data_dir: Path, cohort: Path, codes_yaml: Path, ontology_dir: Path
+def test_no_ontology_keeps_the_universe_leaf_only(
+    tmp_path: Path, data_dir: Path, cohort: Path, codes_yaml: Path
 ):
-    """The two knobs are independent: an ontology alone must not smuggle ancestors into the pool.
-
-    Guards the opposite error from the test above — a "fix" that extends the universe whenever an
-    ontology is present would silently change the query mix of every ontology run, including the
-    ``ancestor_fraction: 0.0`` ones the config's own default describes.
-    """
+    """Without an ontology nothing but the cohort's own codes can be drawn."""
     out_dir = tmp_path / "grid"
     _run_eval(
         data_dir=data_dir,
@@ -326,13 +320,11 @@ def test_ancestor_fraction_zero_keeps_the_universe_leaf_only(
         contexts_path=cohort,
         split=SPLIT,
         n_sequences=96,
-        ontology_dir=ontology_dir,
-        ancestor_fraction=0.0,
     )
 
     queries = set(_all_queries(out_dir / SPLIT / "cohort__sampled96.parquet"))
     assert queries <= set(LEAVES), (
-        f"non-leaf codes {sorted(queries - set(LEAVES))} were drawn at ancestor_fraction=0"
+        f"non-leaf codes {sorted(queries - set(LEAVES))} were drawn without an ontology"
     )
 
 
@@ -359,9 +351,9 @@ def test_designed_ancestor_query_is_true_when_only_a_descendant_occurred(
     branch and the ``per_spec_dirs`` loop, so exploding in only one of them would leave the other
     silently wrong — and ``per_spec_dirs`` is the mode the docs recommend for designed tasks.
 
-    ``ancestor_fraction`` stays at its default 0 here on purpose: both queried codes are in
-    ``query_codes`` already, so nothing rejects the spec and nothing warns.  The pre-fix module
-    ran this exact grid to completion and wrote ``False`` in all four cells.
+    Both queried codes are in ``query_codes`` already, so nothing rejects the spec and nothing
+    warns.  The pre-fix module ran this exact grid to completion and wrote ``False`` in all four
+    cells.
     """
     out_dir = tmp_path / "grid"
     specs = _specs_yaml(tmp_path, circ_30d=ANCESTOR, resp_30d=CONTROL_ANCESTOR)
@@ -400,8 +392,8 @@ def test_a_node_that_is_only_a_prefix_is_both_addressable_and_correctly_labeled(
     """The other ancestor shape: a node that exists *only* as a prefix, never as a code.
 
     ``MED//STATIN`` is in no ``codes.parquet`` and in no event stream; it reaches the eval grid
-    only if ``ancestor_fraction`` put it in the universe (or ``validate_spec_codes`` rejects the
-    spec outright), and it labels correctly only if the closure explosion ran.  So this needs both
+    only if the ontology put it in the universe (or ``validate_spec_codes`` rejects the spec
+    outright), and it labels correctly only if the closure explosion ran.  So this needs both
     halves of the plumbing at once, and pins the label rather than the mere absence of an error.
     """
     out_dir = tmp_path / "grid"
@@ -414,7 +406,6 @@ def test_a_node_that_is_only_a_prefix_is_both_addressable_and_correctly_labeled(
         sequences_path=specs,
         split=SPLIT,
         ontology_dir=ontology_dir,
-        ancestor_fraction=0.5,
     )
 
     # Subject 1 takes atorvastatin 9 days after the prediction time; subject 2 never does.
@@ -429,9 +420,9 @@ def test_leaf_labels_are_untouched_by_the_explosion(
 ):
     """Turning the ontology on must not change what a *leaf* query answers.
 
-    The explosion repeats every event under its ancestors' names; if it dropped, duplicated or
-    renamed the original leaf rows instead of adding to them, leaf answers would move and every
-    leaf metric in an ontology run would shift for a reason nobody would look for.
+    The explosion repeats every event under its ancestors' names; if it dropped, duplicated or renamed the
+    original leaf rows instead of adding to them, leaf answers would move and every leaf metric in an ontology
+    run would shift for a reason nobody would look for.
     """
     specs = _specs_yaml(tmp_path, i50="ICD//CIRC//I50", j44="ICD//RESP//J44")
     got = {}
@@ -469,8 +460,9 @@ def test_eval_and_training_paths_agree_on_the_same_ancestor_query(
 ):
     """One split, one ontology, one ancestor query, one horizon — two samplers, one answer.
 
-    The training sampler is driven so every sampled context draws the single query ``MED//STATIN``
-    at a fixed horizon (``duration_min == duration_max``); the contexts it sampled and the horizon it
+    The training sampler is driven with ``MED//STATIN`` as its only leaf code and a fixed horizon
+    (``duration_min == duration_max``) — the ontology adds the other ancestor nodes to its universe,
+    so only its ``MED//STATIN`` draws are compared; the contexts it sampled and the horizon it
     emitted are then handed back to the eval grid as ``contexts_path`` / a designed spec, so the two
     paths answer a literally identical question about literally identical contexts.
 
@@ -497,10 +489,15 @@ def test_eval_and_training_paths_agree_on_the_same_ancestor_query(
         max_queries=1,
         duration_min=horizon,
         duration_max=horizon,
+        # The comparison is against a fixed-horizon designed spec, so the training draw must be
+        # horizon-only regardless of the config's default event-bound share.
+        eventbound_fraction=0,
         ontology_dir=ontology_dir,
     )
     train_df = pl.concat([pl.read_parquet(fp) for fp in sorted((train_out / SPLIT).glob("*.parquet"))])
-    train_answers = _answers_by_context_and_query(train_df)
+    train_answers = {
+        k: v for k, v in _answers_by_context_and_query(train_df).items() if k[2] == ANCESTOR_ONLY_NODE
+    }
     key = (1, datetime(2020, 6, 6), ANCESTOR_ONLY_NODE)
     assert key in train_answers, "the one context whose answer is True was not sampled; raise num_sequences"
 
@@ -528,7 +525,8 @@ def test_eval_and_training_paths_agree_on_the_same_ancestor_query(
         pl.read_parquet(eval_out / SPLIT / "sampled_cohort__ancestor_spec.parquet")
     )
 
-    assert eval_answers == train_answers, (
+    assert train_answers, "no MED//STATIN query was drawn at all; raise num_sequences"
+    assert {k: eval_answers[k] for k in train_answers} == train_answers, (
         "the two samplers disagree about the same ancestor query on the same contexts: "
         f"eval={eval_answers}, training={train_answers}"
     )
@@ -617,10 +615,9 @@ def test_a_grid_labeled_under_a_different_ontology_is_relabeled_not_skipped(
 ):
     """Neither output tag encodes the ontology, so ``overwrite=false`` must not trust mere existence.
 
-    Both runs below write to exactly the same path and draw exactly the same universe (neither
-    uses ``ancestor_fraction``, so both universes are the leaf list verbatim); they differ only in
-    the closure they label through — the "ontology rebuilt from a different ``codes.parquet``"
-    case.  A guard that hashed only the universe would call these two runs identical.  With an
+    Both runs below write to exactly the same path; they differ in the closure they label
+    through — the "ontology rebuilt from a different ``codes.parquet``" case.  A guard that
+    hashed only the universe could call these two runs identical.  With an
     existence-only skip the second run keeps the first's ``False`` and the grid reports the
     ancestor feature as dead while the config says it is on.
     """
@@ -901,11 +898,11 @@ def test_a_failed_output_write_leaves_no_provenance_behind(
 ):
     """The sidecar is a commit marker, so it may only appear *after* its parquet is committed.
 
-    Written first, it survives a crashed or failed parquet write and then describes whatever stale
-    output happens to be sitting at that path — the next run reads a fingerprint that matches its
-    configuration, skips, and ships the previous ontology's labels.  That is the same
-    silent-wrong-label ending as an existence-only skip, reached through the write ordering
-    instead, and only a failed write can distinguish the two orderings.
+    Written first, it survives a crashed or failed parquet write and then describes whatever stale output
+    happens to be sitting at that path — the next run reads a fingerprint that matches its configuration,
+    skips, and ships the previous ontology's labels.  That is the same silent-wrong-label ending as an
+    existence-only skip, reached through the write ordering instead, and only a failed write can distinguish
+    the two orderings.
     """
     out_dir = tmp_path / "grid"
     specs = _specs_yaml(tmp_path, circ_30d=ANCESTOR)
@@ -937,85 +934,6 @@ def test_a_failed_output_write_leaves_no_provenance_behind(
 # ── 5b. staleness, the universe half: the closure is only one input ──────
 
 
-def test_changing_only_ancestor_fraction_relabels_the_grid(
-    tmp_path: Path, data_dir: Path, cohort: Path, codes_yaml: Path, ontology_dir: Path
-):
-    """Same ontology directory, same output path, a different query universe.
-
-    ``ancestor_fraction`` is a first-class input to a grid's *content* — it decides whether an
-    ancestor node can be drawn at all — and it is encoded in no output tag.  A fingerprint built
-    from the closure alone is identical across these two runs, so the ancestor grid is never
-    written and the leaf-only grid it silently reuses reports leaf skill under an ancestor
-    headline: the very defect this branch exists to fix, reintroduced through the skip path.
-
-    Both existing staleness tests hold the universe fixed and vary only the closure, so neither
-    can distinguish a two-part fingerprint from a closure-only one.
-    """
-    out_dir = tmp_path / "grid"
-    common = {
-        "data_dir": data_dir,
-        "out_dir": out_dir,
-        "query_codes": codes_yaml,
-        "contexts_path": cohort,
-        "split": SPLIT,
-        "n_sequences": 96,
-        "ontology_dir": ontology_dir,
-    }
-    fp = out_dir / SPLIT / "cohort__sampled96.parquet"
-
-    _run_eval(**common, ancestor_fraction=0.0)
-    leaf_only = _all_queries(fp)
-    assert set(leaf_only) <= set(LEAVES)
-
-    _run_eval(**common, ancestor_fraction=0.5)
-    with_ancestors = _all_queries(fp)
-    assert [q for q in with_ancestors if q in USABLE_ANCESTORS], (
-        "raising ancestor_fraction changed nothing on disk: the existing leaf-only grid was "
-        f"treated as current. Queries still drawn: {sorted(set(with_ancestors))}"
-    )
-
-
-def test_changing_only_the_ancestor_multiplicity_relabels_the_grid(
-    tmp_path: Path, data_dir: Path, cohort: Path, codes_yaml: Path, ontology_dir: Path
-):
-    """The universe half must be digested by multiplicity, not by membership.
-
-    ``ancestor_fraction`` 0.5 and 0.7 both put all five usable ancestors in the universe; what
-    differs is how many *slots* each one holds, which is exactly how ``build_query_universe``
-    encodes the mixture the grid is supposed to measure.  A set-valued digest sees the two runs as
-    identical, and a 50%-ancestor grid silently keeps a 30%-ancestor one's queries — a
-    mis-specified evaluation with nothing anywhere to say so.
-    """
-    out_dir = tmp_path / "grid"
-    common = {
-        "data_dir": data_dir,
-        "out_dir": out_dir,
-        "query_codes": codes_yaml,
-        "contexts_path": cohort,
-        "split": SPLIT,
-        "n_sequences": 96,
-        "ontology_dir": ontology_dir,
-    }
-    fp = out_dir / SPLIT / "cohort__sampled96.parquet"
-
-    _run_eval(**common, ancestor_fraction=0.5)
-    thin = Counter(_all_queries(fp))
-    _run_eval(**common, ancestor_fraction=0.7)
-    thick = Counter(_all_queries(fp))
-
-    assert set(thin) == set(thick), (
-        "fixture drift: these two fractions are chosen so the *set* of drawn codes is identical "
-        f"and only the mixture moves. thin={sorted(thin)} thick={sorted(thick)}"
-    )
-    assert thin != thick, (
-        "the 0.7 grid was skipped in favour of the 0.5 grid: the universe is digested by "
-        f"membership only. counts={dict(thick)}"
-    )
-    assert thick[ANCESTOR_ONLY_NODE] > thin[ANCESTOR_ONLY_NODE], (
-        "a richer ancestor mixture must draw ancestors more often, not merely differently"
-    )
-
-
 def test_reordering_the_query_universe_relabels_the_grid(
     tmp_path: Path, data_dir: Path, cohort: Path, ontology_dir: Path
 ):
@@ -1039,7 +957,6 @@ def test_reordering_the_query_universe_relabels_the_grid(
         "split": SPLIT,
         "n_sequences": 96,
         "ontology_dir": ontology_dir,
-        "ancestor_fraction": 0.0,
     }
     fp = out_dir / SPLIT / "cohort__sampled96.parquet"
 
@@ -1084,15 +1001,8 @@ def test_ontology_fingerprint_separates_both_of_its_halves(ontology_dir: Path, s
         "every draw resolves to — reads as the same run"
     )
     assert fingerprint(ontology_dir, [*base, base[0]]) != digest, (
-        "a repeated slot must move the digest: multiplicity is how build_query_universe encodes "
-        "the ancestor mixture"
+        "a repeated slot must move the digest: the digest is of the slot list, not of its set"
     )
-
-    # Two universes that a set-valued digest cannot tell apart, from the real builder.
-    thin = train_seq.build_query_universe(LEAVES, ontology_dir=ontology_dir, ancestor_fraction=0.5)
-    thick = train_seq.build_query_universe(LEAVES, ontology_dir=ontology_dir, ancestor_fraction=0.7)
-    assert set(thin) == set(thick) and Counter(thin) != Counter(thick), "fixture drift"
-    assert fingerprint(ontology_dir, thin) != fingerprint(ontology_dir, thick)
 
 
 # ── 6. config <-> code wiring ───────────────────────────────────────────
@@ -1116,8 +1026,7 @@ def test_eval_ontology_config_keys_match_training_and_are_actually_consumed(
     eval_cfg = yaml.safe_load((configs / "sample_evaluation_query_sequences_config.yaml").read_text())
     train_cfg = yaml.safe_load((configs / "sample_query_sequences_config.yaml").read_text())
 
-    for key in ("ontology_dir", "ancestor_fraction"):
-        assert eval_cfg[key] == train_cfg[key], f"{key} default differs between the two samplers"
+    assert eval_cfg["ontology_dir"] == train_cfg["ontology_dir"], "ontology_dir default differs"
     assert eval_cfg["ontology_dir"] is None
     assert inspect.signature(eval_seq.run_worker).parameters["ontology_dir"].default is None
 
@@ -1155,13 +1064,8 @@ def test_eval_ontology_config_keys_match_training_and_are_actually_consumed(
         contexts_path=cohort,
         split=SPLIT,
         ontology_dir="/some/ontology",
-        ancestor_fraction=0.25,
         seed=1,
     )
 
     assert seen["universe_kwargs"]["ontology_dir"] == "/some/ontology"
-    assert seen["universe_kwargs"]["ancestor_fraction"] == 0.25
-    # The raw configured seed, not a derived axis: the ancestor subset must match the one the
-    # training sampler picked from the same seed, or eval asks about ancestors training never had.
-    assert seen["universe_kwargs"]["seed"] == 1
     assert seen["run_worker_kwargs"]["ontology_dir"] == "/some/ontology"

@@ -81,13 +81,18 @@ Key source modules:
 - `src/every_query/generate_tasks/sample_query_sequences.py` — the 5-stage sequence sampler,
   mirroring `sample_tasks`: Stage 0 `build_prediction_times` (reused), Stage 1'
   `QuerySequenceDistribution` (a `QueryDistribution` subclass adding `min/max_queries` plus the
-  default-off `eos_first_fraction` / `duration_mode` knobs), Stage 2 `sample_patient_contexts`
-  (reused), Stage 3' `build_sequence_index`, Stage 4' `label_binary_occurrence` fanned out per
-  shard. Contexts are drawn **globally across the split**, not per shard, and durations are
-  continuous floats — both differ from the pre-port sampler, so the old checkpoint cannot be
-  compared against new data without retraining. Seeding uses three independent axes:
+  default-off `eos_first_fraction` / `duration_mode` / `eventbound_fraction` knobs — each query it
+  emits is already horizon- or event-bounded), Stage 2 `sample_patient_contexts` (reused),
+  Stage 3' `build_sequence_index` (zips contexts with sequences and resolves prediction times;
+  samples nothing), Stage 4' `label_query_sequences` fanned out per shard. The query universe
+  (`build_query_universe`) is every distinct leaf code plus, with an ontology, every usable
+  ancestor node, each drawn with equal probability as a query code and as an event boundary.
+  Contexts are drawn **globally across the split**, not per shard, and durations are continuous
+  floats — both differ from the pre-port sampler, so the old checkpoint cannot be compared against
+  new data without retraining. Seeding uses four independent axes:
   `derive_seed(seed, "queries")` (identical to the training sampler's draw),
-  `derive_seed(seed, "contexts")`, and `derive_seed(seed, "sequences")` for sequence structure.
+  `derive_seed(seed, "contexts")`, `derive_seed(seed, "sequences")` for sequence structure, and
+  `derive_seed(seed, "bounds")` for which queries are event-bounded and by what.
   `build_sequence_index_df` remains as the in-memory variant for supplied cohorts and the eval grid.
 - `src/every_query/model/conditional_lightning.py` — Lightning module; metrics = pooled
   `answer_auc` + per-position breakdowns (training-time diagnostics only).

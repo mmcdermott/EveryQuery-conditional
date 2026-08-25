@@ -248,7 +248,7 @@ def _sequence_index_df(bound_event: str | None, with_bound_col: bool) -> pl.Data
     """A one-query, one-sequence index frame for the ``sample_query_sequences`` labellers.
 
     An event-bounded row carries ``EVENT_BOUND_DURATION_SENTINEL`` instead of a horizon, exactly as
-    ``assign_event_bounds`` writes it; a time-bounded row carries the real horizon.
+    ``QuerySequenceDistribution.sample_sequences`` emits it; a time-bounded row carries the real horizon.
     """
     duration = EVENT_BOUND_DURATION_SENTINEL if bound_event is not None else DURATION_DAYS
     index_df = pl.DataFrame(

@@ -56,10 +56,16 @@ class QuerySpec:
 
     The Stage 1 output (see ``redesign-spec.md``).  ``duration_days`` is a **float** — durations are
     not rounded to whole days.
+
+    ``bound_event`` is set only by the conditional sequence sampler: an *event-bounded* query's
+    window ends at the next occurrence of that node rather than after a horizon, and its
+    ``duration_days`` then carries ``EVENT_BOUND_DURATION_SENTINEL``.  The single-query pipeline
+    never sets it.
     """
 
     code: str
     duration_days: float
+    bound_event: str | None = None
 
 
 @dataclass(frozen=True)

@@ -231,19 +231,20 @@ def test_extended_vocab_size_covers_every_node(tmp_path):
     assert extended_vocab_size(tmp_path) == int(nodes["token_id"].max()) + 1
 
 
-def test_query_universe_is_untouched_when_the_feature_is_off():
+def test_query_universe_is_untouched_without_an_ontology():
     assert build_query_universe(["A", "B"]) == ["A", "B"]
-    assert build_query_universe(["A", "B"], ontology_dir=None, ancestor_fraction=0.5) == ["A", "B"]
+    assert build_query_universe(["A", "B"], ontology_dir=None) == ["A", "B"]
 
 
-def test_query_universe_mixes_in_ancestors(tmp_path):
+def test_query_universe_is_every_node_exactly_once_leaves_first(tmp_path):
+    """Every leaf and every usable ancestor, each once, so uniform sampling is uniform over nodes.
+
+    Leaves keep their slot indices (they come first, in input order) so a no-ontology run and an ontology run
+    draw the same leaf at the same slot; ancestors follow in sorted order.
+    """
     _write_ontology(tmp_path, _codes(["A//B//C", "D//E//F"]))
-    universe = build_query_universe(
-        ["A//B//C", "D//E//F"], ontology_dir=tmp_path, ancestor_fraction=0.5, seed=3
-    )
-    ancestors = {"A//B", "A", "D//E", "D"}
-    share = sum(1 for c in universe if c in ancestors) / len(universe)
-    assert abs(share - 0.5) < 0.05, f"expected ~50% ancestors, got {share:.2f}"
+    universe = build_query_universe(["A//B//C", "D//E//F"], ontology_dir=tmp_path)
+    assert universe == ["A//B//C", "D//E//F", "A", "A//B", "D", "D//E"]
 
 
 def test_query_universe_never_drops_a_leaf_code(tmp_path):
@@ -254,24 +255,18 @@ def test_query_universe_never_drops_a_leaf_code(tmp_path):
     """
     leaves = [f"LAB//{i}" for i in range(200)] + ["TIMELINE//END"]
     _write_ontology(tmp_path, _codes(leaves))
-    for fraction in (0.05, 0.15, 0.5, 0.9):
-        universe = build_query_universe(leaves, ontology_dir=tmp_path, ancestor_fraction=fraction, seed=1)
-        assert set(leaves) <= set(universe), f"leaves dropped at ancestor_fraction={fraction}"
-
-
-def test_query_universe_rejects_an_all_ancestor_fraction(tmp_path):
-    """Every leaf stays in, so ancestors cannot be 100% of the universe."""
-    _write_ontology(tmp_path, _codes(["A//B//C"]))
-    with pytest.raises(ValueError, match=r"\[0, 1\)"):
-        build_query_universe(["A//B//C"], ontology_dir=tmp_path, ancestor_fraction=1.0, seed=1)
+    universe = build_query_universe(leaves, ontology_dir=tmp_path)
+    assert set(leaves) <= set(universe), "leaves dropped"
+    assert len(universe) == len(set(universe)), "a node appears more than once"
 
 
 def test_query_universe_excludes_tautological_timeline_ancestors(tmp_path):
     """'did any TIMELINE event occur' is free positives and teaches nothing."""
     leaves = ["TIMELINE//END", "TIMELINE//DELTA//1d", "LAB//X//Y"]
     _write_ontology(tmp_path, _codes(leaves))
-    universe = build_query_universe(leaves, ontology_dir=tmp_path, ancestor_fraction=0.5, seed=1)
+    universe = build_query_universe(leaves, ontology_dir=tmp_path)
     assert "TIMELINE" not in set(universe)
+    assert "TIMELINE//DELTA" not in set(universe)
 
 
 # ── 4. model integration ────────────────────────────────────────────────

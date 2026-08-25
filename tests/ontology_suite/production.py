@@ -16,7 +16,7 @@ from every_query.generate_tasks.sample_query_sequences import label_query_sequen
 from .oracle import Event
 
 BOUND_COL = "bound_event"
-#: `assign_event_bounds` writes this in place of a horizon on event-bounded rows.
+#: The sequence sampler writes this in place of a horizon on event-bounded rows.
 EVENT_BOUND_SENTINEL = -1.0
 
 

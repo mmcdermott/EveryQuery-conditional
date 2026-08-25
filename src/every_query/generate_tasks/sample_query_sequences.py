@@ -5,7 +5,8 @@ emitting, per sampled patient context, an ordered *sequence* of queries rather t
 ``(code, duration)``::
 
     Stage 0   build + cache the canonical prediction-time map and subject counts (reused as-is)
-    Stage 1'  sample ``num_sequences`` variable-length query sequences (QuerySequenceDistribution)
+    Stage 1'  sample ``num_sequences`` variable-length query sequences (QuerySequenceDistribution),
+              each query either horizon-bounded or event-bounded
     Stage 2   sample ``num_sequences`` patient contexts (reused as-is)
     Stage 3'  resolve ``prediction_time_index -> prediction_time``, zip, write per-shard index
     Stage 4'  binary-label each index shard independently and write the final dataset parquet
@@ -14,19 +15,22 @@ Stages 0-3' run sequentially in the driver (:func:`run`); Stage 4' fans out one
 :func:`label_one_sequence_shard` worker per shard via ``ProcessPoolExecutor``.  Only the primed
 stages differ from ``sample_tasks``: Stage 1' draws ``L ~ Uniform{min_queries..max_queries}``
 queries per sequence instead of one, and Stage 3' tags each row with ``_ctx_id`` / ``_position`` so
-Stage 4' can reassemble the list columns.
+Stage 4' can reassemble the list columns.  Stage 3' does no sampling of its own: every property of
+a query - code, horizon or boundary - is fixed by Stage 1'.
 
-Every query is an ordinary vocabulary code drawn uniformly - including the end-of-timeline code
-``TIMELINE//END``.  There is **no** privileged censor position and **no** null answer: censoring is
-represented explicitly as a ``TIMELINE//END`` query whose answer is ``True`` exactly when the record
-ends inside the window.  The model trained on these sequences learns
-``P(A_j | patient, Q_1..Q_j, A_1..A_{j-1})``.
+Every query is an ordinary node of the query universe drawn uniformly - including the
+end-of-timeline code ``TIMELINE//END`` and, with an ontology, ancestor nodes.  There is **no**
+privileged censor position and **no** null answer: censoring is represented explicitly as a
+``TIMELINE//END`` query whose answer is ``True`` exactly when the record ends inside the window.
+The model trained on these sequences learns ``P(A_j | patient, Q_1..Q_j, A_1..A_{j-1})``.
 
 Output rows follow :class:`~every_query.data.schema.QuerySeqSchema`.
 
 Two optional, default-off sweep knobs reweight sequence *structure* without touching the base
 code/duration draw: ``eos_first_fraction`` (force position 0 to ``TIMELINE//END``) and
-``duration_mode`` (``random`` | ``same`` | ``nondecreasing``).
+``duration_mode`` (``random`` | ``same`` | ``nondecreasing``).  A third, ``eventbound_fraction``,
+turns that share of queries into *event-bounded* ones whose window ends at the next occurrence of
+a boundary node drawn from the same universe the query codes come from.
 
 Labeling a **supplied** ``(subject_id, prediction_time)`` cohort is the eval sampler's job
 (:mod:`~every_query.generate_tasks.sample_evaluation_query_sequences`, ``contexts_path=``); this
@@ -99,20 +103,6 @@ INDEX_COLUMNS = [
 # Per-query boundary code in the flat index frame; becomes the ``bound_events`` list column.
 BOUND_COL = "bound_event"
 
-# Documented starting point for ``bound_events``, from the upstream experiment's MIMIC-IV
-# vocabulary.  NOT a silent fallback: ``eventbound_fraction > 0`` requires the caller to pass
-# ``bound_events`` explicitly, because these strings are cohort-specific and a boundary code that
-# does not exist in the vocabulary would otherwise be dropped, silently reducing the pool.
-EXAMPLE_BOUNDARY_CODES = (
-    "TIMELINE//END",
-    "MEDS_DEATH",
-    "HOSPITAL_DISCHARGE//HOME",
-    "HOSPITAL_DISCHARGE//UNK",
-    "HOSPITAL_ADMISSION//EW EMER.//EMERGENCY ROOM",
-    "ICU_DISCHARGE//Medical Intensive Care Unit (MICU)",
-    "ICU_ADMISSION//Medical Intensive Care Unit (MICU)",
-)
-
 
 # ---------------------------------------------------------------------------
 # Stage 1' - the sequence query distribution
@@ -130,7 +120,8 @@ class QuerySequenceDistribution(QueryDistribution):
     contract between the two samplers (durations are floats here too - no day-rounding).
 
     Sequence *structure* - how many queries each sequence gets, and the two sweep reweightings -
-    is drawn from a **separate** generator (``structure_rng``) so it never perturbs the base draw.
+    is drawn from a **separate** generator (``structure_rng``) so it never perturbs the base draw;
+    event bounds come from a third (``bound_rng``) for the same reason.
 
     Args:
         min_queries: Minimum queries per sequence (``>= 1``).
@@ -141,6 +132,12 @@ class QuerySequenceDistribution(QueryDistribution):
             ``"same"`` (every query reuses the sequence's first duration); ``"nondecreasing"``
             (durations sorted ascending) - the latter two reflect that many censoring-style asks
             reuse one horizon.
+        eventbound_fraction: Probability, per query, that it is *event-bounded*: its window ends at
+            the next occurrence of a boundary node instead of after a horizon.  The boundary is
+            drawn uniformly from ``query_codes`` - the same universe the query codes come from, so
+            any queryable node (a leaf, or with an ontology an ancestor such as ``X//ANY``) can
+            bound - and the query's ``duration_days`` becomes ``EVENT_BOUND_DURATION_SENTINEL``.
+            ``0.0`` = off.
 
     Examples:
         >>> import numpy as np
@@ -179,6 +176,22 @@ class QuerySequenceDistribution(QueryDistribution):
         >>> all(len({q.duration_days for q in s}) == 1 for s in seqs)
         True
 
+        ``eventbound_fraction=1.0`` bounds every query by a node of the same universe and replaces
+        its horizon with the sentinel; the codes drawn are the ones the unbounded run draws:
+
+        >>> bounded = QuerySequenceDistribution(
+        ...     ["A", "B"], 1.0, 365.0, "log-uniform", 3, 3, eventbound_fraction=1.0)
+        >>> rngs = lambda: (np.random.default_rng(0), np.random.default_rng(1))
+        >>> seqs = bounded.sample_sequences(4, *rngs(), np.random.default_rng(2))
+        >>> {q.bound_event for s in seqs for q in s} <= {"A", "B"}
+        True
+        >>> {q.duration_days for s in seqs for q in s}
+        {-1.0}
+        >>> plain = QuerySequenceDistribution(["A", "B"], 1.0, 365.0, "log-uniform", 3, 3)
+        >>> codes = lambda seqs: [q.code for s in seqs for q in s]
+        >>> codes(seqs) == codes(plain.sample_sequences(4, *rngs()))
+        True
+
         ``num_sequences=0`` is valid and returns an empty list:
 
         >>> dist.sample_sequences(0, np.random.default_rng(0), np.random.default_rng(1))
@@ -189,6 +202,7 @@ class QuerySequenceDistribution(QueryDistribution):
     max_queries: int = 5
     eos_first_fraction: float = 0.0
     duration_mode: str = "random"
+    eventbound_fraction: float = 0.0
 
     _VALID_DURATION_MODES = ("random", "same", "nondecreasing")
 
@@ -204,6 +218,8 @@ class QuerySequenceDistribution(QueryDistribution):
             raise ValueError(
                 f"duration_mode must be one of {self._VALID_DURATION_MODES} (got {self.duration_mode!r})"
             )
+        if not 0.0 <= self.eventbound_fraction <= 1.0:
+            raise ValueError(f"eventbound_fraction must be in [0, 1], got {self.eventbound_fraction}")
         # Forcing a code that is not in the sampling universe would emit queries the model's
         # vocabulary cannot encode - a config error worth failing on rather than discovering as an
         # out-of-vocab crash three stages later.
@@ -224,14 +240,11 @@ class QuerySequenceDistribution(QueryDistribution):
         equality, since a training/eval mismatch in the duration draw silently invalidates eval.
         """
         return cls(
-            # When an ontology is configured, ancestor nodes are mixed into the *universe* the
-            # codes are drawn uniformly from, so the draw itself — and its parity with
+            # When an ontology is configured, ancestor nodes join the *universe* the codes (and
+            # boundaries) are drawn uniformly from, so the draw itself — and its parity with
             # sample_tasks — is untouched.  See build_query_universe.
             query_codes=build_query_universe(
-                read_query_codes(cfg.query_codes),
-                ontology_dir=cfg.get("ontology_dir"),
-                ancestor_fraction=float(cfg.get("ancestor_fraction", 0.0) or 0.0),
-                seed=int(cfg.get("seed", 0)),
+                read_query_codes(cfg.query_codes), ontology_dir=cfg.get("ontology_dir")
             ),
             min_duration=float(cfg.duration_min),
             max_duration=float(cfg.duration_max),
@@ -240,6 +253,7 @@ class QuerySequenceDistribution(QueryDistribution):
             max_queries=int(cfg.max_queries),
             eos_first_fraction=float(cfg.get("eos_first_fraction", 0.0)),
             duration_mode=str(cfg.get("duration_mode", "random")),
+            eventbound_fraction=float(cfg.get("eventbound_fraction", 0.0) or 0.0),
         )
 
     def sample_sequences(
@@ -247,20 +261,34 @@ class QuerySequenceDistribution(QueryDistribution):
         num_sequences: int,
         query_rng: np.random.Generator,
         structure_rng: np.random.Generator,
+        bound_rng: np.random.Generator | None = None,
     ) -> list[list[QuerySpec]]:
         """Draw ``num_sequences`` sequences of ``L ~ Uniform{min_queries..max_queries}`` queries.
 
-        Two caller-owned generators keep the axes independent (mirroring the redesign's invariant
-        5): ``query_rng`` feeds *only* the inherited :meth:`QueryDistribution.sample` (seeded via
-        ``derive_seed(seed, "queries")``, matching the training sampler), while ``structure_rng``
-        (``derive_seed(seed, "sequences")``) draws lengths and applies the two sweep reweightings.
-        Draws happen in a fixed order, so output is deterministic for fixed generators.
+        Three caller-owned generators keep the axes independent (mirroring the redesign's
+        invariant 5): ``query_rng`` feeds *only* the inherited :meth:`QueryDistribution.sample`
+        (seeded via ``derive_seed(seed, "queries")``, matching the training sampler);
+        ``structure_rng`` (``derive_seed(seed, "sequences")``) draws lengths and applies the two
+        sweep reweightings; ``bound_rng`` (``derive_seed(seed, "bounds")``) decides which queries
+        are event-bounded and by what, and is required only when ``eventbound_fraction > 0``.
+        Drawing bounds from either other generator would shift every later code/duration draw
+        (breaking parity with ``sample_tasks``) or perturb the structure knobs.  Draws happen in a
+        fixed order, so output is deterministic for fixed generators.
+
+        Bounds are drawn i.i.d. **per query**, not per sequence, so one sequence mixes horizon and
+        event-bounded asks and the model has to read each slot to know which kind it is given.
+        Because the boundary pool *is* the query pool, a query can draw itself (or, with an
+        ontology, an ancestor of itself) as its boundary; such a query is unconditionally
+        ``False`` under the strict bound (see :func:`label_with_event_bounds`).
 
         Raises:
-            ValueError: If ``num_sequences < 0``.
+            ValueError: If ``num_sequences < 0``, or ``eventbound_fraction > 0`` without a
+                ``bound_rng``.
         """
         if num_sequences < 0:
             raise ValueError(f"num_sequences must be >= 0 (got {num_sequences})")
+        if self.eventbound_fraction > 0 and bound_rng is None:
+            raise ValueError(f"eventbound_fraction={self.eventbound_fraction} > 0 requires a bound_rng")
         if num_sequences == 0:
             return []
 
@@ -285,6 +313,20 @@ class QuerySequenceDistribution(QueryDistribution):
                 for s in sequences
             ]
 
+        # Last, so duration_mode couples the real horizons and only then some are replaced.
+        if self.eventbound_fraction > 0:
+            n = int(offsets[-1])
+            chosen = bound_rng.random(n) < self.eventbound_fraction
+            picks = bound_rng.integers(0, self.query_universe_size, size=n)
+            flat = iter(zip(chosen, picks, strict=True))
+            sequences = [
+                [
+                    QuerySpec(q.code, EVENT_BOUND_DURATION_SENTINEL, self.query_codes[p]) if c else q
+                    for q, (c, p) in zip(s, flat, strict=False)
+                ]
+                for s in sequences
+            ]
+
         return sequences
 
 
@@ -295,6 +337,11 @@ def _expand_sequences(sequences: list[list[QuerySpec]]) -> pl.DataFrame:
     not just within a shard) and ``_position`` is the query's zero-based rank inside its sequence.
     Rows come out in ``(_ctx_id, _position)`` order.
 
+    The ``bound_event`` column is present iff some query carries a bound - keyed on the data, not
+    on a flag, which is the same rule ``build_dense_sequence_index_df`` and the labeling dispatch
+    in :func:`label_query_sequences` use.  A bound-free run is therefore byte-identical to one
+    from before the feature existed (the doctest below relies on that).
+
     Examples:
         >>> seqs = [[QuerySpec("A", 1.0), QuerySpec("B", 2.0)], [QuerySpec("C", 3.0)]]
         >>> _expand_sequences(seqs).to_dicts() == [
@@ -302,6 +349,9 @@ def _expand_sequences(sequences: list[list[QuerySpec]]) -> pl.DataFrame:
         ...     {"_ctx_id": 0, "_position": 1, "query": "B", "duration_days": 2.0},
         ...     {"_ctx_id": 1, "_position": 0, "query": "C", "duration_days": 3.0}]
         True
+        >>> seqs = [[QuerySpec("A", 1.0), QuerySpec("B", -1.0, "X")]]
+        >>> _expand_sequences(seqs)["bound_event"].to_list()
+        [None, 'X']
     """
     lengths = np.array([len(s) for s in sequences], dtype=np.int64)
     if lengths.size and lengths.min() < 1:
@@ -313,16 +363,16 @@ def _expand_sequences(sequences: list[list[QuerySpec]]) -> pl.DataFrame:
         if lengths.size
         else np.empty(0, dtype=np.int64)
     )
-    return pl.DataFrame(
-        {
-            CTX_ID_COL: pl.Series(ctx_ids, dtype=pl.UInt32),
-            POSITION_COL: pl.Series(positions, dtype=pl.Int64),
-            TaskQuerySchema.query_name: pl.Series([q.code for s in sequences for q in s], dtype=pl.Utf8),
-            TaskQuerySchema.duration_days_name: pl.Series(
-                [q.duration_days for s in sequences for q in s], dtype=pl.Float32
-            ),
-        }
-    )
+    flat = [q for s in sequences for q in s]
+    columns = {
+        CTX_ID_COL: pl.Series(ctx_ids, dtype=pl.UInt32),
+        POSITION_COL: pl.Series(positions, dtype=pl.Int64),
+        TaskQuerySchema.query_name: pl.Series([q.code for q in flat], dtype=pl.Utf8),
+        TaskQuerySchema.duration_days_name: pl.Series([q.duration_days for q in flat], dtype=pl.Float32),
+    }
+    if any(q.bound_event is not None for q in flat):
+        columns[BOUND_COL] = pl.Series([q.bound_event for q in flat], dtype=pl.Utf8)
+    return pl.DataFrame(columns)
 
 
 def _attach_queries_to_contexts(contexts: pl.DataFrame, per_query: pl.DataFrame) -> pl.DataFrame:
@@ -350,17 +400,13 @@ def _attach_queries_to_contexts(contexts: pl.DataFrame, per_query: pl.DataFrame)
 _TAUTOLOGICAL_ANCESTOR_PREFIXES = ("TIMELINE",)
 
 
-def build_query_universe(
-    query_codes: Sequence[str],
-    ontology_dir: str | Path | None = None,
-    ancestor_fraction: float = 0.0,
-    seed: int = 0,
-) -> list[str]:
-    """Mix ontology ancestor nodes into the query universe, by multiplicity.
+def build_query_universe(query_codes: Sequence[str], ontology_dir: str | Path | None = None) -> list[str]:
+    """The list of distinct nodes the sampler draws query codes *and* boundaries from, uniformly.
 
-    Returns ``query_codes`` unchanged when the feature is off.  Otherwise returns a list in which
-    **every leaf code appears exactly once** and ancestor nodes are added often enough that they
-    make up ``ancestor_fraction`` of the list — so uniform sampling from it yields that mixture.
+    Without an ontology this is ``query_codes`` unchanged.  With one, every usable ancestor node
+    (the ``TIMELINE`` namespace excluded, see :data:`_TAUTOLOGICAL_ANCESTOR_PREFIXES`) is appended
+    **once**, after the leaves and in sorted order, so a leaf's slot index is the same as in a
+    no-ontology run and every node - leaf or ancestor - is equally likely to be drawn.
 
     Two properties matter here and neither is negotiable:
 
@@ -372,114 +418,39 @@ def build_query_universe(
     - *The draw is not perturbed.*  Reshaping the universe rather than biasing the draw leaves
       the code/duration RNG stream untouched, which is what keeps parity with ``sample_tasks``.
 
-    The cost is that a leaf's marginal probability is no longer exactly ``1/|vocab|`` — which is
-    the point, since the universe is the thing being varied.
-
     Examples:
-        Off by default, and off without an ontology:
+        Off without an ontology:
 
         >>> build_query_universe(["A", "B"]) == ["A", "B"]
         True
     """
-    if not ontology_dir or ancestor_fraction <= 0.0:
+    if not ontology_dir:
         return list(query_codes)
-    if not 0.0 <= ancestor_fraction < 1.0:
-        raise ValueError(
-            f"ancestor_fraction must be in [0, 1), got {ancestor_fraction}; every leaf code stays "
-            "in the universe, so ancestors cannot be 100% of it."
-        )
 
     from every_query.data.ontology import load_nodes
 
+    leaves = list(query_codes)
+    seen = set(leaves)
     nodes = load_nodes(ontology_dir)
     ancestors = sorted(nodes.filter(~pl.col("is_observed_code"))["node_name"].to_list())
-    ancestors = [a for a in ancestors if not a.startswith(_TAUTOLOGICAL_ANCESTOR_PREFIXES)]
+    ancestors = [a for a in ancestors if not a.startswith(_TAUTOLOGICAL_ANCESTOR_PREFIXES) and a not in seen]
     if not ancestors:
         logger.warning(
-            "ancestor_fraction=%g but the ontology at %s contributes no usable ancestor nodes; "
-            "the query universe is unchanged.",
-            ancestor_fraction,
+            "The ontology at %s contributes no usable ancestor nodes; the query universe is unchanged.",
             ontology_dir,
         )
-        return list(query_codes)
-
-    leaves = list(query_codes)
-    # f = anc / (leaves + anc)  =>  anc = leaves * f / (1 - f)
-    n_anc_slots = round(len(leaves) * ancestor_fraction / (1.0 - ancestor_fraction))
-    if n_anc_slots == 0:
         return leaves
 
-    rng = np.random.default_rng(derive_seed(seed, "ancestor_universe"))
-    if n_anc_slots <= len(ancestors):
-        picks = sorted(rng.choice(len(ancestors), size=n_anc_slots, replace=False).tolist())
-        anc_slots = [ancestors[i] for i in picks]
-    else:
-        # More slots than ancestors: give every ancestor the same base multiplicity, then hand
-        # the remainder to a seeded subset, so the target fraction is hit exactly.
-        reps, remainder = divmod(n_anc_slots, len(ancestors))
-        anc_slots = ancestors * reps
-        if remainder:
-            extra = sorted(rng.choice(len(ancestors), size=remainder, replace=False).tolist())
-            anc_slots += [ancestors[i] for i in extra]
-
-    universe = leaves + anc_slots
+    universe = leaves + ancestors
     logger.info(
-        "Ontology: query universe is %d slot(s) — %d leaf code(s) plus %d ancestor slot(s) drawn "
-        "from %d ancestor node(s), an ancestor share of %.1f%%.",
+        "Ontology: query universe is %d distinct node(s) — %d leaf code(s) plus %d ancestor node(s) "
+        "(%.1f%% ancestors), each drawn with equal probability.",
         len(universe),
         len(leaves),
-        len(anc_slots),
         len(ancestors),
-        100.0 * len(anc_slots) / len(universe),
+        100.0 * len(ancestors) / len(universe),
     )
     return universe
-
-
-def resolve_bound_events(cfg: DictConfig, query_codes: Sequence[str]) -> list[str]:
-    """Resolve and validate the boundary-code pool for event-bounded queries.
-
-    ``bound_events`` is a **required** key once ``eventbound_fraction > 0``: the codes are
-    cohort-specific strings (see :data:`EXAMPLE_BOUNDARY_CODES` for the upstream MIMIC-IV set),
-    and there is no defensible default that works across cohorts.
-
-    A boundary code absent from ``query_codes`` is a hard error rather than a silent drop.
-    Dropping would shrink the pool without saying so — in the limit to nothing — and the
-    resulting model would look trained while never having seen the boundary you asked for.
-
-    Returns:
-        The validated boundary codes, or ``[]`` when the feature is off.
-    """
-    fraction = float(cfg.get("eventbound_fraction", 0.0) or 0.0)
-    if fraction <= 0.0:
-        return []
-
-    raw = cfg.get("bound_events")
-    if not raw:
-        raise ValueError(
-            "eventbound_fraction > 0 requires `bound_events`, either a list of boundary codes or "
-            "a path to a YAML list of them, present in this cohort's vocabulary.  These strings "
-            f"are cohort-specific; the upstream MIMIC-IV set was {list(EXAMPLE_BOUNDARY_CODES)}."
-        )
-    # Accept a file path as well as a literal list.  Real boundary codes carry spaces, periods
-    # and parentheses ("HOSPITAL_ADMISSION//EW EMER.//EMERGENCY ROOM", "ICU_DISCHARGE//...(MICU)"),
-    # which Hydra's override grammar cannot parse as a bare list on the command line — so
-    # requiring a literal list would make the documented codes unusable from the CLI.
-    configured = read_query_codes(raw)
-
-    unknown = sorted(set(configured) - set(query_codes))
-    if unknown:
-        raise ValueError(
-            f"{len(unknown)} bound_events code(s) are not in the query vocabulary: {unknown}.  "
-            "A boundary code the encoder never saw cannot define a window; fix the spelling or "
-            "drop it explicitly rather than letting the pool shrink silently."
-        )
-    logger.info(
-        "Event bounds: %.0f%% of queries will be bounded by one of %d boundary code(s): %s",
-        100.0 * fraction,
-        len(configured),
-        configured,
-    )
-    return configured
 
 
 def build_sequence_index_df(
@@ -494,7 +465,6 @@ def build_sequence_index_df(
     duration_mode: str = "random",
     duration_distribution: str = "log-uniform",
     eventbound_fraction: float = 0.0,
-    bound_events: Sequence[str] | None = None,
 ) -> pl.DataFrame:
     """Expand *already-resolved* contexts into a flat per-query index frame (in-memory variant).
 
@@ -538,13 +508,12 @@ def build_sequence_index_df(
         ['TIMELINE//END']
 
         ``eventbound_fraction`` converts that share of queries into event-bounded ones, which
-        carry a boundary code and the duration sentinel instead of a horizon:
+        carry a boundary node drawn from the same universe and the duration sentinel instead of a
+        horizon:
 
-        >>> idx = build_sequence_index_df(
-        ...     ctx, ["A", "B"], 4, 4, 1, 365, 0,
-        ...     eventbound_fraction=1.0, bound_events=["DISCHARGE"])
-        >>> idx["bound_event"].unique().to_list()
-        ['DISCHARGE']
+        >>> idx = build_sequence_index_df(ctx, ["A", "B"], 4, 4, 1, 365, 0, eventbound_fraction=1.0)
+        >>> set(idx["bound_event"].to_list()) <= {"A", "B"}
+        True
         >>> idx["duration_days"].unique().to_list()
         [-1.0]
 
@@ -563,10 +532,8 @@ def build_sequence_index_df(
         max_queries=max_queries,
         eos_first_fraction=eos_first_fraction,
         duration_mode=duration_mode,
+        eventbound_fraction=eventbound_fraction,
     )
-
-    bounded = eventbound_fraction > 0.0
-    columns = [*INDEX_COLUMNS, BOUND_COL] if bounded else INDEX_COLUMNS
 
     if contexts.height == 0:
         empty = contexts.head(0).select(
@@ -577,7 +544,7 @@ def build_sequence_index_df(
             pl.lit("", dtype=pl.Utf8).alias(TaskQuerySchema.query_name),
             pl.lit(0.0, dtype=pl.Float32).alias(TaskQuerySchema.duration_days_name),
         )
-        if bounded:
+        if eventbound_fraction > 0.0:
             empty = empty.with_columns(pl.lit(None, dtype=pl.Utf8).alias(BOUND_COL))
         return empty
 
@@ -585,18 +552,10 @@ def build_sequence_index_df(
         contexts.height,
         np.random.default_rng(derive_seed(seed, "queries")),
         np.random.default_rng(derive_seed(seed, "sequences")),
+        np.random.default_rng(derive_seed(seed, "bounds")),
     )
     per_query = _expand_sequences(sequences)
-    if bounded:
-        # A fourth, independent seed axis.  Drawing bounds from the "queries" generator would
-        # shift every later code/duration draw and break the distribution-parity contract with
-        # sample_tasks; drawing from "sequences" would perturb eos_first_fraction/duration_mode.
-        per_query = assign_event_bounds(
-            per_query,
-            list(bound_events or ()),
-            eventbound_fraction,
-            np.random.default_rng(derive_seed(seed, "bounds")),
-        )
+    columns = [*INDEX_COLUMNS, BOUND_COL] if BOUND_COL in per_query.columns else INDEX_COLUMNS
     return _attach_queries_to_contexts(contexts, per_query).select(columns)
 
 
@@ -672,9 +631,6 @@ def build_sequence_index(
     contexts: pl.DataFrame,
     training_task_artifacts_dir: Path,
     split: str,
-    eventbound_fraction: float = 0.0,
-    bound_events: Sequence[str] | None = None,
-    seed: int = 0,
 ) -> int:
     """Stage 3': zip sequences with contexts, resolve prediction times, write partitioned index.
 
@@ -683,6 +639,11 @@ def build_sequence_index(
     expands each context into the ``L`` queries of its sequence, tagged with ``_ctx_id`` /
     ``_position`` so Stage 4' can reassemble the list columns.  ``sequences[i]`` belongs to
     ``contexts`` row ``i`` - the two are drawn with the same length and zipped positionally.
+
+    Nothing is sampled here.  Every property of a query - its code, its horizon, or the boundary
+    node that replaces the horizon - is already fixed on the :class:`QuerySpec` by Stage 1'; this
+    stage only carries it into the index (the ``bound_event`` column appears iff some query is
+    event-bounded, see :func:`_expand_sequences`).
 
     Everything else matches ``build_index`` deliberately: the rank -> timestamp resolution runs one
     shard at a time through :func:`resolve_prediction_times` (one ``read_parquet`` per shard, so
@@ -717,17 +678,7 @@ def build_sequence_index(
     assert contexts.height > 0, "contexts must be non-empty"
 
     per_query = _expand_sequences(sequences)
-    bounded = eventbound_fraction > 0.0
-    if bounded:
-        # Fourth seed axis — see build_sequence_index_df for why it must not share the query or
-        # sequence generators.
-        per_query = assign_event_bounds(
-            per_query,
-            list(bound_events or ()),
-            eventbound_fraction,
-            np.random.default_rng(derive_seed(seed, "bounds")),
-        )
-    columns = [*INDEX_COLUMNS, BOUND_COL] if bounded else INDEX_COLUMNS
+    columns = [*INDEX_COLUMNS, BOUND_COL] if BOUND_COL in per_query.columns else INDEX_COLUMNS
     combined = _attach_queries_to_contexts(contexts, per_query)
 
     index_dir = training_task_artifacts_dir / split / INDEX_DIRNAME
@@ -971,12 +922,14 @@ def label_with_event_bounds(index_df: pl.DataFrame, events_df: pl.DataFrame) -> 
 
 
 def log_degenerate_bounds(index_df: pl.DataFrame, events_df: pl.DataFrame) -> dict[str, float]:
-    """Report, per boundary code, the fraction of event-bounded rows whose boundary never fires.
+    """Report how often a boundary never fires, and return the per-boundary never-fires rate.
 
-    Those rows are silently relabelled "does this code ever occur again" (see
-    :func:`label_with_event_bounds`).  A boundary that degenerates most of the time is not
-    really being learned as a boundary, and the resulting AUROC would say otherwise — so the
-    rate is logged at generation time, when it is still cheap to notice.
+    A boundary that never occurs after the prediction time silently relabels the row "does this
+    code ever occur again" (see :func:`label_with_event_bounds`).  A boundary that degenerates most
+    of the time is not really being learned as a boundary, and the resulting AUROC would say
+    otherwise — so it is logged at generation time, when it is still cheap to notice: one summary
+    line plus the ten boundary nodes that never fire most often (boundaries are drawn from the
+    whole query universe, so a per-node line would be one per vocabulary entry).
     """
     if BOUND_COL not in index_df.columns:
         return {}
@@ -988,23 +941,30 @@ def log_degenerate_bounds(index_df: pl.DataFrame, events_df: pl.DataFrame) -> di
         (pl.col(TaskQuerySchema.prediction_time_name) + pl.duration(microseconds=1)).alias("_pts")
     )
     joined = _first_occurrence_after(left, events_df, BOUND_COL, "_b_time")
-    rates = (
-        joined.group_by(BOUND_COL)
-        .agg(pl.col("_b_time").is_null().mean().alias("degenerate_rate"), pl.len().alias("n"))
-        .sort(BOUND_COL)
+    rates = joined.group_by(BOUND_COL).agg(
+        pl.col("_b_time").is_null().mean().alias("degenerate_rate"),
+        pl.col("_b_time").is_null().sum().alias("n_degenerate"),
+        pl.len().alias("n"),
     )
-    out: dict[str, float] = {}
-    for row in rates.iter_rows(named=True):
-        out[row[BOUND_COL]] = float(row["degenerate_rate"])
+    logger.info(
+        "Event bounds: %d bounded quer%s over %d distinct boundary node(s); %.1f%% have no boundary "
+        "occurrence after the prediction time (window runs to end of record — the query degenerates "
+        "to 'does this code ever occur again').",
+        bounded.height,
+        "y" if bounded.height == 1 else "ies",
+        rates.height,
+        100.0 * rates["n_degenerate"].sum() / bounded.height,
+    )
+    worst = rates.filter(pl.col("n_degenerate") > 0).sort("n_degenerate", BOUND_COL, descending=[True, False])
+    for row in worst.head(10).iter_rows(named=True):
         logger.info(
-            "Event bound %r: %.1f%% of %d queries have no boundary occurrence after the "
-            "prediction time (window runs to end of record — the query degenerates to "
-            "'does this code ever occur again').",
+            "  never fires: %r — %d of %d (%.1f%%)",
             row[BOUND_COL],
-            100.0 * row["degenerate_rate"],
+            row["n_degenerate"],
             row["n"],
+            100.0 * row["degenerate_rate"],
         )
-    return out
+    return {r[BOUND_COL]: float(r["degenerate_rate"]) for r in rates.sort(BOUND_COL).iter_rows(named=True)}
 
 
 def maybe_expand_to_matching_query_nodes(events_df: pl.DataFrame, ontology_dir: str | Path | None):
@@ -1045,7 +1005,8 @@ def label_query_sequences(index_df: pl.DataFrame, events_df: pl.DataFrame) -> pl
 
     Args:
         index_df: Flat per-query index frame (one row per query of each sequence).
-        events_df: The event stream to answer against.
+        events_df: The event stream to answer against, already closure-exploded by the caller
+            when an ontology is in use, so ancestor queries and boundaries label correctly.
 
     Returns:
         One row per sequence, with the ``queries``/``durations``/``answers`` list columns
@@ -1055,79 +1016,6 @@ def label_query_sequences(index_df: pl.DataFrame, events_df: pl.DataFrame) -> pl
         log_degenerate_bounds(index_df, events_df)
         return label_with_event_bounds(index_df, events_df)
     return label_binary_occurrence(index_df, events_df)
-
-
-def assign_event_bounds(
-    index_df: pl.DataFrame,
-    boundary_codes: Sequence[str],
-    eventbound_fraction: float,
-    rng: np.random.Generator,
-) -> pl.DataFrame:
-    """Convert a fraction of the per-query rows into event-bounded queries.
-
-    Draws i.i.d. **per query**, not per sequence, so a single sequence mixes time- and
-    event-bounded asks — which is the point: the model has to read the slot to know which
-    kind it is being given.  Chosen rows get a boundary code and the
-    ``EVENT_BOUND_DURATION_SENTINEL`` in place of their sampled horizon; the rest keep their
-    horizon and a null bound.
-
-    ``rng`` is passed in rather than a seed so the caller can keep this on its own seed axis:
-    drawing bounds from the query generator would shift every subsequent code/duration draw
-    and break the sampler's distribution-parity contract with ``sample_tasks``.
-
-    Examples:
-        >>> import numpy as np
-        >>> idx = pl.DataFrame({
-        ...     "query": ["A", "B", "C", "D"],
-        ...     "duration_days": [30.0, 30.0, 30.0, 30.0],
-        ... }).with_columns(pl.col("duration_days").cast(pl.Float32))
-
-        ``0.0`` adds the column but bounds nothing, so the frame is unchanged apart from an
-        all-null ``bound_event``:
-
-        >>> out = assign_event_bounds(idx, ["X"], 0.0, np.random.default_rng(0))
-        >>> out["bound_event"].to_list(), out["duration_days"].to_list()
-        ([None, None, None, None], [30.0, 30.0, 30.0, 30.0])
-
-        ``1.0`` bounds every row and replaces every horizon with the sentinel:
-
-        >>> out = assign_event_bounds(idx, ["X"], 1.0, np.random.default_rng(0))
-        >>> out["bound_event"].to_list(), out["duration_days"].to_list()
-        (['X', 'X', 'X', 'X'], [-1.0, -1.0, -1.0, -1.0])
-
-        Bounds are drawn from the supplied pool only:
-
-        >>> out = assign_event_bounds(idx, ["X", "Y"], 1.0, np.random.default_rng(3))
-        >>> set(out["bound_event"].to_list()) <= {"X", "Y"}
-        True
-    """
-    if not boundary_codes:
-        raise ValueError(
-            "assign_event_bounds requires at least one boundary code.  Pass `bound_events=[...]` "
-            "with codes present in the cohort vocabulary."
-        )
-    if not 0.0 <= eventbound_fraction <= 1.0:
-        raise ValueError(f"eventbound_fraction must be in [0, 1], got {eventbound_fraction}")
-
-    n = index_df.height
-    if n == 0:
-        return index_df.with_columns(pl.lit(None, dtype=pl.Utf8).alias(BOUND_COL))
-
-    chosen = rng.random(n) < eventbound_fraction
-    picks = rng.integers(0, len(boundary_codes), size=n)
-    # A plain list of ``str | None``, not a numpy object array: polars cannot cast Object to Utf8,
-    # which only shows up once the draw is actually mixed (all-None and all-bound both survive it).
-    bounds = [boundary_codes[p] if c else None for c, p in zip(chosen, picks, strict=True)]
-
-    return index_df.with_columns(
-        pl.Series(BOUND_COL, bounds, dtype=pl.Utf8),
-    ).with_columns(
-        pl.when(pl.col(BOUND_COL).is_not_null())
-        .then(pl.lit(EVENT_BOUND_DURATION_SENTINEL))
-        .otherwise(pl.col(TaskQuerySchema.duration_days_name))
-        .cast(pl.Float32)
-        .alias(TaskQuerySchema.duration_days_name)
-    )
 
 
 def label_one_sequence_shard(
@@ -1189,9 +1077,9 @@ def _label_sequence_shards(
 ) -> None:
     """Fan one :func:`label_one_sequence_shard` worker out per shard via a spawn-based pool.
 
-    ``"spawn"``, not the Linux default ``"fork"``: by Stage 4' the driver has already run polars
-    (which starts a rayon threadpool), and forking while those threads hold locks leaves the child
-    with inherited-but-locked mutexes, deadlocking the worker the moment it touches polars (#210).
+    ``"spawn"``, not the Linux default ``"fork"``: by Stage 4' the driver has already run polars (which starts
+    a rayon threadpool), and forking while those threads hold locks leaves the child with inherited-but-locked
+    mutexes, deadlocking the worker the moment it touches polars (#210).
     """
     mp_context = multiprocessing.get_context("spawn")
     with ProcessPoolExecutor(max_workers=n_workers, mp_context=mp_context) as ex:
@@ -1281,6 +1169,10 @@ def run(cfg: DictConfig) -> None:
     seq_tasks_dir = _require_path_arg(cfg.get("out_dir"), "out_dir")
     seq_task_artifacts_dir = default_artifacts_dir(seq_tasks_dir)
 
+    # Resolve the query distribution (and so the universe) before any Stage 0 work, so a config
+    # error fails in seconds rather than after the prediction-time map has been rebuilt.
+    query_dist = QuerySequenceDistribution.from_config(cfg)
+
     # Stage 0: precompute & cache subject prediction_time_indexes and per-subject counts.
     n_subjects = build_prediction_times(
         path_to_data=path_to_data,
@@ -1294,23 +1186,20 @@ def run(cfg: DictConfig) -> None:
     num_sequences = int(cfg.num_sequences)
 
     # Independent RNG streams per axis (invariant 5): "queries" matches the training sampler's draw
-    # exactly (parity), "contexts" matches its context draw, and "sequences" carries the
-    # structure-only draws that have no counterpart there.
+    # exactly (parity), "contexts" matches its context draw, "sequences" carries the structure-only
+    # draws that have no counterpart there, and "bounds" decides which queries are event-bounded.
     query_rng = np.random.default_rng(derive_seed(cfg.seed, "queries"))
     context_rng = np.random.default_rng(derive_seed(cfg.seed, "contexts"))
     structure_rng = np.random.default_rng(derive_seed(cfg.seed, "sequences"))
+    bound_rng = np.random.default_rng(derive_seed(cfg.seed, "bounds"))
 
     # Stage 1': sample one variable-length query sequence per context-to-be.
-    query_dist = QuerySequenceDistribution.from_config(cfg)
-    # Validate the boundary pool before any sampling work: a bad code should fail in seconds,
-    # not after Stage 0 has rebuilt the prediction-time map.
-    bound_events = resolve_bound_events(cfg, query_dist.query_codes)
-    sequences = query_dist.sample_sequences(num_sequences, query_rng, structure_rng)
+    sequences = query_dist.sample_sequences(num_sequences, query_rng, structure_rng, bound_rng)
     n_queries = sum(len(s) for s in sequences)
     logger.info(
-        "Stage 1': sampled %s sequence(s) totaling %s quer%s from a %s-code universe "
+        "Stage 1': sampled %s sequence(s) totaling %s quer%s from a %s-node universe "
         "(%s durations over [%g, %g] days, lengths ~ U{%d..%d}, eos_first_fraction=%g, "
-        "duration_mode=%s).",
+        "duration_mode=%s, eventbound_fraction=%g).",
         f"{num_sequences:,}",
         f"{n_queries:,}",
         "y" if n_queries == 1 else "ies",
@@ -1322,6 +1211,7 @@ def run(cfg: DictConfig) -> None:
         query_dist.max_queries,
         query_dist.eos_first_fraction,
         query_dist.duration_mode,
+        query_dist.eventbound_fraction,
     )
 
     # Stage 2: one patient context per sequence.  Re-sort by subject_id so the subject_idx ->
@@ -1343,9 +1233,6 @@ def run(cfg: DictConfig) -> None:
         contexts=contexts,
         training_task_artifacts_dir=seq_task_artifacts_dir,
         split=cfg.split,
-        eventbound_fraction=float(cfg.get("eventbound_fraction", 0.0) or 0.0),
-        bound_events=bound_events,
-        seed=cfg.seed,
     )
     logger.info(
         "Stage 3': wrote partitioned index for split=%s (%s query rows across %s shard(s)).",

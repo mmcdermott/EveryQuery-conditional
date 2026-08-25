@@ -19,12 +19,6 @@ import pytest
 from meds import train_split, tuning_split
 
 from conftest import run_and_check
-from every_query.data.seq_dataset import EOS_CODE
-
-
-def _vocabulary(preprocessed: Path) -> list[str]:
-    codes_fp = preprocessed / "metadata" / "codes.parquet"
-    return pl.read_parquet(codes_fp, columns=["code"])["code"].to_list()
 
 
 @pytest.fixture(scope="module")
@@ -61,10 +55,6 @@ def featured_tasks_dir(eq_preprocessed_dataset: Path, ontology_dir: Path, tmp_pa
     intermediate = eq_preprocessed_dataset.parent / "intermediate"
     out_dir = tmp_path_factory.mktemp("featured_seq_tasks")
 
-    vocab = _vocabulary(eq_preprocessed_dataset)
-    # Any real code works as a boundary; prefer the end-of-timeline code, which every cohort has.
-    bounds = [EOS_CODE] if EOS_CODE in vocab else [vocab[0]]
-
     for split in (train_split, tuning_split):
         run_and_check(
             [
@@ -73,7 +63,7 @@ def featured_tasks_dir(eq_preprocessed_dataset: Path, ontology_dir: Path, tmp_pa
                 f"out_dir={out_dir!s}",
                 f"query_codes={eq_preprocessed_dataset!s}",
                 f"split={split}",
-                "num_sequences=16",
+                "num_sequences=64",
                 "min_queries=2",
                 "max_queries=4",
                 "duration_min=1",
@@ -81,9 +71,7 @@ def featured_tasks_dir(eq_preprocessed_dataset: Path, ontology_dir: Path, tmp_pa
                 "min_prediction_times_per_subject=1",
                 "seed=1",
                 "eventbound_fraction=0.3",
-                f"bound_events=[{','.join(bounds)}]",
                 f"ontology_dir={ontology_dir!s}",
-                "ancestor_fraction=0.3",
             ],
             timeout=300.0,
         )
@@ -108,6 +96,9 @@ def test_generation_emits_every_query_form(featured_tasks_dir: Path, ontology_di
     queries = df["queries"].explode().to_list()
     assert ancestors, "the fixture ontology produced no ancestor nodes"
     assert any(q in ancestors for q in queries), "no ancestor query was generated"
+    # Boundaries come from the same universe, so ancestor nodes bound queries too.
+    bounds = df["bound_events"].explode().drop_nulls().to_list()
+    assert any(b in ancestors for b in bounds), "no ancestor node was drawn as a boundary"
 
     # Answers stay binary and aligned no matter which forms are mixed in.
     assert df["answers"].explode().null_count() == 0
