@@ -119,8 +119,6 @@ def test_train_runs_with_every_feature_enabled(
             f"output_dir={out!s}",
             f"datamodule.config.tensorized_cohort_dir={eq_preprocessed_dataset!s}",
             f"datamodule.config.task_labels_dir={featured_tasks_dir!s}",
-            "datamodule.dataset_kwargs.strip_delta_tokens=true",
-            f"datamodule.dataset_kwargs.ontology_dir={ontology_dir!s}",
             "lightning_module.model.use_rope_time=true",
             f"lightning_module.model.ontology_dir={ontology_dir!s}",
             "trainer.limit_val_batches=1",

@@ -53,16 +53,17 @@ datamodule:
     static_inclusion_mode: omit
     seq_sampling_strategy: to_end
     max_seq_len: 256
-  # Dataset-side feature toggles (see every_query.data.datamodule.ResumableDatamodule).
-  # `strip_delta_tokens` drops the quantized TIMELINE//DELTA* tokens from the encoder input and
-  # emits per-token elapsed-hour `time_pos_ids`; it must be set together with
-  # `lightning_module.model.use_rope_time` below, which is what consumes them.
+  # Dataset-side feature toggles (see every_query.data.datamodule.ResumableDatamodule).  Both are
+  # interpolated from the model-side knob that consumes them, so set each feature once under
+  # `lightning_module.model` and the dataset follows.
   dataset_kwargs:
-    strip_delta_tokens: false
+    # Drops the quantized TIMELINE//DELTA* tokens from the encoder input and emits per-token
+    # elapsed-hour `time_pos_ids` for `use_rope_time`.
+    strip_delta_tokens: ${lightning_module.model.use_rope_time}
     # Ontology artifacts directory (EQ_build_ontology output).  Adds ancestor node names to the
-    # query vocabulary so an ancestor can be queried.  Must match `lightning_module.model
-    # .ontology_dir` below — they index into the same embedding table.
-    ontology_dir: null
+    # query vocabulary so an ancestor can be queried.  Interpolated from `lightning_module.model
+    # .ontology_dir` — they index into the same embedding table, so set it once there.
+    ontology_dir: ${lightning_module.model.ontology_dir}
   batch_size: 96
   num_workers: 8
   pin_memory: True
@@ -83,13 +84,13 @@ lightning_module:
     max_queries: 8
     # Time representation.  false = ModernBERT's default token-index rotary positions, with
     # elapsed time carried by the TIMELINE//DELTA* tokens in the stream.  true = rotary
-    # positions are elapsed hours and the delta tokens are stripped; requires
-    # `datamodule.dataset_kwargs.strip_delta_tokens=true` to supply them.
+    # positions are elapsed hours and the delta tokens are stripped
+    # (`datamodule.dataset_kwargs.strip_delta_tokens` interpolates from here).
     use_rope_time: false
     # Ontology-mixed code embeddings: each code embeds as the weighted average of its own row and
     # its ancestors' ((A @ W)[ids]).  null = ordinary embeddings.  When set, train.py sizes the
     # encoder to the ontology's V_ext instead of the cohort vocab, since ancestor indices sit
-    # above the highest leaf index.  Pair with `datamodule.dataset_kwargs.ontology_dir`.
+    # above the highest leaf index.  `datamodule.dataset_kwargs.ontology_dir` interpolates from here.
     #
     # Note on what to expect: upstream found the *embedding* effect on leaf tasks did not
     # replicate (a second seed reversed it; the unbundling suite scored it null), while the DAG
