@@ -1,0 +1,120 @@
+[
+  {
+    "tag": "clin_len1",
+    "seq_len": 1,
+    "n_sequences": 123349,
+    "n_contexts": 3979,
+    "match_rate": 1.0,
+    "by_position": [
+      {
+        "position": 0,
+        "n": 123349,
+        "prevalence": 0.11390444997527341,
+        "pooled_auroc": 0.723872658041204
+      }
+    ],
+    "by_category": {
+      "dur": {
+        "n_total": 10,
+        "n_scored": 10,
+        "macro_auroc": 0.8160690899127321,
+        "median_auroc": 0.8349370203844942,
+        "min_auroc": 0.6895376956463517,
+        "max_auroc": 0.883370981018027,
+        "n_above_0.5": 10,
+        "sign_test_p": 0.001953125,
+        "n_ci_excludes_0.5": 10,
+        "mean_prevalence": 0.09183211862276955
+      },
+      "evt": {
+        "n_total": 8,
+        "n_scored": 8,
+        "macro_auroc": 0.729712254747319,
+        "median_auroc": 0.7271949870663474,
+        "min_auroc": 0.519740391957241,
+        "max_auroc": 0.8963541347938722,
+        "n_above_0.5": 8,
+        "sign_test_p": 0.0078125,
+        "n_ci_excludes_0.5": 7,
+        "mean_prevalence": 0.16486554410655943
+      },
+      "anc": {
+        "n_total": 13,
+        "n_scored": 13,
+        "macro_auroc": 0.8148182799330171,
+        "median_auroc": 0.7935667362116957,
+        "min_auroc": 0.5775914948388816,
+        "max_auroc": 0.9595414115744484,
+        "n_above_0.5": 13,
+        "sign_test_p": 0.000244140625,
+        "n_ci_excludes_0.5": 13,
+        "mean_prevalence": 0.09952249308871576
+      }
+    }
+  },
+  {
+    "tag": "clin_len3",
+    "seq_len": 3,
+    "n_sequences": 123349,
+    "n_contexts": 3979,
+    "match_rate": 1.0,
+    "by_position": [
+      {
+        "position": 0,
+        "n": 123349,
+        "prevalence": 0.10064126989274336,
+        "pooled_auroc": 0.7030396905533164
+      },
+      {
+        "position": 1,
+        "n": 123349,
+        "prevalence": 0.12081168067840031,
+        "pooled_auroc": 0.6870278759716226
+      },
+      {
+        "position": 2,
+        "n": 123349,
+        "prevalence": 0.11390444997527341,
+        "pooled_auroc": 0.734140538251873
+      }
+    ],
+    "by_category": {
+      "dur": {
+        "n_total": 10,
+        "n_scored": 10,
+        "macro_auroc": 0.8318904703482074,
+        "median_auroc": 0.8556925059869136,
+        "min_auroc": 0.6893259997951966,
+        "max_auroc": 0.8972477395680831,
+        "n_above_0.5": 10,
+        "sign_test_p": 0.001953125,
+        "n_ci_excludes_0.5": 10,
+        "mean_prevalence": 0.09183211862276955
+      },
+      "evt": {
+        "n_total": 8,
+        "n_scored": 8,
+        "macro_auroc": 0.760436186514275,
+        "median_auroc": 0.7734763681994828,
+        "min_auroc": 0.5118350725375413,
+        "max_auroc": 0.9285322654294448,
+        "n_above_0.5": 8,
+        "sign_test_p": 0.0078125,
+        "n_ci_excludes_0.5": 7,
+        "mean_prevalence": 0.16486554410655943
+      },
+      "anc": {
+        "n_total": 13,
+        "n_scored": 13,
+        "macro_auroc": 0.8288991318617203,
+        "median_auroc": 0.8010837869447072,
+        "min_auroc": 0.580515206821827,
+        "max_auroc": 0.9770417003580917,
+        "n_above_0.5": 13,
+        "sign_test_p": 0.000244140625,
+        "n_ci_excludes_0.5": 13,
+        "mean_prevalence": 0.09952249308871576
+      }
+    }
+  }
+]
