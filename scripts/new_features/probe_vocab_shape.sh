@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
 # shellcheck source=scripts/new_features/_env.sh
 source "$(dirname "${BASH_SOURCE[0]}")/_env.sh" > /dev/null
-"$EQ_PY" scripts/new_features/probe_specs.py "${NF_ROOT}/eval_specs" "$@"
+"$EQ_PY" scripts/new_features/probe_vocab_shape.py

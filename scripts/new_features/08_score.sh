@@ -9,4 +9,5 @@ source "$(dirname "${BASH_SOURCE[0]}")/_env.sh"
 "$EQ_PY" scripts/new_features/07_score.py \
     --pred-dir "$NF_PRED_DIR" \
     --spec-dir "${NF_ROOT}/eval_specs" \
-    --out-dir "$NF_METRICS_DIR"
+    --out-dir "$NF_METRICS_DIR" \
+    "$@"

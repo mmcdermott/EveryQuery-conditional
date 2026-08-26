@@ -21,6 +21,7 @@ from every_query.generate_tasks.sample_tasks import read_query_codes
 
 def main() -> int:
     spec_dir = Path(sys.argv[1])
+    tags = sys.argv[2].split(",") if len(sys.argv) > 2 else ["len1", "len3"]
     vocab = addressable_codes(
         read_query_codes(os.environ["TENSORIZED_COHORT_DIR"]),
         ontology_dir=os.environ["NF_ONTOLOGY_DIR"],
@@ -28,7 +29,7 @@ def main() -> int:
     print(f"addressable query vocabulary: {len(vocab)} node(s)")
 
     rc = 0
-    for tag in ("len1", "len3"):
+    for tag in tags:
         specs = read_sequence_specs(spec_dir / f"designed_{tag}.yaml")
         lens = {len(s.queries) for s in specs}
         bounds = [b for s in specs for b in (s.bounds or (None,) * len(s.queries))]

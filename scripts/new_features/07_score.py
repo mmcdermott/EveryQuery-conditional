@@ -168,19 +168,26 @@ def main() -> int:
     ap.add_argument("--pred-dir", required=True)
     ap.add_argument("--spec-dir", required=True)
     ap.add_argument("--out-dir", required=True)
+    ap.add_argument(
+        "--tags",
+        default="len1,len3",
+        help="comma-separated tags; each reads preds_<tag>.parquet and designed_<tag>.yaml",
+    )
     args = ap.parse_args()
+    tags = [t for t in args.tags.split(",") if t]
 
     pred_dir, spec_dir, out_dir = Path(args.pred_dir), Path(args.spec_dir), Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     results = []
-    for tag in ("len1", "len3"):
+    for tag in tags:
         pp = pred_dir / f"preds_{tag}.parquet"
         if not pp.exists():
             print(f"{tag}: MISSING {pp}")
             continue
         results.append(score_one(tag, pp, spec_dir / f"designed_{tag}.yaml", out_dir))
 
-    (out_dir / "summary.json").write_text(json.dumps(results, indent=2))
+    stem = "summary" if tags == ["len1", "len3"] else "summary_" + "_".join(tags)
+    (out_dir / f"{stem}.json").write_text(json.dumps(results, indent=2))
 
     # --- headline comparison ------------------------------------------------------------------
     by = {r["tag"]: r.get("by_category", {}) for r in results if "by_category" in r}
@@ -196,17 +203,18 @@ def main() -> int:
         d = by.get(tag, {}).get(cat)
         return f"{d['n_scored']}/{d['n_total']}" if d else "n/a"
 
+    a, b = (tags + tags)[:2]
     print("\n" + "=" * 70)
     print("HEADLINE - macro AUROC at the target position, by category and sequence length")
-    print(f"{'category':<14}{'len1':>9}{'len3':>9}{'scored1':>10}{'scored3':>10}{'>0.5 (1/3)':>13}")
+    print(f"{'category':<14}{a:>9}{b:>9}{'scored_a':>10}{'scored_b':>10}{'>0.5 (a/b)':>13}")
     for cat, label in (("dur", "duration"), ("evt", "event-bound"), ("anc", "DAG/ancestor")):
-        above = f"{cell('len1', cat, 'n_above_0.5')}/{cell('len3', cat, 'n_above_0.5')}"
+        above = f"{cell(a, cat, 'n_above_0.5')}/{cell(b, cat, 'n_above_0.5')}"
         print(
-            f"{label:<14}{cell('len1', cat, 'macro_auroc'):>9}{cell('len3', cat, 'macro_auroc'):>9}"
-            f"{scored('len1', cat):>10}{scored('len3', cat):>10}{above:>13}"
+            f"{label:<14}{cell(a, cat, 'macro_auroc'):>9}{cell(b, cat, 'macro_auroc'):>9}"
+            f"{scored(a, cat):>10}{scored(b, cat):>10}{above:>13}"
         )
 
-    print(f"\nwrote {out_dir/'summary.json'}")
+    print(f"\nwrote {out_dir / (stem + '.json')}")
     return 0
 
 
