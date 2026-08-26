@@ -245,6 +245,23 @@ def test_bound_draw_is_deterministic():
     assert a == b
 
 
+@pytest.mark.parametrize("fraction", [0.2, 0.5, 0.8, 1.0])
+def test_bound_fraction_is_realised_per_query(fraction):
+    """`eventbound_fraction` is the per-query rate, and bounded rows are marked consistently.
+
+    The rate itself is pinned more tightly in ``tests/test_event_bounds_oracle.py``; this checks
+    the pairing that test does not: every bounded query carries the sentinel duration, and every
+    unbounded one carries a real horizon.
+    """
+    n = 2000
+    qs = [q for s in _draw(_dist(eventbound_fraction=fraction), n) for q in s]
+    assert len(qs) == n
+    bounded = [q for q in qs if q.bound_event is not None]
+    assert len(bounded) / n == pytest.approx(fraction, abs=0.04)
+    assert all(q.duration_days == EVENT_BOUND_DURATION_SENTINEL for q in bounded)
+    assert all(q.duration_days > 0 for q in qs if q.bound_event is None)
+
+
 def test_boundaries_are_drawn_from_the_query_universe():
     """No separate pool: every node a query can be, a boundary can be too."""
     bounds = {q.bound_event for s in _draw(_dist(eventbound_fraction=1.0), 300) for q in s}
