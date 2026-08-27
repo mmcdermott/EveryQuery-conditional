@@ -80,12 +80,12 @@ The conditional query-sequence pipeline (this fork) adds a parallel set of CLIs 
 emit `QuerySeqSchema` rather than `TaskQuerySchema` — see
 [docs/CONDITIONAL_QUERIES.md](docs/CONDITIONAL_QUERIES.md):
 
-| Script                                   | Stage             | Purpose                                                                                                                    | Tests                              |
-| ---------------------------------------- | ----------------- | -------------------------------------------------------------------------------------------------------------------------- | ---------------------------------- |
-| `EQ_generate_query_sequences`            | PT seq labels     | Sample `K` queries per `(subject, prediction_time)` context and label each by observed occurrence (`QuerySeqSchema` parquets) | `test_conditional_cli.py`          |
-| `EQ_generate_evaluation_query_sequences` | eval seq labels   | Label the same `N` query sequences across a supplied cohort (dense grid counterpart)                                        | `test_conditional_cli.py`          |
-| `EQ_predict_sequences`                   | inference         | Consume `QuerySeqSchema` + a conditional checkpoint, emit per-position probabilities                                        | `test_conditional_cli.py`          |
-| `EQ_evaluate_sequences`                  | metrics           | Per-position and macro per-task metrics over conditional predictions                                                        | `test_conditional_cli.py`          |
+| Script                                   | Stage           | Purpose                                                                                                                       | Tests                     |
+| ---------------------------------------- | --------------- | ----------------------------------------------------------------------------------------------------------------------------- | ------------------------- |
+| `EQ_generate_query_sequences`            | PT seq labels   | Sample `K` queries per `(subject, prediction_time)` context and label each by observed occurrence (`QuerySeqSchema` parquets) | `test_conditional_cli.py` |
+| `EQ_generate_evaluation_query_sequences` | eval seq labels | Label the same `N` query sequences at `K` sampled times per subject, or across a supplied cohort (dense grid counterpart)     | `test_conditional_cli.py` |
+| `EQ_predict_sequences`                   | inference       | Consume `QuerySeqSchema` + a conditional checkpoint, emit per-position probabilities                                          | `test_conditional_cli.py` |
+| `EQ_evaluate_sequences`                  | metrics         | Per-position and macro per-task metrics over conditional predictions                                                          | `test_conditional_cli.py` |
 
 The legacy four-stage evaluator (`every_query.evaluate.eval`, with `gen_index_times`, `gen_task`, `select_model` siblings) has been deleted; recover from git history if needed. [#83](https://github.com/payalchandak/EveryQuery/issues/83) tracks the cross-model leaderboard, which now lives in the `EveryQueryExperiments` repo.
 

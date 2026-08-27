@@ -1139,33 +1139,6 @@ def run(cfg: DictConfig) -> None:
 # ---------------------------------------------------------------------------
 
 
-def read_events_for_subjects(split_dir: Path, subjects: pl.Series) -> pl.DataFrame:
-    """Gather the events of ``subjects`` from every shard under ``split_dir``.
-
-    A supplied cohort is an arbitrary subject set rather than one shard, so its events are spread
-    across shards.  The per-shard prefilter keeps peak memory at the cohort's own events - the
-    unfiltered union of a real split is tens of millions of rows.
-    """
-    wanted = subjects.unique()
-    frames = [
-        ev
-        for fp in sorted(split_dir.rglob("*.parquet"))
-        if (ev := _read_event_shard(fp).filter(pl.col(DataSchema.subject_id_name).is_in(wanted))).height
-    ]
-    if not frames:
-        raise ValueError(f"No events under {split_dir} for any of the {wanted.len()} supplied subjects.")
-    events_df = pl.concat(frames, how="vertical").sort([DataSchema.subject_id_name, DataSchema.time_name])
-    n_found = events_df[DataSchema.subject_id_name].n_unique()
-    if n_found < wanted.len():
-        # Silent here would mean all-False answers now and a silent row-drop in EQ_predict_sequences
-        # later (its schema_df semi-join drops subjects absent from the split without erroring).
-        raise ValueError(
-            f"{wanted.len() - n_found} of {wanted.len()} supplied subjects have no events under "
-            f"{split_dir}; check that `split` matches the cohort."
-        )
-    return events_df
-
-
 CONFIGS = str(files("every_query") / "generate_tasks" / "configs")
 
 

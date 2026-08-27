@@ -12,7 +12,7 @@ ancestor claim unmeasurable in two independent ways:
   descendants' do — producing a well-formed ``QuerySeqSchema`` parquet full of wrong answers.
 
 Wiring the two knobs up opened a third way to be silently wrong, which sections 5 and 5b cover:
-neither ``contexts_tag`` nor ``specs_tag`` encodes the ontology, so a leaf-only grid and an
+the output path encodes only the shard, never the ontology, so a leaf-only grid and an
 ancestor grid land on the **same output path**.  ``overwrite: false`` then skips the second run and
 leaves the first one's labels in place — the correct-looking file is simply the wrong file.  The
 provenance sidecar exists to make "already exists" mean "already correct", and it has to be keyed
@@ -30,7 +30,6 @@ built from a vocabulary short one code, so the closure can be varied on its own)
 event stream, all built in this file.  Nothing here reads real data.
 """
 
-import hashlib
 import inspect
 import json
 from collections import Counter
@@ -239,9 +238,21 @@ def _run_train(**overrides) -> None:
     train_seq.main.__wrapped__(cfg)
 
 
-def _answers_by_subject_and_query(fp: Path) -> dict[tuple[int, str], bool]:
-    """Flatten a ``QuerySeqSchema`` parquet of one-query sequences to ``(subject, query) -> answer``."""
-    df = pl.read_parquet(fp)
+def _grid_fps(out_dir: Path) -> list[Path]:
+    """The per-shard output files of one run: both subjects live on separate shards."""
+    return [out_dir / "eval" / SPLIT / f"{shard}.parquet" for shard in ("0", "1")]
+
+
+def _grid(src: Path) -> pl.DataFrame:
+    """Read a whole grid — every shard under ``{out_dir}/eval/{SPLIT}`` — or one shard file."""
+    if src.is_dir():
+        return pl.concat([pl.read_parquet(fp) for fp in _grid_fps(src)])
+    return pl.read_parquet(src)
+
+
+def _answers_by_subject_and_query(src: Path) -> dict[tuple[int, str], bool]:
+    """Flatten a ``QuerySeqSchema`` grid of one-query sequences to ``(subject, query) -> answer``."""
+    df = _grid(src)
     out: dict[tuple[int, str], bool] = {}
     for row in df.iter_rows(named=True):
         for q, a in zip(row["queries"], row["answers"], strict=True):
@@ -258,9 +269,9 @@ def _answers_by_context_and_query(df: pl.DataFrame) -> dict[tuple[int, datetime,
     return out
 
 
-def _all_queries(fp: Path) -> list[str]:
+def _all_queries(src: Path) -> list[str]:
     """Every query string emitted in a grid, in row-major order."""
-    return [q for row in pl.read_parquet(fp).iter_rows(named=True) for q in row["queries"]]
+    return [q for row in _grid(src).iter_rows(named=True) for q in row["queries"]]
 
 
 # ── 1. defect #3: the universe ──────────────────────────────────────────
@@ -290,7 +301,7 @@ def test_an_ontology_puts_every_ancestor_node_in_the_sampled_query_universe(
         ontology_dir=ontology_dir,
     )
 
-    queries = _all_queries(out_dir / SPLIT / "cohort__sampled96.parquet")
+    queries = _all_queries(out_dir)
     drawn_ancestors = [q for q in queries if q in USABLE_ANCESTORS]
 
     assert drawn_ancestors, (
@@ -322,7 +333,7 @@ def test_no_ontology_keeps_the_universe_leaf_only(
         n_sequences=96,
     )
 
-    queries = set(_all_queries(out_dir / SPLIT / "cohort__sampled96.parquet"))
+    queries = set(_all_queries(out_dir))
     assert queries <= set(LEAVES), (
         f"non-leaf codes {sorted(queries - set(LEAVES))} were drawn without an ontology"
     )
@@ -331,14 +342,8 @@ def test_no_ontology_keeps_the_universe_leaf_only(
 # ── 2. defect #4: the label ─────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("per_spec_dirs", [False, True])
 def test_designed_ancestor_query_is_true_when_only_a_descendant_occurred(
-    tmp_path: Path,
-    data_dir: Path,
-    cohort: Path,
-    codes_yaml: Path,
-    ontology_dir: Path,
-    per_spec_dirs: bool,
+    tmp_path: Path, data_dir: Path, cohort: Path, codes_yaml: Path, ontology_dir: Path
 ):
     """``ICD//CIRC`` must label ``True`` for a patient whose stream only holds ``ICD//CIRC//I50``.
 
@@ -347,9 +352,7 @@ def test_designed_ancestor_query_is_true_when_only_a_descendant_occurred(
     and every answer comes back ``False`` — a full, schema-valid parquet of wrong labels, which is
     why this asserts the four booleans themselves rather than a row count.
 
-    Both output layouts are exercised: the events frame is built once and shared by the combined
-    branch and the ``per_spec_dirs`` loop, so exploding in only one of them would leave the other
-    silently wrong — and ``per_spec_dirs`` is the mode the docs recommend for designed tasks.
+    The two subjects sit on separate shards, so both per-shard workers have to explode.
 
     Both queried codes are in ``query_codes`` already, so nothing rejects the spec and nothing
     warns.  The pre-fix module ran this exact grid to completion and wrote ``False`` in all four
@@ -364,21 +367,12 @@ def test_designed_ancestor_query_is_true_when_only_a_descendant_occurred(
         contexts_path=cohort,
         sequences_path=specs,
         split=SPLIT,
-        per_spec_dirs=str(per_spec_dirs).lower(),
         ontology_dir=ontology_dir,
     )
 
-    if per_spec_dirs:
-        fps = [
-            out_dir / "circ_30d" / SPLIT / "tasks.parquet",
-            out_dir / "resp_30d" / SPLIT / "tasks.parquet",
-        ]
-    else:
-        fps = [out_dir / SPLIT / "cohort__specs.parquet"]
-    answers: dict[tuple[int, str], bool] = {}
-    for fp in fps:
+    for fp in _grid_fps(out_dir):
         assert fp.is_file(), f"expected output at {fp}"
-        answers.update(_answers_by_subject_and_query(fp))
+    answers = _answers_by_subject_and_query(out_dir)
 
     assert answers == TRUTH, (
         "ancestor queries are mislabeled: the event stream was not exploded through the closure. "
@@ -409,7 +403,7 @@ def test_a_node_that_is_only_a_prefix_is_both_addressable_and_correctly_labeled(
     )
 
     # Subject 1 takes atorvastatin 9 days after the prediction time; subject 2 never does.
-    assert _answers_by_subject_and_query(out_dir / SPLIT / "cohort__specs.parquet") == {
+    assert _answers_by_subject_and_query(out_dir) == {
         (1, ANCESTOR_ONLY_NODE): True,
         (2, ANCESTOR_ONLY_NODE): False,
     }
@@ -439,7 +433,7 @@ def test_leaf_labels_are_untouched_by_the_explosion(
         if ont is not None:
             kwargs["ontology_dir"] = ont
         _run_eval(**kwargs)
-        got[tag] = _answers_by_subject_and_query(out_dir / SPLIT / "cohort__specs.parquet")
+        got[tag] = _answers_by_subject_and_query(out_dir)
 
     # Anchored, so "both runs are equally wrong" cannot pass: I50 is subject 1's only, J44 is
     # subject 2's only, both inside the 30-day horizon.
@@ -521,9 +515,7 @@ def test_eval_and_training_paths_agree_on_the_same_ancestor_query(
         split=SPLIT,
         ontology_dir=ontology_dir,
     )
-    eval_answers = _answers_by_context_and_query(
-        pl.read_parquet(eval_out / SPLIT / "sampled_cohort__ancestor_spec.parquet")
-    )
+    eval_answers = _answers_by_context_and_query(_grid(eval_out))
 
     assert train_answers, "no MED//STATIN query was drawn at all; raise num_sequences"
     assert {k: eval_answers[k] for k in train_answers} == train_answers, (
@@ -533,28 +525,16 @@ def test_eval_and_training_paths_agree_on_the_same_ancestor_query(
     assert eval_answers == {k: k == key for k in eval_answers}
 
 
-# ── 4. backward compatibility: the ontology-off path is untouched ───────
-
-#: Logical content of the ontology-off grid below, captured by running the **pre-fix** module.
-#: Not a shape: the full ``(subject_id, prediction_time, queries, durations, answers)`` payload,
-#: so a single flipped answer, reordered row or shifted horizon breaks it.
-PRE_FIX_ONTOLOGY_OFF_DIGEST = "7831e25931e3361b9bcc5afaed40813e004119e57d68f8163f4933aaba189161"
+# ── 4. the ontology-off path writes nothing but its parquets ─────────────
 
 
-def _content_digest(fp: Path) -> str:
-    """A stable digest of a parquet's logical rows (not its bytes, which track the writer version)."""
-    payload = json.dumps(pl.read_parquet(fp).to_dicts(), sort_keys=True, default=str)
-    return hashlib.sha256(payload.encode()).hexdigest()
-
-
-def test_ontology_off_output_is_identical_to_the_pre_fix_code(
+def test_ontology_off_writes_no_sidecar_and_no_artifacts(
     tmp_path: Path, data_dir: Path, cohort: Path, codes_yaml: Path
 ):
-    """With ``ontology_dir: null`` — the default — the eval sampler must produce what it always did.
+    """With ``ontology_dir: null`` — the default — no provenance is written anywhere.
 
-    The digest is pinned from the pre-fix module, so this fails if the ontology work perturbed the
-    default path in any way: a different draw (``build_query_universe`` must return its input
-    unchanged, leaving the RNG stream alone), a different label, or a different row order.
+    Not in the output tree, and not in the artifacts sibling, which a default run never creates
+    at all: the on-disk footprint is exactly the per-shard grid and its ``eval_unique`` mirror.
     """
     out_dir = tmp_path / "grid"
     _run_eval(
@@ -566,17 +546,15 @@ def test_ontology_off_output_is_identical_to_the_pre_fix_code(
         n_sequences=8,
         seed=7,
     )
-    fp = out_dir / SPLIT / "cohort__sampled8.parquet"
-    digest = _content_digest(fp)
-    assert digest == PRE_FIX_ONTOLOGY_OFF_DIGEST, (
-        "the ontology-off eval grid changed; the default path must be what it was before the fix. "
-        f"got {digest}, pinned {PRE_FIX_ONTOLOGY_OFF_DIGEST}"
-    )
-    # ...and no provenance sidecar is written when there is no ontology, so the on-disk footprint
-    # of a default run is unchanged too — not in the output tree, and not in the artifacts sibling
-    # (which a supplied cohort never creates at all).
-    assert not eval_seq._provenance_path(out_dir, fp).exists()
-    assert sorted(p.name for p in out_dir.rglob("*") if p.is_file()) == ["cohort__sampled8.parquet"]
+    for fp in _grid_fps(out_dir):
+        assert not eval_seq._provenance_path(out_dir, fp).exists()
+    on_disk = sorted(p.relative_to(out_dir).as_posix() for p in out_dir.rglob("*") if p.is_file())
+    assert on_disk == [
+        f"eval/{SPLIT}/0.parquet",
+        f"eval/{SPLIT}/1.parquet",
+        f"eval_unique/{SPLIT}/0.parquet",
+        f"eval_unique/{SPLIT}/1.parquet",
+    ]
     assert not eval_seq.default_artifacts_dir(out_dir).exists()
 
 
@@ -589,21 +567,6 @@ CIRC_TRUTH = {(1, ANCESTOR): True, (2, ANCESTOR): False}
 CIRC_UNDER_STALE_CLOSURE = {(1, ANCESTOR): False, (2, ANCESTOR): False}
 
 
-def _grid_fps(out_dir: Path, per_spec_dirs: bool, spec_names: list[str], stem: str) -> list[Path]:
-    """The output path(s) one run lands on, in whichever of the two layouts is in play.
-
-    Both layouts have to be exercised by every staleness test, because the skip decision is made
-    **twice** on two different code paths: once up front over all outputs, and once more inside the
-    ``per_spec_dirs`` loop.  A test that only ever runs the combined layout leaves the inner one
-    unexecuted, and reverting it to a bare ``fp.exists()`` then goes unnoticed — in exactly the
-    layout the docs recommend for designed ancestor tasks.
-    """
-    if per_spec_dirs:
-        return [out_dir / name / SPLIT / "tasks.parquet" for name in spec_names]
-    return [out_dir / SPLIT / f"{stem}.parquet"]
-
-
-@pytest.mark.parametrize("per_spec_dirs", [False, True])
 def test_a_grid_labeled_under_a_different_ontology_is_relabeled_not_skipped(
     tmp_path: Path,
     data_dir: Path,
@@ -611,7 +574,6 @@ def test_a_grid_labeled_under_a_different_ontology_is_relabeled_not_skipped(
     codes_yaml: Path,
     ontology_dir: Path,
     stale_ontology_dir: Path,
-    per_spec_dirs: bool,
 ):
     """Neither output tag encodes the ontology, so ``overwrite=false`` must not trust mere existence.
 
@@ -630,38 +592,35 @@ def test_a_grid_labeled_under_a_different_ontology_is_relabeled_not_skipped(
         "contexts_path": cohort,
         "sequences_path": specs,
         "split": SPLIT,
-        "per_spec_dirs": str(per_spec_dirs).lower(),
     }
-    (fp,) = _grid_fps(out_dir, per_spec_dirs, ["circ_30d"], "cohort__specs")
+    fps = _grid_fps(out_dir)
 
     _run_eval(**common, ontology_dir=stale_ontology_dir)
-    assert _answers_by_subject_and_query(fp) == CIRC_UNDER_STALE_CLOSURE, (
+    assert _answers_by_subject_and_query(out_dir) == CIRC_UNDER_STALE_CLOSURE, (
         "the stale ontology has no closure row for subject 1's in-window event, so False is right here"
     )
 
     _run_eval(**common, ontology_dir=ontology_dir)
-    assert _answers_by_subject_and_query(fp) == CIRC_TRUTH, (
+    assert _answers_by_subject_and_query(out_dir) == CIRC_TRUTH, (
         "labels from the previous ontology survived because the output file already existed"
     )
 
     # ...and the guard keys on the ontology rather than relabeling unconditionally: re-running the
-    # same configuration leaves the file untouched (a fresh write means a fresh inode).
-    provenance = eval_seq._provenance_path(out_dir, fp)
-    recorded = json.loads(provenance.read_text())["ontology_fingerprint"]
-    inode = fp.stat().st_ino
+    # same configuration leaves the files untouched (a fresh write means a fresh inode).
+    provenances = [eval_seq._provenance_path(out_dir, fp) for fp in fps]
+    recorded = [json.loads(p.read_text())["ontology_fingerprint"] for p in provenances]
+    inodes = [fp.stat().st_ino for fp in fps]
     _run_eval(**common, ontology_dir=ontology_dir)
-    assert fp.stat().st_ino == inode, "an unchanged ontology should have been skipped, not relabeled"
-    assert json.loads(provenance.read_text())["ontology_fingerprint"] == recorded
+    assert [fp.stat().st_ino for fp in fps] == inodes, "an unchanged ontology should have been skipped"
+    assert [json.loads(p.read_text())["ontology_fingerprint"] for p in provenances] == recorded
 
 
-@pytest.mark.parametrize("per_spec_dirs", [False, True])
 def test_turning_the_ontology_off_relabels_and_clears_the_provenance(
     tmp_path: Path,
     data_dir: Path,
     cohort: Path,
     codes_yaml: Path,
     ontology_dir: Path,
-    per_spec_dirs: bool,
 ):
     """The other direction: an output built *with* an ontology is stale for a run without one.
 
@@ -678,23 +637,23 @@ def test_turning_the_ontology_off_relabels_and_clears_the_provenance(
         "contexts_path": cohort,
         "sequences_path": specs,
         "split": SPLIT,
-        "per_spec_dirs": str(per_spec_dirs).lower(),
     }
-    (fp,) = _grid_fps(out_dir, per_spec_dirs, ["i50"], "cohort__specs")
+    fps = _grid_fps(out_dir)
     leaf_truth = {(1, "ICD//CIRC//I50"): True, (2, "ICD//CIRC//I50"): False}
 
     _run_eval(**common, ontology_dir=ontology_dir)
-    assert _answers_by_subject_and_query(fp) == leaf_truth
-    assert eval_seq._provenance_path(out_dir, fp).is_file()
-    inode = fp.stat().st_ino
+    assert _answers_by_subject_and_query(out_dir) == leaf_truth
+    assert all(eval_seq._provenance_path(out_dir, fp).is_file() for fp in fps)
+    inodes = [fp.stat().st_ino for fp in fps]
 
     _run_eval(**common)
-    assert fp.stat().st_ino != inode, "dropping the ontology must relabel, not skip"
-    assert _answers_by_subject_and_query(fp) == leaf_truth
-    assert not eval_seq._provenance_path(out_dir, fp).exists()
+    assert all(fp.stat().st_ino != i for fp, i in zip(fps, inodes, strict=True)), (
+        "dropping the ontology must relabel, not skip"
+    )
+    assert _answers_by_subject_and_query(out_dir) == leaf_truth
+    assert not any(eval_seq._provenance_path(out_dir, fp).exists() for fp in fps)
 
 
-@pytest.mark.parametrize("per_spec_dirs", [False, True])
 def test_a_sidecar_less_grid_is_relabeled_when_an_ontology_is_turned_on(
     tmp_path: Path,
     data_dir: Path,
@@ -702,7 +661,6 @@ def test_a_sidecar_less_grid_is_relabeled_when_an_ontology_is_turned_on(
     codes_yaml: Path,
     ontology_dir: Path,
     stale_ontology_dir: Path,
-    per_spec_dirs: bool,
 ):
     """A sidecar-less output is the *pre-fix* on-disk state, and it is stale for an ontology run.
 
@@ -729,29 +687,27 @@ def test_a_sidecar_less_grid_is_relabeled_when_an_ontology_is_turned_on(
         "contexts_path": cohort,
         "sequences_path": specs,
         "split": SPLIT,
-        "per_spec_dirs": str(per_spec_dirs).lower(),
     }
-    (fp,) = _grid_fps(out_dir, per_spec_dirs, ["circ_30d"], "cohort__specs")
+    fps = _grid_fps(out_dir)
 
     _run_eval(**common, ontology_dir=stale_ontology_dir)
-    assert _answers_by_subject_and_query(fp) == CIRC_UNDER_STALE_CLOSURE, (
+    assert _answers_by_subject_and_query(out_dir) == CIRC_UNDER_STALE_CLOSURE, (
         "the stale closure is missing the one code that links subject 1's in-window event"
     )
-    eval_seq._provenance_path(out_dir, fp).unlink()
+    for fp in fps:
+        eval_seq._provenance_path(out_dir, fp).unlink()
 
     _run_eval(**common, ontology_dir=ontology_dir)
-    assert _answers_by_subject_and_query(fp) == CIRC_TRUTH, (
+    assert _answers_by_subject_and_query(out_dir) == CIRC_TRUTH, (
         "a sidecar-less (pre-fix) output was treated as current, so turning the ontology on was a no-op"
     )
 
 
-@pytest.mark.parametrize("per_spec_dirs", [False, True])
 def test_rebuilding_the_ontology_in_place_relabels_the_grid(
     tmp_path: Path,
     data_dir: Path,
     cohort: Path,
     codes_yaml: Path,
-    per_spec_dirs: bool,
 ):
     """``ontology_dir`` is unchanged between these two runs; only what is *inside* it changes.
 
@@ -772,23 +728,21 @@ def test_rebuilding_the_ontology_in_place_relabels_the_grid(
         "contexts_path": cohort,
         "sequences_path": specs,
         "split": SPLIT,
-        "per_spec_dirs": str(per_spec_dirs).lower(),
         "ontology_dir": ontology,
     }
-    (fp,) = _grid_fps(out_dir, per_spec_dirs, ["circ_30d"], "cohort__specs")
 
     _run_eval(**common)
-    assert _answers_by_subject_and_query(fp) == CIRC_UNDER_STALE_CLOSURE
+    assert _answers_by_subject_and_query(out_dir) == CIRC_UNDER_STALE_CLOSURE
 
     _write_ontology(ontology, LEAVES)  # same directory, rebuilt from the full vocabulary
     _run_eval(**common)
-    assert _answers_by_subject_and_query(fp) == CIRC_TRUTH, (
+    assert _answers_by_subject_and_query(out_dir) == CIRC_TRUTH, (
         "the ontology was rebuilt in place and the grid kept the old closure's labels; the guard "
         "is keyed on the ontology's location rather than its contents"
     )
 
 
-def test_each_per_spec_output_carries_its_own_provenance(
+def test_each_shard_output_carries_its_own_provenance(
     tmp_path: Path,
     data_dir: Path,
     cohort: Path,
@@ -796,16 +750,18 @@ def test_each_per_spec_output_carries_its_own_provenance(
     ontology_dir: Path,
     stale_ontology_dir: Path,
 ):
-    """Two specs, one ``per_spec_dirs`` tree: neither spec's sidecar may answer for the other.
+    """Two shards, one run: neither shard's sidecar may answer for the other.
 
-    Every ``per_spec_dirs`` output is named ``tasks.parquet``, so a sidecar keyed on the file's
-    *basename* rather than its path below ``out_dir`` collapses the whole tree onto one JSON file.
-    The failure that follows is order-dependent and completely silent: the loop relabels the first
-    spec and rewrites the shared sidecar with the *new* fingerprint, and every later spec then
-    reads that fresh fingerprint, calls itself current and keeps the previous ontology's labels.
+    Every shard's output is ``{shard}.parquet`` under the same ``eval/{split}`` dir, so a sidecar
+    keyed on anything less than the file's path below ``out_dir`` collapses the whole split onto
+    one JSON file.  The failure that follows is order-dependent and completely silent: the loop
+    relabels the first shard and rewrites the shared sidecar with the *new* fingerprint, and every
+    later shard then reads that fresh fingerprint, calls itself current and keeps the previous
+    ontology's labels.
 
-    Both specs ask the same ancestor question at different horizons, so both must flip from
-    all-``False`` to subject 1's ``True`` — whichever of them the loop reaches second.
+    Subject 1 (the one whose ancestor answer flips) is on shard ``0``, the first labeled; subject
+    2 is on shard ``1``.  Both specs ask the same ancestor question at different horizons, so the
+    whole grid must flip from all-``False`` to subject 1's ``True`` on both shards.
     """
     out_dir = tmp_path / "grid"
     specs = tmp_path / "two_specs.yaml"
@@ -817,33 +773,31 @@ def test_each_per_spec_output_carries_its_own_provenance(
         "contexts_path": cohort,
         "sequences_path": specs,
         "split": SPLIT,
-        "per_spec_dirs": "true",
     }
-    fps = _grid_fps(out_dir, True, ["circ_30d", "circ_60d"], "cohort__two_specs")
+    fps = _grid_fps(out_dir)
 
     _run_eval(**common, ontology_dir=stale_ontology_dir)
-    assert [_answers_by_subject_and_query(fp) for fp in fps] == [CIRC_UNDER_STALE_CLOSURE] * 2
+    assert _answers_by_subject_and_query(out_dir) == CIRC_UNDER_STALE_CLOSURE
+    assert [_grid(fp).height for fp in fps] == [2, 2], "one context x two specs per shard"
 
     _run_eval(**common, ontology_dir=ontology_dir)
-    assert [_answers_by_subject_and_query(fp) for fp in fps] == [CIRC_TRUTH] * 2, (
-        "one of the two specs kept the previous ontology's labels: the sidecars collided, so "
-        "relabeling the first spec made the second one look current"
+    assert _answers_by_subject_and_query(out_dir) == CIRC_TRUTH, (
+        "one of the two shards kept the previous ontology's labels: the sidecars collided, so "
+        "relabeling the first shard made the second one look current"
     )
 
     # The mechanism, pinned directly: distinct outputs get distinct sidecars.
     sidecars = [eval_seq._provenance_path(out_dir, fp) for fp in fps]
     assert len(set(sidecars)) == 2, f"the two outputs share one provenance file: {sidecars}"
-    assert all(s.is_file() for s in sidecars)
+    assert all(sc.is_file() for sc in sidecars)
 
 
-@pytest.mark.parametrize("per_spec_dirs", [False, True])
 def test_the_output_tree_holds_only_parquets_when_a_sidecar_is_written(
     tmp_path: Path,
     data_dir: Path,
     cohort: Path,
     codes_yaml: Path,
     ontology_dir: Path,
-    per_spec_dirs: bool,
 ):
     """The provenance sidecar must land in the artifacts sibling, never in the output root.
 
@@ -852,9 +806,9 @@ def test_the_output_tree_holds_only_parquets_when_a_sidecar_is_written(
     sidecar written next to (or under) the parquet is a well-formed JSON file that the consumer
     would try to read as a task frame.
 
-    The suite's other rglob assertion lives in the ontology-**off** backward-compatibility test,
-    which by construction writes no sidecar at all; only a run that actually writes one can catch a
-    regression in where it lands.
+    The suite's other rglob assertion lives in the ontology-**off** test, which by construction
+    writes no sidecar at all; only a run that actually writes one can catch a regression in where
+    it lands.
     """
     out_dir = tmp_path / "grid"
     specs = _specs_yaml(tmp_path, circ_30d=ANCESTOR)
@@ -865,19 +819,19 @@ def test_the_output_tree_holds_only_parquets_when_a_sidecar_is_written(
         contexts_path=cohort,
         sequences_path=specs,
         split=SPLIT,
-        per_spec_dirs=str(per_spec_dirs).lower(),
         ontology_dir=ontology_dir,
     )
-    (fp,) = _grid_fps(out_dir, per_spec_dirs, ["circ_30d"], "cohort__specs")
+    fps = _grid_fps(out_dir)
 
-    sidecar = eval_seq._provenance_path(out_dir, fp)
-    assert sidecar.is_file(), "this run must write a sidecar, or the invariant below is vacuous"
+    sidecars = [eval_seq._provenance_path(out_dir, fp) for fp in fps]
+    assert all(sc.is_file() for sc in sidecars), "this run must write sidecars, or the invariant is vacuous"
 
     on_disk = sorted(p.relative_to(out_dir).as_posix() for p in out_dir.rglob("*") if p.is_file())
-    assert on_disk == [fp.relative_to(out_dir).as_posix()], (
-        f"the output tree must hold nothing but its parquet(s); found {on_disk}"
-    )
-    assert not sidecar.is_relative_to(out_dir), f"the sidecar {sidecar} is inside the output root"
+    assert on_disk == sorted(
+        [fp.relative_to(out_dir).as_posix() for fp in fps]
+        + [f"eval_unique/{SPLIT}/{shard}.parquet" for shard in ("0", "1")]
+    ), f"the output tree must hold nothing but its parquets; found {on_disk}"
+    assert not any(sc.is_relative_to(out_dir) for sc in sidecars), f"a sidecar is inside {out_dir}"
     # Invariant 7 also forbids ``_``-prefixed entries in the output root, directories included.
     assert not list(out_dir.rglob("_*")), f"stray private entries under {out_dir}"
 
@@ -885,12 +839,13 @@ def test_the_output_tree_holds_only_parquets_when_a_sidecar_is_written(
     # output at ``{out_dir}/{rel}.parquet`` lives at ``{out_dir}_artifacts/_labeled/{rel}.json``.
     # Pinned so the sidecar tree stays recognisable to a human debugging a skipped run, and stays
     # segregated from whatever else the artifacts root accumulates.
-    expected = (
+    expected = [
         eval_seq.default_artifacts_dir(out_dir)
         / LABELED_DIRNAME
         / fp.relative_to(out_dir).with_suffix(".json")
-    )
-    assert sidecar == expected
+        for fp in fps
+    ]
+    assert sidecars == expected
 
 
 def test_a_failed_output_write_leaves_no_provenance_behind(
@@ -915,13 +870,13 @@ def test_a_failed_output_write_leaves_no_provenance_behind(
         split=SPLIT,
         ontology_dir=ontology_dir,
     )
-    labeled = pl.read_parquet(out_dir / SPLIT / "cohort__specs.parquet")
+    labeled = _grid(out_dir)
 
     def boom(*_args, **_kwargs):
         raise OSError("no space left on device")
 
     monkeypatch.setattr(eval_seq, "_atomic_write_parquet", boom)
-    target = out_dir / SPLIT / "cohort__other.parquet"
+    target = out_dir / "eval" / SPLIT / "other.parquet"
     with pytest.raises(OSError):
         eval_seq._write(labeled, target, out_dir, "some-ontology-fingerprint")
 
@@ -958,12 +913,10 @@ def test_reordering_the_query_universe_relabels_the_grid(
         "n_sequences": 96,
         "ontology_dir": ontology_dir,
     }
-    fp = out_dir / SPLIT / "cohort__sampled96.parquet"
-
     _run_eval(**common, query_codes=straight)
-    first = Counter(_all_queries(fp))
+    first = Counter(_all_queries(out_dir))
     _run_eval(**common, query_codes=swapped)
-    second = Counter(_all_queries(fp))
+    second = Counter(_all_queries(out_dir))
 
     assert set(first) == set(second), "fixture drift: a permutation cannot change which codes exist"
     assert first != second, (
@@ -1009,7 +962,12 @@ def test_ontology_fingerprint_separates_both_of_its_halves(ontology_dir: Path, s
 
 
 def test_eval_ontology_config_keys_match_training_and_are_actually_consumed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, data_dir: Path, cohort: Path, codes_yaml: Path
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    data_dir: Path,
+    cohort: Path,
+    codes_yaml: Path,
+    ontology_dir: Path,
 ):
     """The eval config's ontology block must agree with training's *and* reach the code.
 
@@ -1043,9 +1001,10 @@ def test_eval_ontology_config_keys_match_training_and_are_actually_consumed(
 
     seen: dict[str, object] = {}
 
-    # Stubs, not wrappers: the point is only that the configured values *arrive* here, so the
-    # ontology path can be a name that does not exist.  What the real functions then do with them
-    # is what every other test in this file measures.
+    # Stubs, not wrappers: the point is only that the configured values *arrive* here.  What the
+    # real functions then do with them is what every other test in this file measures.  (The
+    # ontology has to be a real one: ``main`` resolves the model vocabulary and the provenance
+    # fingerprint from it before any worker runs.)
     def spy_universe(query_codes, **kwargs):
         seen["universe_kwargs"] = kwargs
         return list(query_codes)
@@ -1063,9 +1022,9 @@ def test_eval_ontology_config_keys_match_training_and_are_actually_consumed(
         query_codes=codes_yaml,
         contexts_path=cohort,
         split=SPLIT,
-        ontology_dir="/some/ontology",
+        ontology_dir=ontology_dir,
         seed=1,
     )
 
-    assert seen["universe_kwargs"]["ontology_dir"] == "/some/ontology"
-    assert seen["run_worker_kwargs"]["ontology_dir"] == "/some/ontology"
+    assert seen["universe_kwargs"]["ontology_dir"] == str(ontology_dir)
+    assert seen["run_worker_kwargs"]["ontology_dir"] == str(ontology_dir)

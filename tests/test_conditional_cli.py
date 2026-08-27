@@ -150,7 +150,12 @@ def test_dense_grid_sampled_sequences(eq_preprocessed_dataset: Path, cq_cohort_f
         timeout=120.0,
     )
 
-    df = pl.read_parquet(out_dir / train_split / "cohort__sampled3.parquet")
+    # One output per shard of the split; the fixture cohort is a single shard.
+    fps = sorted((out_dir / "eval" / train_split).glob("*.parquet"))
+    assert [fp.stem for fp in fps] == sorted(
+        p.stem for p in (intermediate / "data" / train_split).glob("*.parquet")
+    )
+    df = pl.concat([pl.read_parquet(fp) for fp in fps])
     assert df.height == n_contexts * 3
     assert (df["queries"].list.len() == 4).all()
     assert df["answers"].explode().null_count() == 0
@@ -164,7 +169,7 @@ def test_dense_grid_sampled_sequences(eq_preprocessed_dataset: Path, cq_cohort_f
     assert per_ctx.height == n_contexts
     assert per_ctx["specs"].n_unique() == 1, "all contexts must share one set of query sequences"
 
-    # Row order is context-major: row i is (contexts[i // N], specs[i % N]).
+    # Row order is context-major within a shard file: row i is (contexts[i // N], specs[i % N]).
     subjects = df["subject_id"].unique(maintain_order=True)
     assert df["subject_id"].to_list() == [s for s in subjects for _ in range(3)]
     first_specs = df.head(3).select("queries", "durations").rows()
@@ -191,7 +196,7 @@ def test_dense_grid_skips_existing_output(eq_preprocessed_dataset: Path, cq_coho
     ]
     env = {"PROCESSED": str(eq_preprocessed_dataset)}
     run_and_check(cmd, env=env, timeout=120.0)
-    fp = out_dir / train_split / "cohort__sampled2.parquet"
+    fp = out_dir / "eval" / train_split / "0.parquet"
     before = fp.stat().st_mtime_ns
 
     run_and_check(cmd, env=env, timeout=120.0)
@@ -201,10 +206,8 @@ def test_dense_grid_skips_existing_output(eq_preprocessed_dataset: Path, cq_coho
     assert fp.stat().st_mtime_ns != before, "overwrite=true must regenerate"
 
 
-def test_dense_grid_designed_sequences_per_spec_dirs(
-    eq_preprocessed_dataset: Path, cq_cohort_fp: Path, tmp_path: Path
-):
-    """Designed named sequences from YAML, one independently-scoreable output dir per task."""
+def test_dense_grid_designed_sequences(eq_preprocessed_dataset: Path, cq_cohort_fp: Path, tmp_path: Path):
+    """Designed named sequences from YAML land verbatim in the grid, N per context."""
     intermediate = eq_preprocessed_dataset.parent / "intermediate"
     n_contexts = pl.read_parquet(cq_cohort_fp).height
     codes = pl.read_parquet(eq_preprocessed_dataset / "metadata" / "codes.parquet")["code"].to_list()
@@ -230,15 +233,16 @@ def test_dense_grid_designed_sequences_per_spec_dirs(
             f"split={train_split}",
             f"contexts_path={cq_cohort_fp!s}",
             f"sequences_path={sequences_fp!s}",
-            "per_spec_dirs=true",
         ],
         env={"PROCESSED": str(eq_preprocessed_dataset)},
         timeout=120.0,
     )
 
-    # Each spec gets its own `tasks_dir`-shaped directory: {out_dir}/{name}/{split}/tasks.parquet.
-    two = pl.read_parquet(out_dir / "end_then_target" / train_split / "tasks.parquet")
-    one = pl.read_parquet(out_dir / "target_only" / train_split / "tasks.parquet")
+    # Spec identity is the (queries, durations) columns: group on them to score one task at a time.
+    df = pl.read_parquet(out_dir / "eval" / train_split / "0.parquet")
+    assert df.height == 2 * n_contexts
+    two = df.filter(pl.col("queries").list.len() == 2)
+    one = df.filter(pl.col("queries").list.len() == 1)
     assert two.height == n_contexts and one.height == n_contexts
     assert two["queries"].to_list() == [["TIMELINE//END", target]] * n_contexts
     assert two["durations"].to_list() == [[1.0, 30.0]] * n_contexts
@@ -366,7 +370,7 @@ def test_dense_grid_is_scoreable_by_predict_sequences(
         env={"PROCESSED": str(eq_preprocessed_dataset)},
         timeout=120.0,
     )
-    tasks_fp = tasks_dir / tuning_split / "cohort__sampled2.parquet"
+    tasks_fp = tasks_dir / "eval" / tuning_split / "0.parquet"
     tasks = pl.read_parquet(tasks_fp)
     assert tasks.height == cohort.height * 2
 
@@ -375,7 +379,8 @@ def test_dense_grid_is_scoreable_by_predict_sequences(
         [
             "EQ_predict_sequences",
             f"model_run_dir={cq_trained_model_dir!s}",
-            f"tasks_dir={tasks_dir!s}",
+            # Point at `eval/`, not the root: MEDS-TorchData rglobs, and `eval_unique/` is not labels.
+            f"tasks_dir={tasks_dir / 'eval'!s}",
             f"output_parquet={predictions_fp!s}",
             f"split={tuning_split}",
         ],

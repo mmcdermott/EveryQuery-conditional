@@ -14,7 +14,6 @@ Covers, in order of pipeline position:
    distribution parity with the training sampler, and per-shard index resolution.
 """
 
-import inspect
 from datetime import datetime
 from functools import partial
 from pathlib import Path
@@ -559,12 +558,6 @@ def test_eval_sampling_defaults_stay_in_training_distribution():
         f"eval length {eval_cfg['min_queries']} is outside training's "
         f"{train_cfg['min_queries']}..{train_cfg['max_queries']} range"
     )
-
-    # The Python-level defaults on ``run_worker`` must agree with the YAML too — programmatic
-    # callers bypass Hydra entirely.
-    defaults = inspect.signature(sample_evaluation_query_sequences.run_worker).parameters
-    for k in ("min_queries", "max_queries", "duration_min", "duration_max"):
-        assert defaults[k].default == eval_cfg[k], f"run_worker default for {k} != config"
 
 
 # ── 6. Stage 1'/3': the 5-stage sequence pipeline ───────────────────────

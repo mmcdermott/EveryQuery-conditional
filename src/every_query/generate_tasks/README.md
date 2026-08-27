@@ -18,8 +18,8 @@ families of (scattered-for-training, dense-for-evaluation) pairs — one per mod
 - **`EQ_generate_query_sequences`** — scattered shape: every context draws its own
     independent sequence of `Uniform{min_queries..max_queries}` queries, for pretraining.
 - **`EQ_generate_evaluation_query_sequences`** — dense-grid shape: the *same* `N` query
-    sequences labeled at every context of a supplied cohort, for feeding
-    `EQ_predict_sequences` → `EQ_evaluate_sequences`.
+    sequences labeled at `K` sampled prediction times per subject (or at a supplied cohort),
+    for feeding `EQ_predict_sequences` → `EQ_evaluate_sequences`.
 
 ## What lives here
 
@@ -64,16 +64,17 @@ families of (scattered-for-training, dense-for-evaluation) pairs — one per mod
     null, because censoring is expressed by the `TIMELINE//END` query itself. Registered as
     `EQ_generate_query_sequences`.
 
-- **`sample_evaluation_query_sequences.py`** — dense-grid conditional-sequence generator.
-    Labels the same `N` sequences at every context of one cohort, so the only thing varying
-    across a given sequence's rows is the patient. Both axes of that grid are supplied or
-    sampled: the cohort from `contexts_path`, or `n_contexts` of them drawn from the split via
-    upstream Stages 0 + 2 on the shared `derive_seed(seed, "contexts")` axis; the `N` sequences
-    designed (`sequences_path=tasks.yaml`, a mapping of `name -> [[code, duration], ...]`) or
-    drawn once from the training query distribution (`n_sequences=64`). Reuses
-    `sample_query_sequences`'s cohort reader, prediction-time resolution, cross-shard event
-    gather, and `label_binary_occurrence` labeler; only the grid build is its own. Registered
-    as `EQ_generate_evaluation_query_sequences`.
+- **`sample_evaluation_query_sequences.py`** — dense-grid conditional-sequence generator:
+    `sample_evaluation_tasks` with `SequenceSpec`s in place of `(code, duration)` grid cells.
+    Same cohort knobs and seed axes (`prediction_times_per_subject`, `min_context_per_subject`,
+    `subject_subsample_fraction`, one worker per shard), so for one `(seed, split, K, ...)` the
+    flat grid and the sequence grid score the identical `(subject, time)` set; `contexts_path`
+    overrides the sampled cohort with a supplied one. The `N` sequences are designed
+    (`sequences_path=tasks.yaml`, a mapping of `name -> [[code, duration], ...]`) or drawn once
+    from the training query distribution (`n_sequences=64`) and shared by every shard. Reuses
+    `sample_evaluation_tasks`'s cohort sampler and `sample_query_sequences`'s
+    `label_query_sequences` labeler; only the grid build is its own. Registered as
+    `EQ_generate_evaluation_query_sequences`.
 
 - **`configs/sample_query_sequences_config.yaml`** / **`configs/sample_evaluation_query_sequences_config.yaml`**
     — the conditional endpoints' configs. Same required-path-arg contract as the single-query
@@ -115,8 +116,11 @@ All intermediates (the Stage 0 prediction-time map, Stage 3 index) live in the *
 `*_artifacts` root (`{parent}/{name}_artifacts` of `$TRAINING_TASKS_DIR`, no env var of its
 own), so the two trees never nest and cleanup is a single `rm -rf` of the artifacts dir.
 
-**Evaluation-task outputs** land at `$EVAL_TASKS_DIR/eval/{split}/*.parquet`. The separate `eval/`
-subdirectory keeps the two row distributions from colliding in one directory.
+**Evaluation-task outputs** land at `$EVAL_TASKS_DIR/eval/{split}/*.parquet` (plus the deduped
+cohort under `eval_unique/`). The separate `eval/` subdirectory keeps the two row distributions
+from colliding in one directory. `EQ_generate_evaluation_query_sequences` writes the same layout
+under *its* `out_dir` — give it a distinct root, since the two `eval/` trees hold incompatible
+schemas and `EQ_predict_sequences` rglobs whatever it is pointed at.
 
 **Sequence outputs** follow the same two-root rule: `out_dir` holds final parquets only, with all
 intermediates in the sibling `{name}_artifacts` root. Both sequence endpoints write layouts
@@ -190,27 +194,23 @@ every validation pass, without paying the cost of scoring the full tuning split.
 ### Conditional query sequences
 
 ```bash
-# Dense evaluation grid: N designed sequences x every context of one cohort.
-# per_spec_dirs=true writes {out_dir}/{name}/{split}/tasks.parquet, so each task is
-# independently scoreable by `EQ_predict_sequences tasks_dir=...`.
+# Dense evaluation grid: N sequences drawn once from the training distribution x K=2 sampled
+# prediction times per subject of every shard of the split -- the same cohort knobs (and cohort)
+# as EQ_generate_evaluation_tasks.  One parquet per shard at {out_dir}/eval/{split}/{shard}.parquet,
+# directly usable as `EQ_predict_sequences tasks_dir=$EVAL_SEQ_TASKS_DIR/eval`.  The sampling
+# defaults mirror `sample_query_sequences_config.yaml`; if the checkpoint was trained with
+# overrides, pass the same ones here (e.g. min_queries=5 max_queries=5 duration_max=365) — an
+# out-of-distribution horizon shows up as an unexplained metric shift, not as an error:
 EQ_generate_evaluation_query_sequences \
-	data_dir=$TOKENIZED_EVENTS_DIR out_dir=$EVAL_TASKS_DIR query_codes=$TENSORIZED_COHORT_DIR \
-	contexts_path=cohort.parquet sequences_path=tasks.yaml \
-	split=held_out per_spec_dirs=true
+	data_dir=$TOKENIZED_EVENTS_DIR out_dir=$EVAL_SEQ_TASKS_DIR query_codes=$TENSORIZED_COHORT_DIR \
+	split=held_out prediction_times_per_subject=2 n_sequences=64
 
-# Or N sequences drawn once from the training distribution, one combined parquet at
-# {out_dir}/{split}/{cohort_stem}__sampled64.parquet.  The sampling defaults mirror
-# `sample_query_sequences_config.yaml`; if the checkpoint was trained with overrides, pass the
-# same ones here (e.g. min_queries=5 max_queries=5 duration_max=365) — an out-of-distribution
-# horizon shows up as an unexplained metric shift, not as an error:
+# Or designed sequences on a supplied cohort (`contexts_path` bypasses the cohort knobs; every
+# subject must be in the split).  Spec identity in the output is the (queries, durations) columns.
 EQ_generate_evaluation_query_sequences \
-	data_dir=$TOKENIZED_EVENTS_DIR out_dir=$EVAL_TASKS_DIR query_codes=$TENSORIZED_COHORT_DIR \
-	contexts_path=cohort.parquet n_sequences=64 split=held_out
+	data_dir=$TOKENIZED_EVENTS_DIR out_dir=$EVAL_SEQ_TASKS_DIR query_codes=$TENSORIZED_COHORT_DIR \
+	split=held_out contexts_path=cohort.parquet sequences_path=tasks.yaml
 ```
-
-A single dense run is one worker by design: the whole point is that all `N` sequences are shared
-across all contexts, so there is no task axis to shard on. Shard the *cohort* if it is too large
-to label in one pass.
 
 `EQ_generate_query_sequences` takes the same three path args and only ever samples its contexts;
 to label a supplied cohort use `EQ_generate_evaluation_query_sequences contexts_path=...`.
@@ -231,6 +231,8 @@ already exists unless `overwrite=true`.
 `sample_evaluation_query_sequences` seeds its sequence draw on `(seed, "eval_seq_specs", split)`
 alone — deliberately independent of the cohort, so the same `(seed, split)` yields the same `N`
 sequences for any cohort you point it at, and two cohorts' metrics are comparable query-for-query.
+Its cohort draw uses `sample_evaluation_tasks`'s axes, `(seed, "prediction_times", split, shard)`
+and `(seed, "subject_subsample", split, shard)`, so it also lands on the flat generator's cohort.
 `sample_query_sequences` still uses the fork's per-shard seed axes; folding it onto upstream's
 `derive_seed(seed, "queries")` / `derive_seed(seed, "contexts")` convention is part of the Phase 2
 rewrite.

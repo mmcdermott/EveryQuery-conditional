@@ -7,28 +7,31 @@ given sequence the only thing varying across its rows is the patient, which is w
 metrics need — pooling across heterogeneous sequences instead measures cross-query base-rate
 separation rather than within-task skill.
 
-Relationship to ``sample_evaluation_tasks``: same *motivation* (dense grid for evaluation),
-different *row shape*.  ``sample_evaluation_tasks`` emits flat ``TaskQuerySchema`` rows — one
-scalar ``boolean_value`` per ``(subject, time, code, duration)`` — for the single-query model's
-``EQ_predict`` → ``EQ_evaluate`` path.  This module emits :class:`QuerySeqSchema` rows with
-``queries``/``durations``/``answers`` list columns for ``EQ_predict_sequences``.  A dense grid of
-*sequences* is a cross product of contexts with ordered ``(code, duration)`` **tuples**, not a
-``codes x durations`` cross join, so the two share no index-building code.
+Relationship to ``sample_evaluation_tasks``: **same knobs, same semantics, different task axis.**
+That module cross-joins its cohort with a ``codes x durations`` grid and emits flat
+``TaskQuerySchema`` rows for ``EQ_predict``; this one cross-joins the *same* cohort with ``N``
+ordered :class:`SequenceSpec` s and emits :class:`QuerySeqSchema` rows (``queries`` /
+``durations`` / ``answers`` list columns) for ``EQ_predict_sequences``.  Everything on the cohort
+side is imported from ``sample_evaluation_tasks`` and driven by its knobs and seed axes, so for
+the same ``(seed, split, prediction_times_per_subject, min_context_per_subject,
+subject_subsample_fraction)`` the two generators score the **identical** ``(subject, time)`` set
+— the flat grid and the sequence grid are directly comparable.
 
-Pipeline (every stage but the grid build is imported from ``sample_query_sequences``):
+Pipeline, one worker per shard of ``{data_dir}/data/{split}/*.parquet`` (all shards, no knob):
 
-    1. Resolve the cohort — either read it from ``contexts_path`` (a parquet with at least
-       ``(subject_id, prediction_time)``), or (when that is null) sample ``n_contexts`` of them
-       from ``split`` itself via upstream Stages 0 + 2 (:func:`sample_grid_contexts`).  Duplicate
-       contexts are dropped either way: a dense grid asks each sequence about each context once.
-    2. Resolve the ``N`` :class:`SequenceSpec` s: read designed ones from ``sequences_path``, or
-       (when that is null) draw ``n_sequences`` once from the same
-       ``uniform codes x log-uniform durations`` distribution the training sampler uses.
+    1. Resolve the ``N`` :class:`SequenceSpec` s **once**: read designed ones from
+       ``sequences_path``, or draw ``n_sequences`` from the training query distribution
+       (:func:`sample_sequence_specs`, seeded on ``(seed, "eval_seq_specs", split)`` alone so the
+       same specs come out for any cohort).  Validate every code against the model vocabulary.
+    2. Per shard: read its events; take the cohort either from ``contexts_path`` (this shard's
+       subjects only) or by sampling it exactly as ``sample_evaluation_tasks`` does —
+       :func:`~every_query.generate_tasks.sample_evaluation_tasks.subsample_subject_ids` then
+       :func:`~every_query.generate_tasks.sample_evaluation_tasks.sample_prediction_times_per_subject`
+       on the same ``("subject_subsample" | "prediction_times", split, shard)`` seed axes.
     3. Cross-join cohort x specs into the flat per-query index frame
-       (:func:`build_dense_sequence_index_df`).
-    4. Label with
-       :func:`~every_query.generate_tasks.sample_query_sequences.label_query_sequences`,
-       align to ``QuerySeqSchema``, write.
+       (:func:`build_dense_sequence_index_df`), label with
+       :func:`~every_query.generate_tasks.sample_query_sequences.label_query_sequences`, align to
+       ``QuerySeqSchema``, write.
 
 Ontology support mirrors the training sampler on both of its halves, because a grid that mirrors
 only one measures the wrong thing without ever failing: ``ontology_dir`` extends the query
@@ -40,34 +43,26 @@ ancestor query is labeled by ordinary occurrence.  Without the explosion an ance
 labeled ``False`` at every context — the ancestor's *name* is in no event stream, only its
 descendants' are — which is a well-formed parquet of wrong answers, not an error.
 
-Both axes carry a tag into the combined file's name: ``contexts_tag`` is the cohort file's stem or
-``sampled{n_contexts}ctx``, ``specs_tag`` the spec file's stem or ``sampled{N}``.
+Output layout, the same as ``sample_evaluation_tasks``':
 
-Because the cohort spans arbitrary subjects rather than one shard, events are gathered across
-every shard of ``split`` via ``read_events_for_subjects`` — which raises if any supplied subject
-is absent from the split, rather than silently labeling them all-``False``.  That holds on the
-sampled path too: it stays a single driver-side pass rather than a per-shard fan-out, because the
-combined output's defining contract is one context-major file (row ``i`` is
-``(contexts[i // N], specs[i % N])``), which sharding the output would break — and because
-``n_contexts`` bounds the cohort to the same size the supplied path already handles.
+    ``{out_dir}/eval/{split}/{shard}.parquet``          the labeled grid, one file per shard
+    ``{out_dir}/eval_unique/{split}/{shard}.parquet``   deduped ``(subject_id, prediction_time)``
+                                                        (``write_unique_prediction_times``)
 
-Output layout, either
+``{out_dir}/eval`` is directly consumable as ``EQ_predict_sequences tasks_dir=...`` (MEDS-TorchData
+rglobs it, so point it at ``eval/`` — never at ``out_dir`` itself, or the ``eval_unique/`` frames
+are read as labels).  Give this generator and ``EQ_generate_evaluation_tasks`` distinct ``out_dir``
+roots: both write ``eval/{split}/{shard}.parquet``, in incompatible schemas.
 
-    ``{out_dir}/{split}/{contexts_tag}__{specs_tag}.parquet``  (default, one combined file), or
-    ``{out_dir}/{spec_name}/{split}/tasks.parquet``            (``per_spec_dirs=true``),
-
-both directly consumable as ``EQ_predict_sequences tasks_dir=...`` — MEDS-TorchData rglobs the
-task-labels dir, so per-spec dirs let you score (and compute metrics for) one designed task at a
-time, while the combined file needs a single inference pass.
-
-In the combined file, spec identity is recoverable two ways: the ``queries``/``durations`` columns
+Within one shard file spec identity is recoverable two ways: the ``queries``/``durations`` columns
 *are* the spec (group on them), and row order is context-major — row ``i`` is
 ``(contexts[i // N], specs[i % N])``.
 
 Answers follow the module-wide sequence contract: binary, never null; an unobservable occurrence
 (record ends before the window does) is ``False``, and censoring is carried by an explicit
-``TIMELINE//END`` query rather than a null answer.  If you need censored windows *excluded* from
-metrics rather than counted as negatives, that filtering belongs downstream (see
+``TIMELINE//END`` query rather than a null answer.  Unlike ``sample_evaluation_tasks`` there is
+therefore no censored-row filter here.  If you need censored windows *excluded* from metrics rather
+than counted as negatives, that filtering belongs downstream (see
 ``scripts/eval_occurs_uncensored.py``).
 """
 
@@ -87,6 +82,12 @@ from omegaconf import DictConfig
 
 from every_query.data.schema import QuerySeqSchema, TaskQuerySchema
 from every_query.data.seq_dataset import EVENT_BOUND_DURATION_SENTINEL
+from every_query.generate_tasks.sample_evaluation_tasks import (
+    _labels_fp,
+    _unique_fp,
+    sample_prediction_times_per_subject,
+    subsample_subject_ids,
+)
 from every_query.generate_tasks.sample_query_sequences import (
     BOUND_COL,
     CTX_ID_COL,
@@ -95,19 +96,16 @@ from every_query.generate_tasks.sample_query_sequences import (
     build_query_universe,
     label_query_sequences,
     maybe_expand_to_matching_query_nodes,
-    read_events_for_subjects,
-    resolve_prediction_times,
 )
 from every_query.generate_tasks.sample_tasks import (
     LABELED_DIRNAME,
     _atomic_write_json,
     _atomic_write_parquet,
+    _read_event_shard,
     _require_path_arg,
-    build_prediction_times,
+    _split_shards,
     default_artifacts_dir,
-    prediction_time_counts_path,
     read_query_codes,
-    sample_patient_contexts,
 )
 from every_query.utils.seeds import derive_seed
 
@@ -606,16 +604,21 @@ def validate_spec_codes(specs: list[SequenceSpec], vocab: Collection[str]) -> No
 
 
 # ---------------------------------------------------------------------------
-# The cohort, source 2 of 2: sampled from the split via upstream Stages 0 + 2
+# The cohort
 # ---------------------------------------------------------------------------
 
 
 def read_supplied_contexts(contexts_path: str | Path) -> pl.DataFrame:
-    """Read a supplied ``(subject_id, prediction_time)`` index parquet.
+    """Read a supplied ``(subject_id, prediction_time)`` cohort parquet, deduplicated.
 
     Extra columns are dropped; ``prediction_time`` is cast to ``Datetime("us")`` for the same reason
     ``_read_event_shard`` casts event times (the ``+1us`` strict-``>`` shift in
-    :func:`label_binary_occurrence` rounds to zero at millisecond precision).
+    :func:`label_binary_occurrence` rounds to zero at millisecond precision).  Duplicate rows are
+    dropped with a warning: a dense grid asks every sequence about every context once, and a
+    duplicated cohort row would silently double-weight that patient in the metrics.
+
+    Raises:
+        ValueError: If a required column is missing, or the file has no rows.
     """
     sid = TaskQuerySchema.subject_id_name
     pt = TaskQuerySchema.prediction_time_name
@@ -624,115 +627,48 @@ def read_supplied_contexts(contexts_path: str | Path) -> pl.DataFrame:
     missing = {sid, pt} - set(df.columns)
     if missing:
         raise ValueError(f"{contexts_path} is missing required column(s) {sorted(missing)}")
-    return df.select(pl.col(sid).cast(pl.Int64), pl.col(pt).cast(pl.Datetime("us")))
+    contexts = df.select(pl.col(sid).cast(pl.Int64), pl.col(pt).cast(pl.Datetime("us")))
+    unique = contexts.unique(maintain_order=True)
+    if unique.height < contexts.height:
+        logger.warning(
+            "Dropped %d duplicate (subject_id, prediction_time) row(s) from %s; %d unique contexts remain.",
+            contexts.height - unique.height,
+            contexts_path,
+            unique.height,
+        )
+    if unique.height == 0:
+        raise ValueError(f"{contexts_path} has no rows; nothing to evaluate.")
+    return unique
 
 
-def sample_grid_contexts(
-    data_dir: Path,
-    artifacts_dir: Path,
-    split: str,
-    n_contexts: int,
-    min_prediction_times_per_subject: int,
-    seed: int,
-    overwrite: bool = False,
-) -> pl.DataFrame:
-    """Draw the grid's cohort from ``split`` itself, for when no ``contexts_path`` is supplied.
+def assert_subjects_in_split(data_dir: Path, split: str, shards: list[str], subjects: pl.Series) -> None:
+    """Fail fast if any supplied-cohort subject has no shard in ``split``.
 
-    The sampled counterpart to
-    :func:`read_supplied_contexts`, assembled
-    entirely from upstream pieces so a sampled evaluation grid is scored at contexts from the
-    *same* distribution the training sampler draws from (``sample_query_sequences.run`` Stages 0
-    and 2, seeded on the same ``"contexts"`` axis):
-
-    1. :func:`~every_query.generate_tasks.sample_tasks.build_prediction_times` (Stage 0) writes /
-       reuses the ``_prediction_times`` map and ``_prediction_time_counts`` summary under
-       ``artifacts_dir`` — the ``{name}_artifacts`` sibling of ``out_dir`` (invariant 7).
-    2. :func:`~every_query.generate_tasks.sample_tasks.sample_patient_contexts` (Stage 2) draws
-       ``n_contexts`` ``(subject_id, shard, prediction_time_index)`` rows.
-    3. :func:`~every_query.generate_tasks.sample_query_sequences.resolve_prediction_times` turns
-       each shard's ``prediction_time_index`` *ranks* into real timestamps, one shard at a time --
-       ``build_dense_sequence_index_df`` and ``label_binary_occurrence`` both need a datetime, and
-       the per-shard call keeps that function's dtype guard and raise-on-null-join intact.
-
-    Stage 2 draws subjects **with replacement**, so the raw draw repeats contexts; a dense grid asks
-    each sequence about each context exactly once, so the draw is deduplicated here.  ``n_contexts``
-    is therefore a ceiling on the grid's width rather than an exact count — the same interpretation
-    the supplied path gives a cohort file that contains duplicate rows.
-
-    Args:
-        data_dir: MEDS root; the split's event shards live beneath it.
-        artifacts_dir: Intermediate-artifacts root (Stage 0 writes here, step 3 reads it back).
-        split: Split to sample from.
-        n_contexts: Number of contexts to draw, before deduplication.
-        min_prediction_times_per_subject: Stage 0 eligibility bound and Stage 2 draw floor.
-        seed: **Already-derived** seed for the context axis — pass
-            ``derive_seed(seed, "contexts")`` so the draw shares the training sampler's axis.
-        overwrite: Forwarded to Stage 0; forces a rebuild of a cached prediction-time map.
-
-    Returns:
-        Deduplicated ``(subject_id, prediction_time)`` rows sorted by both, shaped exactly like
-        ``read_supplied_contexts``' output so nothing downstream can tell the two sources apart.
-
-    Raises:
-        ValueError: If ``n_contexts < 1``, or a drawn context fails to resolve a timestamp.
+    Silent here would mean all-``False`` answers now and a silent row-drop in
+    ``EQ_predict_sequences`` later (its schema_df semi-join drops subjects absent from the split
+    without erroring).  Only the ``subject_id`` column is scanned, so this is cheap even on a real
+    split, and it runs before any shard is labeled rather than after the last one.
     """
-    if n_contexts < 1:
-        raise ValueError(f"n_contexts must be >= 1 (got {n_contexts})")
-
-    n_subjects = build_prediction_times(
-        path_to_data=data_dir,
-        training_task_artifacts_dir=artifacts_dir,
-        split=split,
-        min_prediction_times_per_subject=min_prediction_times_per_subject,
-        overwrite=overwrite,
-    )
-    logger.info("Stage 0: %s eligible subject(s) for split=%s.", f"{n_subjects:,}", split)
-
-    # Re-sort by subject_id so the subject_idx -> subject_id mapping is independent of parquet
-    # round-trip order (the same reason ``sample_query_sequences.run`` re-sorts).
-    counts = pl.read_parquet(prediction_time_counts_path(artifacts_dir, split)).sort("subject_id")
-    drawn = sample_patient_contexts(
-        prediction_time_counts=counts,
-        n=n_contexts,
-        min_prediction_times_per_subject=min_prediction_times_per_subject,
-        rng=np.random.default_rng(seed),
-    )
-    unique_ctx = drawn.unique(maintain_order=True)
-    if unique_ctx.height < drawn.height:
-        logger.info(
-            "Stage 2: drew %s context(s) with replacement; %s unique remain after dedup.",
-            f"{drawn.height:,}",
-            f"{unique_ctx.height:,}",
+    sid = TaskQuerySchema.subject_id_name
+    present = pl.concat(
+        [
+            pl.scan_parquet(data_dir / "data" / split / f"{shard}.parquet").select(pl.col(sid).cast(pl.Int64))
+            for shard in shards
+        ]
+    ).collect()[sid]
+    wanted = subjects.unique()
+    missing = wanted.filter(~wanted.is_in(present.implode()))
+    if missing.len():
+        raise ValueError(
+            f"{missing.len()} of {subjects.n_unique()} supplied subjects have no events under "
+            f"{data_dir / 'data' / split} (e.g. {missing.head(5).to_list()}); "
+            f"check that `split` matches the cohort."
         )
 
-    sid = TaskQuerySchema.subject_id_name
-    pt = TaskQuerySchema.prediction_time_name
-    # ``sort("shard")`` + ``maintain_order=True`` make the shard iteration order deterministic; the
-    # final ``sort(sid, pt)`` then makes the cohort order independent of it entirely.
-    resolved = pl.concat(
-        [
-            resolve_prediction_times(group, artifacts_dir, split, str(shard_key[0]))
-            for shard_key, group in unique_ctx.sort("shard").group_by("shard", maintain_order=True)
-        ]
-    )
-    return (
-        resolved.select(pl.col(sid).cast(pl.Int64), pl.col(pt).cast(pl.Datetime("us")))
-        .unique(maintain_order=True)
-        .sort(sid, pt)
-    )
 
-
-def _spec_fps(
-    out_dir: Path,
-    split: str,
-    stem: str,
-    specs: list[SequenceSpec],
-    per_spec_dirs: bool,
-) -> list[Path]:
-    """Resolve the output parquet path(s) for one run."""
-    if per_spec_dirs:
-        return [out_dir / s.name / split / "tasks.parquet" for s in specs]
-    return [out_dir / split / f"{stem}.parquet"]
+# ---------------------------------------------------------------------------
+# Provenance
+# ---------------------------------------------------------------------------
 
 
 def _frame_digest(df: pl.DataFrame) -> str:
@@ -749,10 +685,9 @@ def _frame_digest(df: pl.DataFrame) -> str:
 def _ontology_fingerprint(ontology_dir: str | Path | None, query_codes: Sequence[str]) -> str | None:
     """Digest of the two ontology-derived inputs to a grid's labels, or ``None`` with no ontology.
 
-    Both output paths — ``{contexts_tag}__{specs_tag}.parquet`` and the ``per_spec_dirs`` tree —
-    encode the *sizes* of a run, never its ontology, so a leaf-only grid and an ancestor grid land
-    on the same file and the existence-only skip would silently keep the first one's labels.  The
-    two things that would make those labels wrong are covered here:
+    The output path encodes the shard, never the ontology, so a leaf-only grid and an ancestor grid
+    land on the same file and an existence-only skip would silently keep the first one's labels.
+    The two things that would make those labels wrong are covered here:
 
     - the **closure**, which decides whether an ancestor query labels ``True`` at all, and
     - the **query universe**, which is where the ontology's ancestor nodes (and the leaf
@@ -760,9 +695,8 @@ def _ontology_fingerprint(ontology_dir: str | Path | None, query_codes: Sequence
       :func:`~every_query.generate_tasks.sample_query_sequences.build_query_universe`; the
       universe is digested with its slot index, since order steers the draw.
 
-    ``None`` when no ontology is configured, so an output written before this sidecar existed
-    (there is no other way to have no sidecar) compares equal and is still skipped — the
-    ontology-off path is byte-for-byte and file-for-file what it was.
+    ``None`` when no ontology is configured, so an output written without a sidecar compares equal
+    and is still skipped — the ontology-off path writes no sidecar at all.
     """
     if not ontology_dir:
         return None
@@ -781,12 +715,12 @@ def _provenance_path(out_dir: Path, fp: Path) -> Path:
     Mirrors :func:`~every_query.generate_tasks.sample_tasks.labeled_fingerprint_path`: provenance
     lives in the ``{name}_artifacts`` sibling, never in the final-output root, so the output tree
     keeps holding nothing but the parquets ``EQ_predict_sequences`` rglobs (invariant 7).  The
-    output's path *below* ``out_dir`` is kept as the sidecar's own, so the combined file and each
-    ``per_spec_dirs`` output get their own and cannot collide.
+    output's path *below* ``out_dir`` is kept as the sidecar's own, so every shard of every split
+    gets its own and none can collide.
 
     Examples:
-        >>> _provenance_path(Path("/x/grid"), Path("/x/grid/held_out/c__s.parquet"))
-        PosixPath('/x/grid_artifacts/_labeled/held_out/c__s.json')
+        >>> _provenance_path(Path("/x/grid"), Path("/x/grid/eval/held_out/0.parquet"))
+        PosixPath('/x/grid_artifacts/_labeled/eval/held_out/0.json')
     """
     rel = fp.relative_to(out_dir).with_suffix(".json")
     return default_artifacts_dir(out_dir) / LABELED_DIRNAME / rel
@@ -810,198 +744,6 @@ def _output_is_current(out_dir: Path, fp: Path, fingerprint: str | None) -> bool
     return fp.exists() and _recorded_fingerprint(out_dir, fp) == fingerprint
 
 
-def run_worker(
-    data_dir: Path,
-    out_dir: Path,
-    split: str,
-    query_codes: list[str],
-    contexts_path: str | Path | None = None,
-    sequences_path: str | Path | None = None,
-    n_sequences: int = 64,
-    # Fixed length 3, inside training's 1..5 range: one length per grid keeps per-position
-    # comparisons clean without going off-distribution.
-    min_queries: int = 3,
-    max_queries: int = 3,
-    # The duration bounds mirror ``sample_query_sequences``' defaults so horizons come from the
-    # distribution the model was pretrained on.  Keep in sync with
-    # ``configs/sample_query_sequences_config.yaml``.
-    duration_min: float = 1,
-    duration_max: float = 731,
-    duration_distribution: str = "log-uniform",
-    seed: int = 1,
-    eos_first_fraction: float = 0.0,
-    duration_mode: str = "random",
-    eventbound_fraction: float = 0.0,
-    ontology_dir: str | None = None,
-    n_contexts: int = 512,
-    min_prediction_times_per_subject: int = 50,
-    per_spec_dirs: bool = False,
-    overwrite: bool = False,
-) -> list[Path]:
-    """Label ``N`` shared query sequences across every context of a cohort.
-
-    Both axes of the grid are resolved the same way — supply a path, or leave it ``None`` and it is
-    sampled:
-
-    ===================  ====================  =============================================
-    axis                 supplied              sampled (path is ``None``)
-    ===================  ====================  =============================================
-    the ``N`` sequences  ``sequences_path``    ``n_sequences`` from the training distribution
-    the cohort           ``contexts_path``     ``n_contexts`` via :func:`sample_grid_contexts`
-    ===================  ====================  =============================================
-
-    A supplied cohort is read verbatim (every one of its subjects must be present in ``split``); a
-    sampled one comes from upstream Stages 0 + 2 over ``split`` itself, whose intermediates land in
-    the ``{name}_artifacts`` sibling of ``out_dir`` (invariant 7).  Either way the cohort reaches
-    the grid build as plain ``(subject_id, prediction_time)`` rows, so the two sources differ only
-    in provenance — and in the output file's ``{contexts_tag}``: the cohort file's stem, or
-    ``sampled{n_contexts}ctx``.
-
-    Args:
-        data_dir: Root whose ``{data_dir}/data/{split}/*.parquet`` shards hold the cohort's events.
-        out_dir: Output root (see the module docstring for the two layouts).
-        split: Split whose shards to gather events from; must contain every cohort subject.
-        query_codes: The model's query vocabulary; the sampling pool when ``sequences_path`` is
-            ``None``, and the validation set for designed specs either way.  With an ontology, pass
-            the *extended* universe from
-            :func:`~every_query.generate_tasks.sample_query_sequences.build_query_universe` — the
-            same list the training sampler draws queries and boundaries from, since ancestor
-            names must be drawable and validatable (:func:`validate_spec_codes`) alike.
-        contexts_path: Parquet with at least ``(subject_id, prediction_time)`` — the cohort.
-            ``None`` samples ``n_contexts`` contexts from ``split`` instead.
-        sequences_path: Designed specs (YAML/JSON/parquet).  ``None`` samples ``n_sequences``.
-        n_contexts: Contexts to draw when ``contexts_path`` is ``None`` — a ceiling, since the draw
-            is with replacement and then deduplicated.  Unused for a supplied cohort.
-        min_prediction_times_per_subject: Stage 0 eligibility bound and Stage 2 draw floor for the
-            sampled cohort.  Unused for a supplied cohort.
-        per_spec_dirs: Write one ``{out_dir}/{spec_name}/{split}/tasks.parquet`` per spec instead
-            of a single combined parquet.
-        ontology_dir: Directory of ``EQ_build_ontology`` artifacts.  Explodes the event stream
-            through the closure before labeling, exactly as the training sampler's Stage 4' does,
-            so "did any descendant of X occur" is answered as an ordinary occurrence question
-            about X.  Without it an ancestor query labels all-``False`` — a well-formed parquet
-            full of wrong labels — so the eval grid must be given the same ontology the training
-            tasks were built with.  ``None`` is a no-op.
-        overwrite: Regenerate outputs that already exist.
-
-    Returns:
-        The written parquet path(s) — empty when every output existed and ``overwrite=False``.
-    """
-    specs = resolve_specs(
-        sequences_path=sequences_path,
-        query_codes=query_codes,
-        n_sequences=n_sequences,
-        min_queries=min_queries,
-        max_queries=max_queries,
-        duration_min=duration_min,
-        duration_max=duration_max,
-        seed=derive_seed(seed, "eval_seq_specs", split),
-        eos_first_fraction=eos_first_fraction,
-        duration_mode=duration_mode,
-        duration_distribution=duration_distribution,
-        eventbound_fraction=eventbound_fraction,
-    )
-    validate_spec_codes(specs, model_query_vocab(query_codes, ontology_dir))
-
-    # Only *designed* specs get the whole-day check.  Sampled specs come from `QueryDistribution`,
-    # which draws continuous float durations by design (the training sampler does too, since the
-    # 5-stage port), so warning about them would fire on essentially every sampled grid.  A designed
-    # spec's fractional duration is still worth flagging: it labels correctly (polars'
-    # `duration(days=...)` honours the fraction) but is usually a hand-authoring slip.
-    if sequences_path is not None:
-        non_integer = sorted({float(d) for s in specs for d in s.durations if not float(d).is_integer()})
-        if non_integer:
-            logger.warning(
-                "%d designed spec duration(s) are not whole days (e.g. %s); labeling honours the "
-                "fraction — check this is intended.",
-                len(non_integer),
-                non_integer[:5],
-            )
-
-    specs_tag = Path(sequences_path).stem if sequences_path else f"sampled{len(specs)}"
-    # ``contexts_path`` is None on the sampled path, so the cohort tag falls back to the *requested*
-    # draw size rather than the post-dedup height: output paths are resolved (and the
-    # already-exists check made) before any cohort is read.
-    contexts_tag = Path(contexts_path).stem if contexts_path is not None else f"sampled{n_contexts}ctx"
-    stem = f"{contexts_tag}__{specs_tag}"
-    out_fps = _spec_fps(out_dir, split, stem, specs, per_spec_dirs)
-    # Neither tag encodes the ontology, so "already exists" is not on its own "already correct":
-    # an output labeled under a different ontology (or none) has to be relabeled, not skipped.
-    fingerprint = _ontology_fingerprint(ontology_dir, query_codes)
-    if not overwrite and all(_output_is_current(out_dir, fp, fingerprint) for fp in out_fps):
-        logger.info("All %d output(s) already exist (e.g. %s), skipping.", len(out_fps), out_fps[0])
-        return []
-
-    if contexts_path is not None:
-        contexts = read_supplied_contexts(contexts_path)
-        n_raw = contexts.height
-        contexts = contexts.unique(maintain_order=True)
-        if contexts.height < n_raw:
-            # A dense grid asks every sequence about every context once; duplicated cohort rows
-            # would silently double-weight those patients in the metrics.
-            logger.warning(
-                "Dropped %d duplicate (subject_id, prediction_time) row(s) from %s; "
-                "%d unique contexts remain.",
-                n_raw - contexts.height,
-                contexts_path,
-                contexts.height,
-            )
-        if contexts.height == 0:
-            raise ValueError(f"{contexts_path} has no rows; nothing to evaluate.")
-    else:
-        contexts = sample_grid_contexts(
-            data_dir=Path(data_dir),
-            # The artifacts root has no config key of its own: it is always the
-            # ``{name}_artifacts`` sibling of out_dir, so the final-output and intermediate trees
-            # stay disjoint and never-nested (invariant 7).
-            artifacts_dir=default_artifacts_dir(Path(out_dir)),
-            split=split,
-            n_contexts=n_contexts,
-            min_prediction_times_per_subject=min_prediction_times_per_subject,
-            # The ``"contexts"`` axis, matching the training sampler; the spec draw above keeps its
-            # own deliberate ``("eval_seq_specs", split)`` axis.
-            seed=derive_seed(seed, "contexts"),
-            overwrite=overwrite,
-        )
-        logger.info(
-            "Sampled %d unique context(s) from split=%s (requested %d).",
-            contexts.height,
-            split,
-            n_contexts,
-        )
-
-    events_df = read_events_for_subjects(data_dir / "data" / split, contexts[TaskQuerySchema.subject_id_name])
-    n_raw_events = events_df.height
-    # Once, on the driver's single whole-cohort frame, and *before* the per-spec loop: the training
-    # sampler explodes inside each Stage 4' worker, so this is the one pass that mirrors it (and
-    # multiplies the frame by the mean closure size in a single process).  Both labeling branches
-    # below read this frame, and patching only one of them would leave the other silently wrong.
-    events_df = maybe_expand_to_matching_query_nodes(events_df, ontology_dir)
-    logger.info(
-        "Loaded %d contexts x %d sequences = %d labeled rows to build, from %d events%s",
-        contexts.height,
-        len(specs),
-        contexts.height * len(specs),
-        n_raw_events,
-        f" ({events_df.height:,} after ontology closure explosion)" if ontology_dir else "",
-    )
-
-    written: list[Path] = []
-    if per_spec_dirs:
-        for spec, fp in zip(specs, out_fps, strict=True):
-            if _output_is_current(out_dir, fp, fingerprint) and not overwrite:
-                logger.info("Labels already exist at %s, skipping.", fp)
-                continue
-            index_df = build_dense_sequence_index_df(contexts, [spec])
-            _write(label_query_sequences(index_df, events_df), fp, out_dir, fingerprint)
-            written.append(fp)
-    else:
-        index_df = build_dense_sequence_index_df(contexts, specs)
-        _write(label_query_sequences(index_df, events_df), out_fps[0], out_dir, fingerprint)
-        written.append(out_fps[0])
-    return written
-
-
 def _write(labeled: pl.DataFrame, fp: Path, out_dir: Path, fingerprint: str | None) -> None:
     """Align to ``QuerySeqSchema``, atomically write one output parquet, and record its provenance.
 
@@ -1021,71 +763,240 @@ def _write(labeled: pl.DataFrame, fp: Path, out_dir: Path, fingerprint: str | No
     logger.info("Wrote %d labeled query sequences to %s", labeled.height, fp)
 
 
+# ---------------------------------------------------------------------------
+# Worker
+# ---------------------------------------------------------------------------
+
+
+def run_worker(
+    data_dir: Path,
+    out_dir: Path,
+    split: str,
+    input_shard: str,
+    specs: list[SequenceSpec],
+    prediction_times_per_subject: int,
+    min_context_per_subject: int,
+    seed: int,
+    overwrite: bool = False,
+    subject_subsample_fraction: float | None = None,
+    contexts: pl.DataFrame | None = None,
+    ontology_dir: str | None = None,
+    fingerprint: str | None = None,
+    write_unique_prediction_times: bool = True,
+    unique_out_dir: Path | None = None,
+) -> Path | None:
+    """Label ``specs`` at every context of one shard, writing one ``QuerySeqSchema`` parquet.
+
+    The sequence analogue of :func:`~every_query.generate_tasks.sample_evaluation_tasks.run_worker`,
+    step for step: same output paths (``out_dir`` is already the ``eval/`` root), same skip rule,
+    same event reader, and — when ``contexts`` is ``None`` — the same cohort sampler on the same
+    seed axes, so the two workers draw the identical cohort for one ``(seed, split, shard)``.
+
+    Args:
+        data_dir: MEDS root; this shard's events are at ``{data_dir}/data/{split}/{input_shard}.parquet``.
+        out_dir: The ``eval/`` output root.  Provenance sidecars are keyed on the path below its
+            *parent*, so ``out_dir.parent`` is what :func:`_provenance_path` receives.
+        split: Split whose shard to label.
+        input_shard: Shard stem.
+        specs: The ``N`` sequences to evaluate at every context — resolved once by the caller and
+            shared across shards.
+        prediction_times_per_subject: ``K`` prediction times to sample per subject.  Ignored when
+            ``contexts`` is supplied.
+        min_context_per_subject: Prior events a subject needs before a time is a candidate.
+            Ignored when ``contexts`` is supplied.
+        seed: Top-level seed; the cohort axes derive on ``(split, input_shard)`` from it.
+        overwrite: Regenerate outputs that already exist.
+        subject_subsample_fraction: Optional per-subject hash-threshold subsample.  Ignored when
+            ``contexts`` is supplied.
+        contexts: A supplied ``(subject_id, prediction_time)`` cohort; only this shard's subjects
+            are taken from it.  ``None`` samples the cohort from the shard instead.
+        ontology_dir: Directory of ``EQ_build_ontology`` artifacts.  Explodes the event stream
+            through the closure before labeling, exactly as the training sampler's Stage 4' does.
+            ``None`` is a no-op.
+        fingerprint: :func:`_ontology_fingerprint` for this run, recorded beside the output so
+            "already exists" means "already labeled under this ontology".
+        write_unique_prediction_times: Also write the deduped cohort under ``unique_out_dir``.
+        unique_out_dir: The ``eval_unique/`` root.
+
+    Returns:
+        The written parquet path, or ``None`` if the output existed and ``overwrite=False``.
+    """
+    root = out_dir.parent
+    labels_fp = _labels_fp(out_dir, split, input_shard)
+    unique_fp = (
+        _unique_fp(unique_out_dir, split, input_shard)
+        if write_unique_prediction_times and unique_out_dir is not None
+        else None
+    )
+    if (
+        not overwrite
+        and _output_is_current(root, labels_fp, fingerprint)
+        and (unique_fp is None or unique_fp.exists())
+    ):
+        logger.info("Labels already exist at %s, skipping.", labels_fp)
+        return None
+
+    sid = TaskQuerySchema.subject_id_name
+    pt = TaskQuerySchema.prediction_time_name
+
+    shard_path = data_dir / "data" / split / f"{input_shard}.parquet"
+    events_df = _read_event_shard(shard_path)
+    logger.info("Loaded %d events from %s", events_df.height, shard_path)
+
+    if contexts is not None:
+        # Subjects are disjoint across shards, so every supplied context lands in exactly one file.
+        shard_contexts = contexts.filter(pl.col(sid).is_in(events_df[sid].unique().implode())).sort(sid, pt)
+    else:
+        if subject_subsample_fraction is not None:
+            subj_seed = derive_seed(seed, "subject_subsample", split, input_shard)
+            events_df = subsample_subject_ids(events_df, subject_subsample_fraction, subj_seed)
+            logger.info(
+                "Subsampled to %d events / %d subjects (fraction=%.4f)",
+                events_df.height,
+                events_df[sid].n_unique(),
+                subject_subsample_fraction,
+            )
+        pt_seed = derive_seed(seed, "prediction_times", split, input_shard)
+        shard_contexts = sample_prediction_times_per_subject(
+            events_df=events_df,
+            k=prediction_times_per_subject,
+            min_context_per_subject=min_context_per_subject,
+            seed=pt_seed,
+        )
+    logger.info(
+        "Cohort: %d contexts across %d subjects x %d sequences = %d rows to label",
+        shard_contexts.height,
+        shard_contexts[sid].n_unique() if shard_contexts.height else 0,
+        len(specs),
+        shard_contexts.height * len(specs),
+    )
+
+    # After the cohort draw (the flat sampler samples from raw events too) and once per shard,
+    # mirroring the training sampler's Stage 4' worker.
+    events_df = maybe_expand_to_matching_query_nodes(events_df, ontology_dir)
+
+    # An empty cohort still writes an empty, well-formed parquet, so downstream sees a complete
+    # split even when a sparse shard yields no eligible prediction time.
+    index_df = build_dense_sequence_index_df(shard_contexts, specs)
+    labeled = label_query_sequences(index_df, events_df)
+    _write(labeled, labels_fp, root, fingerprint)
+
+    if unique_fp is not None:
+        unique_df = labeled.select(sid, pt).unique().sort(sid, pt)
+        _atomic_write_parquet(unique_df, unique_fp)
+        logger.info("Wrote %d unique (subject_id, prediction_time) rows to %s", unique_df.height, unique_fp)
+
+    return labels_fp
+
+
+# ---------------------------------------------------------------------------
+# Hydra entry point
+# ---------------------------------------------------------------------------
+
+
 CONFIGS = str(files("every_query") / "generate_tasks" / "configs")
 
 
 @hydra.main(version_base=None, config_path=CONFIGS, config_name="sample_evaluation_query_sequences_config")
 def main(cfg: DictConfig) -> None:
-    """Hydra entry point; path roots are required args, mirroring ``sample_query_sequences.main``.
+    """Produce one evaluation-sequences parquet per shard of the chosen split.
 
-    Usage (designed sequences, one output dir per task):
+    Shards are discovered from ``{data_dir}/data/{split}/*.parquet`` and all of them are processed
+    in this one invocation, exactly as ``EQ_generate_evaluation_tasks`` does.
 
-        EQ_generate_evaluation_query_sequences \\
-            contexts_path=cohort.parquet sequences_path=tasks.yaml \\
-            split=held_out per_spec_dirs=true data_dir=... out_dir=... query_codes=...
-
-    Usage (``N`` sequences drawn from the training distribution, one combined parquet).  The
-    sampling defaults mirror ``sample_query_sequences_config.yaml``; if the checkpoint was
-    trained with overrides, pass the same ones here:
+    Usage (``N`` sequences drawn from the training distribution at ``K`` sampled times per
+    subject — the zero-argument default beyond the three path roots):
 
         EQ_generate_evaluation_query_sequences \\
-            contexts_path=cohort.parquet n_sequences=64 \\
-            split=held_out data_dir=... out_dir=... query_codes=...
+            data_dir=... out_dir=... query_codes=... split=held_out \\
+            prediction_times_per_subject=2 n_sequences=64
 
-    Usage (no cohort file at all — the grid's contexts are sampled from the split too, the way
-    ``EQ_generate_query_sequences`` samples its own).  This is the zero-argument default, so the
-    endpoint is runnable with nothing but the three path roots:
+    Usage (designed sequences on a supplied cohort):
 
         EQ_generate_evaluation_query_sequences \\
-            n_contexts=512 n_sequences=64 \\
-            split=held_out data_dir=... out_dir=... query_codes=...
+            data_dir=... out_dir=... query_codes=... split=held_out \\
+            contexts_path=cohort.parquet sequences_path=tasks.yaml
     """
     data_dir = _require_path_arg(cfg.get("data_dir"), "data_dir")
     out_dir = _require_path_arg(cfg.get("out_dir"), "out_dir")
+    split = str(cfg.split)
+    seed = int(cfg.seed)
+    ontology_dir = cfg.get("ontology_dir")
+
     # The same two arguments, read the same way, as ``QuerySequenceDistribution.from_config``: an
     # eval grid drawn from a *narrower* universe than training's is the drift this whole module
     # exists to avoid, and the ancestor half of the universe is no exception.
-    query_codes = build_query_universe(
-        read_query_codes(cfg.get("query_codes")), ontology_dir=cfg.get("ontology_dir")
-    )
+    query_codes = build_query_universe(read_query_codes(cfg.get("query_codes")), ontology_dir=ontology_dir)
 
-    # Unset ``contexts_path`` is the sampled-cohort path (Stages 0 + 2 over the split), not an
-    # error: the two sources are peers, exactly as in ``sample_query_sequences.main``.
-    contexts_path = cfg.get("contexts_path")
-
-    run_worker(
-        data_dir=data_dir,
-        out_dir=out_dir,
-        split=str(cfg.split),
+    # The sequence axis, once: the specs are shared by every shard, and are seeded independently of
+    # the cohort so the same ``(seed, split)`` yields the same ``N`` sequences for any cohort.
+    sequences_path = cfg.get("sequences_path")
+    specs = resolve_specs(
+        sequences_path=sequences_path,
         query_codes=query_codes,
-        contexts_path=None if contexts_path is None else str(contexts_path),
-        sequences_path=cfg.get("sequences_path"),
         n_sequences=int(cfg.n_sequences),
         min_queries=int(cfg.min_queries),
         max_queries=int(cfg.max_queries),
         duration_min=float(cfg.duration_min),
         duration_max=float(cfg.duration_max),
-        duration_distribution=str(cfg.get("duration_distribution", "log-uniform")),
-        seed=int(cfg.seed),
+        seed=derive_seed(seed, "eval_seq_specs", split),
         eos_first_fraction=float(cfg.get("eos_first_fraction", 0.0)),
         duration_mode=str(cfg.get("duration_mode", "random")),
+        duration_distribution=str(cfg.get("duration_distribution", "log-uniform")),
         eventbound_fraction=float(cfg.get("eventbound_fraction", 0.0) or 0.0),
-        ontology_dir=cfg.get("ontology_dir"),
-        n_contexts=int(cfg.n_contexts),
-        min_prediction_times_per_subject=int(cfg.min_prediction_times_per_subject),
-        per_spec_dirs=bool(cfg.get("per_spec_dirs", False)),
-        overwrite=bool(cfg.get("overwrite", False)),
     )
+    validate_spec_codes(specs, model_query_vocab(query_codes, ontology_dir))
+    # Only *designed* specs get the whole-day check: sampled ones draw continuous float durations
+    # by design.  A designed spec's fractional duration labels correctly but is usually a slip.
+    if sequences_path is not None:
+        non_integer = sorted({float(d) for s in specs for d in s.durations if not float(d).is_integer()})
+        if non_integer:
+            logger.warning(
+                "%d designed spec duration(s) are not whole days (e.g. %s); labeling honours the "
+                "fraction — check this is intended.",
+                len(non_integer),
+                non_integer[:5],
+            )
+    fingerprint = _ontology_fingerprint(ontology_dir, query_codes)
+
+    # Reject booleans up front: Hydra/OmegaConf parses ``subject_subsample_fraction=true`` as a
+    # Python ``True``, which would otherwise become ``1.0`` and silently disable subsampling.
+    ssf_raw = cfg.get("subject_subsample_fraction")
+    if isinstance(ssf_raw, bool) or (ssf_raw is not None and not isinstance(ssf_raw, int | float)):
+        raise TypeError(
+            f"cfg.subject_subsample_fraction must be a number in (0, 1] or null, "
+            f"got {type(ssf_raw).__name__}: {ssf_raw!r}"
+        )
+    subject_subsample_fraction = None if ssf_raw is None else float(ssf_raw)
+
+    shards = _split_shards(data_dir, split)
+
+    contexts_path = cfg.get("contexts_path")
+    contexts = None
+    if contexts_path is not None:
+        contexts = read_supplied_contexts(str(contexts_path))
+        assert_subjects_in_split(data_dir, split, shards, contexts[TaskQuerySchema.subject_id_name])
+        logger.info("Read %d supplied context(s) from %s", contexts.height, contexts_path)
+
+    write_unique_prediction_times = bool(cfg.get("write_unique_prediction_times", True))
+    for input_shard in shards:
+        run_worker(
+            data_dir=data_dir,
+            out_dir=Path(out_dir) / "eval",
+            split=split,
+            input_shard=input_shard,
+            specs=specs,
+            prediction_times_per_subject=int(cfg.prediction_times_per_subject),
+            min_context_per_subject=int(cfg.min_context_per_subject),
+            seed=seed,
+            overwrite=bool(cfg.get("overwrite", False)),
+            subject_subsample_fraction=subject_subsample_fraction,
+            contexts=contexts,
+            ontology_dir=ontology_dir,
+            fingerprint=fingerprint,
+            write_unique_prediction_times=write_unique_prediction_times,
+            unique_out_dir=Path(out_dir) / "eval_unique" if write_unique_prediction_times else None,
+        )
 
 
 if __name__ == "__main__":
