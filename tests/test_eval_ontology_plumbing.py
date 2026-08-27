@@ -86,7 +86,7 @@ HORIZON = 30.0
 #:
 #: Note ``ICD//CIRC//ANY`` is in no ``codes.parquet``, so a designed spec naming it can only
 #: validate if addressability is resolved against the ontology rather than the sampling universe
-#: — which is exactly what ``addressable_codes`` restores.
+#: — which is exactly what ``model_query_vocab`` restores.
 LEAVES = [
     "ICD//CIRC",
     "ICD//CIRC//I21",

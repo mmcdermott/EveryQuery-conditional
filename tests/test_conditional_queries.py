@@ -937,3 +937,33 @@ def test_conditional_config_declares_warmup_ratio_not_dead_step_counts():
     assert lm["warmup_ratio"] == 0.05
     assert "num_warmup_steps" not in lm["LR_scheduler"]
     assert "num_training_steps" not in lm["LR_scheduler"]
+
+
+def test_seq_dataset_rejects_labels_outside_vocab(tmp_path, tensorized_cohort_dir, seq_task_labels_dir):
+    """Labels naming a code the run's vocabulary lacks fail at construction, not as a KeyError in collate."""
+    import shutil
+
+    from meds import train_split
+    from meds_torchdata import MEDSTorchDataConfig
+
+    from every_query.data.seq_dataset import ConditionalQueryPytorchDataset
+
+    labels = tmp_path / "labels"
+    shutil.copytree(seq_task_labels_dir, labels)
+    shard = labels / train_split / "0.parquet"
+    df = pl.read_parquet(shard)
+    df = df.with_columns(
+        pl.concat_list([pl.lit("NOT//A//CODE"), pl.col("queries").list.slice(1)]).alias("queries")
+    )
+    df.write_parquet(shard)
+
+    cfg = MEDSTorchDataConfig(
+        tensorized_cohort_dir=str(tensorized_cohort_dir),
+        task_labels_dir=str(labels),
+        max_seq_len=64,
+        seq_sampling_strategy="to_end",
+        static_inclusion_mode="omit",
+        batch_mode="SM",
+    )
+    with pytest.raises(ValueError, match="NOT//A//CODE"):
+        ConditionalQueryPytorchDataset(cfg, split=train_split)

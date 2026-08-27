@@ -238,6 +238,20 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
                 len(self.code_to_index) - n_before,
             )
 
+        # Fail before the loader starts rather than as a KeyError deep inside collate: labels
+        # generated against a different codes.parquet / ontology than this run's are the one
+        # mistake gen-time validation cannot see.
+        mentioned = set(self.queries.explode().drop_nulls().to_list())
+        if self.has_bound_events:
+            mentioned |= set(self.bound_events.explode().drop_nulls().to_list())
+        unknown = sorted(mentioned - self.code_to_index.keys())
+        if unknown:
+            raise ValueError(
+                f"{len(unknown)} query/bound code(s) in the labels are not in this run's vocabulary "
+                f"(codes.parquet + ontology): {unknown[:10]}. Regenerate the labels with the same "
+                f"query_codes/ontology_dir as this run, or pass the matching ones here."
+            )
+
         self.eos_query_index: int | None = self.code_to_index.get(EOS_CODE)
 
         self.strip_delta_tokens = strip_delta_tokens

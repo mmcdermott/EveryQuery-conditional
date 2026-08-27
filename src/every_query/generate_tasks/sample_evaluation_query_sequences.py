@@ -75,7 +75,7 @@ import json
 import logging
 import math
 import re
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
@@ -567,32 +567,23 @@ def resolve_specs(
     return specs
 
 
-def addressable_codes(query_codes: Sequence[str], ontology_dir: str | Path | None) -> list[str]:
-    """Every name a designed spec may legally mention: the vocabulary plus ontology nodes.
+def model_query_vocab(query_codes: Sequence[str], ontology_dir: str | Path | None) -> set[str]:
+    """Every name ``ConditionalQueryPytorchDataset.encode_query`` will accept for this run.
 
-    *Addressability* and *sampling* are different questions, and fusing them was a bug: an
-    earlier ``build_query_universe`` returned the vocabulary unchanged unless an ancestor share
-    was configured, so an ontology could be fully loaded and labeling correctly while every
-    hand-written spec naming an ancestor was rejected as an unknown code.  The only ancestor
-    queries that got through were the ones whose names happened to *also* be real codes, which
-    is to say the ones the prefix-absorption defect was silently widening.
-
-    A designed grid does not sample at all; it needs the name to resolve, nothing more.  So
-    validation asks the ontology what exists - including the ``TIMELINE`` ancestors the sampler
-    deliberately leaves out of its universe.
-
-    Returns ``query_codes`` unchanged when there is no ontology.
+    Built by the same :func:`~every_query.data.ontology.extend_code_map` the dataset uses, so a
+    spec that validates here is a spec the dataset can encode — and vice versa.  Note this is
+    *wider* than the sampling universe from ``build_query_universe`` (which drops ``TIMELINE``
+    ancestors): a designed spec does not sample, it only needs the name to resolve.
     """
     if not ontology_dir:
-        return list(query_codes)
+        return set(query_codes)
 
-    from every_query.data.ontology import load_nodes
+    from every_query.data.ontology import extend_code_map
 
-    nodes = load_nodes(ontology_dir)["node_name"].to_list()
-    return list(dict.fromkeys([*query_codes, *nodes]))
+    return set(extend_code_map(dict.fromkeys(query_codes, 0), ontology_dir))
 
 
-def validate_spec_codes(specs: list[SequenceSpec], query_codes: list[str]) -> None:
+def validate_spec_codes(specs: list[SequenceSpec], vocab: Collection[str]) -> None:
     """Fail fast on spec codes outside the model's query vocabulary.
 
     ``ConditionalQueryPytorchDataset.encode_query`` raises ``KeyError`` on an unknown code, which
@@ -605,7 +596,7 @@ def validate_spec_codes(specs: list[SequenceSpec], query_codes: list[str]) -> No
     # and model load.
     mentioned = [q for s in specs for q in s.queries]
     mentioned += [b for s in specs for b in s.bounds if b is not None]
-    unknown = sorted(set(mentioned) - set(query_codes))
+    unknown = sorted(set(mentioned) - set(vocab))
     if unknown:
         shown = ", ".join(repr(c) for c in unknown[:10])
         more = f" (and {len(unknown) - 10} more)" if len(unknown) > 10 else ""
@@ -894,7 +885,7 @@ def run_worker(
         duration_distribution=duration_distribution,
         eventbound_fraction=eventbound_fraction,
     )
-    validate_spec_codes(specs, addressable_codes(query_codes, ontology_dir))
+    validate_spec_codes(specs, model_query_vocab(query_codes, ontology_dir))
 
     # Only *designed* specs get the whole-day check.  Sampled specs come from `QueryDistribution`,
     # which draws continuous float durations by design (the training sampler does too, since the
