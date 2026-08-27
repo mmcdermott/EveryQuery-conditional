@@ -1139,23 +1139,6 @@ def run(cfg: DictConfig) -> None:
 # ---------------------------------------------------------------------------
 
 
-def read_supplied_contexts(contexts_path: str | Path) -> pl.DataFrame:
-    """Read a supplied ``(subject_id, prediction_time)`` index parquet.
-
-    Extra columns are dropped; ``prediction_time`` is cast to ``Datetime("us")`` for the same reason
-    ``_read_event_shard`` casts event times (the ``+1us`` strict-``>`` shift in
-    :func:`label_binary_occurrence` rounds to zero at millisecond precision).
-    """
-    sid = TaskQuerySchema.subject_id_name
-    pt = TaskQuerySchema.prediction_time_name
-
-    df = pl.read_parquet(contexts_path)
-    missing = {sid, pt} - set(df.columns)
-    if missing:
-        raise ValueError(f"{contexts_path} is missing required column(s) {sorted(missing)}")
-    return df.select(pl.col(sid).cast(pl.Int64), pl.col(pt).cast(pl.Datetime("us")))
-
-
 def read_events_for_subjects(split_dir: Path, subjects: pl.Series) -> pl.DataFrame:
     """Gather the events of ``subjects`` from every shard under ``split_dir``.
 

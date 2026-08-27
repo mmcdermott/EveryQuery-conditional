@@ -96,7 +96,6 @@ from every_query.generate_tasks.sample_query_sequences import (
     label_query_sequences,
     maybe_expand_to_matching_query_nodes,
     read_events_for_subjects,
-    read_supplied_contexts,
     resolve_prediction_times,
 )
 from every_query.generate_tasks.sample_tasks import (
@@ -611,6 +610,23 @@ def validate_spec_codes(specs: list[SequenceSpec], vocab: Collection[str]) -> No
 # ---------------------------------------------------------------------------
 
 
+def read_supplied_contexts(contexts_path: str | Path) -> pl.DataFrame:
+    """Read a supplied ``(subject_id, prediction_time)`` index parquet.
+
+    Extra columns are dropped; ``prediction_time`` is cast to ``Datetime("us")`` for the same reason
+    ``_read_event_shard`` casts event times (the ``+1us`` strict-``>`` shift in
+    :func:`label_binary_occurrence` rounds to zero at millisecond precision).
+    """
+    sid = TaskQuerySchema.subject_id_name
+    pt = TaskQuerySchema.prediction_time_name
+
+    df = pl.read_parquet(contexts_path)
+    missing = {sid, pt} - set(df.columns)
+    if missing:
+        raise ValueError(f"{contexts_path} is missing required column(s) {sorted(missing)}")
+    return df.select(pl.col(sid).cast(pl.Int64), pl.col(pt).cast(pl.Datetime("us")))
+
+
 def sample_grid_contexts(
     data_dir: Path,
     artifacts_dir: Path,
@@ -623,7 +639,7 @@ def sample_grid_contexts(
     """Draw the grid's cohort from ``split`` itself, for when no ``contexts_path`` is supplied.
 
     The sampled counterpart to
-    :func:`~every_query.generate_tasks.sample_query_sequences.read_supplied_contexts`, assembled
+    :func:`read_supplied_contexts`, assembled
     entirely from upstream pieces so a sampled evaluation grid is scored at contexts from the
     *same* distribution the training sampler draws from (``sample_query_sequences.run`` Stages 0
     and 2, seeded on the same ``"contexts"`` axis):
