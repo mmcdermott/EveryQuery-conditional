@@ -93,7 +93,8 @@ Key source modules:
   `derive_seed(seed, "queries")` (identical to the training sampler's draw),
   `derive_seed(seed, "contexts")`, `derive_seed(seed, "sequences")` for sequence structure, and
   `derive_seed(seed, "bounds")` for which queries are event-bounded and by what.
-  `build_sequence_index_df` remains as the in-memory variant for supplied cohorts and the eval grid.
+  The eval grid (`sample_evaluation_query_sequences.sample_sequence_specs`) draws its fixed specs
+  from the same `QuerySequenceDistribution` on the same seed axes.
 - `src/every_query/model/conditional_lightning.py` — Lightning module; metrics = pooled
   `answer_auc` + per-position breakdowns (training-time diagnostics only).
 - `src/every_query/train/configs/conditional_config.yaml` — the training config (8-layer encoder,

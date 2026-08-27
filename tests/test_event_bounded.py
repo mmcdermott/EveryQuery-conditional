@@ -28,10 +28,10 @@ from every_query.data.seq_dataset import (
     NO_BOUND_INDEX,
     ConditionalQueryBatch,
 )
+from every_query.generate_tasks.sample_evaluation_query_sequences import sample_sequence_specs
 from every_query.generate_tasks.sample_query_sequences import (
     BOUND_COL,
     QuerySequenceDistribution,
-    build_sequence_index_df,
     label_binary_occurrence,
     label_query_sequences,
     label_with_event_bounds,
@@ -187,21 +187,18 @@ def test_dispatch_keys_on_the_frame_not_a_flag():
 
 def test_bounds_do_not_perturb_the_code_duration_draw():
     """The whole point of the separate seed axis: parity with an unbounded run is preserved."""
-    ctx = pl.DataFrame(
-        {"subject_id": [1, 2], "prediction_time": [PT, PT]},
-        schema={"subject_id": pl.Int64, "prediction_time": pl.Datetime("us")},
-    )
-    plain = build_sequence_index_df(ctx, ["A", "B", "C"], 3, 3, 1, 365, seed=11)
-    bounded = build_sequence_index_df(ctx, ["A", "B", "C"], 3, 3, 1, 365, seed=11, eventbound_fraction=0.5)
-    assert plain["query"].to_list() == bounded["query"].to_list(), (
+    plain = sample_sequence_specs(2, ["A", "B", "C"], 3, 3, 1, 365, seed=11)
+    bounded = sample_sequence_specs(2, ["A", "B", "C"], 3, 3, 1, 365, seed=11, eventbound_fraction=0.5)
+    assert [s.queries for s in plain] == [s.queries for s in bounded], (
         "turning bounds on must not change which codes were drawn"
     )
     # Durations change only where a bound replaced them with the sentinel.
-    unbounded_rows = bounded[BOUND_COL].is_null()
-    assert (
-        bounded.filter(unbounded_rows)["duration_days"].to_list()
-        == plain.filter(unbounded_rows)["duration_days"].to_list()
-    )
+    for p, b in zip(plain, bounded, strict=True):
+        for i, bound in enumerate(b.bounds):
+            if bound is None:
+                assert b.durations[i] == p.durations[i]
+            else:
+                assert b.durations[i] == EVENT_BOUND_DURATION_SENTINEL
 
 
 def _dist(**overrides) -> QuerySequenceDistribution:

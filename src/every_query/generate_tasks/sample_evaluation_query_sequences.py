@@ -91,8 +91,8 @@ from every_query.generate_tasks.sample_query_sequences import (
     BOUND_COL,
     CTX_ID_COL,
     POSITION_COL,
+    QuerySequenceDistribution,
     build_query_universe,
-    build_sequence_index_df,
     label_query_sequences,
     maybe_expand_to_matching_query_nodes,
     read_events_for_subjects,
@@ -357,11 +357,12 @@ def sample_sequence_specs(
 ) -> list[SequenceSpec]:
     """Draw ``n_sequences`` specs from the *training* query distribution, once.
 
-    Delegates to :func:`~every_query.generate_tasks.sample_query_sequences.build_sequence_index_df`
-    against a dummy context frame so the code/duration distribution is byte-for-byte the one the
-    scattered sampler uses — an evaluation grid drawn from a subtly different distribution than
-    training is the kind of drift that shows up as unexplained metric shifts.  The contexts are
-    dummies precisely because these specs are then applied to *every* real context.
+    Delegates to
+    :class:`~every_query.generate_tasks.sample_query_sequences.QuerySequenceDistribution` on the
+    same three seed axes the scattered sampler uses, so the code/duration/bound draw is
+    byte-for-byte the one training saw — an evaluation grid drawn from a subtly different
+    distribution than training is the kind of drift that shows up as unexplained metric shifts.
+    No contexts are involved: these specs are then applied to *every* real context.
 
     Examples:
         >>> specs = sample_sequence_specs(3, ["A", "B", "TIMELINE//END"], 2, 2, 1, 365, seed=0)
@@ -377,48 +378,49 @@ def sample_sequence_specs(
         >>> sample_sequence_specs(3, ["A", "B"], 1, 3, 1, 365, 7) == sample_sequence_specs(
         ...     3, ["A", "B"], 1, 3, 1, 365, 7)
         True
+
+        ``eos_first_fraction=1.0`` forces position 0 to the end-of-timeline query:
+
+        >>> specs = sample_sequence_specs(
+        ...     2, ["A", "B", "TIMELINE//END"], 2, 2, 1, 365, 0, eos_first_fraction=1.0)
+        >>> {s.queries[0] for s in specs}
+        {'TIMELINE//END'}
+
+        ``eventbound_fraction`` converts that share of queries into event-bounded ones, carrying a
+        boundary drawn from the same universe and the duration sentinel instead of a horizon:
+
+        >>> (spec,) = sample_sequence_specs(1, ["A", "B"], 4, 4, 1, 365, 0, eventbound_fraction=1.0)
+        >>> set(spec.bounds) <= {"A", "B"}, set(spec.durations)
+        (True, {-1.0})
     """
     if n_sequences < 1:
         raise ValueError(f"n_sequences must be >= 1 (got {n_sequences})")
 
-    # The context values are irrelevant (only the row *count* drives how many sequences are
-    # drawn), so the prediction times are the epoch, built by cast rather than by a naive
-    # ``datetime`` literal.
-    dummy = pl.DataFrame(
-        {
-            TaskQuerySchema.subject_id_name: [0] * n_sequences,
-            TaskQuerySchema.prediction_time_name: [0] * n_sequences,
-        },
-        schema={
-            TaskQuerySchema.subject_id_name: pl.Int64,
-            TaskQuerySchema.prediction_time_name: pl.Int64,
-        },
-    ).with_columns(pl.col(TaskQuerySchema.prediction_time_name).cast(pl.Datetime("us")))
-    index_df = build_sequence_index_df(
-        contexts=dummy,
-        query_codes=query_codes,
+    dist = QuerySequenceDistribution(
+        query_codes=list(query_codes),
+        min_duration=float(duration_low),
+        max_duration=float(duration_high),
+        duration_distribution=duration_distribution,
         min_queries=min_queries,
         max_queries=max_queries,
-        duration_low=duration_low,
-        duration_high=duration_high,
-        seed=seed,
         eos_first_fraction=eos_first_fraction,
         duration_mode=duration_mode,
-        duration_distribution=duration_distribution,
         eventbound_fraction=eventbound_fraction,
     )
-    agg_cols = [pl.col(TaskQuerySchema.query_name), pl.col(TaskQuerySchema.duration_days_name)]
-    if BOUND_COL in index_df.columns:
-        agg_cols.append(pl.col(BOUND_COL))
-    grouped = index_df.group_by(CTX_ID_COL, maintain_order=True).agg(*agg_cols)
+    sequences = dist.sample_sequences(
+        n_sequences,
+        np.random.default_rng(derive_seed(seed, "queries")),
+        np.random.default_rng(derive_seed(seed, "sequences")),
+        np.random.default_rng(derive_seed(seed, "bounds")),
+    )
     return [
         SequenceSpec(
             name=f"seq_{i:04d}",
-            queries=tuple(row[TaskQuerySchema.query_name]),
-            durations=tuple(float(d) for d in row[TaskQuerySchema.duration_days_name]),
-            bounds=tuple(row[BOUND_COL]) if BOUND_COL in row else (),
+            queries=tuple(q.code for q in seq),
+            durations=tuple(float(q.duration_days) for q in seq),
+            bounds=tuple(q.bound_event for q in seq) if any(q.bound_event for q in seq) else (),
         )
-        for i, row in enumerate(grouped.iter_rows(named=True))
+        for i, seq in enumerate(sequences)
     ]
 
 
@@ -428,7 +430,7 @@ def build_dense_sequence_index_df(
 ) -> pl.DataFrame:
     """Cross-join every context with every spec into the flat per-query index frame.
 
-    The output is shaped exactly like ``build_sequence_index_df``'s — ``(_ctx_id, _position,
+    The output is shaped exactly like ``build_sequence_index``'s — ``(_ctx_id, _position,
     subject_id, prediction_time, query, duration_days)`` — so
     :func:`~every_query.generate_tasks.sample_query_sequences.label_binary_occurrence` consumes it
     unchanged.  ``_ctx_id = context_row * len(specs) + spec_index``, so sorting by ``_ctx_id`` puts
@@ -494,7 +496,7 @@ def build_dense_sequence_index_df(
 
     n_specs = len(specs)
     n_sequences = contexts.height * n_specs
-    # ``_ctx_id`` is UInt32 to match ``build_sequence_index_df`` (whose ids come from
+    # ``_ctx_id`` is UInt32 to match ``build_sequence_index`` (whose ids come from
     # ``with_row_index``); a silently-wrapped id would merge two contexts' sequences into one
     # labeled row, so check rather than trusting the cast.
     if n_sequences > (1 << 32) - 1:

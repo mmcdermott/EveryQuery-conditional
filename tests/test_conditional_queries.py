@@ -45,7 +45,6 @@ from every_query.generate_tasks.sample_query_sequences import (
     POSITION_COL,
     QuerySequenceDistribution,
     build_sequence_index,
-    build_sequence_index_df,
     label_binary_occurrence,
     resolve_prediction_times,
 )
@@ -364,30 +363,20 @@ def _events(rows: list[tuple[int, datetime, str]]) -> pl.DataFrame:
     ).with_columns(pl.col("time").cast(pl.Datetime("us")))
 
 
-def test_build_sequence_index_structure():
-    ctx = pl.DataFrame(
-        {
-            "subject_id": [1, 2, 3],
-            "prediction_time": [datetime(2024, 1, 1), datetime(2024, 2, 1), datetime(2024, 3, 1)],
-        }
-    ).with_columns(pl.col("prediction_time").cast(pl.Datetime("us")))
+def test_sample_sequence_specs_structure():
     codes = ["A", "B", "C", EOS_CODE]
-    idx = build_sequence_index_df(ctx, codes, 1, 5, 1, 365, seed=3)
+    specs = sample_sequence_specs(3, codes, 1, 5, 1, 365, seed=3)
 
-    per_ctx = idx.group_by("_ctx_id").len()
-    assert per_ctx["len"].min() >= 1 and per_ctx["len"].max() <= 5
+    assert len(specs) == 3
+    assert all(1 <= len(s) <= 5 for s in specs)
     # All queries are ordinary codes (no privileged censor position / sentinel).
-    assert bool(idx["query"].is_in(codes).all())
-    # Positions within each context start at 0 and are contiguous.
-    assert idx.filter(pl.col("_position") == 0)["_ctx_id"].n_unique() == 3
+    assert all(q in codes for s in specs for q in s.queries)
+    assert all(s.bounds == () for s in specs)
 
 
 def test_eos_first_fraction_forces_eos_at_position_0():
-    ctx = pl.DataFrame(
-        {"subject_id": [1, 2], "prediction_time": [datetime(2024, 1, 1), datetime(2024, 2, 1)]}
-    ).with_columns(pl.col("prediction_time").cast(pl.Datetime("us")))
-    idx = build_sequence_index_df(ctx, ["A", "B", EOS_CODE], 2, 2, 1, 365, 0, eos_first_fraction=1.0)
-    assert idx.filter(pl.col("_position") == 0)["query"].unique().to_list() == [EOS_CODE]
+    specs = sample_sequence_specs(2, ["A", "B", EOS_CODE], 2, 2, 1, 365, 0, eos_first_fraction=1.0)
+    assert {s.queries[0] for s in specs} == {EOS_CODE}
 
 
 def test_label_binary_known_answers():
@@ -433,14 +422,11 @@ def test_label_binary_known_answers():
 
 
 def test_sampler_determinism():
-    ctx = pl.DataFrame(
-        {"subject_id": [1, 2], "prediction_time": [datetime(2024, 1, 1), datetime(2024, 2, 1)]}
-    ).with_columns(pl.col("prediction_time").cast(pl.Datetime("us")))
-    a = build_sequence_index_df(ctx, ["A", "B"], 1, 4, 1, 365, seed=11)
-    b = build_sequence_index_df(ctx, ["A", "B"], 1, 4, 1, 365, seed=11)
-    c = build_sequence_index_df(ctx, ["A", "B"], 1, 4, 1, 365, seed=12)
-    assert a.equals(b)
-    assert not a.equals(c)
+    a = sample_sequence_specs(2, ["A", "B"], 1, 4, 1, 365, seed=11)
+    b = sample_sequence_specs(2, ["A", "B"], 1, 4, 1, 365, seed=11)
+    c = sample_sequence_specs(2, ["A", "B"], 1, 4, 1, 365, seed=12)
+    assert a == b
+    assert a != c
 
 
 # ── 5. sample_evaluation_query_sequences (dense grid) ────────────────────
@@ -546,7 +532,7 @@ def test_sequence_spec_rejects_bad_durations():
 def test_eval_sampling_defaults_stay_in_training_distribution():
     """A sampled evaluation grid must default to the distribution the model was pretrained on.
 
-    ``sample_evaluation_query_sequences`` reuses ``build_sequence_index_df``, so these knobs mean
+    ``sample_evaluation_query_sequences`` reuses ``QuerySequenceDistribution``, so these knobs mean
     exactly the same thing on both sides; a drifted default would silently produce
     out-of-distribution queries and read as an unexplained metric shift rather than an error.
 
