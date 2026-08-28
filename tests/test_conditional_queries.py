@@ -609,7 +609,8 @@ def test_sequence_durations_are_floats_not_whole_days():
     """The fork rounded durations to integer days; ``QueryDistribution`` does not.
 
     Guards the documented distribution shift that makes the pre-port checkpoint unusable
-    (docs/history/2026-08-18-conditional-v2-integration-plan.md §3) — a silent return to rounding would be a regression.
+    (docs/history/2026-08-18-conditional-v2-integration-plan.md §3) — a silent return to
+    rounding would be a regression.
     """
     seqs = _seq_dist().sample_sequences(50, np.random.default_rng(0), np.random.default_rng(1))
     durations = [q.duration_days for s in seqs for q in s]
