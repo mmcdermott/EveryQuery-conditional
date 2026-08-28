@@ -49,6 +49,12 @@ Output layout, the same as ``sample_evaluation_tasks``':
     ``{out_dir}/eval_unique/{split}/{shard}.parquet``   deduped ``(subject_id, prediction_time)``
                                                         (``write_unique_prediction_times``)
 
+Every output parquet gets a provenance sidecar under ``{out_dir}_artifacts/_labeled/`` recording the
+three inputs that determine its rows — the ontology, the specs and the cohort source — and
+``overwrite=false`` skips a shard only when all three match (:func:`_run_fingerprint`).  Re-running
+into the same ``out_dir`` with a different ``sequences_path``/``n_sequences``/``seed``/cohort therefore
+relabels rather than silently keeping the previous grid.
+
 ``{out_dir}/eval`` is directly consumable as ``EQ_predict_sequences tasks_dir=...`` (MEDS-TorchData
 rglobs it, so point it at ``eval/`` — never at ``out_dir`` itself, or the ``eval_unique/`` frames
 are read as labels).  Give this generator and ``EQ_generate_evaluation_tasks`` distinct ``out_dir``
@@ -66,6 +72,7 @@ than counted as negatives, that filtering belongs downstream (see
 ``scripts/eval_occurs_uncensored.py``).
 """
 
+import hashlib
 import json
 import logging
 import math
@@ -695,8 +702,7 @@ def _ontology_fingerprint(ontology_dir: str | Path | None, query_codes: Sequence
       :func:`~every_query.generate_tasks.sample_query_sequences.build_query_universe`; the
       universe is digested with its slot index, since order steers the draw.
 
-    ``None`` when no ontology is configured, so an output written without a sidecar compares equal
-    and is still skipped — the ontology-off path writes no sidecar at all.
+    ``None`` when no ontology is configured; it is one component of :func:`_run_fingerprint`.
     """
     if not ontology_dir:
         return None
@@ -707,6 +713,57 @@ def _ontology_fingerprint(ontology_dir: str | Path | None, query_codes: Sequence
         schema={"slot": pl.Int64, "code": pl.String},
     )
     return f"{_frame_digest(load_event_to_query_nodes(ontology_dir))}|{_frame_digest(universe)}"
+
+
+def _specs_fingerprint(specs: list[SequenceSpec]) -> str:
+    """Digest of the specs' *content* — ``(queries, durations, bounds)`` in order — never their names.
+
+    Names do not reach the output (``QuerySeqSchema`` has no spec-name column), so two runs whose
+    specs differ only by name write identical grids and must fingerprint identically.
+
+    Examples:
+        >>> a = [SequenceSpec("x", ("A", "B"), (1.0, 30.0))]
+        >>> _specs_fingerprint(a) == _specs_fingerprint([SequenceSpec("renamed", ("A", "B"), (1.0, 30.0))])
+        True
+        >>> _specs_fingerprint(a) == _specs_fingerprint([SequenceSpec("x", ("A", "B"), (1.0, 31.0))])
+        False
+    """
+    payload = [[list(s.queries), list(s.durations), list(s.bounds)] for s in specs]
+    return f"{len(specs)}:{hashlib.sha256(json.dumps(payload).encode()).hexdigest()[:16]}"
+
+
+def _cohort_fingerprint(
+    contexts: pl.DataFrame | None,
+    seed: int,
+    prediction_times_per_subject: int,
+    min_context_per_subject: int,
+    subject_subsample_fraction: float | None,
+) -> str:
+    """Digest of whatever decides the cohort: the supplied frame, or the sampling knobs.
+
+    A supplied cohort is digested whole (:func:`_frame_digest`, order-independent), so editing the
+    cohort parquet relabels every shard.  A sampled cohort is a pure function of the shard's events
+    and ``(seed, K, min_context, fraction)`` — the same axes ``run_worker`` derives its seeds from —
+    so those are what is recorded.
+
+    Examples:
+        >>> _cohort_fingerprint(None, 1, 2, 50, None)
+        'sampled|seed=1|k=2|min_context=50|fraction=None'
+        >>> ctx = pl.DataFrame({"subject_id": [1], "prediction_time": [0]})
+        >>> _cohort_fingerprint(ctx, 1, 2, 50, None).startswith("supplied|")
+        True
+    """
+    if contexts is not None:
+        return f"supplied|{_frame_digest(contexts)}"
+    return (
+        f"sampled|seed={seed}|k={prediction_times_per_subject}|min_context={min_context_per_subject}"
+        f"|fraction={subject_subsample_fraction}"
+    )
+
+
+def _run_fingerprint(ontology: str | None, specs: str, cohort: str) -> dict[str, str | None]:
+    """The sidecar payload: everything that decides an output's rows, so "exists" can mean "current"."""
+    return {"ontology_fingerprint": ontology, "specs_fingerprint": specs, "cohort_fingerprint": cohort}
 
 
 def _provenance_path(out_dir: Path, fp: Path) -> Path:
@@ -726,40 +783,36 @@ def _provenance_path(out_dir: Path, fp: Path) -> Path:
     return default_artifacts_dir(out_dir) / LABELED_DIRNAME / rel
 
 
-def _recorded_fingerprint(out_dir: Path, fp: Path) -> str | None:
-    """Read back :func:`_ontology_fingerprint` for an existing output; ``None`` if absent/unreadable."""
+def _recorded_fingerprint(out_dir: Path, fp: Path) -> dict | None:
+    """Read back :func:`_run_fingerprint` for an existing output; ``None`` if absent/unreadable."""
     try:
-        return json.loads(_provenance_path(out_dir, fp).read_text()).get("ontology_fingerprint")
-    except (OSError, json.JSONDecodeError, AttributeError):
+        recorded = json.loads(_provenance_path(out_dir, fp).read_text())
+    except (OSError, json.JSONDecodeError):
         return None
+    return recorded if isinstance(recorded, dict) else None
 
 
-def _output_is_current(out_dir: Path, fp: Path, fingerprint: str | None) -> bool:
-    """Whether an existing output was labeled under the ontology this run is configured with.
+def _output_is_current(out_dir: Path, fp: Path, fingerprint: dict[str, str | None]) -> bool:
+    """Whether an existing output was labeled under the ontology, specs and cohort of this run.
 
-    An unreadable or missing sidecar reads as ``None``, i.e. "no ontology", matching
-    :func:`label_one_sequence_shard`'s treatment of a missing fingerprint as stale for every case
-    but the one that is genuinely current.
+    A missing or unreadable sidecar is stale, as in :func:`label_one_sequence_shard`: the sidecar
+    is the only record of what produced the parquet, and an output nothing vouches for is not one
+    to reuse.  A pre-fingerprint sidecar carrying only ``ontology_fingerprint`` compares unequal for
+    the same reason.
     """
     return fp.exists() and _recorded_fingerprint(out_dir, fp) == fingerprint
 
 
-def _write(labeled: pl.DataFrame, fp: Path, out_dir: Path, fingerprint: str | None) -> None:
+def _write(labeled: pl.DataFrame, fp: Path, out_dir: Path, fingerprint: dict[str, str | None]) -> None:
     """Align to ``QuerySeqSchema``, atomically write one output parquet, and record its provenance.
 
-    The ontology sidecar is written *after* the parquet is committed, so a present sidecar always
-    describes a present output — the ordering :func:`label_one_sequence_shard` uses for the same
-    reason.  With no ontology no sidecar is written and any stale one is removed, which keeps "no
-    sidecar" meaning exactly "labeled without an ontology".
+    The sidecar is written *after* the parquet is committed, so a present sidecar always describes
+    a present output — the ordering :func:`label_one_sequence_shard` uses for the same reason.
     """
     aligned = QuerySeqSchema.align(labeled.to_arrow())
     fp.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write_parquet(pl.from_arrow(aligned), fp)
-    provenance = _provenance_path(out_dir, fp)
-    if fingerprint is None:
-        provenance.unlink(missing_ok=True)
-    else:
-        _atomic_write_json({"ontology_fingerprint": fingerprint}, provenance)
+    _atomic_write_json(fingerprint, _provenance_path(out_dir, fp))
     logger.info("Wrote %d labeled query sequences to %s", labeled.height, fp)
 
 
@@ -781,7 +834,7 @@ def run_worker(
     subject_subsample_fraction: float | None = None,
     contexts: pl.DataFrame | None = None,
     ontology_dir: str | None = None,
-    fingerprint: str | None = None,
+    fingerprint: dict[str, str | None] | None = None,
     write_unique_prediction_times: bool = True,
     unique_out_dir: Path | None = None,
 ) -> Path | None:
@@ -813,8 +866,9 @@ def run_worker(
         ontology_dir: Directory of ``EQ_build_ontology`` artifacts.  Explodes the event stream
             through the closure before labeling, exactly as the training sampler's Stage 4' does.
             ``None`` is a no-op.
-        fingerprint: :func:`_ontology_fingerprint` for this run, recorded beside the output so
-            "already exists" means "already labeled under this ontology".
+        fingerprint: :func:`_run_fingerprint` for this run, recorded beside the output so
+            "already exists" means "already labeled under this ontology, these specs and this
+            cohort".  ``None`` (direct callers) derives it from the other arguments.
         write_unique_prediction_times: Also write the deduped cohort under ``unique_out_dir``.
         unique_out_dir: The ``eval_unique/`` root.
 
@@ -822,6 +876,18 @@ def run_worker(
         The written parquet path, or ``None`` if the output existed and ``overwrite=False``.
     """
     root = out_dir.parent
+    if fingerprint is None:
+        fingerprint = _run_fingerprint(
+            _ontology_fingerprint(ontology_dir, [c for s in specs for c in s.queries]),
+            _specs_fingerprint(specs),
+            _cohort_fingerprint(
+                contexts,
+                seed,
+                prediction_times_per_subject,
+                min_context_per_subject,
+                subject_subsample_fraction,
+            ),
+        )
     labels_fp = _labels_fp(out_dir, split, input_shard)
     unique_fp = (
         _unique_fp(unique_out_dir, split, input_shard)
@@ -957,7 +1023,7 @@ def main(cfg: DictConfig) -> None:
                 len(non_integer),
                 non_integer[:5],
             )
-    fingerprint = _ontology_fingerprint(ontology_dir, query_codes)
+    ontology_fingerprint = _ontology_fingerprint(ontology_dir, query_codes)
 
     # Reject booleans up front: Hydra/OmegaConf parses ``subject_subsample_fraction=true`` as a
     # Python ``True``, which would otherwise become ``1.0`` and silently disable subsampling.
@@ -977,6 +1043,20 @@ def main(cfg: DictConfig) -> None:
         contexts = read_supplied_contexts(str(contexts_path))
         assert_subjects_in_split(data_dir, split, shards, contexts[TaskQuerySchema.subject_id_name])
         logger.info("Read %d supplied context(s) from %s", contexts.height, contexts_path)
+
+    # Everything that decides an output's rows, recorded beside it: a rerun into the same
+    # ``out_dir`` with different specs or a different cohort must relabel, not skip.
+    fingerprint = _run_fingerprint(
+        ontology_fingerprint,
+        _specs_fingerprint(specs),
+        _cohort_fingerprint(
+            contexts,
+            seed,
+            int(cfg.prediction_times_per_subject),
+            int(cfg.min_context_per_subject),
+            subject_subsample_fraction,
+        ),
+    )
 
     write_unique_prediction_times = bool(cfg.get("write_unique_prediction_times", True))
     for input_shard in shards:
