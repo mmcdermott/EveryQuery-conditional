@@ -528,13 +528,14 @@ def test_eval_and_training_paths_agree_on_the_same_ancestor_query(
 # ── 4. the ontology-off path writes nothing but its parquets ─────────────
 
 
-def test_ontology_off_writes_no_sidecar_and_no_artifacts(
+def test_ontology_off_records_a_null_ontology_and_keeps_the_output_tree_clean(
     tmp_path: Path, data_dir: Path, cohort: Path, codes_yaml: Path
 ):
-    """With ``ontology_dir: null`` — the default — no provenance is written anywhere.
+    """With ``ontology_dir: null`` — the default — the sidecar records ``ontology_fingerprint: null``.
 
-    Not in the output tree, and not in the artifacts sibling, which a default run never creates
-    at all: the on-disk footprint is exactly the per-shard grid and its ``eval_unique`` mirror.
+    The sidecar is always written (it also carries the specs and cohort fingerprints), but only ever
+    to the artifacts sibling: the output tree itself is exactly the per-shard grid and its
+    ``eval_unique`` mirror.
     """
     out_dir = tmp_path / "grid"
     _run_eval(
@@ -547,7 +548,8 @@ def test_ontology_off_writes_no_sidecar_and_no_artifacts(
         seed=7,
     )
     for fp in _grid_fps(out_dir):
-        assert not eval_seq._provenance_path(out_dir, fp).exists()
+        recorded = eval_seq._recorded_fingerprint(out_dir, fp)
+        assert recorded is not None and recorded["ontology_fingerprint"] is None
     on_disk = sorted(p.relative_to(out_dir).as_posix() for p in out_dir.rglob("*") if p.is_file())
     assert on_disk == [
         f"eval/{SPLIT}/0.parquet",
@@ -555,7 +557,6 @@ def test_ontology_off_writes_no_sidecar_and_no_artifacts(
         f"eval_unique/{SPLIT}/0.parquet",
         f"eval_unique/{SPLIT}/1.parquet",
     ]
-    assert not eval_seq.default_artifacts_dir(out_dir).exists()
 
 
 # ── 5. staleness: an existing output is not automatically a current one ─
@@ -615,7 +616,7 @@ def test_a_grid_labeled_under_a_different_ontology_is_relabeled_not_skipped(
     assert [json.loads(p.read_text())["ontology_fingerprint"] for p in provenances] == recorded
 
 
-def test_turning_the_ontology_off_relabels_and_clears_the_provenance(
+def test_turning_the_ontology_off_relabels_and_nulls_the_ontology_provenance(
     tmp_path: Path,
     data_dir: Path,
     cohort: Path,
@@ -625,8 +626,8 @@ def test_turning_the_ontology_off_relabels_and_clears_the_provenance(
     """The other direction: an output built *with* an ontology is stale for a run without one.
 
     A leaf query answers the same either way, so what is at stake is provenance rather than these
-    particular labels — but a sidecar left behind would claim a never-exploded parquet was
-    exploded, and the next ontology run would trust it and skip.
+    particular labels — but a sidecar still carrying the old ontology fingerprint would claim a
+    never-exploded parquet was exploded, and the next ontology run would trust it and skip.
     """
     out_dir = tmp_path / "grid"
     specs = _specs_yaml(tmp_path, i50="ICD//CIRC//I50")
@@ -651,7 +652,7 @@ def test_turning_the_ontology_off_relabels_and_clears_the_provenance(
         "dropping the ontology must relabel, not skip"
     )
     assert _answers_by_subject_and_query(out_dir) == leaf_truth
-    assert not any(eval_seq._provenance_path(out_dir, fp).exists() for fp in fps)
+    assert all(eval_seq._recorded_fingerprint(out_dir, fp)["ontology_fingerprint"] is None for fp in fps)
 
 
 def test_a_sidecar_less_grid_is_relabeled_when_an_ontology_is_turned_on(

@@ -135,8 +135,12 @@ def test_writes_one_grid_and_one_unique_parquet_per_shard(tmp_path: Path, data_d
         *(f"eval/{SPLIT}/{s}.parquet" for s in SHARDS),
         *(f"eval_unique/{SPLIT}/{s}.parquet" for s in SHARDS),
     ]
-    # Ontology off: no sidecar, so no artifacts sibling at all.
-    assert not eval_seq.default_artifacts_dir(out_dir).exists()
+    # Every shard carries its provenance in the artifacts sibling, ontology or not; the ontology
+    # component is simply null here.
+    for shard in SHARDS:
+        recorded = eval_seq._recorded_fingerprint(out_dir, out_dir / "eval" / SPLIT / f"{shard}.parquet")
+        assert recorded is not None and recorded["ontology_fingerprint"] is None
+        assert recorded["specs_fingerprint"] and recorded["cohort_fingerprint"].startswith("sampled|")
 
     for shard in SHARDS:
         df = _labels(out_dir, shard)
@@ -278,6 +282,92 @@ def test_existing_outputs_are_skipped_unless_overwrite(tmp_path: Path, data_dir:
 
     _run_seq(data_dir, out_dir, codes_yaml, overwrite="true")
     assert fp.stat().st_ino != inode, "overwrite=true must regenerate"
+
+
+def _inodes(out_dir: Path) -> list[int]:
+    return [(out_dir / "eval" / SPLIT / f"{s}.parquet").stat().st_ino for s in SHARDS]
+
+
+def test_changed_specs_relabel_instead_of_skipping(tmp_path: Path, data_dir: Path, codes_yaml: Path):
+    """The skip rule is keyed on the specs, not just on the output existing.
+
+    Re-running into the same ``out_dir`` with a different sequence axis used to log "already
+    exists, skipping" and keep the previous grid — a well-formed parquet answering the wrong
+    questions.
+    """
+    out_dir = tmp_path / "grid"
+    _run_seq(data_dir, out_dir, codes_yaml)
+    before = _inodes(out_dir)
+
+    _run_seq(data_dir, out_dir, codes_yaml, n_sequences=N_SEQ + 1)
+    assert all(a != b for a, b in zip(_inodes(out_dir), before, strict=True)), "more sequences must relabel"
+    assert all(_labels(out_dir, s).height == _unique(out_dir, s).height * (N_SEQ + 1) for s in SHARDS)
+
+    designed = tmp_path / "designed.yaml"
+    code = yaml.safe_load(codes_yaml.read_text())[0]
+    designed.write_text(yaml.safe_dump({"one": [[code, 1]]}))
+    before = _inodes(out_dir)
+    _run_seq(data_dir, out_dir, codes_yaml, sequences_path=designed)
+    assert all(a != b for a, b in zip(_inodes(out_dir), before, strict=True)), "designed specs must relabel"
+    assert all(
+        _spec_keys(_labels(out_dir, s)) == [f"{code}#1.0"] * _unique(out_dir, s).height for s in SHARDS
+    )
+
+    # Same designed file again: nothing changed, so nothing is rewritten.
+    before = _inodes(out_dir)
+    _run_seq(data_dir, out_dir, codes_yaml, sequences_path=designed)
+    assert _inodes(out_dir) == before
+
+
+def test_changed_cohort_relabels_instead_of_skipping(
+    tmp_path: Path, data_dir: Path, codes_yaml: Path, synthetic_events: pl.DataFrame
+):
+    """...and on the cohort: sampling knobs for a sampled cohort, the frame itself for a supplied one."""
+    out_dir = tmp_path / "grid"
+    _run_seq(data_dir, out_dir, codes_yaml, prediction_times_per_subject=3)
+    before = _inodes(out_dir)
+
+    _run_seq(data_dir, out_dir, codes_yaml, prediction_times_per_subject=1)
+    assert all(a != b for a, b in zip(_inodes(out_dir), before, strict=True)), "fewer times must relabel"
+    assert all(_unique(out_dir, s).height == _unique(out_dir, s)["subject_id"].n_unique() for s in SHARDS)
+
+    before = _inodes(out_dir)
+    _run_seq(data_dir, out_dir, codes_yaml, prediction_times_per_subject=1, seed=2)
+    assert all(a != b for a, b in zip(_inodes(out_dir), before, strict=True)), "a new seed must relabel"
+
+    cohort = tmp_path / "cohort.parquet"
+    first_times = synthetic_events.group_by("subject_id").agg(pl.col("time").min().alias("prediction_time"))
+    first_times.write_parquet(cohort)
+    before = _inodes(out_dir)
+    _run_seq(data_dir, out_dir, codes_yaml, contexts_path=cohort)
+    assert all(a != b for a, b in zip(_inodes(out_dir), before, strict=True)), (
+        "a supplied cohort must relabel"
+    )
+    assert sum(_unique(out_dir, s).height for s in SHARDS) == first_times.height
+
+    before = _inodes(out_dir)
+    _run_seq(data_dir, out_dir, codes_yaml, contexts_path=cohort)
+    assert _inodes(out_dir) == before, "the same supplied cohort must skip"
+
+    first_times.head(2).write_parquet(cohort)
+    _run_seq(data_dir, out_dir, codes_yaml, contexts_path=cohort)
+    assert sum(_unique(out_dir, s).height for s in SHARDS) == 2, "an edited cohort file must relabel"
+
+
+def test_a_pre_fingerprint_sidecar_is_stale(tmp_path: Path, data_dir: Path, codes_yaml: Path):
+    """A sidecar from before specs/cohort were recorded vouches for nothing and is relabeled once."""
+    out_dir = tmp_path / "grid"
+    _run_seq(data_dir, out_dir, codes_yaml)
+    before = _inodes(out_dir)
+    for shard in SHARDS:
+        fp = out_dir / "eval" / SPLIT / f"{shard}.parquet"
+        eval_seq._provenance_path(out_dir, fp).write_text('{"ontology_fingerprint": null}')
+
+    _run_seq(data_dir, out_dir, codes_yaml)
+    assert all(a != b for a, b in zip(_inodes(out_dir), before, strict=True))
+    before = _inodes(out_dir)
+    _run_seq(data_dir, out_dir, codes_yaml)
+    assert _inodes(out_dir) == before
 
 
 # ── config parity ────────────────────────────────────────────────────────

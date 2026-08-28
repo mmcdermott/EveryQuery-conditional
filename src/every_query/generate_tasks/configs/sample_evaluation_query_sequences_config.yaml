@@ -28,8 +28,9 @@
 # Output layout (`{out_dir}/eval` is directly usable as `EQ_predict_sequences tasks_dir=...`):
 #   {out_dir}/eval/{split}/{shard}.parquet          labeled grid, one file per shard
 #   {out_dir}/eval_unique/{split}/{shard}.parquet   deduped (subject_id, prediction_time)
-# The only intermediate is the ontology provenance sidecar, written to the sibling
-# `{out_dir}_artifacts/_labeled/eval/{split}/{shard}.json` (and only with `ontology_dir` set).
+# The only intermediate is the per-shard provenance sidecar at the sibling
+# `{out_dir}_artifacts/_labeled/eval/{split}/{shard}.json`, recording the ontology, specs and cohort
+# source the shard was labeled under; `overwrite: false` skips a shard only when all three match.
 
 data_dir: ???
 out_dir: ???
