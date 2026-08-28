@@ -71,13 +71,15 @@ sequences_path: null
 # `sequences_path` accepts any of:
 #   YAML/JSON mapping    name -> [[code, duration], ...]
 #   YAML/JSON list       [[[code, duration], ...], ...]      (names auto-generated)
-#   long-format parquet  (seq_id, position, query, duration_days)
+#   long-format parquet  (seq_id, position, query, duration_days[, bound_event])
 # e.g. designed.yaml:
 #   mortality_30d:
 #     - [TIMELINE//END, 1]
 #     - [MEDS_DEATH, 30]
+#   sepsis_before_discharge:
+#     - [SEPSIS, -1, HOSPITAL_DISCHARGE//HOME]
 # On this path nothing is sampled: the codes and durations are exactly what you wrote, and
-# `query_codes` is used only to reject codes outside the model's vocabulary.
+# `query_codes` is used only to reject query and boundary codes outside the model's vocabulary.
 
 # --- Sampling knobs (all `sequences_path: null` only) ---------------------
 # The code and duration distributions below mirror `sample_query_sequences_config.yaml` so a
@@ -96,8 +98,8 @@ n_sequences: 64
 # distribution, since 3 is inside the range the model was trained on — unlike the duration
 # bounds below, widening/narrowing these does not move the grid off-distribution as long as
 # they stay within `[training min_queries, training max_queries]`.
-min_queries: 3
-max_queries: 3
+min_queries: 1
+max_queries: 1
 
 # Duration bounds in days.  Each query's horizon is drawn log-uniformly over the continuous
 # [min, max] interval and kept as a **float** (no day-rounding) — so it skews short: over
@@ -124,8 +126,9 @@ duration_mode: random
 #
 # Fraction of *sampled* eval queries that are event-bounded; the boundary is drawn uniformly from
 # the query universe (leaves plus, with `ontology_dir`, ancestor nodes).  Designed specs set their
-# bounds explicitly instead, via a `[code, -1, bound_event]` triple.
-eventbound_fraction: 0.0
+# bounds explicitly instead, via a `[code, -1, bound_event]` triple or the parquet `bound_event`
+# column; this fraction is ignored when `sequences_path` is set.
+eventbound_fraction: 0.5
 
 # --- Ontology / hierarchical embeddings ---------------------------------------------------------
 # Directory of ontology artifacts written by EQ_build_ontology (nodes/mix/closure parquets).

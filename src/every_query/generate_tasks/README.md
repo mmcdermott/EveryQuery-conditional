@@ -70,8 +70,9 @@ families of (scattered-for-training, dense-for-evaluation) pairs — one per mod
     `subject_subsample_fraction`, one worker per shard), so for one `(seed, split, K, ...)` the
     flat grid and the sequence grid score the identical `(subject, time)` set; `contexts_path`
     overrides the sampled cohort with a supplied one. The `N` sequences are designed
-    (`sequences_path=tasks.yaml`, a mapping of `name -> [[code, duration], ...]`) or drawn once
-    from the training query distribution (`n_sequences=64`) and shared by every shard. Reuses
+    (`sequences_path=tasks.yaml`, a mapping of `name -> [[code, duration], ...]`, with
+    `[code, -1, bound_event]` for an event-bounded position) or drawn once from the training query
+    distribution (`n_sequences=64`, 50% event-bounded by default) and shared by every shard. Reuses
     `sample_evaluation_tasks`'s cohort sampler and `sample_query_sequences`'s
     `label_query_sequences` labeler; only the grid build is its own. Registered as
     `EQ_generate_evaluation_query_sequences`.
@@ -206,7 +207,9 @@ EQ_generate_evaluation_query_sequences \
 	split=held_out prediction_times_per_subject=2 n_sequences=64
 
 # Or designed sequences on a supplied cohort (`contexts_path` bypasses the cohort knobs; every
-# subject must be in the split).  Spec identity in the output is the (queries, durations) columns.
+# subject must be in the split). Event-bounded positions use `[query, -1, bound_event]`; long-format
+# parquet specs use the optional nullable `bound_event` column. Spec identity in the output is the
+# (queries, durations, bound_events) columns.
 EQ_generate_evaluation_query_sequences \
 	data_dir=$TOKENIZED_EVENTS_DIR out_dir=$EVAL_SEQ_TASKS_DIR query_codes=$TENSORIZED_COHORT_DIR \
 	split=held_out contexts_path=cohort.parquet sequences_path=tasks.yaml

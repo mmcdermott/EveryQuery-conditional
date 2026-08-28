@@ -218,7 +218,7 @@ def test_dense_grid_designed_sequences(eq_preprocessed_dataset: Path, cq_cohort_
         yaml.safe_dump(
             {
                 "end_then_target": [["TIMELINE//END", 1], [target, 30]],
-                "target_only": [[target, 7]],
+                "target_before_end": [[target, -1, "TIMELINE//END"]],
             }
         )
     )
@@ -247,6 +247,8 @@ def test_dense_grid_designed_sequences(eq_preprocessed_dataset: Path, cq_cohort_
     assert two["queries"].to_list() == [["TIMELINE//END", target]] * n_contexts
     assert two["durations"].to_list() == [[1.0, 30.0]] * n_contexts
     assert one["queries"].to_list() == [[target]] * n_contexts
+    assert one["durations"].to_list() == [[-1.0]] * n_contexts
+    assert one["bound_events"].to_list() == [["TIMELINE//END"]] * n_contexts
     assert one["answers"].explode().null_count() == 0
 
 

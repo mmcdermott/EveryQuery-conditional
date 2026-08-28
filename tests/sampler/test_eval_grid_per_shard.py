@@ -150,6 +150,9 @@ def test_writes_one_grid_and_one_unique_parquet_per_shard(tmp_path: Path, data_d
         assert df.height == uniq.height * N_SEQ
         assert (df["queries"].list.len() == LEN).all()
         assert df["answers"].explode().null_count() == 0
+        assert "bound_events" in df.columns, "the sampled grid defaults eventbound_fraction to 0.5"
+        bounded = df.explode("durations", "bound_events").filter(pl.col("bound_events").is_not_null())
+        assert bounded.height > 0 and (bounded["durations"] == -1.0).all()
         assert uniq.sort("subject_id", "prediction_time").equals(
             df.select("subject_id", "prediction_time").unique().sort("subject_id", "prediction_time")
         )
@@ -172,6 +175,15 @@ def test_rows_are_context_major_within_a_shard(tmp_path: Path, data_dir: Path, c
             block = df.slice(c * N_SEQ, N_SEQ)
             assert keys[c * N_SEQ : (c + 1) * N_SEQ] == first
             assert block.select("subject_id", "prediction_time").n_unique() == 1
+
+
+def test_eventbound_fraction_zero_keeps_sampled_grid_bound_free(
+    tmp_path: Path, data_dir: Path, codes_yaml: Path
+):
+    """An explicit zero still disables bounds despite the new 0.5 default."""
+    out_dir = tmp_path / "grid"
+    _run_seq(data_dir, out_dir, codes_yaml, eventbound_fraction=0)
+    assert all("bound_events" not in _labels(out_dir, shard).columns for shard in SHARDS)
 
 
 def test_specs_are_shared_across_shards(tmp_path: Path, data_dir: Path, codes_yaml: Path):
@@ -254,6 +266,61 @@ def test_supplied_cohort_is_partitioned_by_shard_and_bypasses_the_cohort_knobs(
     assert _labels(out_dir, "0").height == 4 * N_SEQ and _labels(out_dir, "1").height == 2 * N_SEQ
 
 
+def test_supplied_event_bounded_sequence_is_labeled_end_to_end(
+    tmp_path: Path, data_dir: Path, codes_yaml: Path, synthetic_events: pl.DataFrame
+):
+    """A mixed designed spec retains its bounds and uses them to decide the answers.
+
+    A boundary that never occurs leaves the window open through the end of the patient's record.
+    The third query therefore finds its target, while the fourth query confirms that an absent
+    target still answers false rather than becoming an automatic positive. The fifth query is an
+    ordinary one-day horizon and confirms that the later ``MED//E05`` does not count.
+    """
+    cohort = synthetic_events.group_by("subject_id").agg(pl.col("time").min().alias("prediction_time"))
+    cohort_fp = tmp_path / "cohort.parquet"
+    cohort.write_parquet(cohort_fp)
+
+    never_boundary = "BOUNDARY//NEVER"
+    never_target = "TARGET//NEVER"
+    extended_codes_fp = tmp_path / "codes_with_never_boundary.yaml"
+    extended_codes_fp.write_text(
+        yaml.safe_dump([*yaml.safe_load(codes_yaml.read_text()), never_boundary, never_target])
+    )
+
+    specs_fp = tmp_path / "event_bounded.yaml"
+    specs_fp.write_text(
+        yaml.safe_dump(
+            {
+                "before_d": [
+                    ["ICD//C03", -1, "MED//D04"],
+                    ["MED//E05", -1, "MED//D04"],
+                    ["MED//E05", -1, never_boundary],
+                    [never_target, -1, never_boundary],
+                    ["MED//E05", 1],
+                    ["ICD//A01", 100],
+                ]
+            }
+        )
+    )
+
+    out_dir = tmp_path / "grid"
+    _run_seq(data_dir, out_dir, extended_codes_fp, contexts_path=cohort_fp, sequences_path=specs_fp)
+
+    for shard in SHARDS:
+        labels = _labels(out_dir, shard)
+        QuerySeqSchema.align(pq.read_table(out_dir / "eval" / SPLIT / f"{shard}.parquet"))
+        assert (
+            labels["queries"].to_list()
+            == [["ICD//C03", "MED//E05", "MED//E05", never_target, "MED//E05", "ICD//A01"]] * labels.height
+        )
+        assert labels["durations"].to_list() == [[-1.0, -1.0, -1.0, -1.0, 1.0, 100.0]] * labels.height
+        assert (
+            labels["bound_events"].to_list()
+            == [["MED//D04", "MED//D04", never_boundary, never_boundary, None, None]] * labels.height
+        )
+        assert labels["answers"].to_list() == [[True, False, True, False, False, True]] * labels.height
+
+
 def test_supplied_cohort_with_a_subject_outside_the_split_raises_before_writing(
     tmp_path: Path, data_dir: Path, codes_yaml: Path, synthetic_events: pl.DataFrame
 ):
@@ -304,7 +371,8 @@ def test_changed_specs_relabel_instead_of_skipping(tmp_path: Path, data_dir: Pat
     assert all(_labels(out_dir, s).height == _unique(out_dir, s).height * (N_SEQ + 1) for s in SHARDS)
 
     designed = tmp_path / "designed.yaml"
-    code = yaml.safe_load(codes_yaml.read_text())[0]
+    codes = yaml.safe_load(codes_yaml.read_text())
+    code = codes[0]
     designed.write_text(yaml.safe_dump({"one": [[code, 1]]}))
     before = _inodes(out_dir)
     _run_seq(data_dir, out_dir, codes_yaml, sequences_path=designed)
@@ -317,6 +385,17 @@ def test_changed_specs_relabel_instead_of_skipping(tmp_path: Path, data_dir: Pat
     before = _inodes(out_dir)
     _run_seq(data_dir, out_dir, codes_yaml, sequences_path=designed)
     assert _inodes(out_dir) == before
+
+    # Changing only the boundary changes both the labels and the task consumed by the model, so
+    # it must participate in the provenance fingerprint just like the query and duration do.
+    designed.write_text(yaml.safe_dump({"one": [[code, -1, codes[1]]]}))
+    _run_seq(data_dir, out_dir, codes_yaml, sequences_path=designed)
+    before = _inodes(out_dir)
+    designed.write_text(yaml.safe_dump({"one": [[code, -1, codes[2]]]}))
+    _run_seq(data_dir, out_dir, codes_yaml, sequences_path=designed)
+    assert all(a != b for a, b in zip(_inodes(out_dir), before, strict=True)), (
+        "a boundary-only spec change must relabel"
+    )
 
 
 def test_changed_cohort_relabels_instead_of_skipping(
@@ -392,14 +471,13 @@ def test_config_cohort_keys_mirror_the_flat_sampler_and_sampling_keys_mirror_tra
     for gone in ("n_contexts", "min_prediction_times_per_subject", "per_spec_dirs"):
         assert gone not in seq_cfg, f"{gone} was removed from the eval-seq config"
 
-    # ``eventbound_fraction`` is deliberately not in this list: the eval grid defaults it to 0.0
-    # while training draws 0.5, a pre-existing divergence the other parity tests also exempt.
     sampling_keys = [
         "duration_min",
         "duration_max",
         "duration_distribution",
         "eos_first_fraction",
         "duration_mode",
+        "eventbound_fraction",
         "ontology_dir",
     ]
     assert {k: seq_cfg[k] for k in sampling_keys} == {k: train_cfg[k] for k in sampling_keys}

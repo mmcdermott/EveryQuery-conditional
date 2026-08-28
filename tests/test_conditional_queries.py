@@ -29,6 +29,7 @@ from meds import held_out_split, tuning_split
 from every_query.data.seq_dataset import (
     ANSWERS_COL,
     EOS_CODE,
+    EVENT_BOUND_DURATION_SENTINEL,
     ConditionalQueryBatch,
 )
 from every_query.generate_tasks import sample_evaluation_query_sequences
@@ -434,11 +435,21 @@ def test_sampler_determinism():
 def test_read_sequence_specs_yaml_mapping_and_list(tmp_path):
     """Both YAML forms parse; the mapping form keeps its names, the list form generates them."""
     mapping_fp = tmp_path / "mapping.yaml"
-    mapping_fp.write_text(yaml.safe_dump({"mortality_30d": [[EOS_CODE, 1], ["MEDS_DEATH", 30]]}))
+    mapping_fp.write_text(
+        yaml.safe_dump(
+            {
+                "mortality_30d": [
+                    [EOS_CODE, 1],
+                    ["MEDS_DEATH", EVENT_BOUND_DURATION_SENTINEL, "DISCHARGE"],
+                ]
+            }
+        )
+    )
     (spec,) = read_sequence_specs(mapping_fp)
     assert spec.name == "mortality_30d"
     assert spec.queries == (EOS_CODE, "MEDS_DEATH")
-    assert spec.durations == (1, 30)
+    assert spec.durations == (1, EVENT_BOUND_DURATION_SENTINEL)
+    assert spec.bounds == (None, "DISCHARGE")
 
     list_fp = tmp_path / "list.yaml"
     list_fp.write_text(yaml.safe_dump([[["A", 7]], [["B", 14], ["C", 30]]]))
@@ -448,19 +459,21 @@ def test_read_sequence_specs_yaml_mapping_and_list(tmp_path):
 
 
 def test_read_sequence_specs_parquet_orders_by_position(tmp_path):
-    """The long-format parquet form is ordered by ``position``, not by row order."""
+    """Long-format parquet preserves optional bounds and orders every field by ``position``."""
     fp = tmp_path / "specs.parquet"
     pl.DataFrame(
         {
             "seq_id": ["s", "s", "s"],
             "position": [2, 0, 1],
             "query": ["third", "first", "second"],
-            "duration_days": [3.0, 1.0, 2.0],
+            "duration_days": [3.0, 1.0, EVENT_BOUND_DURATION_SENTINEL],
+            "bound_event": [None, None, "DISCHARGE"],
         }
     ).write_parquet(fp)
     (spec,) = read_sequence_specs(fp)
     assert spec.queries == ("first", "second", "third")
-    assert spec.durations == (1.0, 2.0, 3.0)
+    assert spec.durations == (1.0, EVENT_BOUND_DURATION_SENTINEL, 3.0)
+    assert spec.bounds == (None, "DISCHARGE", None)
 
 
 def test_read_sequence_specs_rejects_malformed(tmp_path):
@@ -526,6 +539,10 @@ def test_sequence_spec_rejects_bad_durations():
     # ``bool`` is an int subclass; True must not silently become 1.0 days.
     with pytest.raises(TypeError, match="must be a number"):
         SequenceSpec("s", ("A",), (True,))
+    with pytest.raises(ValueError, match=r"duration must be the -1\.0 sentinel"):
+        SequenceSpec("s", ("A",), (30.0,), ("DISCHARGE",))
+    with pytest.raises(ValueError, match="boundary at position 0 must be a non-empty string"):
+        SequenceSpec("s", ("A",), (EVENT_BOUND_DURATION_SENTINEL,), ("",))
 
 
 def test_eval_sampling_defaults_stay_in_training_distribution():
@@ -550,6 +567,7 @@ def test_eval_sampling_defaults_stay_in_training_distribution():
         "duration_distribution",
         "eos_first_fraction",
         "duration_mode",
+        "eventbound_fraction",
     ]
     assert {k: eval_cfg[k] for k in exact} == {k: train_cfg[k] for k in exact}
 
