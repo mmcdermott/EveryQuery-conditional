@@ -1,121 +1,76 @@
-# EveryQuery
+# EveryQuery — conditional query sequences
 
 [![tests](https://github.com/payalchandak/EveryQuery/actions/workflows/tests.yaml/badge.svg?branch=main)](https://github.com/payalchandak/EveryQuery/actions/workflows/tests.yaml)
-[![codecov](https://codecov.io/gh/payalchandak/EveryQuery/branch/main/graph/badge.svg)](https://codecov.io/gh/payalchandak/EveryQuery)
 [![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org)
 [![PyTorch Lightning](https://img.shields.io/badge/PyTorch_Lightning-792ee5?logo=lightning&logoColor=white)](https://lightning.ai)
 [![Config: Hydra](https://img.shields.io/badge/config-hydra-89b8cd)](https://hydra.cc)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Given a MEDS dataset, EveryQuery trains a ModernBERT-style encoder to answer
-"query" prediction tasks of the form: *given a subject's history up to time `t`, will code
-`c` occur within `d` days?* The same trained model is then evaluated against arbitrary
-`(code, duration)` combinations.
+Given a [MEDS](https://github.com/Medical-Event-Data-Standard) dataset, EveryQuery trains a model
+that answers an **ordered sequence of queries** about a patient:
 
-EveryQuery is built on the [MEDS](https://github.com/Medical-Event-Data-Standard) ecosystem leveraging [`meds-torch-data`](https://github.com/mmcdermott/meds-torch-data) for tensorization and [`MEDS-transforms`](https://github.com/mmcdermott/MEDS_transforms) for preprocessing.
+> *Given the record up to time $t$, will code $c_1$ occur within $d_1$ days? Given that answer, will
+> $c_2$ occur within $d_2$ days? …*
 
-> [!IMPORTANT]
-> **This fork (`conditional-v2` branch) adds a conditional query-sequence model** — a
-> bidirectional patient encoder + block-autoregressive decoder that answers an ordered list of
-> queries, each conditioned on the patient state and the teacher-forced answers of all earlier
-> queries. Binary observed-occurrence labels; censoring is expressed by querying the real
-> `TIMELINE//END` code rather than via a separate head. See
-> **[docs/CONDITIONAL_QUERIES.md](docs/CONDITIONAL_QUERIES.md)** for the design, the new
-> `EQ_generate_query_sequences` / `EQ_predict_sequences` / `EQ_evaluate_sequences` CLIs, the macro
-> per-task evaluation methodology, and results.
+A bidirectional ModernBERT encoder embeds the patient record once; a block-autoregressive decoder
+then answers each query conditioned on the patient state **and the (teacher-forced) answers to all
+earlier queries**, i.e. it learns
+
+$$
+P(A_j \mid \text{patient},\, Q_1, \dots, Q_j,\, A_1, \dots, A_{j-1})
+$$
+
+rather than the marginal $P(A \mid \text{patient}, Q)$. Answers are binary
+YES/NO. Censoring is not a label class — it is a query on the real end-of-record code
+`TIMELINE//END` (`(TIMELINE//END, 30)=YES` means "the record ends within 30 days"), so later
+queries can be conditioned on it. Queries can also be **event-bounded** ("does `c` occur before the
+next `HOSPITAL_DISCHARGE`?") and, with an ontology, can address a whole **code family**
+("does any `LAB//220645//*` occur?").
+
+`docs/CONDITIONAL_QUERIES.md` is the design doc (model, masking, evaluation methodology,
+results). The upstream single-query pipeline (`EQ_generate_training_tasks`, `EQ_predict`,
+`EQ_evaluate`, …) still ships in the tree but is not covered here.
 
 ## Install
 
-**As a dependency:**
-
 ```bash
+uv sync --group dev # from a checkout
+# or
 pip install EveryQuery
 ```
 
-## Repository layout
-
-Every production module lives under a submodule that reflects its role:
-
-```
-src/every_query/
-├── preprocessing/      → EQ_process_data        (raw MEDS → tensorized cohort)
-├── generate_tasks/     → EQ_generate_training_tasks + EQ_generate_evaluation_tasks + EQ_sample_task_tracking_pairs (TaskQuerySchema parquets: scattered for PT, dense for eval, pos/neg pairs for in-training AUROC)
-├── train/              → EQ_train               (train the model)
-├── predict/            → EQ_predict             (inference; consumes TaskQuerySchema, emits PredictionSchema)
-│   └── external_tasks/                         (ACES + composite aggregation — currently `python -m` only;
-│                                                  [#62](https://github.com/payalchandak/EveryQuery/issues/62) tracks promoting to console scripts, draft PR [#95](https://github.com/payalchandak/EveryQuery/pull/95))
-├── evaluate/           → EQ_evaluate           (metrics on a PredictionSchema parquet)
-├── model/              (shared: nn.Module + LightningModule)
-├── data/               (shared: PyTorch Dataset + Batch types + TaskQuerySchema)
-└── utils/              (helpers: seeds, code slugs, env-var validation, model_loader)
-```
-
-Every submodule has its own `README.md` explaining what belongs there, its pipeline
-position, and the tracking issues for remaining work.
-
-Research-only, paper-specific code (ID/OOD code sampling, ablations, the results notebook,
-figure code, the ETHOS comparison) lives in the separate `EveryQueryExperiments` repo, which
-depends on `EveryQuery` as an installed library. The split is tracked in
-[#186](https://github.com/payalchandak/EveryQuery/issues/186).
-
-## Console scripts
-
-`pip install` exposes the CLIs below, all Hydra-configurable. Run any with `--help` or
-`--cfg job` to inspect the resolved config. The **Tests** column summarises the coverage
-that lands with each CLI on `dev` today — unit tests (fast, `tests/test_<name>_logic.py`
-or `tests/test_<module>.py`), CLI smoke tests (`tests/test_cli_smoke.py`, `--help`-exits-0),
-and end-to-end subprocess tests that run the real script against a fixture cohort.
-
-| Script                          | Stage            | Purpose                                                                                                                 | Tests                                                                                                                    |
-| ------------------------------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `EQ_process_data`               | preprocessing    | Orchestrate MEDS-transforms + `meds-torch-data` tensorization                                                           | smoke; E2E via `test_process_data.py` + `test_e2e_foundation.py`                                                         |
-| `EQ_generate_training_tasks`    | PT task labels   | Sample `N` tasks × `M` contexts (scattered `(query, duration_days)`), label via single-pass asof                        | smoke; unit `tests/sampler/`; E2E `test_generate_tasks.py`                                                               |
-| `EQ_generate_evaluation_tasks`  | eval task labels | Sample `K` prediction times per subject, cross-join with `(codes × durations)` grid for dense evaluation shape          | smoke; E2E `test_generate_evaluation_tasks_cli.py`                                                                       |
-| `EQ_sample_task_tracking_pairs` | AUROC tracking   | Sample one pos + one neg row per `(query, duration_days)` from the dense eval labels for cheap in-training AUROC        | smoke; E2E `test_sample_task_tracking_pairs_cli.py`                                                                      |
-| `EQ_train`                      | training         | Train the ModernBERT encoder on the labeled tasks                                                                       | smoke; unit `test_training.py`; E2E `test_train_cli.py` + `test_train.py`; signal test `tests/training_validity/` (slow) |
-| `EQ_predict`                    | inference        | Consume a `TaskQuerySchema` parquet dir + checkpoint, emit a `PredictionSchema` parquet (`censor_prob`, `occurs_prob`)  | smoke; E2E `test_predict_cli.py` (row-order preserved); exercised by `tests/training_validity/` (slow)                   |
-| `EQ_evaluate`                   | metrics          | Consume a `PredictionSchema` parquet, write per-`(query, duration_days)` metrics (`occurs_auroc`, `censor_auroc`, etc.) | smoke; E2E `test_evaluate_cli.py`; exercised by `tests/training_validity/` (slow)                                        |
-
-The conditional query-sequence pipeline (this fork) adds a parallel set of CLIs that consume and
-emit `QuerySeqSchema` rather than `TaskQuerySchema` — see
-[docs/CONDITIONAL_QUERIES.md](docs/CONDITIONAL_QUERIES.md):
-
-| Script                                   | Stage           | Purpose                                                                                                                       | Tests                     |
-| ---------------------------------------- | --------------- | ----------------------------------------------------------------------------------------------------------------------------- | ------------------------- |
-| `EQ_generate_query_sequences`            | PT seq labels   | Sample `K` queries per `(subject, prediction_time)` context and label each by observed occurrence (`QuerySeqSchema` parquets) | `test_conditional_cli.py` |
-| `EQ_generate_evaluation_query_sequences` | eval seq labels | Label the same `N` query sequences at `K` sampled times per subject, or across a supplied cohort (dense grid counterpart)     | `test_conditional_cli.py` |
-| `EQ_predict_sequences`                   | inference       | Consume `QuerySeqSchema` + a conditional checkpoint, emit per-position probabilities                                          | `test_conditional_cli.py` |
-| `EQ_evaluate_sequences`                  | metrics         | Per-position and macro per-task metrics over conditional predictions                                                          | `test_conditional_cli.py` |
-
-The legacy four-stage evaluator (`every_query.evaluate.eval`, with `gen_index_times`, `gen_task`, `select_model` siblings) has been deleted; recover from git history if needed. [#83](https://github.com/payalchandak/EveryQuery/issues/83) tracks the cross-model leaderboard, which now lives in the `EveryQueryExperiments` repo.
+Every CLI below is a Hydra entry point: override any knob with `key=value`, add one with
+`+key=value`, and print the resolved config with `--cfg job`. Path arguments are required
+(`???` in the YAML) — there is no env-var fallback. `env.example.sh` lists the variables used
+below; copy it to `env.sh`, edit, and `source env.sh` so they expand into the commands.
 
 ## Pipeline
 
-### Current (on `dev`)
-
 ```mermaid
 flowchart TD
-    meds[MEDS cohort] --> process[EQ_process_data]
-    process --> intermediate[("MEDS event shards<br/>($TOKENIZED_EVENTS_DIR)")]
-    process --> cohort[("tensorized cohort<br/>($TENSORIZED_COHORT_DIR)")]
+    meds[raw MEDS cohort] --> process[EQ_process_data]
+    process --> events[("event shards<br/>$TOKENIZED_EVENTS_DIR")]
+    process --> cohort[("tensorized cohort<br/>$TENSORIZED_COHORT_DIR")]
+    cohort -. optional .-> onto[EQ_build_ontology]
+    onto -.-> ontodir[("$ONTOLOGY_DIR")]
 
-    intermediate --> train_tasks[EQ_generate_training_tasks<br/><i>scattered, random tasks</i>]
-    intermediate --> eval_tasks[EQ_generate_evaluation_tasks<br/><i>dense grid: codes × durations</i>]
+    events --> gen[EQ_generate_query_sequences]
+    events --> geneval[EQ_generate_evaluation_query_sequences]
+    ontodir -.-> gen
+    ontodir -.-> geneval
 
-    train_tasks -- TaskQuerySchema parquets --> train[EQ_train]
-    cohort -- tensorized cohort --> train
-    train --> ckpt[/best_model.ckpt/]
+    gen -- QuerySeqSchema --> train["EQ_train --config-name=conditional_config"]
+    cohort --> train
+    ontodir -.-> train
+    train --> ckpt[/run dir: checkpoints + resolved_config.yaml/]
 
-    ckpt --> predict[EQ_predict]
-    eval_tasks -- TaskQuerySchema parquets --> predict
-
-    predict -- PredictionSchema parquet --> evaluate[EQ_evaluate]
-    evaluate --> metrics[("per-(query, duration_days)<br/>metrics parquet")]
+    ckpt --> predict[EQ_predict_sequences]
+    geneval -- QuerySeqSchema --> predict
+    predict -- per-position parquet --> evaluate[EQ_evaluate_sequences]
+    evaluate --> metrics[("by_position / by_query parquets")]
 ```
 
-Both task-generation endpoints emit `TaskQuerySchema`-conformant parquets. Training uses the scattered shape (one random `(query, duration_days)` per row); evaluation uses the dense shape (every held-out `(subject, time)` × every `(query × duration)` the user wants metrics for) so `EQ_predict` + `EQ_evaluate` cover a full grid without having to run inference twice.
-
-### 1. Preprocess
+### 1. Preprocess — `EQ_process_data`
 
 ```bash
 EQ_process_data \
@@ -124,240 +79,246 @@ EQ_process_data \
 	output_dir="$TENSORIZED_COHORT_DIR"
 ```
 
-Produces a tensorized MEDS cohort under `$TENSORIZED_COHORT_DIR`. `$TOKENIZED_EVENTS_DIR` is a staging
-directory for the MEDS-transforms stages; `$TENSORIZED_COHORT_DIR` holds cross-shard metadata
-(`$TENSORIZED_COHORT_DIR/metadata/codes.parquet` is the query-code universe the sampler draws from).
+| Arg                | Meaning                                                                               |
+| ------------------ | ------------------------------------------------------------------------------------- |
+| `input_dir`        | raw MEDS cohort root (`data/{split}/*.parquet`, `metadata/codes.parquet`)             |
+| `intermediate_dir` | MEDS-transforms staging; the string-coded event shards the samplers read              |
+| `output_dir`       | tensorized cohort for training; `metadata/codes.parquet` here is the model vocabulary |
+| `do_reshard=true`  | reshard the input first (default `false`)                                             |
 
-### 2a. Generate pre-training task labels
+### 2. (Optional) Build an ontology — `EQ_build_ontology`
 
 ```bash
-EQ_generate_training_tasks \
-	split=train \
-	num_queries=4000000 \
-	num_contexts_per_query=1 \
-	max_workers=1 \
+EQ_build_ontology \
+	tensorized_cohort_dir="$TENSORIZED_COHORT_DIR" \
+	out_dir="$ONTOLOGY_DIR" \
+	decay=0.5 \
+	subtree_suffix=ANY
+```
+
+Run once per cohort. See [How the ontology works](#how-the-ontology-works). Every later step
+takes `ontology_dir=$ONTOLOGY_DIR`; skip it everywhere (default `null`) to work with leaf codes
+only. **The same directory must be used for generation, training and evaluation** — ancestor
+token indices are assigned by the build, so mixing ontologies addresses the wrong embedding rows
+(the dataset raises on unknown codes).
+
+### 3. Generate training sequences — `EQ_generate_query_sequences`
+
+```bash
+EQ_generate_query_sequences \
 	data_dir="$TOKENIZED_EVENTS_DIR" \
 	out_dir="$TRAINING_TASKS_DIR" \
-	query_codes="$TENSORIZED_COHORT_DIR"
+	query_codes="$TENSORIZED_COHORT_DIR" \
+	split=train \
+	num_sequences=4096 \
+	ontology_dir="$ONTOLOGY_DIR" # omit for leaf codes only
 ```
 
-`data_dir` is the MEDS dataset root (event shards read from `{data_dir}/data/{split}/*.parquet`) and `out_dir` is the final-dataset root. Both are required Hydra args (no `.env` fallback — see [#235](https://github.com/payalchandak/EveryQuery/issues/235)); pass them as shell-expanded vars after `source env.sh`.
+Samples `num_sequences` random `(subject, prediction_time)` contexts across the whole split, draws
+an i.i.d. query sequence for each, and labels every query by observed occurrence. Output:
+`{out_dir}/{split}/{shard}.parquet` in `QuerySeqSchema` — one row per context with aligned list
+columns `queries`, `durations` (float days), `answers` (bool) and, when `eventbound_fraction > 0`,
+`bound_events`. Run it for `split=train` and `split=tuning` (training validates on `tuning`).
 
-One command runs the whole 5-stage sampler in a single process (Stages 0–3 inline, then Stage 4 labels shards in parallel). The dataset lands at `$TRAINING_TASKS_DIR/{split}/{shard}.parquet`, with intermediates in the sibling `*_artifacts` dir (see [`generate_tasks/README.md`](src/every_query/generate_tasks/README.md)). Columns conform to [`TaskQuerySchema`](src/every_query/data/schema.py) — `subject_id, prediction_time, query, duration_days, boolean_value` — where `boolean_value` is three-valued: `True` (query code occurs in `(prediction_time, prediction_time + duration_days)`), `False` (window fully observed, no occurrence), or `null` (censored — window extends past the subject's last recorded time).
+| Knob                                                      | Default                 | Meaning                                                                                                                       |
+| --------------------------------------------------------- | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `query_codes`                                             | required                | query universe: a tensorized-cohort root (reads `metadata/codes.parquet`), an inline list `[HR,TEMP]`, or a YAML/parquet path |
+| `num_sequences`                                           | 4096                    | total sequences over the split (global budget, not per shard)                                                                 |
+| `min_queries` / `max_queries`                             | 1 / 5                   | sequence length ~ Uniform{min..max}                                                                                           |
+| `duration_min` / `duration_max` / `duration_distribution` | 1 / 731 / `log-uniform` | per-query horizon draw, continuous days                                                                                       |
+| `eventbound_fraction`                                     | 0.5                     | fraction of queries bounded by the next occurrence of a random boundary event instead of a horizon                            |
+| `eos_first_fraction`                                      | 0.0                     | probability a sequence starts with `TIMELINE//END`                                                                            |
+| `duration_mode`                                           | `random`                | `random` \| `same` \| `nondecreasing` horizons within a sequence                                                              |
+| `min_prediction_times_per_subject`                        | 50                      | eligibility threshold for a prediction time                                                                                   |
+| `ontology_dir`                                            | null                    | adds every ancestor node to the query/boundary universe and labels ancestor queries via descendants                           |
+| `max_workers`                                             | cores                   | shard-labeling parallelism (raise → more RAM)                                                                                 |
+| `seed`                                                    | 1                       | per-shard seeds also mix in the shard id, so no two shards draw the same queries                                              |
 
-> `max_workers` sets how many shards are labeled in parallel, so raising it raises peak RAM. If Stage 4 OOMs, set `max_workers=1`.
+Intermediates (prediction-time counts, sequence index) land in the sibling
+`{out_dir}_artifacts/`; `out_dir` holds final parquets only.
 
-> **Note:** The total number of training samples generated will be `num_queries * num_contexts_per_query`
+### 4. Generate evaluation sequences — `EQ_generate_evaluation_query_sequences`
 
-`query_codes=` is required for training. Set it to a metadata root (`query_codes=$TENSORIZED_COHORT_DIR`) to
-sample from `{dir}/metadata/codes.parquet`, or to an inline list / YAML path to restrict which codes
-can be sampled as queries. YAML files may be a flat list or a mapping with a `codes:` key. This does
-not remove codes from patient histories.
+Labels the **same** `N` sequences at every evaluation context, so metrics are comparable
+query-for-query across cohorts. Two ways to choose the sequences:
+
+**a) Sampled from the training distribution** (positional/macro evaluation):
 
 ```bash
-EQ_generate_training_tasks query_codes=/path/to/train_query_codes.yaml …
-```
-
-```yaml
-# train_query_codes.yaml
-codes:
-  - HR
-  - TEMP
-```
-
-### 2b. Generate evaluation task labels
-
-```bash
-EQ_generate_evaluation_tasks \
-	split=held_out \
-	prediction_times_per_subject=5 \
-	'query_codes=[HR, TEMP]' \
-	'durations=[1, 7, 30, 90, 365]' \
+EQ_generate_evaluation_query_sequences \
 	data_dir="$TOKENIZED_EVENTS_DIR" \
-	out_dir=$EVAL_TASKS_DIR
+	out_dir="$EVAL_SEQ_TASKS_DIR" \
+	query_codes="$TENSORIZED_COHORT_DIR" \
+	split=held_out \
+	prediction_times_per_subject=1 \
+	n_sequences=64 \
+	ontology_dir="$ONTOLOGY_DIR"
 ```
 
-Samples `1` prediction times per subject by default, cross-joins with the full `(codes × durations)` grid, labels via the same primitive as training. Output lands under `$EVAL_TASKS_DIR/eval/{split}/*.parquet` (separate `eval/` subdir so it doesn't collide with the training-task output).
+The sampling knobs (`min/max_queries`, `duration_*`, `eventbound_fraction`, …) mirror step 3; pass
+the same overrides you trained with, or the grid is silently out of distribution.
 
-The endpoint discovers every shard under `{data_dir}/data/{split}/*.parquet` and processes them all in one invocation, writing one output parquet per shard — no shard counting, no `-m input_shard=...` sweep (removed in #279; passing `input_shard=` now fails as an unknown override). The prediction-time sampler is deterministic per shard in `(seed, input_shard, split)`, so outputs are identical to the old exhaustive sweep. Reruns skip shards whose outputs already exist unless `overwrite=true`.
-
-As with training, `data_dir` / `out_dir` are required Hydra args (pass them as shell-expanded vars). `query_codes` is also required — it is the evaluation query universe.
-
-`query_codes=` accepts an inline list (as above), a metadata root / `codes.parquet` path (`query_codes=$TENSORIZED_COHORT_DIR` reads `{dir}/metadata/codes.parquet`), or — for reproducible pre-sampled code universes kept out of git — a path to a YAML file. The YAML is either a bare list or a mapping with a `codes:` key:
+**b) Designed sequences** via `sequences_path=` — nothing is sampled, `query_codes` only validates
+the vocabulary:
 
 ```yaml
-# sampled_codes.yaml
-codes:
-  - HR
-  - TEMP
-  - ICD//A01
+# designed.yaml   name -> [[code, duration_days], ...]   (a triple sets an event bound)
+mortality_30d_uncensored:
+  - [TIMELINE//END, 30]      # condition on "record continues past 30d"
+  - [MEDS_DEATH, 30]
+sepsis_before_discharge:
+  - [SEPSIS, -1, HOSPITAL_DISCHARGE//HOME]
+any_sodium_lab_7d:
+  - [LAB//220645//ANY, 7]     # ancestor query (needs ontology_dir)
 ```
 
 ```bash
-EQ_generate_evaluation_tasks query_codes=/path/to/sampled_codes.yaml …
+EQ_generate_evaluation_query_sequences ... sequences_path=designed.yaml
 ```
 
-### 3. Train
+A long-format parquet `(seq_id, position, query, duration_days[, bound_event])` works too.
+
+Cohort knobs: `prediction_times_per_subject`, `min_context_per_subject` (prior events, default 50),
+`subject_subsample_fraction`, or `contexts_path=` — a parquet of `(subject_id, prediction_time)`
+labeled verbatim (e.g. 24h-post-admission anchors).
+
+Output: `{out_dir}/eval/{split}/{shard}.parquet` (pass `{out_dir}/eval` to predict) plus the
+deduplicated contexts under `{out_dir}/eval_unique/`. Use a different `out_dir` from the
+single-query `EQ_generate_evaluation_tasks`; they share the layout but not the schema.
+
+### 5. Train — `EQ_train --config-name=conditional_config`
 
 ```bash
-EQ_train \
+EQ_train --config-name=conditional_config \
+	output_dir="$TRAINING_OUTPUT_DIR" \
 	datamodule.config.tensorized_cohort_dir="$TENSORIZED_COHORT_DIR" \
 	datamodule.config.task_labels_dir="$TRAINING_TASKS_DIR" \
-	output_dir="$TRAINING_OUTPUT_DIR"
+	lightning_module.model.ontology_dir="$ONTOLOGY_DIR" # omit for leaf codes only
 ```
 
-- `output_dir` is a required Hydra arg that is a base path you supply with `output_dir=`, e.g. `=$TRAINING_OUTPUT_DIR`. Hydra appends `<YYYY-MM-DD>/<HH-MM-SS>` for per-run uniqueness.
-- If you want to override more parameters for training refer to `src/every_query/train/configs/config.yaml`
+Each launch lands in `{output_dir}/<date>/<time>/` with `checkpoints/`, `loggers/csv/metrics.csv`
+and `resolved_config.yaml` — that run dir is what `EQ_predict_sequences` consumes. Vocabulary size
+and max positions are sized from the cohort (or the ontology's extended vocabulary) automatically.
 
-#### Optional: in-training macro-AUROC tracking
+Common overrides (full list: `src/every_query/train/configs/conditional_config.yaml`):
 
-`EQ_train` can log a cheap, macro-averaged per-task AUROC estimate every validation pass
-(`tuning/occurs_auroc_macro_sampled`, plus `..._n_tasks` for how many tasks contributed) via
-`TaskAurocTrackingCallback`. Instead of scoring the whole tuning split, it scores a fixed,
-offline-sampled parquet of exactly one positive + one negative row per `(query, duration_days)`
-task. Because a task's AUROC equals `P(score(pos) > score(neg))` for a random pos/neg pair, the
-win/tie/loss on that one pair is an unbiased (high-variance) estimate; macro-averaging across
-tasks gives macro AUROC at `O(n_tasks)` forward examples. It is **tracking-only** — it does not
-affect `tuning/loss`-driven checkpointing or early stopping.
+| Knob                                                          | Default                                                     |
+| ------------------------------------------------------------- | ----------------------------------------------------------- |
+| `datamodule.batch_size` / `datamodule.num_workers`            | 96 / 8                                                      |
+| `datamodule.config.max_seq_len`                               | 256 patient tokens                                          |
+| `lightning_module.model.num_hidden_layers` / `decoder_layers` | 8 / 4 (hidden 384, 6 heads)                                 |
+| `lightning_module.model.max_queries`                          | 8 (≥ the longest sequence in your labels)                   |
+| `lightning_module.model.use_rope_time`                        | false — `true` uses elapsed hours as rotary positions       |
+| `lightning_module.optimizer.lr` / `warmup_ratio`              | 2e-4 / 0.05                                                 |
+| `trainer.max_epochs` / `trainer.precision`                    | 1 / `bf16-mixed`                                            |
+| `do_resume=true`                                              | resume the run in `output_dir` (mid-epoch, stateful loader) |
+| `seed`                                                        | 140799                                                      |
 
-First sample the tracking pairs once from the dense **tuning**-split eval labels (output of
-`EQ_generate_evaluation_tasks`):
+Checkpointing and early stopping monitor `tuning/loss`. `ontology_dir` is set once on the model;
+the datamodule interpolates it.
 
-```bash
-EQ_sample_task_tracking_pairs \
-	eval_labels_dir="$EVAL_TASKS_DIR/eval" \
-	out_dir="$TASK_TRACKING_DIR" \
-	split=tuning
-# pairs land at $TASK_TRACKING_DIR/tuning/0.parquet
-```
-
-Then enable the callback via its Hydra config group and point `task_labels_dir` at
-`$TASK_TRACKING_DIR`:
+### 6. Predict — `EQ_predict_sequences`
 
 ```bash
-EQ_train +callbacks=task_auroc \
-	++trainer.callbacks.task_auroc_tracking.config.task_labels_dir="$TASK_TRACKING_DIR"
-```
-
-`+callbacks=task_auroc` composes `configs/callbacks/task_auroc.yaml` into the callbacks list.
-It is off by default — `config.yaml` ships `task_auroc_tracking: null`, and `values_as_list`
-drops `None` entries, so a plain `EQ_train` (e.g. when EveryQuery is used as a dependency) runs
-without it and without needing any tracking pairs. Notes:
-
-- The split is locked to `tuning` on purpose — tracking mirrors `tuning/loss` checkpointing, so
-    it is not configurable. Sample the pairs with `split=tuning`.
-- Out-of-vocab query codes (not in the model vocab) are skipped at scoring; the callback warns at
-    setup and you'll see a smaller `..._n_tasks`. An empty tracking set logs a warning and simply
-    never logs the metric (training is unaffected).
-- Under DDP it scores on rank 0 only (the tracking set is identical on every rank), and the
-    parquet is read once at setup — re-sampling mid-run requires a restart.
-- To disable it entirely, just omit `+callbacks=task_auroc` (the default). The mandatory
-    `task_labels_dir: ???` only errors when the group is actually enabled.
-
-### 4. Predict
-
-```bash
-EQ_predict \
+EQ_predict_sequences \
 	model_run_dir="$TRAINING_OUTPUT_DIR/YYYY-MM-DD/HH-MM-SS" \
-	tasks_dir="$EVAL_TASKS_DIR/eval/held_out" \
+	tasks_dir="$EVAL_SEQ_TASKS_DIR/eval" \
 	output_parquet="$TRAINING_OUTPUT_DIR/predictions.parquet" \
 	split=held_out
 ```
 
-Reads every `*.parquet` under `tasks_dir` (`TaskQuerySchema`-conformant), runs the checkpoint's `predict_step` over the chosen split, writes a single `PredictionSchema` parquet with `censor_prob` + `occurs_prob` per input row. See [`predict/README.md`](src/every_query/predict/README.md) for details.
+Runs teacher-forced inference (each answer is conditioned on the ground-truth earlier answers)
+over every `QuerySeqSchema` parquet under `tasks_dir`. Output is flat, one row per query position:
+`subject_id, prediction_time, position, query, duration_days, answer, answer_prob[, bound_event]`.
+Options: `ckpt_name=` (checkpoint stem under `checkpoints/`, default best), `batch_size=`,
+`overwrite=true`. `split=train` is refused.
 
-### 5. Evaluate
+### 7. Evaluate — `EQ_evaluate_sequences`
 
 ```bash
-EQ_evaluate \
+EQ_evaluate_sequences \
 	predictions_parquet="$TRAINING_OUTPUT_DIR/predictions.parquet" \
-	metrics_parquet="$TRAINING_OUTPUT_DIR/metrics.parquet"
+	metrics_stem="$TRAINING_OUTPUT_DIR/metrics"
 ```
 
-Per-`(query, duration_days)` metrics from the predictions parquet — `n_rows`, `n_occurs_labeled`, `n_positive`, `prevalence`, `occurs_auroc` (on non-censored rows), `censor_auroc`. See [`evaluate/README.md`](src/every_query/evaluate/README.md).
+Writes `metrics.by_position.parquet` (AUROC / `n_rows` / `prevalence` per sequence position) and
+`metrics.by_query.parquet` (the same per `(query, duration_bucket)`, with an `event-bound` bucket).
 
-## Configuration
+> Report **macro (per-query) AUROC**, not AUROC pooled over queries. Pooled AUROC scores
+> cross-query pairs and is inflated by base-rate differences (≈0.91 pooled vs ≈0.77 per task on
+> MIMIC-IV). `scripts/eval_macro_position.py` is the paired estimator behind the headline
+> position-trend result; `scripts/eval_clinical.py` covers designed clinical tasks. See
+> `docs/CONDITIONAL_QUERIES.md` §4.
 
-All CLIs are `@hydra.main` entry points; every config knob is overridable on the command
-line with `key=value` or `+new_key=value`. The config directory is resolved via
-`importlib.resources.files("every_query")`, so package-shipped YAMLs work identically
-whether you run from a source checkout or a `pip install`ed wheel.
+## How the ontology works
 
-### Paths & environment
+MEDS code names are already a hierarchy: `LAB//A//mEq/L//value_[5,13)` sits under
+`LAB//A//mEq/L`, under `LAB//A`, under `LAB`. `EQ_build_ontology` reads the cohort's
+`metadata/codes.parquet` (plus an explicit `parent_codes` column if present) and turns every
+`//`-prefix into a DAG node:
 
-Path roots are **plain Hydra args**, not env vars read by the package (the `.env`/`load_dotenv`
-layer was removed in [#235](https://github.com/payalchandak/EveryQuery/issues/235)). The shell owns
-the vars: `source env.sh` (copied from `env.example.sh`) exports them, and you pass them into each
-CLI as shell-expanded `key=$VAR` overrides — `source`-ing one file is all that's needed to move
-machines (SLURM scripts `source` the same file). `EQ_train` validates only the values it actually
-resolves — `validate_training_config()` in `train.py` checks the resolved cohort/task dirs exist and
-that `WANDB_ENTITY` is set *only* when a wandb logger is enabled.
+```mermaid
+flowchart TD
+    LAB(["LAB<br/><i>ancestor</i>"]) --> A(["LAB//A<br/><i>ancestor</i>"])
+    LAB --> B(["LAB//B<br/><i>ancestor</i>"])
+    A --> U(["LAB//A//mEq/L<br/><i>ancestor</i>"])
+    U --> v1["LAB//A//mEq/L//value_[5,13)"]
+    U --> v2["LAB//A//mEq/L//value_[13,20)"]
+    B --> b1["LAB//B//value_lo"]
+    INF["INFUSION_START//X<br/><i>real code AND parent</i>"]
+    INFANY(["INFUSION_START//X//ANY<br/><i>subtree node</i>"]) --> INF
+    INFANY --> INFV["INFUSION_START//X//value_[…)"]
+```
 
-The genuine env read that remains in the **train** config: `WANDB_ENTITY` (read natively by `wandb`,
-backs `${oc.env:WANDB_ENTITY,null}`). `output_dir` is now a required arg with no env fallback
-(pass `output_dir=$TRAINING_OUTPUT_DIR` if you keep that var in `env.sh`). The **preprocessing** subprocess bridge (`RAW_MEDS_DIR`,
-`MTD_INPUT_DIR`, `MIN_SUBJECTS_PER_CODE`, `MIN_EVENTS_PER_SUBJECT`) and the optional `aces_to_eq`
-pipeline (`ACES_SHARDS_DIR`) also use `${oc.env:...}` — see those submodules.
+Rectangles are observed leaf codes (they appear in patient streams and keep their cohort token
+ids); rounded nodes are ancestors minted by the build (fresh ids above the highest leaf). A query
+on `LAB//A` is answered YES if *any* of its descendants occurs. A name that is both a real code and
+a parent (`INFUSION_START//X`) keeps its exact meaning and gets a `//ANY` sibling for the subtree
+meaning. The build writes three parquets to `out_dir`:
 
-| Var                     | Used as                                                                                                                                                                   |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `TOKENIZED_EVENTS_DIR`  | `data_dir=` for the samplers (MEDS event shards)                                                                                                                          |
-| `TENSORIZED_COHORT_DIR` | `output_dir=` (preprocess); `datamodule.config.tensorized_cohort_dir=` (`EQ_train`); `query_codes=` for the samplers (its `metadata/codes.parquet` is the query universe) |
-| `TRAINING_TASKS_DIR`    | `out_dir=` for training tasks; `datamodule.config.task_labels_dir=` for `EQ_train`                                                                                        |
-| `EVAL_TASKS_DIR`        | `out_dir=` for evaluation tasks (`$EVAL_TASKS_DIR/eval/...`)                                                                                                              |
-| `TRAINING_OUTPUT_DIR`   | passed as the `output_dir=` base for `EQ_train` (no longer auto-read; Hydra appends `<date>/<time>`)                                                                      |
-| `WANDB_ENTITY`          | W&B entity (read natively by `wandb`; only when the logger is enabled)                                                                                                    |
+| File                           | Contents                                                                                                                                                         |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ontology_vocab.parquet`       | `(node_name, token_id, is_observed_code)` — the extended vocabulary. Leaf codes keep their cohort indices; ancestor nodes get fresh ones above the highest leaf. |
+| `embedding_mix.parquet`        | sparse $A$ with entry $\text{decay}^{\,\text{distance}}$ for each (node, ancestor) pair plus a self-loop                                                         |
+| `event_to_query_nodes.parquet` | `(event_code, query_node)` closure: every leaf paired with itself and each ancestor it satisfies                                                                 |
 
-`env.example.sh` is the reference — copy to `env.sh`, edit, and `source` it.
+Setting `ontology_dir` does two things:
+
+1. **Ancestors become queryable.** The samplers add every ancestor node to the query and
+    boundary-event universe (each leaf and ancestor drawn with equal probability), and label an
+    ancestor query by exploding the event stream through the closure — "did any descendant occur?".
+    The model's embedding table is sized to the extended vocabulary, so an ancestor is an ordinary
+    query token at prediction time.
+2. **Embeddings are ontology-mixed.** The encoder's input embedding becomes $(A W)[\text{ids}]$: each
+    code's vector is the row-normalised weighted average of its own row and its ancestors'. A rare
+    leaf is pulled toward its better-estimated parents, and an ancestor node (never seen in a patient
+    stream) still gets gradient through its descendants. `decay=0` keeps the structure with no mixing.
+
+**Dual-role names.** A name that is both a real code and another code's prefix (e.g.
+`INFUSION_START//X` is an unvalued event *and* the parent of its `//value_[…)` bins) gets a
+sibling subtree node `INFUSION_START//X//ANY` meaning "this code or any descendant"; the bare name
+stays exact. `subtree_suffix=null` disables this.
 
 ## Development
 
 ```bash
-uv sync --group dev
-uv run pytest                         # full suite, excluding slow tests (~2 min)
-uv run pytest -m 'slow or not slow'   # full suite incl. slow training-validity test (~8-10 min extra)
-uv run pytest tests/test_cli_smoke.py # CLI smoke tests only
-uv run pre-commit run --all-files     # lint, format, codespell
+uv run pytest                                                                 # full suite minus slow tests (~2 min)
+uv run pytest tests/test_conditional_queries.py tests/test_conditional_cli.py # this pipeline
+uv run pytest tests/test_cli_smoke.py                                         # every EQ_* --help exits 0
+uv run pre-commit run --all-files                                             # ruff lint + format + codespell
 ```
 
-CI runs the full `pytest -m "slow or not slow"` (both `slow`-marked and unmarked tests)
-on Python 3.11 and 3.12, plus `ruff check` and `ruff format --check` on every PR; coverage
-is uploaded to Codecov. Full CI session: ~10-11 min typical.
-
-### Test layout
-
-```
-tests/
-├── test_cli_smoke.py               (every EQ_* CLI; --help exits 0)
-├── test_process_data.py            (E2E: EQ_process_data output shape + metadata)
-├── test_generate_tasks.py          (E2E: EQ_generate_training_tasks ground-truth label recompute + reproducibility)
-├── test_generate_evaluation_tasks_cli.py  (E2E: EQ_generate_evaluation_tasks dense-grid shape + determinism)
-├── sampler/                        (unit: per-stage sampler tests — stage0-4, pure helpers, orchestration)
-├── test_sampler_dataset_integration.py  (integration: sampler output is drop-in for EveryQueryPytorchDataset)
-├── test_train_cli.py               (E2E: EQ_train CLI, resume flow, overwrite flag)
-├── test_train.py                   (E2E: resume-actually-loads-ckpt two-stage differential)
-├── test_training.py                (unit: single training step, checkpoint roundtrip, demo-mode checks)
-├── test_predict_cli.py             (E2E: EQ_predict against a trained checkpoint + row-order preservation)
-├── test_evaluate_cli.py            (E2E: EQ_evaluate on a synthetic PredictionSchema parquet)
-├── test_e2e_foundation.py          (E2E: full preprocess → generate_training_tasks → train pipeline chains)
-├── test_dataset_logic.py           (unit: EveryQueryPytorchDataset + EveryQueryBatch)
-├── test_lightning_logic.py         (unit: LightningModule loss wiring, mask semantics)
-├── test_model_logic.py             (unit: model heads, censored/occurs loss flip sensitivity)
-└── training_validity/              (E2E @pytest.mark.slow: model actually learns; runs the full EQ_predict → EQ_evaluate chain; see its README)
-    ├── __init__.py
-    ├── conftest.py
-    ├── README.md
-    └── test_training_validity.py
-```
+`tests/test_conditional_cli.py` runs the full generate → train → predict → evaluate chain on a
+fixture cohort. `pytest` runs with `--doctest-modules --doctest-glob=*.md`, so code examples in
+docstrings and Markdown execute as tests.
 
 ## Acknowledgements
 
-EveryQuery sits on top of [MEDS](https://github.com/Medical-Event-Data-Standard),
+Built on [MEDS](https://github.com/Medical-Event-Data-Standard),
 [`meds-torch-data`](https://github.com/mmcdermott/meds-torch-data),
 [`MEDS-transforms`](https://github.com/mmcdermott/MEDS_transforms), and
-[`MEDS_EIC_AR`](https://github.com/mmcdermott/MEDS_EIC_AR) (architectural reference). It
-uses [Hydra](https://hydra.cc) for configuration, [PyTorch Lightning](https://lightning.ai)
-for training, and [W&B](https://wandb.ai) for telemetry.
+[`MEDS_EIC_AR`](https://github.com/mmcdermott/MEDS_EIC_AR); uses [Hydra](https://hydra.cc),
+[PyTorch Lightning](https://lightning.ai) and [W&B](https://wandb.ai).
 
 ## License
 
