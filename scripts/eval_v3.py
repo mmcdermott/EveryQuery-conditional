@@ -5,8 +5,8 @@
 constructs designed ``[C,d]`` / ``[EOS,d][C,d]`` / ``[C,7d][C,30d]`` specs).  This script does the
 same *inference* — teacher-forced scoring of the **last** query of each sequence, with the optional
 counterfactual override of all prior answers — but takes the sequences as input instead of
-generating them.  Build them however you like; ``EQ_generate_query_sequences contexts_path=...``
-is the supported path for a user-supplied cohort.
+generating them.  Build them however you like; ``EQ_generate_evaluation_query_sequences
+contexts_path=...`` is the supported path for a user-supplied cohort.
 
 The model is fed ``q_1..q_K`` plus the ground-truth answers to ``q_1..q_{K-1}``; the reported
 ``prob`` is its predicted probability for ``q_K``.  (Inference here is teacher-forced, not
@@ -302,7 +302,7 @@ def macro_auroc(df: pl.DataFrame, group_cols, prob_col="prob", min_pos=10, min_n
     """Per-group AUROC, macro-averaged over groups with enough of both classes.
 
     Pooled AUROC is base-rate inflated (≈0.91 vs an honest macro ≈0.77 on ``big_v2``); see
-    ``CONDITIONAL_QUERIES.md:127-152``.  ``group_cols`` chooses the estimand: ``["target_query"]``
+    ``docs/CONDITIONAL_QUERIES.md:127-152``.  ``group_cols`` chooses the estimand: ``["target_query"]``
     reproduces eval_v2's view, ``CONDITIONAL_KEYS`` scores each conditioning context separately.
 
     Returns ``(table, macro, n_groups_total)`` — the total counts *all* groups, so the caller can

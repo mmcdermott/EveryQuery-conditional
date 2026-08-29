@@ -17,7 +17,7 @@ import pytest
 from meds import DatasetMetadataSchema, train_split, tuning_split
 from meds_testing_helpers.dataset import MEDSDataset
 
-from conftest import ENSURE_ENV_PLACEHOLDERS, run_and_check
+from conftest import run_and_check
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -235,19 +235,21 @@ def oracle_trained_model_dir(
             "lightning_module.model.config_overrides.num_hidden_layers=4",
             "lightning_module.model.config_overrides.num_attention_heads=4",
             "lightning_module.model.config_overrides.intermediate_size=256",
-            "lightning_module.model.config_overrides.max_position_embeddings=512",
             # 2000 steps is enough once the weight init is reproducible — the #124 fix moved
             # `seed_everything` above `instantiate(cfg.lightning_module)`, so weight init is
             # now platform-independent for a given `cfg.seed`.  Before that, an unlucky 3.12
             # init had the censor head stuck at AUROC 0.765 / flat duration means at 2000
             # steps; that can't happen anymore.
-            "trainer.max_steps=2000",
+            "+trainer.max_steps=2000",
+            # CI runners are CPU-only and lack bf16 fast paths (AMX/AVX512-BF16), so the
+            # _demo_train default of bf16-mixed runs ~3-4x slower than fp32 and blows the
+            # 1800s timeout.  This test checks learning behavior, not AMP, so pin fp32.
+            "trainer.precision=32-true",
             "trainer.max_epochs=10000",
             "trainer.limit_val_batches=2",
             "trainer.val_check_interval=1000",
             "lightning_module.optimizer.lr=1e-3",
         ],
-        env=ENSURE_ENV_PLACEHOLDERS,
         timeout=1800.0,
     )
     return output_dir
@@ -292,7 +294,6 @@ def test_trained_model_learns_occurs_and_censor(
             f"output_parquet={predictions_parquet!s}",
             f"split={tuning_split}",
         ],
-        env=ENSURE_ENV_PLACEHOLDERS,
         timeout=600.0,
     )
 
@@ -304,7 +305,6 @@ def test_trained_model_learns_occurs_and_censor(
             f"predictions_parquet={predictions_parquet!s}",
             f"metrics_parquet={metrics_parquet!s}",
         ],
-        env=ENSURE_ENV_PLACEHOLDERS,
         timeout=60.0,
     )
     metrics = pl.read_parquet(metrics_parquet).sort(["query", "duration_days"])

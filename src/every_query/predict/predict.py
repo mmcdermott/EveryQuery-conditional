@@ -3,7 +3,7 @@
 Takes a trained model run directory and a directory of task-query parquets
 (:class:`TaskQuerySchema`), runs per-row inference, writes a
 :class:`PredictionSchema`-conformant parquet.  No AUCs, no model selection, no
-multi-model orchestration — all of that is ``evaluate/`` or ``paper_experiments/``
+multi-model orchestration — all of that is ``evaluate/`` or ``EveryQueryExperiments``
 territory.
 
 Implementation is a single pass through :class:`EveryQueryPytorchDataset`:
@@ -187,13 +187,13 @@ def _check_vocab(task_codes: set[str], train_cfg: DictConfig) -> None:
             f"EQ_predict needs this to validate task codes against the model's vocab."
         )
     training_vocab = set(pl.read_parquet(metadata_fp, columns=["code"])["code"].to_list())
-    missing = task_codes - training_vocab
+    missing = sorted(set(task_codes) - training_vocab)
     if missing:
         raise ValueError(
             f"{len(missing)} of {len(task_codes)} task-query codes are not in the model's training "
             f"vocabulary.  Out-of-vocab codes would be PAD-encoded and produce near-uniform "
             f"probabilities; refuse rather than write misleading predictions.  Missing codes: "
-            f"{sorted(missing)[:10]}{'...' if len(missing) > 10 else ''}"
+            f"{missing[:10]}{'...' if len(missing) > 10 else ''}"
         )
 
 
@@ -520,6 +520,9 @@ def main(cfg: DictConfig) -> None:
     batch_size_override = cfg.get("batch_size")
     if batch_size_override is not None:
         train_cfg.datamodule.batch_size = int(batch_size_override)
+    num_workers_override = cfg.get("num_workers")
+    if num_workers_override is not None:
+        train_cfg.datamodule.num_workers = int(num_workers_override)
     train_cfg.datamodule.config.task_labels_dir = str(tasks_dir)
     D = instantiate(train_cfg.datamodule)
 

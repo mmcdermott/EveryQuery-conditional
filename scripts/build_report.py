@@ -8,6 +8,12 @@ Writes:
   --out           report PDF
 
 Uses matplotlib (training-stability figures, built here) + reportlab (document layout).
+
+Status (conditional-v2): this builds the **v1** report.  Its prose describes the deleted
+``__CENSOR__`` sentinel, the separate censor head, and the 3-valued censored label — all removed in
+the v2 redesign for leaking terminal-event labels — and it reads ``censor_auroc`` /
+``censor_prevalence`` out of ``run_full_evaluation.py``'s ``summary.json``.  Kept verbatim as the
+record of that report; ``build_report_final.py`` is the current builder.
 """
 
 import argparse
@@ -19,21 +25,29 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import polars as pl
-from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER, TA_LEFT
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-from reportlab.lib.units import inch
-from reportlab.platypus import (
-    HRFlowable,
-    Image,
-    PageBreak,
-    Paragraph,
-    SimpleDocTemplate,
-    Spacer,
-    Table,
-    TableStyle,
-)
+
+try:  # `reportlab` is a report-only dependency, deliberately absent from pyproject.toml.
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import inch
+    from reportlab.platypus import (
+        HRFlowable,
+        Image,
+        PageBreak,
+        Paragraph,
+        SimpleDocTemplate,
+        Spacer,
+        Table,
+        TableStyle,
+    )
+except ModuleNotFoundError as e:  # pragma: no cover - depends on the active venv
+    raise ModuleNotFoundError(
+        "scripts/build_report*.py needs `reportlab`, which this project does not depend on: the "
+        "PDFs under reports/ were built in a separate venv.  Install it into the active venv with "
+        "`uv pip install reportlab` and rerun."
+    ) from e
 
 # ── Training-stability figures ──────────────────────────────────────────
 
@@ -288,7 +302,7 @@ def build(train_csv: Path, eval_dir: Path, out: Path):
     P(
         "<b>Original EveryQuery task.</b> Sample a code <i>c</i>, a horizon <i>d</i> (days), a patient, and a "
         "prediction time <i>t</i>; the model receives <i>(c, d, patient history up to t)</i> and predicts "
-        "whether <i>c</i> occurs in <i>(t, t+d]</i>. A separate <i>censor</i> head predicts whether any data "
+        "whether <i>c</i> occurs in <i>(t, t+d)</i>. A separate <i>censor</i> head predicts whether any data "
         "exist after <i>t+d</i>, so that predictions are not biased by missing follow-up.",
         "Body",
     )

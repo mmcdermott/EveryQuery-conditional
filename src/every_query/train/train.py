@@ -2,7 +2,6 @@ import builtins
 import logging
 import os
 import shutil
-from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
@@ -12,21 +11,11 @@ import torch
 from hydra.utils import instantiate
 from lightning.pytorch import seed_everything
 from MEDS_transforms.configs.utils import OmegaConfResolver
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 
 from every_query.train.resume_check import validate_resume_directory
 
 logger = logging.getLogger(__name__)
-
-_RUN_ID = None
-
-
-@OmegaConfResolver(replace=True)
-def run_id():
-    global _RUN_ID
-    if _RUN_ID is None:
-        _RUN_ID = datetime.now(UTC).strftime("%Y-%m-%d/%H-%M-%S")
-    return _RUN_ID
 
 
 @OmegaConfResolver(replace=True)
@@ -50,7 +39,9 @@ def int_prod(x: int, y: int) -> int:
 
 
 def values_as_list(**kwargs) -> list[Any]:
-    return list(kwargs.values())
+    # Drop None so an optional callback can be toggled off with `<name>: null` instead of
+    # deleting/commenting its config block.
+    return [v for v in kwargs.values() if v is not None]
 
 
 def save_resolved_config(cfg: DictConfig, fp: Path) -> bool:
@@ -185,11 +176,86 @@ def find_checkpoint_path(output_dir: Path) -> Path | None:
     return sorted_checkpoints[-1] if sorted_checkpoints else None
 
 
-def _init_env() -> None:
-    """Validate required env vars and configure thread counts for polars/OMP."""
-    from every_query.utils._env import ensure_env
+def _is_wandb_logger(logger_cfg: Any) -> bool:
+    """Return ``True`` if *logger_cfg* is a wandb-shaped logger node.
 
-    ensure_env()
+    A disabled (``false`` / ``null``) or non-wandb logger returns ``False`` so that
+    ``WANDB_ENTITY`` is only required when a wandb logger is actually instantiated.
+
+    Examples:
+        >>> _is_wandb_logger(False)
+        False
+        >>> _is_wandb_logger(None)
+        False
+        >>> _is_wandb_logger(OmegaConf.create({"_target_": "lightning.pytorch.loggers.CSVLogger"}))
+        False
+        >>> _is_wandb_logger(
+        ...     OmegaConf.create({"_target_": "pytorch_lightning.loggers.wandb.WandbLogger"})
+        ... )
+        True
+    """
+    if not logger_cfg or not isinstance(logger_cfg, DictConfig):
+        return False
+    return "WandbLogger" in str(logger_cfg.get("_target_", ""))
+
+
+def validate_training_config(cfg: DictConfig) -> None:
+    """Validate the *resolved* training config, raising a clear error on a missing/bad value.
+
+    Replaces the old blind env-var presence gate (#184).  Because this runs after Hydra has
+    composed the config, a CLI override of a node (e.g. ``datamodule.config.task_labels_dir=/p``)
+    means the backing ``${oc.env:...}`` interpolation never evaluates and the env var is not
+    required.  Each error message names both the config node and the env var that backs it.
+
+    Checks:
+      * ``datamodule.config.tensorized_cohort_dir`` / ``datamodule.config.task_labels_dir`` —
+        must resolve to an existing directory (these are read inputs).
+      * ``output_dir`` — must resolve to a non-empty path (write target; created later, so it
+        need not pre-exist).
+      * wandb ``entity`` — required only when ``trainer.logger`` is wandb-shaped.
+
+    Raises:
+        ValueError: If a required path/value is missing or empty.
+        NotADirectoryError: If a required input path does not exist or is not a directory.
+    """
+    ds_cfg = cfg.datamodule.config
+    for node, env_var in (
+        ("tensorized_cohort_dir", "TENSORIZED_COHORT_DIR"),
+        ("task_labels_dir", "TRAINING_TASKS_DIR"),
+    ):
+        value = ds_cfg.get(node)
+        if not value:
+            raise ValueError(
+                f"datamodule.config.{node} is unset. Pass it as a CLI override "
+                f"(datamodule.config.{node}=/path, typically =${env_var})."
+            )
+        if not Path(value).is_dir():
+            raise NotADirectoryError(
+                f"datamodule.config.{node} ({value!r}, from ${env_var}) is not an existing directory."
+            )
+
+    # ``output_dir`` is a required base (``???``); supply it with ``output_dir=/path``.  An unset
+    # value surfaces as Hydra's "Missing mandatory value" error on access, but guard explicitly too
+    # for callers that build the config without Hydra (e.g. the tests).
+    if not cfg.get("output_dir"):
+        raise ValueError("output_dir is unset. Pass output_dir=/path.")
+
+    # main() writes to trainer.default_root_dir (the Hydra-resolved per-run/per-job dir), not
+    # output_dir directly.  Validate the dir actually used so a stray default_root_dir= override
+    # can't pass this gate while artifacts land somewhere unintended.
+    if not cfg.trainer.get("default_root_dir"):
+        raise ValueError("trainer.default_root_dir is unset.")
+
+    if _is_wandb_logger(cfg.trainer.get("logger")) and not cfg.trainer.logger.get("entity"):
+        raise ValueError(
+            "trainer.logger.entity is unset for a wandb logger. Pass "
+            "trainer.logger.entity=<entity> or export $WANDB_ENTITY "
+            "(or disable the logger with trainer.logger=false)."
+        )
+
+
+def _init_env() -> None:
+    """Configure thread counts for polars/OMP from the SLURM/system environment."""
     num_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 1))
     threads_per_file = max(1, num_cpus // 10)
     os.environ["POLARS_MAX_THREADS"] = str(threads_per_file)
@@ -202,6 +268,37 @@ CONFIGS = str(files("every_query") / "train" / "configs")
 @hydra.main(version_base="1.3", config_path=CONFIGS, config_name="config.yaml")
 def main(cfg: DictConfig) -> float | None:
     _init_env()
+    validate_training_config(cfg)
+
+    # Size the model from the data: vocab from metadata/codes.parquet, positions from the
+    # datamodule window plus the two tokens the model adds — the query token (prepended in
+    # ``EveryQueryPytorchDataset._seeded_getitem``) and the duration token (spliced in
+    # ``EveryQueryModel._hf_inputs``).  Done here, before the config is saved and before
+    # ``validate_resume_directory`` diffs it, so the run dir records the real numbers and a
+    # resumed run compares like with like.
+    ds_cfg = instantiate(cfg.datamodule.config)
+    vocab_size = ds_cfg.vocab_size
+
+    # With an ontology, the embedding table must cover the ancestor nodes too: they are appended
+    # above the highest leaf index, so the cohort's own vocab_size would leave every ancestor
+    # index out of range.  Read it from the ontology rather than making the user keep a hardcoded
+    # V_ext in the config in sync with a rebuilt DAG.
+    ontology_dir = cfg.lightning_module.model.get("ontology_dir")
+    if ontology_dir:
+        from every_query.data.ontology import extended_vocab_size
+
+        v_ext = extended_vocab_size(ontology_dir)
+        if v_ext < vocab_size:
+            raise ValueError(
+                f"Ontology at {ontology_dir} declares V_ext={v_ext}, smaller than the cohort's "
+                f"vocab_size={vocab_size}.  It was almost certainly built from a different "
+                f"codes.parquet than this cohort."
+            )
+        logger.info("Ontology: sizing the encoder to V_ext=%d (cohort vocab %d).", v_ext, vocab_size)
+        vocab_size = v_ext
+
+    cfg.lightning_module.model.config_overrides.vocab_size = vocab_size
+    cfg.lightning_module.model.config_overrides.max_position_embeddings = ds_cfg.max_seq_len + 2
 
     if cfg.do_overwrite and cfg.do_resume:
         logger.warning(
@@ -209,38 +306,50 @@ def main(cfg: DictConfig) -> float | None:
             "Only `do_overwrite` will be used, and the output directory will be cleared."
         )
 
-    output_dir = Path(cfg.output_dir)
-    if output_dir.is_file():
-        raise NotADirectoryError(f"Output directory {output_dir} is a file, not a directory.")
+    # The per-run/per-job dir Hydra resolved (run.dir for a single run, sweep.dir/subdir for a sweep
+    # job) — *not* cfg.output_dir, which is only the shared base.  Reading the resolved dir keeps
+    # sweep jobs from rmtree-ing/writing to the common base and colliding.
+    run_dir = Path(cfg.trainer.default_root_dir)
+    if run_dir.is_file():
+        raise NotADirectoryError(f"Run directory {run_dir} is a file, not a directory.")
 
-    cfg_path = output_dir / "config.yaml"
+    cfg_path = run_dir / "config.yaml"
     ckpt_path = None
     if cfg_path.exists():
         if cfg.do_overwrite:
-            logger.info(f"Overwriting existing output directory {output_dir}.")
-            shutil.rmtree(output_dir, ignore_errors=True)
+            logger.info(f"Overwriting existing run directory {run_dir}.")
+            shutil.rmtree(run_dir, ignore_errors=True)
         elif cfg.do_resume:
-            logger.info(f"Resuming training in existing output directory {output_dir}.")
-            validate_resume_directory(output_dir, cfg)
-            ckpt_path = find_checkpoint_path(output_dir)
+            logger.info(f"Resuming training in existing run directory {run_dir}.")
+            validate_resume_directory(run_dir, cfg)
+            ckpt_path = find_checkpoint_path(run_dir)
+            # Reuse the original run's wandb id so the resumed run continues the same curve
+            # instead of starting a new wandb run.  Mutated *after* validate_resume_directory
+            # so the config diff still compares like with like.
+            wandb_id_fp = run_dir / "wandb_run_id"
+            if ckpt_path and _is_wandb_logger(cfg.trainer.get("logger")) and wandb_id_fp.is_file():
+                with open_dict(cfg.trainer.logger):
+                    cfg.trainer.logger.id = wandb_id_fp.read_text().strip()
+                    cfg.trainer.logger.resume = "allow"
         else:
             raise FileExistsError(
-                f"Output directory {output_dir} already exists and is populated. "
+                f"Run directory {run_dir} already exists and is populated. "
                 "Use `do_overwrite` or `do_resume` to proceed."
             )
 
-    # Ensure output_dir exists *after* any overwrite rmtree above, then write the config for this
+    # Ensure run_dir exists *after* any overwrite rmtree above, then write the config for this
     # run.  On resume (without overwrite) we keep the original run's config untouched so the
     # resumed run stays bit-identical to the first.  On overwrite the previous rmtree wiped the
     # old config; writing it here restores reproducibility for downstream tools that load
     # ``resolved_config.yaml`` from the run dir.  Fixes #31.
-    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(run_dir, exist_ok=True)
     if not cfg.do_resume or cfg.do_overwrite:
-        OmegaConf.save(cfg, output_dir / "config.yaml")
-        save_resolved_config(cfg, output_dir / "resolved_config.yaml")
+        OmegaConf.save(cfg, run_dir / "config.yaml")
+        save_resolved_config(cfg, run_dir / "resolved_config.yaml")
 
-    logger.info("Setting torch float32 matmul precision to 'medium'.")
-    torch.set_float32_matmul_precision("medium")
+    # Kept in step with ``utils/model_loader.py`` so training and scoring use the same matmuls.
+    logger.info("Setting torch float32 matmul precision to 'high'.")
+    torch.set_float32_matmul_precision("high")
 
     # Seed *before* any `instantiate(...)` call so that model weight init, DataLoader
     # generator construction, and any other RNG-consuming work happen under the seeded
@@ -262,10 +371,29 @@ def main(cfg: DictConfig) -> float | None:
 
     trainer = instantiate(cfg.trainer)
 
+    # Log the run dir up front so every run (even crashed/in-flight) is matchable from the wandb UI
+    # back to its folder on disk — best_ckpt_path below is only logged after fit() completes.
+    for log in trainer.loggers:
+        log.log_hyperparams({"run_dir": str(run_dir)})
+
+    # Persist the wandb run id so a later `do_resume` continues the same wandb curve.
+    # log_hyperparams above already created the experiment, so `version` is the real run id
+    # on rank zero (non-zero ranks see None and skip).
+    if _is_wandb_logger(cfg.trainer.get("logger")) and not (run_dir / "wandb_run_id").is_file():
+        run_id = trainer.logger.version
+        if trainer.is_global_zero and run_id:
+            (run_dir / "wandb_run_id").write_text(str(run_id))
+
     trainer_kwargs = {"model": M, "datamodule": D}
     if ckpt_path:
         logger.info(f"Trying to resume training from checkpoint {ckpt_path}.")
         trainer_kwargs["ckpt_path"] = ckpt_path
+    if not ckpt_path:
+        # Baseline val metrics at step 0 so tuning curves start from the untrained model.
+        # The sanity check can't do this: it doesn't write to loggers.
+        logger.info("Running baseline validation")
+        trainer.validate(M, datamodule=D)
+
     logger.info("Fitting model")
     trainer.fit(**trainer_kwargs)
 
@@ -276,7 +404,7 @@ def main(cfg: DictConfig) -> float | None:
         for log in trainer.loggers:
             log.log_hyperparams({"best_ckpt_path": best_ckpt_path})
 
-    output_fp = Path(cfg.output_dir) / "best_model.ckpt"
+    output_fp = run_dir / "best_model.ckpt"
     shutil.copyfile(best_ckpt_path, output_fp)
 
     best_score = trainer.checkpoint_callback.best_model_score

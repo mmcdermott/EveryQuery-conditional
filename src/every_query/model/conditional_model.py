@@ -46,7 +46,7 @@ from every_query.model.model import MLP
 logger = logging.getLogger(__name__)
 
 # Answer-token vocabulary for teacher forcing.  Answers are binary: every query asks
-# "is this code observed in (t, t+d]?" and the answer is YES/NO.  There is no separate
+# "is this code observed in (t, t+d)?" and the answer is YES/NO.  There is no separate
 # "censored" answer class — censoring is expressed *as a query*, by asking about the
 # end-of-timeline code (TIMELINE//END): "[TIMELINE//END, d]" answered YES means the record
 # ends within d (the window is not fully observed), NO means data continue past t+d.  A
@@ -153,10 +153,24 @@ class ConditionalQueryOutput(BaseModelOutput):
             >>> out.answer_probs
             tensor([[0.5000, 0.5000, 0.5000],
                     [0.5000, 0.5000, 0.5000]])
+
+            bf16 logits are upcast before the sigmoid, so confident predictions stay
+            distinguishable instead of all saturating to exactly 1.0:
+
+            >>> bf16 = ConditionalQueryOutput(
+            ...     last_hidden_state=None, answer_logits=torch.tensor([[8.0]], dtype=torch.bfloat16)
+            ... )
+            >>> bf16.answer_probs.dtype, bool(bf16.answer_probs < 1.0)
+            (torch.float32, True)
         """
         if self.answer_logits is None:
             return None
-        return torch.sigmoid(self.answer_logits)
+        # Upcast before the sigmoid, exactly as EveryQueryOutput.logits_to_probs does.  Training
+        # runs at bf16-mixed, where sigmoid rounds a logit of ~6 to exactly 1.0 — every confident
+        # prediction collapses into a tie, which flattens ranking metrics like AUROC.  These
+        # probabilities flow straight into the predictions parquet via predict_sequences, so the
+        # damage would show up as a quietly depressed score rather than an error.
+        return torch.sigmoid(self.answer_logits.float())
 
 
 class ConditionalQueryModel(torch.nn.Module):
@@ -172,6 +186,21 @@ class ConditionalQueryModel(torch.nn.Module):
         decoder_heads: Attention heads in the decoder.
         decoder_ffn_mult: Decoder feed-forward width as a multiple of ``hidden_size``.
         max_queries: Maximum query blocks per sequence (sizes the block-position embedding).
+        ontology_dir: Directory of ontology artifacts (``nodes``/``mix``/``closure`` parquets).
+            When set, the encoder's input-embedding module is replaced — through
+            ``set_input_embeddings`` — so every code embedding becomes the ancestor-mixed
+            average ``(A @ W)[ids]``; see :mod:`every_query.model.ontology_embedding`.  The
+            encoder must be sized to the ontology's ``V_ext``, which ``train.py`` does
+            automatically.  Because the wrapper substitutes the shared table, both the query
+            codes and an event-bounded query's boundary codes inherit the structure too.
+        use_rope_time: Drive the encoder's rotary positions from ``batch.time_pos_ids``
+            (elapsed integer hours) instead of token index.  Pair with
+            ``ConditionalQueryPytorchDataset(strip_delta_tokens=True)``, which removes the
+            quantized ``TIMELINE//DELTA*`` tokens and emits those positions.  Attention then
+            sees continuous relative time rather than token distance.  This flag and the
+            dataset's ``strip_delta_tokens`` must be set together: a mismatch in *either*
+            direction is a hard error at the first forward pass, because either one silently
+            costs the encoder its elapsed-time signal.  See :meth:`_encoder_position_kwargs`.
     """
 
     PRECISION_TO_MODEL_WEIGHTS_DTYPE: ClassVar[dict[str, torch.dtype]] = {
@@ -194,6 +223,8 @@ class ConditionalQueryModel(torch.nn.Module):
         decoder_heads: int | None = None,
         decoder_ffn_mult: int = 4,
         max_queries: int = 8,
+        use_rope_time: bool = False,
+        ontology_dir: str | None = None,
     ):
         super().__init__()
 
@@ -234,9 +265,24 @@ class ConditionalQueryModel(torch.nn.Module):
         self.answer_embed = torch.nn.Embedding(N_ANSWER_CLASSES, H)
         self.token_type_embed = torch.nn.Embedding(TOKENS_PER_QUERY, H)
         self.block_pos_embed = torch.nn.Embedding(max_queries, H)
+        # Marks a duration slot as event-bounded.  Added to the boundary code's token embedding
+        # so the model can tell "window ends at the next X" from "is X observed" — both use the
+        # same embedding table.  Always allocated (not gated on a flag) so the parameter set does
+        # not depend on the data, which would make checkpoints silently incompatible.
+        self.bound_marker = torch.nn.Parameter(torch.randn(H) * 0.02)
         self.answer_mlp = MLP(layers=[H, 128, 1], dropout_prob=mlp_dropout)
 
         self.max_queries = max_queries
+        self.use_rope_time = use_rope_time
+        self.ontology_dir = ontology_dir
+        if ontology_dir is not None:
+            # Must run after HF_model exists and before any lookup.  Substituting the module
+            # (rather than patching call sites) is what lets query codes and boundary codes
+            # alike inherit ontology structure without further changes.
+            from every_query.data.ontology import load_mix_matrix
+            from every_query.model.ontology_embedding import wrap_tok_embeddings
+
+            wrap_tok_embeddings(self, load_mix_matrix(ontology_dir))
         self.criterion = torch.nn.BCEWithLogitsLoss()
 
         self.hparams = {
@@ -249,6 +295,8 @@ class ConditionalQueryModel(torch.nn.Module):
             "decoder_heads": n_heads,
             "decoder_ffn_mult": decoder_ffn_mult,
             "max_queries": max_queries,
+            "use_rope_time": use_rope_time,
+            "ontology_dir": ontology_dir,
         }
 
     @property
@@ -266,12 +314,115 @@ class ConditionalQueryModel(torch.nn.Module):
             return logits.sum() * 0.0
         return self.criterion(logits, target)
 
+    def _encoder_position_kwargs(self, batch) -> dict[str, torch.Tensor]:
+        """Extra ``HF_model`` kwargs carrying the encoder's rotary positions.
+
+        Empty when ``use_rope_time`` is off *and* the batch carries no ``time_pos_ids``, so
+        ModernBERT uses token-index positions and elapsed time reaches the encoder the ordinary
+        way — as the quantized ``TIMELINE//DELTA*`` tokens sitting in the stream.
+
+        ``use_rope_time`` (model) and ``strip_delta_tokens`` (dataset) are two halves of one
+        setting, and **either** half-configuration is a hard error rather than a silent
+        fallback.  Both directions yield a model that trains, validates and checkpoints with
+        entirely normal-looking numbers while its encoder is missing the time signal:
+
+        * ``use_rope_time=True`` with no ``time_pos_ids`` — the model would quietly train or
+          score on token-index positions, indistinguishable from success until the numbers are
+          already published.  The upstream experiment hit exactly this and had to issue an
+          erratum after a full eval grid had been computed against a model that never received
+          its time positions.  The misconfiguration is a real one: pairing a RoPE checkpoint
+          with a dataset built without ``strip_delta_tokens=True``.
+        * ``use_rope_time=False`` with ``time_pos_ids`` present — worse, and the reason this
+          direction is checked at all.  ``time_pos_ids`` is emitted by exactly one code path,
+          ``ConditionalQueryPytorchDataset(strip_delta_tokens=True)``, so its presence on the
+          batch means the strip was **asked for**, and normally that the ``TIMELINE//DELTA*``
+          tokens have already been deleted from ``batch.code``.  Ignoring the positions then
+          leaves the encoder with **no elapsed-time information at all**: the delta tokens are
+          gone from the stream and the elapsed hours that replaced them are dropped on the
+          floor.  Nothing downstream recovers them — ``time_delta_days`` survives on the batch
+          but never reaches the encoder, which reads only ``code``, the attention mask and
+          these positions.
+
+          One case emits the positions without deleting anything: a cohort whose vocabulary has
+          no ``TIMELINE//DELTA*`` codes at all, where the dataset warns and carries on
+          (:mod:`every_query.data.seq_dataset`).  Refusing is still correct there — the strip
+          was requested deliberately, nothing is consuming the positions, and the run is
+          misconfigured in a way the user needs told about rather than smoothed over.
+
+        Rotary frequencies are computed from ``position_ids`` on the fly rather than looked up
+        in a table, so elapsed-hour values far exceeding ``max_position_embeddings`` are
+        well-defined.  Only the *local*-attention sliding-window mask is token-index based, and
+        it is deliberately left that way — windows are over neighbouring events, not hours.
+        """
+        time_pos = getattr(batch, "time_pos_ids", None)
+        if not self.use_rope_time:
+            if time_pos is not None:
+                raise ValueError(
+                    "use_rope_time=False but the batch carries time_pos_ids, which only "
+                    "ConditionalQueryPytorchDataset(..., strip_delta_tokens=True) emits — so the "
+                    "TIMELINE//DELTA* tokens have already been stripped from the encoder input, "
+                    "and token-index positions would leave the encoder with no elapsed-time "
+                    "information at all.  Either half of the pair fixes it: set "
+                    "`lightning_module.model.use_rope_time=true` to consume the positions (most "
+                    "likely what was meant, since the strip was switched on deliberately), or "
+                    "`datamodule.dataset_kwargs.strip_delta_tokens=false` to keep the delta "
+                    "tokens in the stream.  Refusing to silently discard elapsed time."
+                )
+            return {}
+        if time_pos is None:
+            raise ValueError(
+                "use_rope_time=True but the batch carries no time_pos_ids.  Build the dataset "
+                "with ConditionalQueryPytorchDataset(..., strip_delta_tokens=True) — via "
+                "`datamodule.dataset_kwargs.strip_delta_tokens=true` — so elapsed-hour positions "
+                "are emitted.  Refusing to fall back to token-index positions silently."
+            )
+        return {"position_ids": time_pos.to(batch.code.device)}
+
+    def _query_code_embeds(self, batch) -> torch.Tensor:
+        """``(B, L, H)`` content of each query block's **code** slot.
+
+        A seam: a feature that changes *what is being asked about* replaces this, while the
+        block layout, the mask and the answer readout stride stay untouched.
+        """
+        return self.HF_model.get_input_embeddings()(batch.q_codes)
+
+    def _query_duration_embeds(self, batch) -> torch.Tensor:
+        """``(B, L, H)`` content of each query block's **duration** slot.
+
+        A seam: features that change *what bounds the window* (an event boundary rather than a
+        scalar horizon) replace this.  Note the answer for block ``j`` is read from this slot's
+        output position, so whatever goes here must stay a per-query vector.
+
+        For an **event-bounded** query the window runs to the next occurrence of a boundary
+        code rather than for a fixed horizon, so the slot carries that code's token embedding
+        plus a learned marker distinguishing "this is a boundary" from "this code is being
+        asked about" (the same embedding table feeds the code slot).  The scalar-duration MLP
+        is bypassed entirely for those positions — its input there is only the sentinel.
+
+        With no bounds present this is exactly the scalar path, so a bound-free dataset trains
+        bit-identically to a model without the feature.
+        """
+        dur_emb = self.duration_embed((batch.q_durations / 365.0).unsqueeze(-1))
+
+        q_bounds = getattr(batch, "q_bound_codes", None)
+        if q_bounds is None:
+            return dur_emb
+
+        bound_emb = self.HF_model.get_input_embeddings()(q_bounds).to(dur_emb.dtype)
+        bound_emb = bound_emb + self.bound_marker.to(dur_emb.dtype)
+        return torch.where((q_bounds > 0).unsqueeze(-1), bound_emb, dur_emb)
+
     def _decoder_tokens(self, batch) -> torch.Tensor:
-        """Build the interleaved ``(B, 3L, H)`` decoder input from a ConditionalQueryBatch."""
+        """Build the interleaved ``(B, 3L, H)`` decoder input from a ConditionalQueryBatch.
+
+        Exactly three tokens per query block.  Nothing here may add a fourth: ``TOKENS_PER_QUERY``
+        is baked into :func:`build_block_causal_mask`, the ``TOKEN_DURATION::TOKENS_PER_QUERY``
+        answer readout stride, and the mask's doctests.
+        """
         B, L = batch.q_codes.shape
 
-        code_emb = self.HF_model.embeddings.tok_embeddings(batch.q_codes)
-        dur_emb = self.duration_embed((batch.q_durations / 365.0).unsqueeze(-1))
+        code_emb = self._query_code_embeds(batch)
+        dur_emb = self._query_duration_embeds(batch)
         ans_emb = self.answer_embed(batch.q_answers)
 
         tokens = torch.stack([code_emb, dur_emb, ans_emb], dim=2)  # (B, L, 3, H)
@@ -279,9 +430,9 @@ class ConditionalQueryModel(torch.nn.Module):
         device = tokens.device
         block_idx = torch.arange(L, device=device).clamp(max=self.max_queries - 1)
         tokens = tokens + self.block_pos_embed(block_idx).view(1, L, 1, -1)
-        tokens = tokens + self.token_type_embed(
-            torch.arange(TOKENS_PER_QUERY, device=device)
-        ).view(1, 1, TOKENS_PER_QUERY, -1)
+        tokens = tokens + self.token_type_embed(torch.arange(TOKENS_PER_QUERY, device=device)).view(
+            1, 1, TOKENS_PER_QUERY, -1
+        )
 
         return tokens.reshape(B, L * TOKENS_PER_QUERY, -1)
 
@@ -291,10 +442,12 @@ class ConditionalQueryModel(torch.nn.Module):
         Expects a ``ConditionalQueryBatch`` with ``code`` (patient tokens), ``q_codes``,
         ``q_durations``, ``q_answers`` and ``q_mask``.
         """
-        B, L = batch.q_codes.shape
+        _, L = batch.q_codes.shape
 
         enc_attention_mask = batch.code != batch.PAD_INDEX
-        memory = self.HF_model(input_ids=batch.code, attention_mask=enc_attention_mask).last_hidden_state
+        memory = self.HF_model(
+            input_ids=batch.code, attention_mask=enc_attention_mask, **self._encoder_position_kwargs(batch)
+        ).last_hidden_state
 
         tgt = self._decoder_tokens(batch)
         tgt_mask = build_block_causal_mask(L, device=tgt.device)

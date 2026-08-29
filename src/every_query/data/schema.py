@@ -107,9 +107,19 @@ class QuerySeqSchema(LabelSchema):
             the end-of-timeline code ``TIMELINE//END``, which is an ordinary code).
         durations: Per-query horizons in days (``float32``), aligned with ``queries``.
         answers: Per-query booleans aligned with ``queries`` — *"was ``queries[j]`` observed in
-            ``(prediction_time, prediction_time + durations[j]]``?"*.  Binary, never null; an
-            unobservable event (record ends first) is ``False``.  Censoring is carried by a
-            ``TIMELINE//END`` query rather than a null answer.
+            ``(prediction_time, prediction_time + durations[j])``?"*.  The window is **open at
+            both ends**: an occurrence exactly at ``prediction_time`` is outside it, and so is one
+            landing exactly on the horizon ``prediction_time + durations[j]``.  Binary, never
+            null; an unobservable event (record ends first) is ``False``.  Censoring is carried
+            by a ``TIMELINE//END`` query rather than a null answer.
+        bound_events: Optional per-query boundary-event codes.  ``bound_events[j]`` is null for
+            an ordinary time-bounded query (``durations[j]`` is the horizon), and a vocabulary
+            code for an **event-bounded** one — the window is then ``(prediction_time, boundary)``
+            where ``boundary`` is the next occurrence of that code, open at both ends exactly as
+            the time-bounded window is, so a query code sharing the boundary event's instant does
+            NOT count.  ``durations[j]`` holds the
+            ``EVENT_BOUND_DURATION_SENTINEL`` (-1.0) rather than a horizon.  The whole column is
+            absent from bound-free parquets, which stay valid.
 
     Examples:
         >>> from datetime import datetime
@@ -122,11 +132,26 @@ class QuerySeqSchema(LabelSchema):
         >>> aligned = QuerySeqSchema.align(data)
         >>> [f.name for f in aligned.schema]
         ['subject_id', 'prediction_time', 'queries', 'durations', 'answers']
+
+        ``bound_events`` is optional: it appears only when the data carry it, so parquets
+        generated before the feature existed remain valid and readable.
+
+        >>> bounded = pa.Table.from_pylist([
+        ...     {"subject_id": 1, "prediction_time": datetime(2023, 1, 1),
+        ...      "queries": ["ICD//I10", "ICD//E11"], "durations": [30.0, -1.0],
+        ...      "answers": [False, True], "bound_events": [None, "HOSPITAL_DISCHARGE//HOME"]},
+        ... ])
+        >>> aligned = QuerySeqSchema.align(bounded)
+        >>> [f.name for f in aligned.schema]
+        ['subject_id', 'prediction_time', 'queries', 'durations', 'answers', 'bound_events']
+        >>> aligned.column("bound_events").to_pylist()
+        [[None, 'HOSPITAL_DISCHARGE//HOME']]
     """
 
     queries: Required(pa.large_list(pa.large_string()), nullable=False)
     durations: Required(pa.large_list(pa.float32()), nullable=False)
     answers: Required(pa.large_list(pa.bool_()), nullable=False)
+    bound_events: Optional(pa.large_list(pa.large_string()), nullable=True)
 
 
 def empty_task_query_df() -> pl.DataFrame:

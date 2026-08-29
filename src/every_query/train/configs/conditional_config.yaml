@@ -7,49 +7,103 @@
 #     ModernBERT-base defaults are for a 50k-token text vocab and 22 layers);
 #   - logger is a local CSVLogger (training-stability curves are read from metrics.csv).
 #
-# vocab_size must be > max code/vocab_index (index 0 is padding).  For the MIMIC-IV v0.3.0
-# cohort the max vocab index is 11958, so vocab_size is 11959.  No sentinel slot is needed —
-# the end-of-timeline code (TIMELINE//END, index 11884) is an ordinary vocabulary code.
+# `vocab_size` / `max_position_embeddings` are `???` on purpose: train.py sizes them from the
+# tensorized cohort (metadata/codes.parquet and datamodule.config.max_seq_len) before the config
+# is saved, so any value written here would be silently overwritten.
 
 defaults:
   - _self_
 
-output_dir: ${oc.env:OUTPUT_DIR}/${run_id:}/
+output_dir: ??? # required base — supply via `output_dir=`; Hydra appends <date>/<time> (see hydra block)
 do_overwrite: false
 do_resume: false
 seed: 140799
 
+# Uniqueness comes from Hydra's native run/sweep dir (not the retired `${run_id:}` resolver, dropped
+# upstream in f3d50eb): each launch lands in ${output_dir}/<date>/<time>.  ${now:} is fixed once per
+# launch, so run.dir and sweep.dir share one timestamp.  Reuse the same output_dir across runs.
+hydra:
+  run:
+    dir: ${output_dir}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: ${output_dir}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+  job:
+    config:
+      override_dirname:
+        # keep only the swept hyperparameters in the subdir name — drop the always-present path args
+        # (their `/` would otherwise nest the sweep folders).
+        exclude_keys:
+          - output_dir
+          - datamodule.config.tensorized_cohort_dir
+          - datamodule.config.task_labels_dir
+
 datamodule:
-  _target_: meds_torchdata.extensions.lightning_datamodule.Datamodule
+  # Stateful train loader: with max_epochs=1 a `do_resume` must pick up mid-epoch (see
+  # every_query.data.datamodule.ResumableDatamodule).
+  _target_: every_query.data.datamodule.ResumableDatamodule
   data_class: every_query.data.seq_dataset.ConditionalQueryPytorchDataset
   config:
     _target_: meds_torchdata.MEDSTorchDataConfig
-    tensorized_cohort_dir: ${oc.env:FINAL_DATA_DIR}
-    task_labels_dir: ${oc.env:TASK_DIR}
+    # Required Hydra args — no `.env`/env-var fallback (#235).  Pass shell-expanded vars:
+    #   datamodule.config.tensorized_cohort_dir=$TENSORIZED_COHORT_DIR
+    #   datamodule.config.task_labels_dir=$TRAINING_TASKS_DIR
+    tensorized_cohort_dir: ???
+    task_labels_dir: ???
     static_inclusion_mode: omit
     seq_sampling_strategy: to_end
     max_seq_len: 256
+  # Dataset-side feature toggles (see every_query.data.datamodule.ResumableDatamodule).  Both are
+  # interpolated from the model-side knob that consumes them, so set each feature once under
+  # `lightning_module.model` and the dataset follows.
+  dataset_kwargs:
+    # Drops the quantized TIMELINE//DELTA* tokens from the encoder input and emits per-token
+    # elapsed-hour `time_pos_ids` for `use_rope_time`.
+    strip_delta_tokens: ${lightning_module.model.use_rope_time}
+    # Ontology artifacts directory (EQ_build_ontology output).  Adds ancestor node names to the
+    # query vocabulary so an ancestor can be queried.  Interpolated from `lightning_module.model
+    # .ontology_dir` — they index into the same embedding table, so set it once there.
+    ontology_dir: ${lightning_module.model.ontology_dir}
   batch_size: 96
   num_workers: 8
   pin_memory: True
 
 lightning_module:
   _target_: every_query.model.conditional_lightning.ConditionalQueryLightningModule
+  # One answer head means one loss, so this throttles the cheap total-grad-norm log in
+  # `on_before_optimizer_step` — not upstream's two extra autograd passes.  Every step is fine.
+  grad_norm_log_every_n_steps: 1
   model:
     _target_: every_query.model.conditional_model.ConditionalQueryModel
-    precision: "bf16-mixed"
+    precision: ${trainer.precision} # single source of truth: the Trainer owns AMP
     mlp_dropout: 0.1
     num_hidden_layers: 8
     decoder_layers: 4
     decoder_heads: 6
     decoder_ffn_mult: 4
     max_queries: 8
+    # Time representation.  false = ModernBERT's default token-index rotary positions, with
+    # elapsed time carried by the TIMELINE//DELTA* tokens in the stream.  true = rotary
+    # positions are elapsed hours and the delta tokens are stripped
+    # (`datamodule.dataset_kwargs.strip_delta_tokens` interpolates from here).
+    use_rope_time: false
+    # Ontology-mixed code embeddings: each code embeds as the weighted average of its own row and
+    # its ancestors' ((A @ W)[ids]).  null = ordinary embeddings.  When set, train.py sizes the
+    # encoder to the ontology's V_ext instead of the cohort vocab, since ancestor indices sit
+    # above the highest leaf index.  `datamodule.dataset_kwargs.ontology_dir` interpolates from here.
+    #
+    # Note on what to expect: upstream found the *embedding* effect on leaf tasks did not
+    # replicate (a second seed reversed it; the unbundling suite scored it null), while the DAG
+    # structure was worth ~+0.039 AUROC on ancestor queries.  The demonstrated value is in being
+    # able to ASK about an ancestor, not in mixing improving ordinary leaf queries.
+    ontology_dir: null
     config_overrides:
       hidden_size: 384
       num_attention_heads: 6
       intermediate_size: 1536
-      max_position_embeddings: 512
-      vocab_size: 11959
+      # Dictated by the data — filled in by train.py from the datamodule config.
+      max_position_embeddings: ???
+      vocab_size: ???
       pad_token_id: 0
       cls_token_id: 1
       bos_token_id: 1
@@ -64,11 +118,13 @@ lightning_module:
     betas: [0.9, 0.98]
     amsgrad: false
     fused: false
+  # Fraction of total optimizer steps spent in LR warmup; the module derives the actual step
+  # counts from trainer.estimated_stepping_batches at fit time and passes them to the scheduler
+  # factory, which is why `num_warmup_steps`/`num_training_steps` are *not* declared below.
+  warmup_ratio: 0.05
   LR_scheduler:
     _target_: transformers.get_cosine_schedule_with_warmup
     _partial_: true
-    num_warmup_steps: ${int_prod:0.05,${.num_training_steps}}
-    num_training_steps: ${trainer.max_steps}
     num_cycles: 0.5
 
 trainer:
@@ -104,17 +160,16 @@ trainer:
       stopping_threshold: null
       divergence_threshold: null
       check_on_train_epoch_end: false
-  default_root_dir: ${output_dir}
-  min_epochs: 0
-  max_epochs: null
-  max_steps: 30000
+  default_root_dir: ${hydra:runtime.output_dir} # single source of truth: run.dir OR sweep.dir/subdir
+  min_epochs: 0 # prevents early stopping
+  max_epochs: 1 # total steps come from the data: one pass over the train set
   accelerator: "auto"
   devices: 1
   strategy: "auto"
   accumulate_grad_batches: 1
   log_every_n_steps: 50
-  check_val_every_n_epoch: null
-  val_check_interval: 1000
+  check_val_every_n_epoch: 1
+  val_check_interval: 0.05 # validate 20 times per epoch
   limit_val_batches: 100
   deterministic: False
   gradient_clip_val: 1.0

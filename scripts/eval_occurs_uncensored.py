@@ -6,7 +6,7 @@ fully observed).  We replicate that exactly: for a random task (code C, duration
 sequence ``[TIMELINE//END, D]=0  [C, D]`` — telling the model, via the teacher-forced EOS=NO prior,
 that the record does NOT end within D (uncensored) — and evaluate the C-prediction ONLY on contexts
 where that is actually true (the subject has data past t+D).  Positives are uncensored contexts
-where C occurs in (t, t+D]; negatives are uncensored contexts where it does not.  We report the
+where C occurs in (t, t+D); negatives are uncensored contexts where it does not.  We report the
 within-task AUROC, macro-averaged over tasks (patient-uniform), with a bootstrap CI.
 
 We also report the marginal ``[C, D]`` (no EOS prefix) on the same uncensored cohort, to isolate
@@ -26,11 +26,17 @@ import numpy as np
 import polars as pl
 from meds import DataSchema
 
-from eval_v2 import load_model, sample_eval_contexts, score_last
+from eval_v2 import (
+    add_context_sampling_args,
+    contexts_from_args,
+    load_model,
+    log_uniform_durations,
+    score_last,
+)
 from every_query.data.schema import QuerySeqSchema
 from every_query.data.seq_dataset import EOS_CODE
 from every_query.generate_tasks.sample_query_sequences import (
-    CTX_ID_COL, POSITION_COL, label_binary_occurrence, sample_log_uniform_durations,
+    CTX_ID_COL, POSITION_COL, label_binary_occurrence,
 )
 from every_query.generate_tasks.sample_tasks import read_query_codes
 
@@ -41,8 +47,8 @@ def build_uncensored_triples(ce, n_tasks, dmin, dmax, min_ctx, seed, max_valid=8
     """Patient-uniform (query, uncensored pos-ctx, uncensored neg-ctx) triples.
 
     A context (subj, t) is UNCENSORED for horizon D iff the subject has data past t+D
-    (max_time > t+D).  Positive: uncensored context with C in (t, t+D].  Negative: uncensored
-    context with no C in (t, t+D].  Patient-uniform within each.
+    (max_time > t+D).  Positive: uncensored context with C in (t, t+D).  Negative: uncensored
+    context with no C in (t, t+D).  Patient-uniform within each.
     """
     rng = np.random.default_rng(seed)
     triples = []
@@ -64,16 +70,16 @@ def build_uncensored_triples(ce, n_tasks, dmin, dmax, min_ctx, seed, max_valid=8
             if len(triples) >= n_tasks:
                 break
             C = codes_present[int(rng.integers(len(codes_present)))]
-            D = float(sample_log_uniform_durations(1, dmin, dmax, rng)[0])
+            D = float(log_uniform_durations(1, dmin, dmax, rng)[0])
             occ = ev.filter(pl.col(CODE) == C).select(SID, pl.col(TIME).alias("tau"))
             win = pl.duration(days=D)
             # uncensored: data past t+D
             Vu = V.filter(pl.col("mt") > pl.col("t") + win)
             if Vu.height == 0:
                 continue
-            # positive: uncensored ctx with C in (t, t+D]
+            # positive: uncensored ctx with C in (t, t+D)
             pos = Vu.join(occ, on=SID).filter(
-                (pl.col("t") < pl.col("tau")) & (pl.col("tau") <= pl.col("t") + win)
+                (pl.col("t") < pl.col("tau")) & (pl.col("tau") < pl.col("t") + win)
             ).select(SID, "t").unique()
             if pos.height == 0:
                 continue
@@ -89,7 +95,7 @@ def build_uncensored_triples(ce, n_tasks, dmin, dmax, min_ctx, seed, max_valid=8
                 tv = Vu.filter(pl.col(SID) == s)["t"]
                 s_t = tv[int(rng.integers(tv.len()))]
                 hit = occ.filter(
-                    (pl.col(SID) == s) & (pl.col("tau") > s_t) & (pl.col("tau") <= s_t + timedelta(days=D))
+                    (pl.col(SID) == s) & (pl.col("tau") > s_t) & (pl.col("tau") < s_t + timedelta(days=D))
                 )
                 if hit.height == 0:
                     neg = (s, s_t)
@@ -131,16 +137,18 @@ def main():
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--split", default="held_out")
     ap.add_argument("--n-tasks", type=int, default=40000)
-    ap.add_argument("--n-per-shard", type=int, default=700)
+    ap.add_argument("--min-ctx", type=int, default=10,
+                    help="Minimum prior events a context needs to be a valid anchor.")
     ap.add_argument("--dmin", type=int, default=1)
     ap.add_argument("--dmax", type=int, default=365)
     ap.add_argument("--batch-size", type=int, default=512)
     ap.add_argument("--boot", type=int, default=4000)
+    add_context_sampling_args(ap, default_n_contexts=8192)
     args = ap.parse_args()
 
     model = load_model(args.run_dir)
-    ce = sample_eval_contexts(args.intermediate, args.split, args.n_per_shard, seed=23)
-    triples = build_uncensored_triples(ce, args.n_tasks, args.dmin, args.dmax, args.min_ctx if hasattr(args, "min_ctx") else 10, seed=9)
+    ce = contexts_from_args(args, args.out.parent, seed=23)
+    triples = build_uncensored_triples(ce, args.n_tasks, args.dmin, args.dmax, args.min_ctx, seed=9)
     T = len(triples)
     print(f"{T} uncensored (query, pos, neg) triples")
 

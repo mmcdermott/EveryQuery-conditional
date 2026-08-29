@@ -36,9 +36,10 @@ dependencies = [
   "meds-torch-data[lightning]~=0.9.0",
   "transformers>=4.48,<5",
   "torch>=2.6,<3",
+  "torchdata>=0.8,<1", # StatefulDataLoader for mid-epoch train resume
   "torchmetrics>=1.4,<2",
-  "lightning>=2.3,<3",
-  "dotenv>=0.9.9,<1",
+  # >=2.5: fit loop snapshots/restores stateful dataloaders (mid-epoch resume)
+  "lightning>=2.5,<3",
   "wandb>=0.22.3,<1",
   "ipykernel>=7.2,<8",
   "scikit-learn>=1.6,<2",
@@ -75,6 +76,7 @@ every_query = ["**/*.yaml"]
 EQ_process_data = "every_query.preprocessing.__main__:main"
 EQ_generate_training_tasks = "every_query.generate_tasks.sample_tasks:main"
 EQ_generate_evaluation_tasks = "every_query.generate_tasks.sample_evaluation_tasks:main"
+EQ_sample_task_tracking_pairs = "every_query.generate_tasks.sample_task_tracking_pairs:main"
 EQ_train = "every_query.train.train:main"
 EQ_predict = "every_query.predict.predict:main"
 # EQ_evaluate points at the single-stage evaluator (consumes a PredictionSchema
@@ -86,6 +88,9 @@ EQ_evaluate = "every_query.evaluate.evaluate:main"
 # Conditional query-sequence pipeline (block-autoregressive decoder over query/answer
 # blocks; see src/every_query/model/conditional_model.py).
 EQ_generate_query_sequences = "every_query.generate_tasks.sample_query_sequences:main"
+# Builds the code-ontology DAG artifacts (nodes/mix/closure parquets) that ancestor queries and
+# ontology-mixed embeddings read.  Side-car: the cohort's codes.parquet is read, never written.
+EQ_build_ontology = "every_query.data.build_ontology:main"
 # Dense counterpart: labels the same N query sequences across a supplied cohort.
 EQ_generate_evaluation_query_sequences = "every_query.generate_tasks.sample_evaluation_query_sequences:main"
 EQ_predict_sequences = "every_query.predict.predict_sequences:main"
@@ -99,10 +104,31 @@ EQ_evaluate_sequences = "every_query.evaluate.evaluate_sequences:main"
 patch = ["subprocess"]
 
 [tool.pytest.ini_options] # Default pytest options
+# Put *this* checkout's `src` ahead of the editable install on `sys.path`.
+#
+# The editable install is a plain `.pth` naming one absolute path — the main checkout's `src`.
+# A `git worktree` shares that venv, so `pytest` launched from a worktree imported `every_query`
+# from the *main* checkout and silently tested a different branch's code: green runs that proved
+# nothing about the branch under test, and mutation-testing runs that reported a mutation
+# "caught" when the mutated file was never imported.  Nothing about that failure is visible in
+# the output — the suite passes either way — which is the same silent-wrong-answer shape as the
+# defects this branch exists to fix.
+pythonpath = ["src"]
 addopts = [
   "--color=yes",
   "--doctest-modules", # Ensures that doctest runs
   "--ignore=docs",
+  # Research-only eval/report builders for the conditional model.  `--doctest-modules` imports
+  # every .py under the rootdir, and these are one-off scripts with hardcoded run paths (not a
+  # test surface), so importing them at collection time only couples the suite to whatever the
+  # library API looked like when a given experiment was run.  Upstream keeps research code in a
+  # separate repo entirely (#186); this fork vendors it for self-containment instead.
+  #
+  # This exclusion is what hid several scripts sitting broken behind stale `every_query` imports
+  # across the sampler redesign.  `tests/test_cli_smoke.py::test_script_imports` now imports each
+  # one explicitly, which catches that drift without dragging them into doctest collection (where a
+  # missing optional dep like reportlab would be a collection *error*, not a skip).
+  "--ignore=scripts",
   "--ignore=AGENTS.md",
   "--ignore=CONTRIBUTORS.md",
   "--doctest-glob=*.md",
@@ -121,7 +147,14 @@ Issues = "https://github.com/payalchandak/EveryQuery/issues"
 [tool.ruff] # Ruff configuration for linting and formatting
 target-version = "py311"
 line-length = 110
-extend-exclude = ["docs/index.md"]
+# `scripts/` holds the conditional-model research drivers, ported verbatim from the fork
+# (docs/history/2026-08-18-conditional-v2-integration-plan.md §2, "Research artifacts: port everything as-is").  They arrived
+# with ~200 pre-existing ruff findings — long lines, single-letter stats names, unused loop vars —
+# and `ruff format` would rewrite all of them wholesale.  Since code-quality CI runs pre-commit over
+# *changed* files, that debt turns every future edit to a script into a red build unrelated to the
+# edit.  Excluded deliberately, matching the `--ignore=scripts` pytest exclusion above; the guard
+# that actually matters for these files is `tests/test_cli_smoke.py::test_script_imports`.
+extend-exclude = ["docs/index.md", "scripts"]
 
 # Enable linters
 [tool.ruff.lint]
@@ -145,4 +178,6 @@ select = [
 "*.ipynb" = ["E402"]  # Notebooks have imports spread across cells
 
 [tool.ruff.lint.pep8-naming]
-extend-ignore-names = ["*MEDS*", "*NRT*", "D", "M", "L", "LR*"]
+# B/S/H join the existing D/M/L: single-capital tensor-shape locals (batch, sequence, hidden),
+# the conventional notation in the model and dataset code.
+extend-ignore-names = ["*MEDS*", "*NRT*", "D", "M", "L", "LR*", "B", "S", "H"]

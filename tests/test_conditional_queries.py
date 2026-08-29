@@ -10,23 +10,27 @@ Covers, in order of pipeline position:
    (padding, binary answer classes, masks).
 4. ``sample_query_sequences`` — fully-random sequence sampling and binary observed-occurrence
    labeling on a hand-built events frame.
+5. ``sample_query_sequences`` Stages 1'/3' — the 5-stage pipeline's sequence-specific stages:
+   distribution parity with the training sampler, and per-shard index resolution.
 """
 
-import inspect
 from datetime import datetime
+from functools import partial
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 import numpy as np
 import polars as pl
 import pytest
 import torch
 import yaml
+from meds import held_out_split, tuning_split
 
 from every_query.data.seq_dataset import (
     ANSWERS_COL,
     EOS_CODE,
+    EVENT_BOUND_DURATION_SENTINEL,
     ConditionalQueryBatch,
-    ConditionalQueryPytorchDataset,
 )
 from every_query.generate_tasks import sample_evaluation_query_sequences
 from every_query.generate_tasks.sample_evaluation_query_sequences import (
@@ -38,8 +42,17 @@ from every_query.generate_tasks.sample_evaluation_query_sequences import (
 )
 from every_query.generate_tasks.sample_query_sequences import (
     CTX_ID_COL,
-    build_sequence_index_df,
+    POSITION_COL,
+    QuerySequenceDistribution,
+    build_sequence_index,
     label_binary_occurrence,
+    resolve_prediction_times,
+)
+from every_query.generate_tasks.sample_tasks import (
+    QueryDistribution,
+    QuerySpec,
+    index_path,
+    prediction_times_path,
 )
 from every_query.model.conditional_model import (
     ANSWER_NO,
@@ -64,7 +77,7 @@ def test_mask_no_self_answer_leakage(n_queries):
 
 @pytest.mark.parametrize("n_queries", [2, 3, 5])
 def test_mask_full_visibility_of_prior_blocks(n_queries):
-    """Every token sees *all* tokens (incl. answers) of strictly earlier blocks."""
+    """Every token sees *all* tokens (including answers) of strictly earlier blocks."""
     allowed = ~build_block_causal_mask(n_queries)
     for j in range(1, n_queries):
         for tok in range(TOKENS_PER_QUERY):
@@ -129,12 +142,12 @@ def make_batch(
     q_durations: list[list[float]] | None = None,
     q_mask: list[list[bool]] | None = None,
 ) -> ConditionalQueryBatch:
-    """Build a small ConditionalQueryBatch with sensible defaults (2 samples × 3 queries)."""
+    """Build a small ConditionalQueryBatch with sensible defaults (2 samples x 3 queries)."""
     B, L = len(q_answers), len(q_answers[0])
     if patient_codes is None:
         patient_codes = [[3, 4, 5, 6]] * B
     if q_codes is None:
-        q_codes = [[EOS_IDX] + list(range(7, 6 + L))] * B
+        q_codes = [[EOS_IDX, *range(7, 6 + L)]] * B
     if q_durations is None:
         q_durations = [[30.0] * L] * B
     if q_mask is None:
@@ -204,9 +217,7 @@ def test_own_query_changes_own_logit(tiny_model):
     """The prediction for A_j must depend on Q_j's code and duration."""
     base = make_batch([[ANSWER_YES, ANSWER_NO, ANSWER_YES]])
     diff_code = make_batch([[ANSWER_YES, ANSWER_NO, ANSWER_YES]], q_codes=[[EOS_IDX, 30, 8]])
-    diff_dur = make_batch(
-        [[ANSWER_YES, ANSWER_NO, ANSWER_YES]], q_durations=[[30.0, 300.0, 30.0]]
-    )
+    diff_dur = make_batch([[ANSWER_YES, ANSWER_NO, ANSWER_YES]], q_durations=[[30.0, 300.0, 30.0]])
     _, out = tiny_model(base)
     _, out_code = tiny_model(diff_code)
     _, out_dur = tiny_model(diff_dur)
@@ -352,30 +363,20 @@ def _events(rows: list[tuple[int, datetime, str]]) -> pl.DataFrame:
     ).with_columns(pl.col("time").cast(pl.Datetime("us")))
 
 
-def test_build_sequence_index_structure():
-    ctx = pl.DataFrame(
-        {
-            "subject_id": [1, 2, 3],
-            "prediction_time": [datetime(2024, 1, 1), datetime(2024, 2, 1), datetime(2024, 3, 1)],
-        }
-    ).with_columns(pl.col("prediction_time").cast(pl.Datetime("us")))
+def test_sample_sequence_specs_structure():
     codes = ["A", "B", "C", EOS_CODE]
-    idx = build_sequence_index_df(ctx, codes, 1, 5, 1, 365, seed=3)
+    specs = sample_sequence_specs(3, codes, 1, 5, 1, 365, seed=3)
 
-    per_ctx = idx.group_by("_ctx_id").len()
-    assert per_ctx["len"].min() >= 1 and per_ctx["len"].max() <= 5
+    assert len(specs) == 3
+    assert all(1 <= len(s) <= 5 for s in specs)
     # All queries are ordinary codes (no privileged censor position / sentinel).
-    assert bool(idx["query"].is_in(codes).all())
-    # Positions within each context start at 0 and are contiguous.
-    assert idx.filter(pl.col("_position") == 0)["_ctx_id"].n_unique() == 3
+    assert all(q in codes for s in specs for q in s.queries)
+    assert all(s.bounds == () for s in specs)
 
 
 def test_eos_first_fraction_forces_eos_at_position_0():
-    ctx = pl.DataFrame(
-        {"subject_id": [1, 2], "prediction_time": [datetime(2024, 1, 1), datetime(2024, 2, 1)]}
-    ).with_columns(pl.col("prediction_time").cast(pl.Datetime("us")))
-    idx = build_sequence_index_df(ctx, ["A", "B", EOS_CODE], 2, 2, 1, 365, 0, eos_first_fraction=1.0)
-    assert idx.filter(pl.col("_position") == 0)["query"].unique().to_list() == [EOS_CODE]
+    specs = sample_sequence_specs(2, ["A", "B", EOS_CODE], 2, 2, 1, 365, 0, eos_first_fraction=1.0)
+    assert {s.queries[0] for s in specs} == {EOS_CODE}
 
 
 def test_label_binary_known_answers():
@@ -421,14 +422,11 @@ def test_label_binary_known_answers():
 
 
 def test_sampler_determinism():
-    ctx = pl.DataFrame(
-        {"subject_id": [1, 2], "prediction_time": [datetime(2024, 1, 1), datetime(2024, 2, 1)]}
-    ).with_columns(pl.col("prediction_time").cast(pl.Datetime("us")))
-    a = build_sequence_index_df(ctx, ["A", "B"], 1, 4, 1, 365, seed=11)
-    b = build_sequence_index_df(ctx, ["A", "B"], 1, 4, 1, 365, seed=11)
-    c = build_sequence_index_df(ctx, ["A", "B"], 1, 4, 1, 365, seed=12)
-    assert a.equals(b)
-    assert not a.equals(c)
+    a = sample_sequence_specs(2, ["A", "B"], 1, 4, 1, 365, seed=11)
+    b = sample_sequence_specs(2, ["A", "B"], 1, 4, 1, 365, seed=11)
+    c = sample_sequence_specs(2, ["A", "B"], 1, 4, 1, 365, seed=12)
+    assert a == b
+    assert a != c
 
 
 # ── 5. sample_evaluation_query_sequences (dense grid) ────────────────────
@@ -437,11 +435,21 @@ def test_sampler_determinism():
 def test_read_sequence_specs_yaml_mapping_and_list(tmp_path):
     """Both YAML forms parse; the mapping form keeps its names, the list form generates them."""
     mapping_fp = tmp_path / "mapping.yaml"
-    mapping_fp.write_text(yaml.safe_dump({"mortality_30d": [[EOS_CODE, 1], ["MEDS_DEATH", 30]]}))
+    mapping_fp.write_text(
+        yaml.safe_dump(
+            {
+                "mortality_30d": [
+                    [EOS_CODE, 1],
+                    ["MEDS_DEATH", EVENT_BOUND_DURATION_SENTINEL, "DISCHARGE"],
+                ]
+            }
+        )
+    )
     (spec,) = read_sequence_specs(mapping_fp)
     assert spec.name == "mortality_30d"
     assert spec.queries == (EOS_CODE, "MEDS_DEATH")
-    assert spec.durations == (1, 30)
+    assert spec.durations == (1, EVENT_BOUND_DURATION_SENTINEL)
+    assert spec.bounds == (None, "DISCHARGE")
 
     list_fp = tmp_path / "list.yaml"
     list_fp.write_text(yaml.safe_dump([[["A", 7]], [["B", 14], ["C", 30]]]))
@@ -451,19 +459,21 @@ def test_read_sequence_specs_yaml_mapping_and_list(tmp_path):
 
 
 def test_read_sequence_specs_parquet_orders_by_position(tmp_path):
-    """The long-format parquet form is ordered by ``position``, not by row order."""
+    """Long-format parquet preserves optional bounds and orders every field by ``position``."""
     fp = tmp_path / "specs.parquet"
     pl.DataFrame(
         {
             "seq_id": ["s", "s", "s"],
             "position": [2, 0, 1],
             "query": ["third", "first", "second"],
-            "duration_days": [3.0, 1.0, 2.0],
+            "duration_days": [3.0, 1.0, EVENT_BOUND_DURATION_SENTINEL],
+            "bound_event": [None, None, "DISCHARGE"],
         }
     ).write_parquet(fp)
     (spec,) = read_sequence_specs(fp)
     assert spec.queries == ("first", "second", "third")
-    assert spec.durations == (1.0, 2.0, 3.0)
+    assert spec.durations == (1.0, EVENT_BOUND_DURATION_SENTINEL, 3.0)
+    assert spec.bounds == (None, "DISCHARGE", None)
 
 
 def test_read_sequence_specs_rejects_malformed(tmp_path):
@@ -529,12 +539,16 @@ def test_sequence_spec_rejects_bad_durations():
     # ``bool`` is an int subclass; True must not silently become 1.0 days.
     with pytest.raises(TypeError, match="must be a number"):
         SequenceSpec("s", ("A",), (True,))
+    with pytest.raises(ValueError, match=r"duration must be the -1\.0 sentinel"):
+        SequenceSpec("s", ("A",), (30.0,), ("DISCHARGE",))
+    with pytest.raises(ValueError, match="boundary at position 0 must be a non-empty string"):
+        SequenceSpec("s", ("A",), (EVENT_BOUND_DURATION_SENTINEL,), ("",))
 
 
 def test_eval_sampling_defaults_stay_in_training_distribution():
     """A sampled evaluation grid must default to the distribution the model was pretrained on.
 
-    ``sample_evaluation_query_sequences`` reuses ``build_sequence_index_df``, so these knobs mean
+    ``sample_evaluation_query_sequences`` reuses ``QuerySequenceDistribution``, so these knobs mean
     exactly the same thing on both sides; a drifted default would silently produce
     out-of-distribution queries and read as an unexplained metric shift rather than an error.
 
@@ -547,7 +561,14 @@ def test_eval_sampling_defaults_stay_in_training_distribution():
     train_cfg = yaml.safe_load((configs / "sample_query_sequences_config.yaml").read_text())
     eval_cfg = yaml.safe_load((configs / "sample_evaluation_query_sequences_config.yaml").read_text())
 
-    exact = ["duration_min", "duration_max", "eos_first_fraction", "duration_mode"]
+    exact = [
+        "duration_min",
+        "duration_max",
+        "duration_distribution",
+        "eos_first_fraction",
+        "duration_mode",
+        "eventbound_fraction",
+    ]
     assert {k: eval_cfg[k] for k in exact} == {k: train_cfg[k] for k in exact}
 
     assert eval_cfg["min_queries"] == eval_cfg["max_queries"], "eval grid uses one fixed length"
@@ -556,8 +577,405 @@ def test_eval_sampling_defaults_stay_in_training_distribution():
         f"{train_cfg['min_queries']}..{train_cfg['max_queries']} range"
     )
 
-    # The Python-level defaults on ``run_worker`` must agree with the YAML too — programmatic
-    # callers bypass Hydra entirely.
-    defaults = inspect.signature(sample_evaluation_query_sequences.run_worker).parameters
-    for k in ("min_queries", "max_queries", "duration_min", "duration_max"):
-        assert defaults[k].default == eval_cfg[k], f"run_worker default for {k} != config"
+
+# ── 6. Stage 1'/3': the 5-stage sequence pipeline ───────────────────────
+
+
+def _seq_dist(**overrides) -> QuerySequenceDistribution:
+    kwargs = {
+        "query_codes": ["A", "B", "C", EOS_CODE],
+        "min_duration": 1.0,
+        "max_duration": 365.0,
+        "duration_distribution": "log-uniform",
+        "min_queries": 1,
+        "max_queries": 5,
+    }
+    kwargs.update(overrides)
+    return QuerySequenceDistribution(**kwargs)
+
+
+def test_sequence_draw_is_identical_to_the_training_query_distribution():
+    """Stage 1' must draw from *exactly* the training sampler's distribution.
+
+    This is the distribution-parity anchor the integration plan calls for.  Because sequence
+    *structure* (lengths, the two sweep knobs) is drawn from a separate generator, the flattened
+    ``(code, duration)`` stream is identical to ``QueryDistribution.sample`` for the same generator
+    and total — so a future change to either sampler's draw breaks this test rather than silently
+    retraining the conditional model on a shifted distribution.
+    """
+    dist = _seq_dist()
+    seqs = dist.sample_sequences(50, np.random.default_rng(0), np.random.default_rng(1))
+    flat = [q for s in seqs for q in s]
+
+    base = QueryDistribution(dist.query_codes, 1.0, 365.0, "log-uniform")
+    assert flat == base.sample(len(flat), np.random.default_rng(0))
+
+
+def test_structure_rng_does_not_perturb_the_query_draw():
+    """Changing only the structure seed must leave the code/duration stream untouched.
+
+    The two axes are independent by construction; if they ever share a generator, a change to a sweep knob
+    would silently move the query distribution too.
+    """
+    dist = _seq_dist(min_queries=3, max_queries=3)  # fixed length => same total either way
+    a = dist.sample_sequences(20, np.random.default_rng(0), np.random.default_rng(1))
+    b = dist.sample_sequences(20, np.random.default_rng(0), np.random.default_rng(99))
+    assert [q for s in a for q in s] == [q for s in b for q in s]
+
+
+def test_sequence_durations_are_floats_not_whole_days():
+    """The fork rounded durations to integer days; ``QueryDistribution`` does not.
+
+    Guards the documented distribution shift that makes the pre-port checkpoint unusable
+    (docs/history/2026-08-18-conditional-v2-integration-plan.md §3) — a silent return to
+    rounding would be a regression.
+    """
+    seqs = _seq_dist().sample_sequences(50, np.random.default_rng(0), np.random.default_rng(1))
+    durations = [q.duration_days for s in seqs for q in s]
+    assert any(d != round(d) for d in durations)
+
+
+def test_sequence_lengths_span_the_configured_range():
+    seqs = _seq_dist(min_queries=2, max_queries=4).sample_sequences(
+        200, np.random.default_rng(0), np.random.default_rng(1)
+    )
+    assert {len(s) for s in seqs} == {2, 3, 4}
+
+
+def test_duration_mode_nondecreasing_sorts_within_each_sequence():
+    seqs = _seq_dist(min_queries=4, max_queries=4, duration_mode="nondecreasing").sample_sequences(
+        20, np.random.default_rng(0), np.random.default_rng(1)
+    )
+    for s in seqs:
+        durations = [q.duration_days for q in s]
+        assert durations == sorted(durations)
+
+
+def test_duration_mode_same_shares_one_horizon_per_sequence():
+    seqs = _seq_dist(min_queries=4, max_queries=4, duration_mode="same").sample_sequences(
+        20, np.random.default_rng(0), np.random.default_rng(1)
+    )
+    assert all(len({q.duration_days for q in s}) == 1 for s in seqs)
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"min_queries": 0}, "min_queries must be >= 1"),
+        ({"min_queries": 3, "max_queries": 2}, "must be >= min_queries"),
+        ({"eos_first_fraction": 1.5}, r"must be in \[0, 1\]"),
+        ({"duration_mode": "sorted"}, "duration_mode must be one of"),
+        ({"query_codes": ["A"], "eos_first_fraction": 0.5}, "not in query_codes"),
+    ],
+)
+def test_sequence_distribution_rejects_bad_config(kwargs, match):
+    """Config errors must fail at construction, not three stages downstream."""
+    with pytest.raises(ValueError, match=match):
+        _seq_dist(**kwargs)
+
+
+def _write_prediction_times_map(artifacts: Path, split: str, shard: str, rows: list[tuple]) -> None:
+    """Write a Stage 0 ``_prediction_times/{shard}.parquet`` map with upstream's exact dtypes."""
+    fp = prediction_times_path(artifacts, split, shard)
+    fp.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame(
+        {
+            "subject_id": [r[0] for r in rows],
+            "prediction_time_index": [r[1] for r in rows],
+            "time": [r[2] for r in rows],
+        },
+        schema={
+            "subject_id": pl.Int64,
+            "prediction_time_index": pl.Int64,
+            "time": pl.Datetime("us"),
+        },
+    ).write_parquet(fp)
+
+
+def _stage2_contexts(rows: list[tuple]) -> pl.DataFrame:
+    """A Stage 2 output frame: ``(subject_id, shard, prediction_time_index)``."""
+    return pl.DataFrame(
+        {
+            "subject_id": [r[0] for r in rows],
+            "shard": [r[1] for r in rows],
+            "prediction_time_index": [r[2] for r in rows],
+        },
+        schema={"subject_id": pl.Int64, "shard": pl.Utf8, "prediction_time_index": pl.Int64},
+    )
+
+
+def test_build_sequence_index_partitions_by_shard_and_resolves_times(tmp_path: Path):
+    """Stage 3': one index partition per shard, ranks resolved, sequences kept intact."""
+    artifacts, split = tmp_path / "tasks_artifacts", "train"
+    _write_prediction_times_map(
+        artifacts, split, "0", [(1, 0, datetime(2024, 1, 1)), (1, 1, datetime(2024, 1, 8))]
+    )
+    _write_prediction_times_map(artifacts, split, "1", [(2, 0, datetime(2024, 2, 1))])
+
+    sequences = [
+        [QuerySpec("A", 3.0), QuerySpec("B", -1.0, "DISCHARGE")],  # -> shard 0, subject 1, rank 1
+        [QuerySpec("C", 5.0)],  # -> shard 1, subject 2, rank 0
+        [QuerySpec("A", 1.0), QuerySpec(EOS_CODE, 9.0)],  # -> shard 0, subject 1, rank 0
+    ]
+    contexts = _stage2_contexts([(1, "0", 1), (2, "1", 0), (1, "0", 0)])
+
+    assert build_sequence_index(sequences, contexts, artifacts, split) == 2
+
+    shard0 = pl.read_parquet(index_path(artifacts, split, "0"))
+    shard1 = pl.read_parquet(index_path(artifacts, split, "1"))
+    assert shard0.height == 4 and shard1.height == 1
+
+    # Ranks resolved to the map's timestamps, and each sequence's queries stayed together, in
+    # order, under its own _ctx_id.
+    by_ctx = {
+        key[0]: (grp["query"].to_list(), grp["prediction_time"].to_list())
+        for key, grp in shard0.sort(CTX_ID_COL, POSITION_COL).group_by(CTX_ID_COL, maintain_order=True)
+    }
+    assert by_ctx[0] == (["A", "B"], [datetime(2024, 1, 8)] * 2)
+    assert by_ctx[2] == (["A", EOS_CODE], [datetime(2024, 1, 1)] * 2)
+    assert shard1["prediction_time"].to_list() == [datetime(2024, 2, 1)]
+
+    # _ctx_id is globally unique, so no two sequences collide when Stage 4' regroups.
+    assert len(set(shard0[CTX_ID_COL].to_list() + shard1[CTX_ID_COL].to_list())) == 3
+
+    # Stage 3' samples nothing: the bound Stage 1' put on a spec is carried into the index as-is,
+    # and every shard of the run agrees on the column, bounded rows or not.
+    ordered = shard0.sort(CTX_ID_COL, POSITION_COL)
+    assert ordered["bound_event"].to_list() == [None, "DISCHARGE", None, None]
+    assert ordered["duration_days"].to_list()[1] == -1.0
+    assert shard1["bound_event"].to_list() == [None]
+
+
+def test_build_sequence_index_rejects_length_mismatch(tmp_path: Path):
+    with pytest.raises(ValueError, match=r"must equal contexts\.height"):
+        build_sequence_index(
+            [[QuerySpec("A", 1.0)]],
+            _stage2_contexts([(1, "0", 0), (2, "0", 0)]),
+            tmp_path,
+            "train",
+        )
+
+
+def test_resolve_prediction_times_raises_on_unresolvable_rank(tmp_path: Path):
+    """The join is total by design — a null timestamp is a hard error, never a silent drop."""
+    artifacts, split = tmp_path / "a", "train"
+    _write_prediction_times_map(artifacts, split, "0", [(1, 0, datetime(2024, 1, 1))])
+    with pytest.raises(ValueError, match="null prediction_time"):
+        resolve_prediction_times(_stage2_contexts([(1, "0", 99)]), artifacts, split, "0")
+
+
+def test_resolve_prediction_times_raises_on_join_key_dtype_drift(tmp_path: Path):
+    """A dtype mismatch silently produces an all-null join in polars; it must fail loudly."""
+    artifacts, split = tmp_path / "a", "train"
+    _write_prediction_times_map(artifacts, split, "0", [(1, 0, datetime(2024, 1, 1))])
+    drifted = _stage2_contexts([(1, "0", 0)]).with_columns(pl.col("subject_id").cast(pl.UInt32))
+    with pytest.raises(ValueError, match="dtype mismatch"):
+        resolve_prediction_times(drifted, artifacts, split, "0")
+
+
+# ── ConditionalQueryLightningModule: training-loop hooks ────────────────
+#
+# Every method below is either overridden by the conditional module or inherited from
+# ``EveryQueryLightningModule``.  The inherited ones were written for the two-headed single-query
+# model and reach for ``outputs.occurs_loss`` / ``outputs.censor_loss`` / ``batch.occurs`` /
+# ``batch.censor``, none of which exist on ``ConditionalQueryOutput`` / ``ConditionalQueryBatch``.
+# These tests run each hook against a real conditional batch so a re-introduced two-head assumption
+# fails here instead of at step 0 of a real training run.
+
+
+@pytest.fixture
+def tiny_lightning_module(tiny_model):
+    from every_query.model.conditional_lightning import ConditionalQueryLightningModule
+
+    return ConditionalQueryLightningModule(
+        model=tiny_model,
+        optimizer=partial(torch.optim.AdamW, lr=1e-4, weight_decay=0.01),
+    )
+
+
+@pytest.mark.parametrize("hook", ["training_step", "validation_step", "test_step", "predict_step"])
+def test_lightning_step_hooks_run_on_a_conditional_batch(tiny_lightning_module, hook):
+    """No step hook may touch a two-head-only attribute."""
+    batch = make_batch([[ANSWER_YES, ANSWER_NO, ANSWER_YES], [ANSWER_NO, ANSWER_NO, ANSWER_YES]])
+    with patch.object(tiny_lightning_module, "log"):
+        out = getattr(tiny_lightning_module, hook)(batch)
+    if hook == "predict_step":
+        assert set(out) == {"answer_probs", "q_mask", "q_answers", "q_codes", "q_durations"}
+    else:
+        assert out.isfinite()
+
+
+def test_epoch_end_hooks_compute_only_conditional_metrics(tiny_lightning_module):
+    """``_on_epoch_end`` walks ``self.metrics``; the conditional set has no occurs/censor entries."""
+    for split in (tuning_split, held_out_split):
+        names = set(tiny_lightning_module.metrics[split])
+        assert "occurs_auc" not in names and "censor_auc" not in names
+        assert names == {"answer_auc"} | {f"answer_auc_pos{j}" for j in range(8)}
+
+    batch = make_batch([[ANSWER_YES, ANSWER_NO, ANSWER_YES], [ANSWER_NO, ANSWER_NO, ANSWER_YES]])
+    logged = {}
+    with patch.object(tiny_lightning_module, "log", side_effect=lambda k, v, **kw: logged.setdefault(k, v)):
+        tiny_lightning_module.validation_step(batch)
+        tiny_lightning_module.on_validation_epoch_end()
+        tiny_lightning_module.test_step(batch)
+        tiny_lightning_module.on_test_epoch_end()
+        tiny_lightning_module.on_train_epoch_end()
+    assert f"{tuning_split}/answer_auc" in logged
+    assert f"{held_out_split}/answer_auc" in logged
+
+
+def test_grad_norm_hook_is_throttled(tiny_model):
+    """``grad_norm_log_every_n_steps`` gates the total-grad-norm log (0-indexed, so step 0 fires)."""
+    from every_query.model.conditional_lightning import ConditionalQueryLightningModule
+
+    module = ConditionalQueryLightningModule(model=tiny_model, grad_norm_log_every_n_steps=4)
+    # ``grad_norm`` reads ``.grad``; without a backward there is nothing to norm.
+    loss, _ = module.model(make_batch([[ANSWER_YES, ANSWER_NO, ANSWER_YES]]))
+    loss.backward()
+
+    fired = []
+    for step in (0, 1, 4, 5, 8):
+        with (
+            patch.object(type(module), "global_step", property(lambda _s, v=step: v)),
+            patch.object(module, "log", side_effect=lambda k, *a, **kw: fired.append(k)),
+        ):
+            module.on_before_optimizer_step(None)
+    assert fired == ["train/grad_norm", "train/grad_norm", "train/grad_norm"]
+
+
+def test_warmup_ratio_drives_the_lr_schedule(tiny_model):
+    """``warmup_ratio`` x ``estimated_stepping_batches`` -> ``num_warmup_steps`` at fit time."""
+    from transformers import get_cosine_schedule_with_warmup
+
+    from every_query.model.conditional_lightning import ConditionalQueryLightningModule
+
+    module = ConditionalQueryLightningModule(
+        model=tiny_model,
+        optimizer=partial(torch.optim.AdamW, lr=1e-4, weight_decay=0.01),
+        LR_scheduler=partial(get_cosine_schedule_with_warmup),
+        warmup_ratio=0.1,
+    )
+    module.trainer = Mock(estimated_stepping_batches=10_000)
+    result = module.configure_optimizers()
+    # 10% of 10,000 = 1,000 warmup steps, so the linear ramp is halfway done at step 500.
+    assert result["lr_scheduler"]["scheduler"].lr_lambdas[0](500) == pytest.approx(0.5)
+    assert result["lr_scheduler"]["interval"] == "step"
+
+
+def test_warmup_ratio_is_validated(tiny_model):
+    from every_query.model.conditional_lightning import ConditionalQueryLightningModule
+
+    with pytest.raises(ValueError, match=r"warmup_ratio must be in \[0.0, 1.0\]"):
+        ConditionalQueryLightningModule(model=tiny_model, warmup_ratio=1.5)
+
+
+def test_warmup_ratio_survives_checkpoint_round_trip(tiny_model, tmp_path):
+    import lightning as L
+
+    from every_query.model.conditional_lightning import ConditionalQueryLightningModule
+
+    module = ConditionalQueryLightningModule(
+        model=tiny_model,
+        optimizer=partial(torch.optim.AdamW, lr=1e-4, weight_decay=0.01),
+        warmup_ratio=0.25,
+    )
+    ckpt = tmp_path / "cq.ckpt"
+    torch.save(
+        {
+            "state_dict": module.state_dict(),
+            "hyper_parameters": dict(module.hparams),
+            "pytorch-lightning_version": L.__version__,
+        },
+        ckpt,
+    )
+    loaded = ConditionalQueryLightningModule.load_from_checkpoint(str(ckpt))
+    assert loaded.warmup_ratio == 0.25
+    assert loaded.model.hparams["max_queries"] == tiny_model.hparams["max_queries"]
+
+    # Checkpoints written before warmup_ratio existed load with no warmup rather than KeyError.
+    old_hparams = dict(module.hparams)
+    old_hparams.pop("warmup_ratio")
+    old_ckpt = tmp_path / "old.ckpt"
+    torch.save(
+        {
+            "state_dict": module.state_dict(),
+            "hyper_parameters": old_hparams,
+            "pytorch-lightning_version": L.__version__,
+        },
+        old_ckpt,
+    )
+    assert ConditionalQueryLightningModule.load_from_checkpoint(str(old_ckpt)).warmup_ratio == 0.0
+
+
+# ── conditional_config.yaml / _demo_train_conditional.yaml invariants ───
+
+
+def _train_config(name: str) -> dict:
+    from every_query.train.train import CONFIGS
+
+    return yaml.safe_load((Path(CONFIGS) / name).read_text())
+
+
+@pytest.mark.parametrize("name", ["conditional_config.yaml", "_demo_train_conditional.yaml"])
+def test_conditional_configs_leave_encoder_sizing_to_the_data(name):
+    """train.py overwrites both from the tensorized cohort; a literal here would be a lie."""
+    overrides = _train_config(name)["lightning_module"]["model"]["config_overrides"]
+    assert overrides["vocab_size"] == "???"
+    assert overrides["max_position_embeddings"] == "???"
+
+
+@pytest.mark.parametrize("name", ["conditional_config.yaml", "_demo_train_conditional.yaml"])
+def test_conditional_configs_have_one_source_of_truth_for_precision_and_steps(name):
+    cfg = _train_config(name)
+    assert cfg["lightning_module"]["model"]["precision"] == "${trainer.precision}"
+    assert cfg["trainer"]["precision"] == "bf16-mixed"
+    # Removed upstream (8f83423): total steps come from the data via max_epochs.
+    assert "max_steps" not in cfg["trainer"]
+    assert cfg["trainer"]["max_epochs"] == 1
+
+
+def test_conditional_config_writes_into_the_hydra_run_dir():
+    """``${output_dir}`` is the shared base; a second run there would raise FileExistsError."""
+    cfg = _train_config("conditional_config.yaml")
+    assert cfg["trainer"]["default_root_dir"] == "${hydra:runtime.output_dir}"
+    assert cfg["hydra"]["run"]["dir"].startswith("${output_dir}/")
+    for key in ("logger", "callbacks"):
+        assert "${trainer.default_root_dir}" in yaml.safe_dump(cfg["trainer"][key])
+
+
+def test_conditional_config_declares_warmup_ratio_not_dead_step_counts():
+    """``configure_optimizers`` overrides these as call-site kwargs, so declaring them is dead."""
+    lm = _train_config("conditional_config.yaml")["lightning_module"]
+    assert lm["warmup_ratio"] == 0.05
+    assert "num_warmup_steps" not in lm["LR_scheduler"]
+    assert "num_training_steps" not in lm["LR_scheduler"]
+
+
+def test_seq_dataset_rejects_labels_outside_vocab(tmp_path, tensorized_cohort_dir, seq_task_labels_dir):
+    """Labels naming a code the run's vocabulary lacks fail at construction, not as a KeyError in collate."""
+    import shutil
+
+    from meds import train_split
+    from meds_torchdata import MEDSTorchDataConfig
+
+    from every_query.data.seq_dataset import ConditionalQueryPytorchDataset
+
+    labels = tmp_path / "labels"
+    shutil.copytree(seq_task_labels_dir, labels)
+    shard = labels / train_split / "0.parquet"
+    df = pl.read_parquet(shard)
+    df = df.with_columns(
+        pl.concat_list([pl.lit("NOT//A//CODE"), pl.col("queries").list.slice(1)]).alias("queries")
+    )
+    df.write_parquet(shard)
+
+    cfg = MEDSTorchDataConfig(
+        tensorized_cohort_dir=str(tensorized_cohort_dir),
+        task_labels_dir=str(labels),
+        max_seq_len=64,
+        seq_sampling_strategy="to_end",
+        static_inclusion_mode="omit",
+        batch_mode="SM",
+    )
+    with pytest.raises(ValueError, match="NOT//A//CODE"):
+        ConditionalQueryPytorchDataset(cfg, split=train_split)

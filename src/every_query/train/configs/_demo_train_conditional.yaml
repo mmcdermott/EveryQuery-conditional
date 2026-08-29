@@ -15,7 +15,9 @@ do_resume: false
 seed: 1
 
 datamodule:
-  _target_: meds_torchdata.extensions.lightning_datamodule.Datamodule
+  # Match production (conditional_config.yaml): the stateful loader, so the demo run exercises
+  # the same train_dataloader path.
+  _target_: every_query.data.datamodule.ResumableDatamodule
   data_class: every_query.data.seq_dataset.ConditionalQueryPytorchDataset
   config:
     _target_: meds_torchdata.MEDSTorchDataConfig
@@ -25,6 +27,11 @@ datamodule:
     seq_sampling_strategy: to_end
     max_seq_len: 64
     batch_mode: SM
+  # Mirror production's feature-toggle surface so integration tests can switch features on with
+  # a plain Hydra override rather than a `+` append (and so the demo drifts less from real runs).
+  dataset_kwargs:
+    strip_delta_tokens: false
+    ontology_dir: null
   batch_size: 2
   num_workers: 0
   pin_memory: false
@@ -33,8 +40,10 @@ lightning_module:
   _target_: every_query.model.conditional_lightning.ConditionalQueryLightningModule
   model:
     _target_: every_query.model.conditional_model.ConditionalQueryModel
-    precision: "32-true"
+    precision: ${trainer.precision}
     mlp_dropout: 0.1
+    use_rope_time: false
+    ontology_dir: null
     decoder_layers: 2
     decoder_heads: 2
     decoder_ffn_mult: 2
@@ -44,8 +53,9 @@ lightning_module:
       num_hidden_layers: 2
       num_attention_heads: 2
       intermediate_size: 128
-      max_position_embeddings: 128
-      vocab_size: 100
+      # Dictated by the data — filled in by train.py from the datamodule config.
+      max_position_embeddings: ???
+      vocab_size: ???
       pad_token_id: 0
       cls_token_id: 1
       bos_token_id: 1
@@ -75,9 +85,9 @@ trainer:
   default_root_dir: ${output_dir}
   min_epochs: 0
   max_epochs: 1
-  max_steps: 2
   accelerator: cpu
   devices: 1
+  precision: "bf16-mixed"
   accumulate_grad_batches: 1
   log_every_n_steps: 1
   check_val_every_n_epoch: null

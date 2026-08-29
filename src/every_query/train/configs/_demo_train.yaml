@@ -15,7 +15,9 @@ do_resume: false
 seed: 1
 
 datamodule:
-  _target_: meds_torchdata.extensions.lightning_datamodule.Datamodule
+  # Match production (config.yaml): the stateful loader + a worker process, so the CLI
+  # resume tests exercise the checkpoint save/restore path the real config runs.
+  _target_: every_query.data.datamodule.ResumableDatamodule
   data_class: every_query.data.dataset.EveryQueryPytorchDataset
   config:
     _target_: meds_torchdata.MEDSTorchDataConfig
@@ -26,14 +28,14 @@ datamodule:
     max_seq_len: 64
     batch_mode: SM
   batch_size: 2
-  num_workers: 0
+  num_workers: 1
   pin_memory: false
 
 lightning_module:
   _target_: every_query.model.lightning_module.EveryQueryLightningModule
   model:
     _target_: every_query.model.EveryQueryModel
-    precision: "32-true"
+    precision: ${trainer.precision}
     do_demo: true
     do_grad_ckpt: false
     mlp_dropout: 0.1
@@ -42,13 +44,9 @@ lightning_module:
       num_hidden_layers: 2
       num_attention_heads: 2
       intermediate_size: 128
-      max_position_embeddings: 128
-      vocab_size: 100
-      pad_token_id: 0
-      cls_token_id: 1
-      bos_token_id: 1
-      sep_token_id: 2
-      eos_token_id: 2
+      # Dictated by the data — filled in by train.py from the datamodule config.
+      vocab_size: ???
+      max_position_embeddings: ???
   optimizer:
     _target_: torch.optim.AdamW
     _partial_: true
@@ -73,9 +71,9 @@ trainer:
   default_root_dir: ${output_dir}
   min_epochs: 0
   max_epochs: 1
-  max_steps: 2
   accelerator: cpu
   devices: 1
+  precision: "bf16-mixed"
   accumulate_grad_batches: 1
   log_every_n_steps: 1
   check_val_every_n_epoch: null

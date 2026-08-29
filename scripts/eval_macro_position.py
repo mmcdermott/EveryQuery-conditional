@@ -9,7 +9,7 @@ score_neg) (Mann-Whitney), so for one positive/negative patient pair drawn for t
 estimates macro-AUC.
 
 DESIGN (fully paired): sample T tasks = queries Q=(code, duration).  For each, draw one positive
-context (Q occurs in (t, t+d]) and one negative context.  Place Q at every position p (p random
+context (Q occurs in (t, t+d)) and one negative context.  Place Q at every position p (p random
 filler queries before it, their TRUE answers teacher-forced), scoring the SAME pos/neg pair at
 each position.  macro_AUC(p) = mean_T 1[score_pos(p) > score_neg(p)].  Bootstrap over tasks gives
 a CI on the slope (and Spearman rho) of macro_AUC vs p; the conditioning trend is "confirmed" only
@@ -26,12 +26,17 @@ import numpy as np
 import polars as pl
 from scipy import stats as sstats
 
-from eval_v2 import load_model, sample_eval_contexts, score_last
+from eval_v2 import (
+    add_context_sampling_args,
+    contexts_from_args,
+    load_model,
+    log_uniform_durations,
+    score_last,
+)
 from every_query.generate_tasks.sample_query_sequences import (
     CTX_ID_COL,
     POSITION_COL,
     label_binary_occurrence,
-    sample_log_uniform_durations,
 )
 from every_query.generate_tasks.sample_tasks import read_query_codes
 from every_query.data.schema import QuerySeqSchema
@@ -40,8 +45,14 @@ from meds import DataSchema
 
 def occurrence_labels(flat: pl.DataFrame, events: pl.DataFrame) -> pl.DataFrame:
     """Per-row binary occurrence: for each (subject_id, prediction_time, query, duration_days) row,
-    did the query code occur in (prediction_time, prediction_time + duration_days)?  Same strict-> asof
-    join as label_binary_occurrence, but row-wise (no per-sequence aggregation)."""
+    did the query code occur in (prediction_time, prediction_time + duration_days)?  Same asof join
+    as label_binary_occurrence, but row-wise (no per-sequence aggregation).
+
+    The window is open at BOTH ends: strict at the prediction instant (the ``+1us`` shift below) and
+    strict at the horizon (``<``).  This mirrors ``label_binary_occurrence`` deliberately — a
+    context whose only occurrence lands exactly on the horizon must not be trained as a negative and
+    scored here as a positive.  See tests/test_window_bounds_contract.py for the rule this follows;
+    this file is not collected by pytest, so that agreement is maintained by hand."""
     sid, time = DataSchema.subject_id_name, DataSchema.time_name
     left = flat.with_row_index("_row").with_columns(
         (pl.col("prediction_time") + pl.duration(microseconds=1)).alias("_pts")
@@ -64,7 +75,7 @@ def build_triples_occurrence(ce, n_tasks, dmin, dmax, min_ctx, seed, scheme="pat
       - ``"patient"`` (patient-level, default): pick a patient uniformly among those that permit a
         positive, then a positive prediction time for that patient uniformly — each patient counts
         once, so long-stay patients with many positive windows do not dominate.
-    The NEGATIVE uses the matching scheme over valid contexts where C does not occur in (t, t+T].
+    The NEGATIVE uses the matching scheme over valid contexts where C does not occur in (t, t+T).
     """
     rng = np.random.default_rng(seed)
     triples = []
@@ -86,14 +97,14 @@ def build_triples_occurrence(ce, n_tasks, dmin, dmax, min_ctx, seed, scheme="pat
             if len(triples) >= n_tasks:
                 break
             C = codes_present[int(rng.integers(len(codes_present)))]
-            T = float(sample_log_uniform_durations(1, dmin, dmax, rng)[0])
+            T = float(log_uniform_durations(1, dmin, dmax, rng)[0])
             occ = ev.filter(pl.col(DataSchema.code_name) == C).select(sid, pl.col(time).alias("tau"))
             if occ.height > max_occ:
                 occ = occ.sample(n=max_occ, seed=int(rng.integers(1 << 31)))
             win = pl.duration(days=T)
-            # POSITIVE label-1 contexts: valid (subj, t) with a C-occurrence in (t, t+T].
+            # POSITIVE label-1 contexts: valid (subj, t) with a C-occurrence in (t, t+T).
             pos_ctx = V.join(occ, on=sid).filter(
-                (pl.col("t") < pl.col("tau")) & (pl.col("tau") <= pl.col("t") + win)
+                (pl.col("t") < pl.col("tau")) & (pl.col("tau") < pl.col("t") + win)
             ).select(sid, "t").unique()
             if pos_ctx.height == 0:
                 continue
@@ -105,7 +116,7 @@ def build_triples_occurrence(ce, n_tasks, dmin, dmax, min_ctx, seed, scheme="pat
             else:  # pair-uniform
                 pr = pos_ctx.row(int(rng.integers(pos_ctx.height)), named=True)
                 pos_subj, pos_t = pr[sid], pr["t"]
-            # NEGATIVE: valid context where C does NOT occur in (t, t+T], matching the scheme.
+            # NEGATIVE: valid context where C does NOT occur in (t, t+T), matching the scheme.
             neg = None
             for _ in range(40):
                 if scheme == "patient":
@@ -117,7 +128,7 @@ def build_triples_occurrence(ce, n_tasks, dmin, dmax, min_ctx, seed, scheme="pat
                     vr = V.row(int(rng.integers(V.height)), named=True)
                     s, s_t = vr[sid], vr["t"]
                 hit = occ.filter(
-                    (pl.col(sid) == s) & (pl.col("tau") > s_t) & (pl.col("tau") <= s_t + timedelta(days=T))
+                    (pl.col(sid) == s) & (pl.col("tau") > s_t) & (pl.col("tau") < s_t + timedelta(days=T))
                 )
                 if hit.height == 0:
                     neg = (s, s_t)
@@ -131,7 +142,7 @@ def build_triples_occurrence(ce, n_tasks, dmin, dmax, min_ctx, seed, scheme="pat
 def build_triples(ce, vocab, n_tasks, dmin, dmax, min_pos, min_neg, seed):
     """Find T tasks each with >=1 pos and >=1 neg context; return one (query, pos_ctx, neg_ctx) triple
     per task.  Occurrence is labeled per shard against that shard's contexts (a context's pos/neg for
-    a query Q is whether Q's code occurs in (t, t+d])."""
+    a query Q is whether Q's code occurs in (t, t+d))."""
     rng = np.random.default_rng(seed)
     triples = []  # (code, dur, pos_subj, pos_time, neg_subj, neg_time)
     # draw a big candidate query list; we keep those that yield a pos and a neg within a shard
@@ -144,7 +155,7 @@ def build_triples(ce, vocab, n_tasks, dmin, dmax, min_pos, min_neg, seed):
         # candidate queries for this shard
         n_cand = max(64, n_tasks // max(1, len(ce["events"])) * 4)
         codes = [vocab[int(rng.integers(len(vocab)))] for _ in range(n_cand)]
-        durs = sample_log_uniform_durations(n_cand, dmin, dmax, rng)
+        durs = log_uniform_durations(n_cand, dmin, dmax, rng)
         # build (query x context) grid, label per-row occurrence in one pass
         ctx_rows = ctx.select("subject_id", "prediction_time").to_dicts()
         rows = []
@@ -181,7 +192,7 @@ def build_position_tasks(triples, max_pos, vocab, dmin, dmax, seed):
         cid = 0
         for (code, d, ps, pt, ns, nt) in triples:
             fcodes = [vocab[int(rng.integers(len(vocab)))] for _ in range(p)]
-            fdurs = sample_log_uniform_durations(p, dmin, dmax, rng).tolist() if p else []
+            fdurs = log_uniform_durations(p, dmin, dmax, rng).tolist() if p else []
             for (subj, t) in [(ps, pt), (ns, nt)]:
                 seq = [(fcodes[j], fdurs[j]) for j in range(p)] + [(code, d)]
                 for pos, (cc, dd) in enumerate(seq):
@@ -207,7 +218,6 @@ def main():
     ap.add_argument("--split", default="held_out")
     ap.add_argument("--n-tasks", type=int, default=2000)
     ap.add_argument("--max-pos", type=int, default=5)
-    ap.add_argument("--n-per-shard", type=int, default=400)
     ap.add_argument("--sampling", choices=["patient", "pair", "context-pool"], default="patient",
                     help="positive/negative sampling scheme: 'patient' (patient-uniform, default), "
                          "'pair' (context-uniform over positive pairs), 'context-pool' (legacy random pool)")
@@ -218,11 +228,12 @@ def main():
     ap.add_argument("--dmax", type=int, default=365)
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--boot", type=int, default=3000)
+    add_context_sampling_args(ap, default_n_contexts=4096)
     args = ap.parse_args()
 
     model = load_model(args.run_dir)
     vocab = read_query_codes(args.processed)
-    ce = sample_eval_contexts(args.intermediate, args.split, args.n_per_shard, seed=21)
+    ce = contexts_from_args(args, args.out.parent, seed=21)
     print(f"sampling triples (scheme={args.sampling}) over {ce['contexts'].height} contexts...")
     if args.sampling == "context-pool":
         triples = build_triples(ce, vocab, args.n_tasks, args.dmin, args.dmax, args.min_pos, args.min_neg, seed=5)

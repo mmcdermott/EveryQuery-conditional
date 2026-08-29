@@ -41,6 +41,7 @@ import pytest
 import torch
 from meds import train_split, tuning_split
 from meds_torchdata.config import MEDSTorchDataConfig
+from omegaconf import OmegaConf
 from transformers import ModernBertConfig
 
 from every_query.data.dataset import EveryQueryBatch, EveryQueryPytorchDataset
@@ -62,14 +63,21 @@ _PRED_TIMES: dict[int, datetime] = {
 
 _QUERY_CODES = ["HR", "TEMP"]
 
+# Architecture sizes come from _demo_train.yaml so fixtures and the Hydra demo config
+# can't drift; the remaining fields are the ones train.py injects from the data at
+# runtime, which unit-test fixtures must pin statically.
+_DEMO_TRAIN_YAML = Path(__file__).parent / "src/every_query/train/configs/_demo_train.yaml"
+_demo_train_cfg = OmegaConf.load(_DEMO_TRAIN_YAML)
+_yaml_overrides = OmegaConf.to_container(_demo_train_cfg.lightning_module.model.config_overrides)
+
+# Mirrors training: "bf16-mixed" via ${trainer.precision} — still fp32 weights; autocast
+# (when a test opts in) owns the bf16 casting, exactly as under the Trainer.
+DEMO_PRECISION: str = _demo_train_cfg.lightning_module.model.precision
+
 DEMO_CONFIG_OVERRIDES: dict[str, int] = {
-    "hidden_size": 64,
-    "num_hidden_layers": 2,
-    "num_attention_heads": 2,
-    "intermediate_size": 128,
+    **{k: v for k, v in _yaml_overrides.items() if v != "???"},
     "max_position_embeddings": 128,
     "vocab_size": 100,
-    "pad_token_id": 0,
     "cls_token_id": 1,
     "bos_token_id": 1,
     "sep_token_id": 2,
@@ -93,7 +101,7 @@ def demo_model() -> EveryQueryModel:
     model = EveryQueryModel(
         config_overrides=DEMO_CONFIG_OVERRIDES,
         do_demo=True,
-        precision="32-true",
+        precision=DEMO_PRECISION,
     )
     model.eval()
     return model
@@ -165,24 +173,12 @@ def run_and_check(cmd: list[str], *, env: dict[str, str] | None = None, timeout:
     return result
 
 
-# Placeholder values for the ``ensure_env()`` gate in ``utils/_env.py``.  The demo Hydra configs
-# do not interpolate any of these env vars, so the actual values are inert — they exist purely
-# to let the gate pass on a clean CI machine with no ``.env`` file.
-ENSURE_ENV_PLACEHOLDERS: dict[str, str] = {
-    "PROJECT_DIR": "/tmp",
-    "OUTPUT_DIR": "/tmp",
-    "TASK_DIR": "/tmp",
-    "FINAL_DATA_DIR": "/tmp",
-    "WANDB_ENTITY": "test",
-}
-
-
 @pytest.fixture(scope="session")
 def eq_preprocessed_dataset(simple_static_MEDS: Path, tmp_path_factory: pytest.TempPathFactory) -> Path:
     """Runs ``EQ_process_data do_demo=True`` against ``simple_static_MEDS``.
 
     Returns the tensorized-cohort output dir (``final/``), ready to feed into
-    ``EQ_generate_training_tasks`` and ``EQ_train`` as ``$PROCESSED`` and
+    ``EQ_generate_training_tasks`` and ``EQ_train`` as ``$TENSORIZED_COHORT_DIR`` and
     ``tensorized_cohort_dir`` respectively.
 
     Sibling ``intermediate/`` dir is also produced (needed as ``data_dir`` for
@@ -237,17 +233,15 @@ def eq_sampled_tasks_dir(eq_preprocessed_dataset: Path, tmp_path_factory: pytest
                 "EQ_generate_training_tasks",
                 f"data_dir={intermediate!s}",
                 f"out_dir={out_dir!s}",
+                f"query_codes={eq_preprocessed_dataset!s}",
                 f"split={split}",
-                "input_shard=0",
-                "task_shard=0",
-                "n_tasks=8",
-                "contexts_per_task=2",
-                "duration_min=1",
-                "duration_max=30",
-                "min_context_per_subject=1",
+                "num_queries=8",
+                "num_contexts_per_query=2",
+                "min_duration=1",
+                "max_duration=30",
+                "min_prediction_times_per_subject=1",
                 "seed=1",
             ],
-            env={"PROCESSED": str(eq_preprocessed_dataset)},
             timeout=120.0,
         )
 
@@ -275,7 +269,6 @@ def eq_trained_model_dir(
             f"datamodule.config.tensorized_cohort_dir={eq_preprocessed_dataset!s}",
             f"datamodule.config.task_labels_dir={eq_sampled_tasks_dir!s}",
         ],
-        env=ENSURE_ENV_PLACEHOLDERS,
         timeout=300.0,
     )
     return output_dir
@@ -401,7 +394,7 @@ def sample_batch(demo_dataset: EveryQueryPytorchDataset) -> EveryQueryBatch:
 def seq_task_labels_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """Hand-built ``QuerySeqSchema``-shaped query-sequence labels for train + tuning splits.
 
-    Layout matches ``sample_query_sequences.run_worker`` output::
+    Layout matches ``sample_query_sequences.run`` output::
 
         {seq_task_labels_dir}/{split}/{shard}.parquet
 

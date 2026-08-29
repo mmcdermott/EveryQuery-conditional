@@ -2,7 +2,7 @@
 """Designed, clinically meaningful evaluation of the conditional model on held-out MIMIC-IV.
 
 Three prediction-anchor families (a task's positives/negatives are the anchors where the target
-code does / does not occur in (t, t+d]):
+code does / does not occur in (t, t+d)):
 
   - POST-ADMISSION  : 24 h after a HOSPITAL_ADMISSION event  (acute in-hospital risk).
   - POST-DISCHARGE  : at a HOSPITAL_DISCHARGE//HOME event     (genuine post-discharge outcomes).

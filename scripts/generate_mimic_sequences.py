@@ -1,96 +1,48 @@
 #!/usr/bin/env python
-"""Drive EQ_generate_query_sequences workers across all MIMIC-IV shards in-process.
+"""Superseded: the sequence sampler now fans out across shards by itself.
 
-Usage:
-    python scripts/generate_mimic_sequences.py \
-        --data-dir /path/to/intermediate --out-dir /path/to/tasks \
-        --processed /path/to/preprocessed --split train --n-contexts 2048 --jobs 8
+This script existed because the fork's sampler was **shard-local** — one ``run_worker`` per
+``(input_shard, task_shard)``, each drawing its own contexts from that shard's own events — so
+covering a split meant driving a pool of workers from outside.
 
-One worker per (shard, task_shard); workers are pure functions writing one parquet each, so
-re-running skips existing outputs (resume-friendly).
+The 5-stage rewrite (Phase 2 of ``docs/history/2026-08-18-conditional-v2-integration-plan.md``) moved that fan-out inside
+``EQ_generate_query_sequences``: Stage 0 scans the split once, Stages 1'-3' run in the driver, and
+Stage 4' fans one labeling worker out per shard via a ``ProcessPoolExecutor`` sized by
+``max_workers``.  One invocation now covers the whole split.
+
+Equivalent command::
+
+    EQ_generate_query_sequences \\
+        data_dir=$TOKENIZED_EVENTS_DIR \\
+        out_dir=$TRAINING_TASKS_DIR \\
+        query_codes=$TENSORIZED_COHORT_DIR \\
+        split=train \\
+        num_sequences=... \\
+        min_queries=1 max_queries=5 \\
+        duration_min=1 duration_max=731 \\
+        min_prediction_times_per_subject=50 \\
+        max_workers=8
+
+Note the two semantic changes, both of which shift the training distribution (see §3 of the plan):
+
+- ``--n-contexts`` was a **per-shard** count; ``num_sequences`` is a **global** budget across the
+  split, with contexts drawn weighted by each subject's prediction-time count.
+- ``--min-context-per-subject`` counted *events*; ``min_prediction_times_per_subject`` counts
+  distinct prediction times.  Carrying the old number across is a silent behaviour change.
+
+This file is kept as a signpost rather than deleted so anyone rerunning an old command gets a
+pointer instead of an obscure ``TypeError`` from the removed ``run_worker`` keyword arguments.
 """
 
-import argparse
-import multiprocessing
-import os
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from pathlib import Path
+import sys
 
-os.environ.setdefault("POLARS_MAX_THREADS", "4")
+MESSAGE = __doc__
 
 
-def _worker(args_tuple):
-    from every_query.generate_tasks.sample_query_sequences import run_worker
-
-    kwargs = args_tuple
-    return str(run_worker(**kwargs))
-
-
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--data-dir", required=True, type=Path)
-    p.add_argument("--out-dir", required=True, type=Path)
-    p.add_argument("--processed", required=True, type=Path, help="dir holding metadata/codes.parquet")
-    p.add_argument("--split", default="train")
-    p.add_argument("--n-contexts", type=int, default=2048)
-    p.add_argument("--task-shards", type=int, default=1)
-    p.add_argument("--min-queries", type=int, default=1)
-    p.add_argument("--max-queries", type=int, default=5)
-    p.add_argument("--duration-min", type=int, default=1)
-    p.add_argument("--duration-max", type=int, default=365)
-    p.add_argument("--min-context-per-subject", type=int, default=10)
-    p.add_argument("--eos-first-fraction", type=float, default=0.0)
-    p.add_argument("--duration-mode", default="random", choices=["random", "same", "nondecreasing"])
-    p.add_argument("--seed", type=int, default=1)
-    p.add_argument("--jobs", type=int, default=8)
-    p.add_argument("--limit-shards", type=int, default=None)
-    args = p.parse_args()
-
-    from every_query.generate_tasks.sample_tasks import read_query_codes
-
-    query_codes = read_query_codes(args.processed)
-    print(f"query universe: {len(query_codes)} codes")
-
-    shard_dir = args.data_dir / "data" / args.split
-    shards = sorted(fp.stem for fp in shard_dir.glob("*.parquet"))
-    if args.limit_shards:
-        shards = shards[: args.limit_shards]
-    print(f"{len(shards)} shards x {args.task_shards} task shards for split={args.split}")
-
-    jobs = [
-        dict(
-            data_dir=args.data_dir,
-            out_dir=args.out_dir,
-            query_codes=query_codes,
-            split=args.split,
-            input_shard=shard,
-            task_shard=ts,
-            seed=args.seed,
-            n_contexts=args.n_contexts,
-            min_queries=args.min_queries,
-            max_queries=args.max_queries,
-            duration_min=args.duration_min,
-            duration_max=args.duration_max,
-            min_context_per_subject=args.min_context_per_subject,
-            eos_first_fraction=args.eos_first_fraction,
-            duration_mode=args.duration_mode,
-        )
-        for shard in shards
-        for ts in range(args.task_shards)
-    ]
-
-    done = 0
-    # ``spawn`` (not fork): the parent has live polars/torch thread pools by this point, and
-    # fork-inheriting their locks deadlocks the children on first use.
-    ctx = multiprocessing.get_context("spawn")
-    with ProcessPoolExecutor(max_workers=args.jobs, mp_context=ctx) as ex:
-        futures = [ex.submit(_worker, j) for j in jobs]
-        for fut in as_completed(futures):
-            fut.result()  # re-raise worker errors
-            done += 1
-            if done % 20 == 0 or done == len(jobs):
-                print(f"{done}/{len(jobs)} workers done")
+def main() -> int:
+    print(MESSAGE, file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

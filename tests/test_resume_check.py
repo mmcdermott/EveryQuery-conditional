@@ -40,6 +40,54 @@ def test_resume_ignores_legacy_query_stanza(tmp_path: Path) -> None:
     validate_resume_directory(tmp_path, new_cfg)
 
 
+def test_resume_survives_the_amp_precision_move(tmp_path: Path) -> None:
+    """A run dir predating the AMP move — no ``trainer.precision``, old model value — still resumes."""
+    saved = tmp_path / "config.yaml"
+    _write_cfg(
+        saved,
+        trainer={"accelerator": "auto"},
+        lightning_module={"model": {"precision": "16-mixed"}},
+    )
+
+    new_cfg = OmegaConf.create(
+        {
+            "seed": 140799,
+            "datamodule": {"config": {"max_seq_len": 256}},
+            "trainer": {"accelerator": "auto", "precision": "bf16-mixed"},
+            "lightning_module": {"model": {"precision": "bf16-mixed"}},
+        }
+    )
+
+    validate_resume_directory(tmp_path, new_cfg)
+
+
+def test_resume_still_rejects_precision_drift_after_the_amp_move(tmp_path: Path) -> None:
+    """Once a run dir has ``trainer.precision``, precision drift raises again.
+
+    The legacy exemption must not become a blanket allow-list: ``bf16-true`` casts weights to bf16
+    via Lightning's ``HalfPrecision.convert_module``, so silently accepting it would resume with
+    half-precision masters.
+    """
+    saved = tmp_path / "config.yaml"
+    _write_cfg(
+        saved,
+        trainer={"accelerator": "auto", "precision": "bf16-mixed"},
+        lightning_module={"model": {"precision": "bf16-mixed"}},
+    )
+
+    new_cfg = OmegaConf.create(
+        {
+            "seed": 140799,
+            "datamodule": {"config": {"max_seq_len": 256}},
+            "trainer": {"accelerator": "auto", "precision": "bf16-true"},
+            "lightning_module": {"model": {"precision": "bf16-true"}},
+        }
+    )
+
+    with pytest.raises(ValueError, match="precision"):
+        validate_resume_directory(tmp_path, new_cfg)
+
+
 def test_resume_rejects_non_legacy_drift(tmp_path: Path) -> None:
     """A structural mismatch outside the allow-list / legacy set must still raise."""
     saved = tmp_path / "config.yaml"

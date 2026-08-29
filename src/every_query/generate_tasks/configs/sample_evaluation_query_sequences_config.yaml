@@ -1,34 +1,67 @@
 # Hydra config for the dense-grid conditional query-*sequence* evaluation generator.
 #
-# Sibling to `sample_query_sequences_config.yaml` (scattered shape: every context draws its
-# own independent sequence).  This endpoint takes a supplied cohort and labels the *same* N
-# query sequences at every context in it — the row shape per-sequence metrics need.
+# Same knobs and semantics as `sample_evaluation_tasks_config.yaml`, extended from a
+# `codes x durations` grid to ordered query sequences: `K` prediction times are sampled per subject
+# of every shard of `split` (gated on `min_context_per_subject` prior events, optionally subsampled
+# by subject) and the *same* `N` sequences are labeled at every one of them.  The cohort half reuses
+# `sample_evaluation_tasks`' sampler on its seed axes, so for one `(seed, split, K, min_context,
+# fraction)` both generators score the identical `(subject, time)` set — the flat grid and the
+# sequence grid are directly comparable.  This endpoint emits QuerySeqSchema rows
+# (queries/durations/answers list columns) for EQ_predict_sequences, where that one emits flat
+# TaskQuerySchema rows for EQ_predict.
 #
-# Relationship to `sample_evaluation_tasks_config.yaml`: same dense-grid motivation, but that
-# one emits flat TaskQuerySchema rows for EQ_predict/EQ_evaluate, while this one emits
-# QuerySeqSchema rows (queries/durations/answers list columns) for EQ_predict_sequences.
+# All shards under `{data_dir}/data/{split}/*.parquet` are discovered and processed in one
+# invocation (one output parquet per shard) — there is no shard knob.
 #
-# Path roots follow the same `.env` fallback convention as `sample_tasks_config.yaml`:
-#   data_dir  -> $INTERMEDIATE   (event shards live under `{data_dir}/data/{split}/*.parquet`;
-#                                 every cohort subject must be present in `split`)
-#   out_dir   -> $TASK_DIR
-#   query_codes: null -> $PROCESSED/metadata/codes.parquet
+# Path roots are machine-specific, **required** Hydra args — no `.env`/env-var fallback (#235).
+# Pass them on the CLI as shell-expanded vars:
+#   data_dir=$TOKENIZED_EVENTS_DIR out_dir=$EVAL_SEQ_TASKS_DIR query_codes=$TENSORIZED_COHORT_DIR
 #
-# Output layout (both directly usable as `EQ_predict_sequences tasks_dir=...`):
-#   per_spec_dirs=false  ->  {out_dir}/{split}/{contexts_stem}__{specs_tag}.parquet
-#   per_spec_dirs=true   ->  {out_dir}/{spec_name}/{split}/tasks.parquet
+#   data_dir     MEDS dataset root (event shards under `{data_dir}/data/{split}/*.parquet`)
+#   out_dir      output root (layout below).  Give it a root distinct from
+#                `EQ_generate_evaluation_tasks`' — both write `eval/{split}/{shard}.parquet`, in
+#                incompatible schemas, and EQ_predict_sequences rglobs whatever it is pointed at.
+#   query_codes  vocabulary: a metadata root dir (loads `{dir}/metadata/codes.parquet`), an
+#                explicit Hydra list, or a YAML/parquet path.  With `sequences_path` set it is
+#                used only to reject codes outside the model's vocabulary.
+#
+# Output layout (`{out_dir}/eval` is directly usable as `EQ_predict_sequences tasks_dir=...`):
+#   {out_dir}/eval/{split}/{shard}.parquet          labeled grid, one file per shard
+#   {out_dir}/eval_unique/{split}/{shard}.parquet   deduped (subject_id, prediction_time)
+# The only intermediate is the per-shard provenance sidecar at the sibling
+# `{out_dir}_artifacts/_labeled/eval/{split}/{shard}.json`, recording the ontology, specs and cohort
+# source the shard was labeled under; `overwrite: false` skips a shard only when all three match.
 
-data_dir: null
-out_dir: null
-query_codes: null
+data_dir: ???
+out_dir: ???
+query_codes: ???
 
 split: held_out # typical inference split; use `tuning` for intermediate validation.
 seed: 1
 
-# --- The cohort (required) ------------------------------------------------
-# Parquet with at least (subject_id, prediction_time).  Extra columns are dropped; duplicate
-# contexts are deduped (a dense grid asks each sequence about each context exactly once).
+# --- The cohort (identical to sample_evaluation_tasks_config.yaml) ----------------------------
+# How many prediction times to sample per subject.  The grid is
+# `prediction_times_per_subject x n_sequences` rows per subject.
+prediction_times_per_subject: 1
+
+# Minimum prior events a subject must have accumulated before a prediction time is valid.
+min_context_per_subject: 50
+
+# Optional subject subsample: a float in (0, 1] applies a deterministic per-subject hash-threshold
+# filter, so the expected fraction is honored regardless of shard size and is a uniform global
+# subsample (subject IDs are disjoint across shards).  Values outside (0, 1] raise.  null disables.
+subject_subsample_fraction: null
+
+# Supplied-cohort override: a parquet with at least (subject_id, prediction_time).  Extra columns
+# are dropped and duplicate rows deduped.  When set, the three knobs above are ignored — the cohort
+# is labeled verbatim, partitioned into shard files by subject — and every subject must be present
+# in `split`, or the run raises before labeling anything.  Leave null to sample the cohort.
 contexts_path: null
+
+# Also emit the deduped (subject_id, prediction_time) parquet under
+# {out_dir}/eval_unique/{split}/{shard}.parquet — the input shape a trajectory-generation baseline
+# expects (one trajectory per prediction time, not one per sequence).
+write_unique_prediction_times: true
 
 # --- The N query sequences ------------------------------------------------
 # Path to designed sequences.  Leave null to instead draw `n_sequences` of them from the
@@ -36,15 +69,17 @@ contexts_path: null
 sequences_path: null
 #
 # `sequences_path` accepts any of:
-#   YAML/JSON mapping    name -> [[code, duration], ...]     (names become output dir names)
+#   YAML/JSON mapping    name -> [[code, duration], ...]
 #   YAML/JSON list       [[[code, duration], ...], ...]      (names auto-generated)
-#   long-format parquet  (seq_id, position, query, duration_days)
+#   long-format parquet  (seq_id, position, query, duration_days[, bound_event])
 # e.g. designed.yaml:
 #   mortality_30d:
 #     - [TIMELINE//END, 1]
 #     - [MEDS_DEATH, 30]
+#   sepsis_before_discharge:
+#     - [SEPSIS, -1, HOSPITAL_DISCHARGE//HOME]
 # On this path nothing is sampled: the codes and durations are exactly what you wrote, and
-# `query_codes` is used only to reject codes outside the model's vocabulary.
+# `query_codes` is used only to reject query and boundary codes outside the model's vocabulary.
 
 # --- Sampling knobs (all `sequences_path: null` only) ---------------------
 # The code and duration distributions below mirror `sample_query_sequences_config.yaml` so a
@@ -52,7 +87,9 @@ sequences_path: null
 # If your checkpoint was trained with overrides, pass the same overrides here — an
 # out-of-distribution horizon shows up as an unexplained metric shift, not as an error.
 
-# Number of sequences to draw.  They are drawn once and shared across every cohort context.
+# Number of sequences to draw.  They are drawn once, seeded on `(seed, "eval_seq_specs", split)`
+# alone, and shared across every context of every shard — so the same `(seed, split)` yields the
+# same `N` sequences for any cohort, and two cohorts' metrics are comparable query-for-query.
 n_sequences: 64
 
 # Sequence length ~ Uniform{min_queries..max_queries} inclusive, per sequence.  Fixed at 3
@@ -61,14 +98,18 @@ n_sequences: 64
 # distribution, since 3 is inside the range the model was trained on — unlike the duration
 # bounds below, widening/narrowing these does not move the grid off-distribution as long as
 # they stay within `[training min_queries, training max_queries]`.
-min_queries: 3
-max_queries: 3
+min_queries: 1
+max_queries: 1
 
 # Duration bounds in days.  Each query's horizon is drawn log-uniformly over the continuous
-# [min, max] interval, then rounded and clipped to whole days — so it skews short: over
+# [min, max] interval and kept as a **float** (no day-rounding) — so it skews short: over
 # 1..731 the median is ~27d and ~52% of horizons are <= 30d.
+# These three must stay byte-equal to `sample_query_sequences_config.yaml` (a test asserts it):
+# both sides feed the same `QueryDistribution`, so any drift silently makes the eval grid
+# out-of-distribution and reads as an unexplained metric shift rather than an error.
 duration_min: 1
 duration_max: 731
+duration_distribution: log-uniform # uniform | log-uniform
 
 # Codes are drawn per query (not per sequence) iid uniform over `query_codes`, with
 # replacement — a code can repeat within a sequence, and TIMELINE//END is an ordinary member,
@@ -78,12 +119,25 @@ duration_max: 731
 eos_first_fraction: 0.0
 duration_mode: random
 
-# Write one output dir per sequence (`{out_dir}/{spec_name}/{split}/tasks.parquet`) instead of
-# one combined parquet.  Useful with designed, named sequences: each dir is independently
-# scoreable, so per-task metrics need no post-hoc grouping.  With the combined file, sequence
-# identity is recoverable from the queries/durations columns, or from row order — row i is
-# (contexts[i // N], specs[i % N]).
-per_spec_dirs: false
+# --- Event-bounded duration queries -----------------------------------------------------------
+# Must mirror sample_query_sequences_config.yaml exactly (the two are asserted key-identical on
+# every sampling knob): a knob that drifts between the training sampler and the eval grid
+# silently invalidates the grid.  See that file for the full explanation.
+#
+# Fraction of *sampled* eval queries that are event-bounded; the boundary is drawn uniformly from
+# the query universe (leaves plus, with `ontology_dir`, ancestor nodes).  Designed specs set their
+# bounds explicitly instead, via a `[code, -1, bound_event]` triple or the parquet `bound_event`
+# column; this fraction is ignored when `sequences_path` is set.
+eventbound_fraction: 0.5
+
+# --- Ontology / hierarchical embeddings ---------------------------------------------------------
+# Directory of ontology artifacts written by EQ_build_ontology (nodes/mix/closure parquets).
+# Set it to put every ancestor NODE into the query universe — each leaf and each ancestor is then
+# drawn with equal probability, as a query and as an event boundary — and to explode the event
+# stream through the closure so an ancestor query is labelled by ordinary occurrence ("did any
+# descendant of X occur").  null = off (leaf codes only).  Must be the SAME directory the model is
+# trained with — the indices have to agree, or a query would address the wrong embedding row.
+ontology_dir: null
 
 overwrite: false
 

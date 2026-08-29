@@ -15,7 +15,7 @@ import pytest
 import yaml
 from meds import train_split, tuning_split
 
-from conftest import ENSURE_ENV_PLACEHOLDERS, run_and_check
+from conftest import run_and_check
 
 EVAL_V3 = Path(__file__).parent.parent / "scripts" / "eval_v3.py"
 
@@ -44,7 +44,13 @@ def test_cli_help_exits_zero(cli):
 
 @pytest.fixture(scope="session")
 def cq_sequence_tasks_dir(eq_preprocessed_dataset: Path, tmp_path_factory) -> Path:
-    """Runs ``EQ_generate_query_sequences`` for train + tuning splits on the fixture cohort."""
+    """Runs the sampled 5-stage ``EQ_generate_query_sequences`` for train + tuning splits.
+
+    Exercises the Phase-2 pipeline end to end: Stage 0 builds the prediction-time map, Stage 1'
+    draws the sequences, Stage 2 the contexts, Stage 3' the per-shard index, and Stage 4' fans out
+    the labeling.  ``min_prediction_times_per_subject=1`` because the demo cohort's subjects have
+    only a handful of distinct times each.
+    """
     intermediate = eq_preprocessed_dataset.parent / "intermediate"
     out_dir = tmp_path_factory.mktemp("cq_seq_tasks")
     for split in (train_split, tuning_split):
@@ -53,26 +59,27 @@ def cq_sequence_tasks_dir(eq_preprocessed_dataset: Path, tmp_path_factory) -> Pa
                 "EQ_generate_query_sequences",
                 f"data_dir={intermediate!s}",
                 f"out_dir={out_dir!s}",
+                f"query_codes={eq_preprocessed_dataset!s}",
                 f"split={split}",
-                "input_shard=0",
-                "task_shard=0",
-                "n_contexts=8",
+                "num_sequences=8",
                 "min_queries=1",
                 "max_queries=5",
                 "duration_min=1",
                 "duration_max=30",
-                "min_context_per_subject=1",
+                "min_prediction_times_per_subject=1",
                 "seed=1",
             ],
-            env={"PROCESSED": str(eq_preprocessed_dataset)},
             timeout=120.0,
         )
     return out_dir
 
 
 def test_generated_sequences_conform(cq_sequence_tasks_dir: Path):
-    fp = cq_sequence_tasks_dir / train_split / "0__0000.parquet"
-    assert fp.exists()
+    # Outputs are named after the data shards now (one per Stage 3' index partition), and the
+    # final root holds nothing but {shard}.parquet -- intermediates live in the _artifacts sibling.
+    shards = sorted((cq_sequence_tasks_dir / train_split).glob("*.parquet"))
+    assert shards, f"no output shards under {cq_sequence_tasks_dir / train_split}"
+    fp = shards[0]
     df = pl.read_parquet(fp)
     assert df.height > 0
     assert set(df.columns) >= {"subject_id", "prediction_time", "queries", "durations", "answers"}
@@ -87,38 +94,26 @@ def test_generated_sequences_conform(cq_sequence_tasks_dir: Path):
     assert df["answers"].explode().null_count() == 0
 
 
-def test_supplied_contexts_mode(eq_preprocessed_dataset: Path, tmp_path: Path):
-    """``contexts_path`` scores a user-supplied index df: N sequences per row, K queries each."""
-    intermediate = eq_preprocessed_dataset.parent / "intermediate"
-    shard = pl.read_parquet(next((intermediate / "data" / train_split).rglob("*.parquet")))
-    cohort = shard.group_by("subject_id").agg(pl.col("time").max().alias("prediction_time")).head(3)
-    cohort_fp = tmp_path / "cohort.parquet"
-    cohort.write_parquet(cohort_fp)
+def test_sampled_run_writes_exactly_num_sequences_across_shards(cq_sequence_tasks_dir: Path):
+    """The global budget is honoured: one output row per sampled sequence, split-wide."""
+    for split in (train_split, tuning_split):
+        total = sum(pl.read_parquet(fp).height for fp in (cq_sequence_tasks_dir / split).glob("*.parquet"))
+        assert total == 8, f"{split}: expected num_sequences=8 rows, found {total}"
 
-    out_dir = tmp_path / "out"
-    run_and_check(
-        [
-            "EQ_generate_query_sequences",
-            f"data_dir={intermediate!s}",
-            f"out_dir={out_dir!s}",
-            f"split={train_split}",
-            f"contexts_path={cohort_fp!s}",
-            "n_replicates=4",
-            "min_queries=5",
-            "max_queries=5",
-            "duration_min=1",
-            "duration_max=365",
-        ],
-        env={"PROCESSED": str(eq_preprocessed_dataset)},
-        timeout=120.0,
-    )
 
-    df = pl.read_parquet(out_dir / train_split / "cohort__0000.parquet")
-    assert df.height == cohort.height * 4
-    assert (df["queries"].list.len() == 5).all()
-    # Every supplied context is present, each replicated exactly 4x.
-    counts = df.group_by("subject_id", "prediction_time").len()
-    assert counts.height == cohort.height and (counts["len"] == 4).all()
+def test_sampled_run_keeps_the_two_artifact_roots_disjoint(cq_sequence_tasks_dir: Path):
+    """Invariant 7: the final root holds only ``{shard}.parquet``; intermediates go to the sibling.
+
+    MEDS-TorchData rglobs the task-labels dir, so any stray parquet or ``_``-prefixed entry leaking
+    into the final root would be picked up as labels and break the schema-concat downstream.
+    """
+    artifacts = cq_sequence_tasks_dir.parent / f"{cq_sequence_tasks_dir.name}_artifacts"
+    assert (artifacts / train_split / "_prediction_time_counts.parquet").exists()
+    assert list((artifacts / train_split / "_index").glob("*.parquet"))
+
+    stray = [p.name for p in (cq_sequence_tasks_dir / train_split).iterdir() if p.name.startswith("_")]
+    assert not stray, f"intermediates leaked into the final output root: {stray}"
+    assert artifacts not in cq_sequence_tasks_dir.parents, "artifact roots must never nest"
 
 
 @pytest.fixture
@@ -142,6 +137,7 @@ def test_dense_grid_sampled_sequences(eq_preprocessed_dataset: Path, cq_cohort_f
             "EQ_generate_evaluation_query_sequences",
             f"data_dir={intermediate!s}",
             f"out_dir={out_dir!s}",
+            f"query_codes={eq_preprocessed_dataset!s}",
             f"split={train_split}",
             f"contexts_path={cq_cohort_fp!s}",
             "n_sequences=3",
@@ -154,7 +150,12 @@ def test_dense_grid_sampled_sequences(eq_preprocessed_dataset: Path, cq_cohort_f
         timeout=120.0,
     )
 
-    df = pl.read_parquet(out_dir / train_split / "cohort__sampled3.parquet")
+    # One output per shard of the split; the fixture cohort is a single shard.
+    fps = sorted((out_dir / "eval" / train_split).glob("*.parquet"))
+    assert [fp.stem for fp in fps] == sorted(
+        p.stem for p in (intermediate / "data" / train_split).glob("*.parquet")
+    )
+    df = pl.concat([pl.read_parquet(fp) for fp in fps])
     assert df.height == n_contexts * 3
     assert (df["queries"].list.len() == 4).all()
     assert df["answers"].explode().null_count() == 0
@@ -168,7 +169,7 @@ def test_dense_grid_sampled_sequences(eq_preprocessed_dataset: Path, cq_cohort_f
     assert per_ctx.height == n_contexts
     assert per_ctx["specs"].n_unique() == 1, "all contexts must share one set of query sequences"
 
-    # Row order is context-major: row i is (contexts[i // N], specs[i % N]).
+    # Row order is context-major within a shard file: row i is (contexts[i // N], specs[i % N]).
     subjects = df["subject_id"].unique(maintain_order=True)
     assert df["subject_id"].to_list() == [s for s in subjects for _ in range(3)]
     first_specs = df.head(3).select("queries", "durations").rows()
@@ -184,6 +185,7 @@ def test_dense_grid_skips_existing_output(eq_preprocessed_dataset: Path, cq_coho
         "EQ_generate_evaluation_query_sequences",
         f"data_dir={intermediate!s}",
         f"out_dir={out_dir!s}",
+        f"query_codes={eq_preprocessed_dataset!s}",
         f"split={train_split}",
         f"contexts_path={cq_cohort_fp!s}",
         "n_sequences=2",
@@ -194,7 +196,7 @@ def test_dense_grid_skips_existing_output(eq_preprocessed_dataset: Path, cq_coho
     ]
     env = {"PROCESSED": str(eq_preprocessed_dataset)}
     run_and_check(cmd, env=env, timeout=120.0)
-    fp = out_dir / train_split / "cohort__sampled2.parquet"
+    fp = out_dir / "eval" / train_split / "0.parquet"
     before = fp.stat().st_mtime_ns
 
     run_and_check(cmd, env=env, timeout=120.0)
@@ -204,10 +206,8 @@ def test_dense_grid_skips_existing_output(eq_preprocessed_dataset: Path, cq_coho
     assert fp.stat().st_mtime_ns != before, "overwrite=true must regenerate"
 
 
-def test_dense_grid_designed_sequences_per_spec_dirs(
-    eq_preprocessed_dataset: Path, cq_cohort_fp: Path, tmp_path: Path
-):
-    """Designed named sequences from YAML, one independently-scoreable output dir per task."""
+def test_dense_grid_designed_sequences(eq_preprocessed_dataset: Path, cq_cohort_fp: Path, tmp_path: Path):
+    """Designed named sequences from YAML land verbatim in the grid, N per context."""
     intermediate = eq_preprocessed_dataset.parent / "intermediate"
     n_contexts = pl.read_parquet(cq_cohort_fp).height
     codes = pl.read_parquet(eq_preprocessed_dataset / "metadata" / "codes.parquet")["code"].to_list()
@@ -218,7 +218,7 @@ def test_dense_grid_designed_sequences_per_spec_dirs(
         yaml.safe_dump(
             {
                 "end_then_target": [["TIMELINE//END", 1], [target, 30]],
-                "target_only": [[target, 7]],
+                "target_before_end": [[target, -1, "TIMELINE//END"]],
             }
         )
     )
@@ -229,22 +229,26 @@ def test_dense_grid_designed_sequences_per_spec_dirs(
             "EQ_generate_evaluation_query_sequences",
             f"data_dir={intermediate!s}",
             f"out_dir={out_dir!s}",
+            f"query_codes={eq_preprocessed_dataset!s}",
             f"split={train_split}",
             f"contexts_path={cq_cohort_fp!s}",
             f"sequences_path={sequences_fp!s}",
-            "per_spec_dirs=true",
         ],
         env={"PROCESSED": str(eq_preprocessed_dataset)},
         timeout=120.0,
     )
 
-    # Each spec gets its own `tasks_dir`-shaped directory: {out_dir}/{name}/{split}/tasks.parquet.
-    two = pl.read_parquet(out_dir / "end_then_target" / train_split / "tasks.parquet")
-    one = pl.read_parquet(out_dir / "target_only" / train_split / "tasks.parquet")
+    # Spec identity is the (queries, durations) columns: group on them to score one task at a time.
+    df = pl.read_parquet(out_dir / "eval" / train_split / "0.parquet")
+    assert df.height == 2 * n_contexts
+    two = df.filter(pl.col("queries").list.len() == 2)
+    one = df.filter(pl.col("queries").list.len() == 1)
     assert two.height == n_contexts and one.height == n_contexts
     assert two["queries"].to_list() == [["TIMELINE//END", target]] * n_contexts
     assert two["durations"].to_list() == [[1.0, 30.0]] * n_contexts
     assert one["queries"].to_list() == [[target]] * n_contexts
+    assert one["durations"].to_list() == [[-1.0]] * n_contexts
+    assert one["bound_events"].to_list() == [["TIMELINE//END"]] * n_contexts
     assert one["answers"].explode().null_count() == 0
 
 
@@ -262,6 +266,7 @@ def test_dense_grid_rejects_out_of_vocab_code(
                 "EQ_generate_evaluation_query_sequences",
                 f"data_dir={intermediate!s}",
                 f"out_dir={tmp_path / 'out'!s}",
+                f"query_codes={eq_preprocessed_dataset!s}",
                 f"split={train_split}",
                 f"contexts_path={cq_cohort_fp!s}",
                 f"sequences_path={sequences_fp!s}",
@@ -284,7 +289,6 @@ def cq_trained_model_dir(
             f"datamodule.config.tensorized_cohort_dir={eq_preprocessed_dataset!s}",
             f"datamodule.config.task_labels_dir={cq_sequence_tasks_dir!s}",
         ],
-        env=ENSURE_ENV_PLACEHOLDERS,
         timeout=300.0,
     )
     return output_dir
@@ -301,7 +305,8 @@ def test_conditional_predict_and_evaluate(
     # Predict on the tuning split sequences (the fixture cohort has no held_out labels here).
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
-    src = cq_sequence_tasks_dir / tuning_split / "0__0000.parquet"
+    # The sampled path names outputs after the data shards; take the first one.
+    src = sorted((cq_sequence_tasks_dir / tuning_split).glob("*.parquet"))[0]
     (tasks_dir / "tasks.parquet").write_bytes(src.read_bytes())
 
     predictions_fp = tmp_path / "predictions.parquet"
@@ -313,7 +318,6 @@ def test_conditional_predict_and_evaluate(
             f"output_parquet={predictions_fp!s}",
             f"split={tuning_split}",
         ],
-        env=ENSURE_ENV_PLACEHOLDERS,
         timeout=300.0,
     )
 
@@ -356,6 +360,7 @@ def test_dense_grid_is_scoreable_by_predict_sequences(
             "EQ_generate_evaluation_query_sequences",
             f"data_dir={intermediate!s}",
             f"out_dir={tasks_dir!s}",
+            f"query_codes={eq_preprocessed_dataset!s}",
             f"split={tuning_split}",
             f"contexts_path={cohort_fp!s}",
             "n_sequences=2",
@@ -367,7 +372,7 @@ def test_dense_grid_is_scoreable_by_predict_sequences(
         env={"PROCESSED": str(eq_preprocessed_dataset)},
         timeout=120.0,
     )
-    tasks_fp = tasks_dir / tuning_split / "cohort__sampled2.parquet"
+    tasks_fp = tasks_dir / "eval" / tuning_split / "0.parquet"
     tasks = pl.read_parquet(tasks_fp)
     assert tasks.height == cohort.height * 2
 
@@ -376,11 +381,11 @@ def test_dense_grid_is_scoreable_by_predict_sequences(
         [
             "EQ_predict_sequences",
             f"model_run_dir={cq_trained_model_dir!s}",
-            f"tasks_dir={tasks_dir!s}",
+            # Point at `eval/`, not the root: MEDS-TorchData rglobs, and `eval_unique/` is not labels.
+            f"tasks_dir={tasks_dir / 'eval'!s}",
             f"output_parquet={predictions_fp!s}",
             f"split={tuning_split}",
         ],
-        env=ENSURE_ENV_PLACEHOLDERS,
         timeout=300.0,
     )
 
@@ -399,14 +404,11 @@ def test_eval_v3_scores_supplied_sequences(
 ):
     """``scripts/eval_v3.py`` score-last inference over a supplied QuerySeqSchema parquet.
 
-    Uses ``contexts_path`` mode so the tasks carry replicates, exercising the alignment check and
-    the extra-column passthrough that make positional attachment of probabilities sound.
+    Tasks come from the sampled training pipeline (fixed length 3), so the parquet carries repeated
+    ``(subject_id, prediction_time)`` keys the way any sampled split does, exercising the alignment
+    check and the extra-column passthrough that make positional attachment of probabilities sound.
     """
     intermediate = eq_preprocessed_dataset.parent / "intermediate"
-    shard = pl.read_parquet(next((intermediate / "data" / tuning_split).rglob("*.parquet")))
-    cohort = shard.group_by("subject_id").agg(pl.col("time").max().alias("prediction_time")).head(3)
-    cohort_fp = tmp_path / "cohort.parquet"
-    cohort.write_parquet(cohort_fp)
 
     tasks_dir = tmp_path / "tasks"
     run_and_check(
@@ -414,19 +416,19 @@ def test_eval_v3_scores_supplied_sequences(
             "EQ_generate_query_sequences",
             f"data_dir={intermediate!s}",
             f"out_dir={tasks_dir!s}",
+            f"query_codes={eq_preprocessed_dataset!s}",
             f"split={tuning_split}",
-            f"contexts_path={cohort_fp!s}",
-            "n_replicates=2",
+            "num_sequences=6",
             "min_queries=3",
             "max_queries=3",
             "duration_min=1",
             "duration_max=30",
+            "min_prediction_times_per_subject=1",
         ],
         env={"PROCESSED": str(eq_preprocessed_dataset)},
         timeout=120.0,
     )
-    tasks_fp = tasks_dir / tuning_split / "cohort__0000.parquet"
-    n_seqs = pl.read_parquet(tasks_fp).height
+    n_seqs = sum(pl.read_parquet(fp).height for fp in (tasks_dir / tuning_split).glob("*.parquet"))
 
     out_dir = tmp_path / "eval_v3_out"
     script = EVAL_V3
@@ -452,7 +454,6 @@ def test_eval_v3_scores_supplied_sequences(
             "--min-neg",
             "1",
         ],
-        env=ENSURE_ENV_PLACEHOLDERS,
         timeout=300.0,
     )
 
@@ -507,7 +508,6 @@ def test_eval_v3_scores_supplied_sequences(
             "--force-prior",
             "yes",
         ],
-        env=ENSURE_ENV_PLACEHOLDERS,
         timeout=300.0,
     )
     forced = pl.read_parquet(forced_dir / "predictions.parquet")
@@ -623,7 +623,8 @@ def test_eval_v3_rejects_wrong_split(
     """Subjects absent from ``--split`` are dropped by the schema_df semi-join; that must not be silent."""
     tasks_dir = tmp_path / "tasks"
     (tasks_dir / train_split).mkdir(parents=True)
-    src = cq_sequence_tasks_dir / train_split / "0__0000.parquet"
+    # The sampled path names outputs after the data shards; take the first one.
+    src = sorted((cq_sequence_tasks_dir / train_split).glob("*.parquet"))[0]
     (tasks_dir / train_split / "tasks.parquet").write_bytes(src.read_bytes())
 
     script = EVAL_V3
@@ -643,6 +644,5 @@ def test_eval_v3_rejects_wrong_split(
                 "--out-dir",
                 str(tmp_path / "out"),
             ],
-            env=ENSURE_ENV_PLACEHOLDERS,
             timeout=300.0,
         )

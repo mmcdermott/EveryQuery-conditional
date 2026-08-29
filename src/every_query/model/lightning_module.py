@@ -1,5 +1,6 @@
 import copy
 import logging
+import math
 import re
 from collections.abc import Callable, Iterator
 from functools import partial
@@ -115,18 +116,41 @@ def _dict_to_factory(d: dict[str, Any] | None) -> partial | None:
 
 
 class EveryQueryLightningModule(L.LightningModule):
-    """LightningModule for EveryQuery with factory-friendly optimizers and metrics."""
+    """LightningModule for EveryQuery with factory-friendly optimizers and metrics.
+
+    ``warmup_ratio`` is the fraction of total optimizer steps spent in LR warmup; the
+    step counts themselves are derived from the trainer at fit time (see
+    ``configure_optimizers``).  It must lie in ``[0.0, 1.0]``:
+
+    Examples:
+        >>> EveryQueryLightningModule(model=demo_model, warmup_ratio=1.5)
+        Traceback (most recent call last):
+            ...
+        ValueError: warmup_ratio must be in [0.0, 1.0], got 1.5
+        >>> EveryQueryLightningModule(model=demo_model, warmup_ratio=-0.1)
+        Traceback (most recent call last):
+            ...
+        ValueError: warmup_ratio must be in [0.0, 1.0], got -0.1
+    """
 
     def __init__(
         self,
         model: EveryQueryModel,
         optimizer: Callable[[Iterator[torch.nn.parameter.Parameter]], torch.optim.Optimizer] | None = None,
-        LR_scheduler: Callable[[torch.optim.Optimizer], torch.optim.lr_scheduler._LRScheduler] | None = None,
+        LR_scheduler: Callable[..., Any] | None = None,
+        warmup_ratio: float = 0.0,
+        grad_norm_log_every_n_steps: int = 1000,
     ):
         super().__init__()
+        if not 0.0 <= warmup_ratio <= 1.0:
+            raise ValueError(f"warmup_ratio must be in [0.0, 1.0], got {warmup_ratio}")
         self.model = model
         self.optimizer_factory = optimizer
         self.LR_scheduler_factory = LR_scheduler
+        self.warmup_ratio = warmup_ratio
+        # Logging knob only — intentionally kept out of save_hyperparameters so old
+        # checkpoints load unchanged and load_from_checkpoint needs no edits.
+        self.grad_norm_log_every_n_steps = grad_norm_log_every_n_steps
 
         self.metrics = {
             train_split: {},
@@ -145,6 +169,7 @@ class EveryQueryLightningModule(L.LightningModule):
                 "model": getattr(model, "hparams", {}),
                 "optimizer": _factory_to_dict(self.optimizer_factory),
                 "LR_scheduler": _factory_to_dict(self.LR_scheduler_factory),
+                "warmup_ratio": warmup_ratio,
             }
         )
 
@@ -248,7 +273,7 @@ class EveryQueryLightningModule(L.LightningModule):
                 self._update_metric(
                     name="censor_auc",
                     split=split,
-                    preds=outputs.censor_logits.detach().cpu().squeeze(1).sigmoid().float(),
+                    preds=outputs.censor_logits.detach().cpu().squeeze(1).float().sigmoid(),
                     target=batch.censor.detach().cpu().long(),
                 )
             if (
@@ -256,7 +281,7 @@ class EveryQueryLightningModule(L.LightningModule):
                 and getattr(batch, "occurs", None) is not None
             ):
                 mask = (~batch.censor).detach().cpu().bool() if hasattr(batch, "censor") else None
-                preds = outputs.occurs_logits.detach().cpu().squeeze(1).sigmoid().float()
+                preds = outputs.occurs_logits.detach().cpu().squeeze(1).float().sigmoid()
                 target = batch.occurs.detach().cpu().long()
                 if mask is not None:
                     preds = preds[mask]
@@ -264,10 +289,90 @@ class EveryQueryLightningModule(L.LightningModule):
                 if preds.numel() > 0:
                     self._update_metric(name="occurs_auc", split=split, preds=preds, target=target)
 
+    def _encoder_grad_norm(self, task_loss: torch.Tensor) -> torch.Tensor:
+        """Global L2 norm of d(task_loss)/d(encoder), over ``self.model.HF_model`` params only.
+
+        Examples:
+            >>> loss, outputs = demo_lightning_module.model(sample_batch)
+            >>> n = demo_lightning_module._encoder_grad_norm(outputs.censor_loss)
+            >>> n.ndim, bool(n.isfinite()), bool(n >= 0)
+            (0, True, True)
+
+            ``torch.autograd.grad`` never writes into ``.grad``, so optimization state
+            is untouched:
+
+            >>> all(p.grad is None for p in demo_lightning_module.model.HF_model.parameters())
+            True
+
+            The graph is retained, so the total loss can still be backpropagated
+            afterwards (as Lightning does after training_step):
+
+            >>> loss.backward()
+        """
+        # ponytail: reentrant grad-ckpt breaks autograd.grad; pass
+        # gradient_checkpointing_kwargs={"use_reentrant": False} in model.py if
+        # do_grad_ckpt runs ever need these norms.
+        encoder_params = [p for p in self.model.HF_model.parameters() if p.requires_grad]
+        # torch.autograd.grad (not .backward()) returns grads as a tuple and never
+        # writes into p.grad, so this cannot pollute the optimizer step or trip
+        # DDP's reducer (its allreduce hooks only fire on .grad accumulation during
+        # .backward(), so these norms are per-rank/local — fine for logging).
+        #
+        # retain_graph=True: Lightning runs the real backward on the total loss
+        # *after* training_step returns, and we call this twice (once per task
+        # loss) on the same graph — the graph must survive all of that.
+        #
+        # allow_unused=True: on an all-censored batch, occurs_loss is the
+        # differentiable zero `logits.sum() * 0.0` (see model._get_loss); its graph
+        # may not reach every encoder parameter, and unused params come back as
+        # None — we skip those (norm contribution 0).
+        #
+        # create_graph is left False (default): grads are not part of a new graph,
+        # so there is no second-order autograd cost or memory retention.
+        #
+        # Under AMP this differentiates the *unscaled* loss (bypassing Lightning's
+        # GradScaler), giving true norms; with "16-mixed" tiny intermediate fp16
+        # grads can underflow so norms may slightly under-report, which doesn't
+        # matter for comparing the two tasks' relative magnitude.
+        grads = torch.autograd.grad(task_loss, encoder_params, retain_graph=True, allow_unused=True)
+        # Accumulate the squared norm in float32 regardless of AMP dtype for a
+        # numerically stable global norm: sqrt(sum_p ||g_p||^2).
+        sq = torch.zeros((), device=task_loss.device)
+        for g in grads:
+            if g is not None:
+                sq = sq + g.detach().float().pow(2).sum()
+        return sq.sqrt()
+
     def training_step(self, batch: EveryQueryBatch) -> torch.Tensor:
         """Forward pass and metric logging for a single training batch."""
         loss, outputs = self.model(batch)
         self._log_metrics(loss, outputs, batch, train_split)
+        # self.global_step counts optimizer steps in Lightning, so this fires once
+        # every N optimizer steps (including step 0, giving an early baseline).
+        if torch.is_grad_enabled() and self.global_step % self.grad_norm_log_every_n_steps == 0:
+            occurs_norm = self._encoder_grad_norm(outputs.occurs_loss)
+            censor_norm = self._encoder_grad_norm(outputs.censor_loss)
+            # The optimizer minimizes w * occurs_loss + (1 - w) * censor_loss, and
+            # scalar weights factor out of the norm (||w ∇L|| = w ||∇L||), so the
+            # weighted contributions reuse the norms above — no extra autograd.grad.
+            w = self.model.occurs_loss_weight
+            # >1 means the task pulls harder on the shared encoder than the other.
+            scalars = {
+                "occurs_encoder_grad_norm": occurs_norm,
+                "censor_encoder_grad_norm": censor_norm,
+                "encoder_grad_ratio": occurs_norm / (censor_norm + 1e-8),
+                "weighted_occurs_encoder_grad_norm": w * occurs_norm,
+                "weighted_censor_encoder_grad_norm": (1 - w) * censor_norm,
+                "weighted_encoder_grad_ratio": (w * occurs_norm) / ((1 - w) * censor_norm + 1e-8),
+            }
+            for name, value in scalars.items():
+                self.log(
+                    f"train/{name}",
+                    value,
+                    on_step=True,
+                    on_epoch=False,
+                    batch_size=batch.batch_size,
+                )
         return loss
 
     @torch.no_grad()
@@ -394,7 +499,9 @@ class EveryQueryLightningModule(L.LightningModule):
         """Builds optimizer (and optional LR scheduler) with norm/bias weight-decay separation.
 
         Returns an optimizer when no LR scheduler factory is set, or a dict with
-        ``"optimizer"`` and ``"lr_scheduler"`` keys when one is provided.
+        ``"optimizer"`` and ``"lr_scheduler"`` keys when one is provided.  The factory
+        must be HF-style, i.e. accept ``num_warmup_steps`` and ``num_training_steps``
+        keyword arguments (e.g. ``transformers.get_cosine_schedule_with_warmup``).
 
         Raises:
             ValueError: If no optimizer factory was provided at init time.
@@ -418,31 +525,39 @@ class EveryQueryLightningModule(L.LightningModule):
                 ...
             ValueError: Optimizer factory is not set. Cannot configure optimizers.
 
-            With an LR scheduler, returns a dict containing optimizer and scheduler config:
+            With an LR scheduler, returns a dict containing optimizer and scheduler config.
+            The scheduler's step counts come from the trainer at fit time:
+            ``warmup_ratio=0.1`` of 10,000 estimated stepping batches gives 1,000
+            warmup steps, so the LR ramp is halfway done at step 500:
 
-            >>> module_with_sched = EveryQueryLightningModule(
+            >>> from unittest.mock import Mock
+            >>> from transformers import get_cosine_schedule_with_warmup
+            >>> module_warm = EveryQueryLightningModule(
             ...     model=demo_model,
             ...     optimizer=partial(torch.optim.AdamW, lr=1e-4),
-            ...     LR_scheduler=partial(torch.optim.lr_scheduler.StepLR, step_size=1),
+            ...     LR_scheduler=partial(get_cosine_schedule_with_warmup),
+            ...     warmup_ratio=0.1,
             ... )
-            >>> result_sched = module_with_sched.configure_optimizers()
+            >>> trainer = Mock(estimated_stepping_batches=10_000)
+            >>> module_warm.trainer = trainer
+            >>> result_sched = module_warm.configure_optimizers()
             >>> sorted(result_sched.keys())
             ['lr_scheduler', 'optimizer']
-            >>> result_sched['lr_scheduler']['interval']
-            'step'
+            >>> result_sched['lr_scheduler']['interval'], result_sched['lr_scheduler']['frequency']
+            ('step', 1)
+            >>> result_sched['lr_scheduler']['scheduler'].lr_lambdas[0](500)
+            0.5
 
-            ``ReduceLROnPlateau`` gets epoch-level monitoring instead:
+            With the default ``warmup_ratio=0.0`` the schedule starts at full LR:
 
-            >>> module_plateau = EveryQueryLightningModule(
+            >>> module_no_warm = EveryQueryLightningModule(
             ...     model=demo_model,
             ...     optimizer=partial(torch.optim.AdamW, lr=1e-4),
-            ...     LR_scheduler=partial(torch.optim.lr_scheduler.ReduceLROnPlateau),
+            ...     LR_scheduler=partial(get_cosine_schedule_with_warmup),
             ... )
-            >>> result_plateau = module_plateau.configure_optimizers()
-            >>> result_plateau['lr_scheduler']['interval']
-            'epoch'
-            >>> result_plateau['lr_scheduler']['monitor']
-            'tuning/loss'
+            >>> module_no_warm.trainer = trainer
+            >>> module_no_warm.configure_optimizers()['lr_scheduler']['scheduler'].lr_lambdas[0](0)
+            1.0
         """
         if self.optimizer_factory is None:
             raise ValueError("Optimizer factory is not set. Cannot configure optimizers.")
@@ -457,27 +572,38 @@ class EveryQueryLightningModule(L.LightningModule):
         if self.LR_scheduler_factory is None:
             return optimizer
 
-        scheduler = self.LR_scheduler_factory(optimizer)
+        # HF-style schedulers size warmup against the full schedule.  Both step counts
+        # are derived here at fit time — estimated_stepping_batches is Lightning's own
+        # accounting of epochs, accumulation, and world size — so the Hydra config only
+        # ever specifies warmup_ratio.
+        num_training_steps = self.trainer.estimated_stepping_batches
 
-        LR_config = {
-            "scheduler": scheduler,
-            "frequency": 1,
+        if not math.isfinite(num_training_steps) or num_training_steps <= 0:
+            raise ValueError(
+                f"Cannot construct LR schedule with "
+                f"estimated_stepping_batches={num_training_steps}. "
+                "Set a finite Trainer(max_steps=...) or use a finite dataloader."
+            )
+        num_warmup_steps = int(self.warmup_ratio * num_training_steps)
+        # save_hyperparameters ran at init, before the trainer existed; log the
+        # fit-time step counts separately so they show up in wandb's config.
+        if self.logger is not None:
+            self.logger.log_hyperparams(
+                {
+                    "LR_scheduler/num_training_steps": int(num_training_steps),
+                    "LR_scheduler/num_warmup_steps": num_warmup_steps,
+                }
+            )
+        scheduler = self.LR_scheduler_factory(
+            optimizer,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=num_training_steps,
+        )
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "step", "frequency": 1},
         }
-
-        if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-            # ReduceLROnPlateau requires observing stable trends to make a conclusion about LR decay, so an
-            # epcoh level interval is more appropriate.
-
-            LR_config["monitor"] = "tuning/loss"
-            LR_config["strict"] = True
-            LR_config["interval"] = "epoch"
-        else:
-            # All other schedulers operate at a step level as they do not monitor the loss to make a
-            # conclusion about LR decay.
-
-            LR_config["interval"] = "step"
-
-        return {"optimizer": optimizer, "lr_scheduler": LR_config}
 
     @classmethod
     def load_from_checkpoint(cls, ckpt_path: str | None = None) -> "EveryQueryLightningModule":
@@ -504,7 +630,7 @@ class EveryQueryLightningModule(L.LightningModule):
             >>> loaded.hparams['LR_scheduler'] is None
             True
             >>> loaded.hparams['model']['precision']
-            '32-true'
+            'bf16-mixed'
             >>> loaded.hparams['model']['do_demo']
             True
 
@@ -512,6 +638,37 @@ class EveryQueryLightningModule(L.LightningModule):
 
             >>> torch.equal(next(loaded.parameters()), next(demo_lightning_module.parameters()))
             True
+
+        ``warmup_ratio`` survives the round-trip too:
+
+            >>> module_warm = EveryQueryLightningModule(
+            ...     model=demo_model,
+            ...     optimizer=partial(torch.optim.AdamW, lr=1e-4),
+            ...     warmup_ratio=0.25,
+            ... )
+            >>> with tempfile.TemporaryDirectory() as tmpdir:
+            ...     warm_path = tmpdir + "/warm.ckpt"
+            ...     torch.save({
+            ...         'state_dict': module_warm.state_dict(),
+            ...         'hyper_parameters': dict(module_warm.hparams),
+            ...         'pytorch-lightning_version': L.__version__,
+            ...     }, warm_path)
+            ...     EveryQueryLightningModule.load_from_checkpoint(warm_path).warmup_ratio
+            0.25
+
+        Older checkpoints without a ``warmup_ratio`` hyper-parameter default to ``0.0``:
+
+            >>> old_hparams = dict(demo_lightning_module.hparams)
+            >>> _ = old_hparams.pop("warmup_ratio")
+            >>> with tempfile.TemporaryDirectory() as tmpdir:
+            ...     old_path = tmpdir + "/old.ckpt"
+            ...     torch.save({
+            ...         'state_dict': demo_lightning_module.state_dict(),
+            ...         'hyper_parameters': old_hparams,
+            ...         'pytorch-lightning_version': L.__version__,
+            ...     }, old_path)
+            ...     EveryQueryLightningModule.load_from_checkpoint(old_path).warmup_ratio
+            0.0
 
         A checkpoint missing a required hparam key raises ``KeyError``:
 
@@ -547,4 +704,6 @@ class EveryQueryLightningModule(L.LightningModule):
             model=model,
             optimizer=optimizer,
             LR_scheduler=LR_scheduler,
+            # Checkpoints predating warmup_ratio simply had no warmup.
+            warmup_ratio=hparams.get("warmup_ratio", 0.0),
         )

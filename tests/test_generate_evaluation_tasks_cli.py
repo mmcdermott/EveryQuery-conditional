@@ -22,7 +22,7 @@ import pyarrow.parquet as pq
 import pytest
 from meds import DataSchema
 
-from conftest import ENSURE_ENV_PLACEHOLDERS, run_and_check
+from conftest import run_and_check
 from every_query.data.schema import TaskQuerySchema
 from every_query.generate_tasks.sample_evaluation_tasks import subsample_subject_ids
 
@@ -44,17 +44,14 @@ def test_eq_generate_evaluation_tasks_end_to_end(
         [
             "EQ_generate_evaluation_tasks",
             f"data_dir={intermediate!s}",
-            f"codes_dir={eq_preprocessed_dataset!s}",
             f"out_dir={out_dir!s}",
             "split=tuning",
-            "input_shard=0",
             f"prediction_times_per_subject={pt_per_subject}",
             "min_context_per_subject=1",
-            "codes=[HR,TEMP]",
+            "query_codes=[HR,TEMP]",
             "durations=[1,7,30]",
             "seed=42",
         ],
-        env=ENSURE_ENV_PLACEHOLDERS,
         timeout=120.0,
     )
 
@@ -62,6 +59,13 @@ def test_eq_generate_evaluation_tasks_end_to_end(
     unique_fp = out_dir / "eval_unique" / "tuning" / "0.parquet"
     assert labels_fp.is_file(), f"expected {labels_fp} to exist; got {list(out_dir.rglob('*.parquet'))}"
     assert unique_fp.is_file(), f"expected sibling unique parquet at {unique_fp}"
+
+    # Shard discovery (#279): every shard in the split must have an output parquet.
+    input_shards = sorted(p.stem for p in (intermediate / "data" / "tuning").glob("*.parquet"))
+    output_shards = sorted(p.stem for p in (out_dir / "eval" / "tuning").glob("*.parquet"))
+    assert output_shards == input_shards, (
+        f"expected one output per input shard: inputs={input_shards}, outputs={output_shards}"
+    )
 
     TaskQuerySchema.align(pq.read_table(labels_fp))
 
@@ -102,12 +106,10 @@ def test_eq_generate_evaluation_tasks_deterministic(
     intermediate = eq_preprocessed_dataset.parent / "intermediate"
     common_args: list[str] = [
         f"data_dir={intermediate!s}",
-        f"codes_dir={eq_preprocessed_dataset!s}",
         "split=tuning",
-        "input_shard=0",
         "prediction_times_per_subject=3",
         "min_context_per_subject=1",
-        "codes=[HR,TEMP]",
+        "query_codes=[HR,TEMP]",
         "durations=[1,7,30]",
         "seed=7",
     ]
@@ -117,7 +119,6 @@ def test_eq_generate_evaluation_tasks_deterministic(
     for out in (out_a, out_b):
         run_and_check(
             ["EQ_generate_evaluation_tasks", f"out_dir={out!s}", *common_args],
-            env=ENSURE_ENV_PLACEHOLDERS,
             timeout=120.0,
         )
 
@@ -156,12 +157,10 @@ def test_eq_generate_evaluation_tasks_subject_subsample_deterministic(
     intermediate = eq_preprocessed_dataset.parent / "intermediate"
     common_args: list[str] = [
         f"data_dir={intermediate!s}",
-        f"codes_dir={eq_preprocessed_dataset!s}",
         "split=tuning",
-        "input_shard=0",
         "prediction_times_per_subject=3",
         "min_context_per_subject=1",
-        "codes=[HR,TEMP]",
+        "query_codes=[HR,TEMP]",
         "durations=[1,7,30]",
         "seed=7",
         "subject_subsample_fraction=0.5",
@@ -172,7 +171,6 @@ def test_eq_generate_evaluation_tasks_subject_subsample_deterministic(
     for out in (out_a, out_b):
         run_and_check(
             ["EQ_generate_evaluation_tasks", f"out_dir={out!s}", *common_args],
-            env=ENSURE_ENV_PLACEHOLDERS,
             timeout=120.0,
         )
 
@@ -187,6 +185,21 @@ def test_eq_generate_evaluation_tasks_subject_subsample_deterministic(
     assert df_a.equals(df_b), (
         "EQ_generate_evaluation_tasks should be deterministic with subject_subsample_fraction set"
     )
+
+
+def test_eq_generate_evaluation_tasks_rejects_input_shard_override(tmp_path: Path) -> None:
+    """The removed ``input_shard`` knob must fail loudly, not be silently ignored (#279)."""
+    with pytest.raises(RuntimeError, match="Could not override 'input_shard'"):
+        run_and_check(
+            [
+                "EQ_generate_evaluation_tasks",
+                f"data_dir={tmp_path!s}",
+                f"out_dir={tmp_path!s}",
+                "input_shard=0",
+                "query_codes=[HR]",
+            ],
+            timeout=60.0,
+        )
 
 
 # ---------------------------------------------------------------------------

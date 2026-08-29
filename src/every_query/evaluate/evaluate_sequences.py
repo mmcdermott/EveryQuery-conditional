@@ -30,14 +30,35 @@ logging.basicConfig(level=logging.INFO)
 CONFIGS = str(files("every_query") / "evaluate" / "configs")
 
 # (upper-exclusive edge in days, bucket label) pairs for the by-query table.
-DURATION_BUCKETS = [(2, "1d"), (8, "2-7d"), (31, "8-30d"), (91, "31-90d"), (181, "91-180d"), (366, "181-365d")]
+DURATION_BUCKETS = [
+    (2, "1d"),
+    (8, "2-7d"),
+    (31, "8-30d"),
+    (91, "31-90d"),
+    (181, "91-180d"),
+    (366, "181-365d"),
+]
+
+
+EVENT_BOUND_BUCKET = "event-bound"
 
 
 def _bucket_expr(col: str = "duration_days") -> pl.Expr:
-    """Map a duration to a human-readable horizon bucket label."""
-    hi, label = DURATION_BUCKETS[0]
-    expr = pl.when(pl.col(col) < hi).then(pl.lit(label))
-    for hi, label in DURATION_BUCKETS[1:]:
+    """Map a duration to a human-readable horizon bucket label.
+
+    An **event-bounded** query has no horizon: its window ends at a boundary event, and its
+    ``duration_days`` is the negative :data:`EVENT_BOUND_DURATION_SENTINEL`.  It gets its own
+    bucket rather than falling through the ``<`` ladder, where ``-1.0 < 2`` would file every
+    such row under the shortest horizon and quietly mix two different questions into one
+    number.
+
+    Examples:
+        >>> df = pl.DataFrame({"duration_days": [0.5, 3.0, 400.0, -1.0]})
+        >>> df.select(_bucket_expr())["duration_bucket"].to_list()
+        ['1d', '2-7d', '>365d', 'event-bound']
+    """
+    expr = pl.when(pl.col(col) < 0).then(pl.lit(EVENT_BOUND_BUCKET))
+    for hi, label in DURATION_BUCKETS:
         expr = expr.when(pl.col(col) < hi).then(pl.lit(label))
     return expr.otherwise(pl.lit(">365d")).alias("duration_bucket")
 
@@ -81,10 +102,29 @@ def compute_sequence_metrics(predictions: pl.DataFrame) -> tuple[pl.DataFrame, p
         [1.0, 1.0]
         >>> sorted(by_query["query"].to_list())
         ['A', 'TIMELINE//END']
+
+        When the predictions carry boundary events, the same code asked over two different
+        boundaries is two different questions, so ``bound_event`` joins the grouping key:
+
+        >>> bounded = preds.with_columns(
+        ...     pl.Series("bound_event", [None, "DISCHARGE", None, "DISCHARGE"]),
+        ...     pl.Series("duration_days", [30.0, -1.0, 30.0, -1.0]),
+        ... )
+        >>> _, by_query = compute_sequence_metrics(bounded)
+        >>> "bound_event" in by_query.columns
+        True
+        >>> sorted(by_query["duration_bucket"].to_list())
+        ['8-30d', 'event-bound']
     """
     by_position = _group_metrics(predictions, ["position"])
 
-    by_query = _group_metrics(predictions.with_columns(_bucket_expr()), ["query", "duration_bucket"])
+    # A query bounded by "next discharge" and the same query over a fixed 30 days are different
+    # questions; pooling them would average two different base rates into one AUROC.
+    group_cols = ["query", "duration_bucket"]
+    if "bound_event" in predictions.columns:
+        group_cols.append("bound_event")
+
+    by_query = _group_metrics(predictions.with_columns(_bucket_expr()), group_cols)
 
     return by_position, by_query
 
