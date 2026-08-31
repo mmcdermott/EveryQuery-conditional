@@ -77,7 +77,7 @@ lightning_module:
     _target_: every_query.model.conditional_model.ConditionalQueryModel
     precision: ${trainer.precision} # single source of truth: the Trainer owns AMP
     mlp_dropout: 0.1
-    num_hidden_layers: 8
+    num_hidden_layers: 12
     decoder_layers: 4
     decoder_heads: 6
     decoder_ffn_mult: 4
@@ -98,7 +98,7 @@ lightning_module:
     # able to ASK about an ancestor, not in mixing improving ordinary leaf queries.
     ontology_dir: null
     config_overrides:
-      hidden_size: 384
+      hidden_size: 256
       num_attention_heads: 6
       intermediate_size: 1536
       # Dictated by the data — filled in by train.py from the datamodule config.
