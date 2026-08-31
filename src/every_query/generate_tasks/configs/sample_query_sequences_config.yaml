@@ -31,7 +31,7 @@ seed: 1
 # One sampled patient context = one sequence = one output row.  This is a *global* budget, not a
 # per-shard one — Stage 2 draws contexts across the whole split weighted by each subject's
 # prediction-time count — so it supersedes the fork's per-shard `n_contexts`.
-num_sequences: 4096
+num_sequences: 1000000
 
 # Each sequence is Uniform{min..max} i.i.d. queries (random code incl. TIMELINE//END, random
 # duration), fully random order — no privileged censor position.
@@ -46,7 +46,7 @@ max_queries: 5
 # class's `min_duration`/`max_duration`, so this file and
 # `sample_evaluation_query_sequences_config.yaml` stay key-identical (a test asserts that).
 duration_min: 1
-duration_max: 731
+duration_max: 1826
 duration_distribution: log-uniform # uniform | log-uniform
 
 # Minimum prior *prediction times* (distinct (subject_id, time) rows, NOT events) required before
