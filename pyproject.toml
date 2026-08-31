@@ -33,6 +33,7 @@ dependencies = [
   "filelock>=3.13,<4",
   "pytest>=8,<9",
   "meds-transforms>=0.6.7,<0.7",
+  "hydra-joblib-launcher>=1.2,<2", # parallel preprocessing workers (_parallel_runner.yaml)
   "meds-torch-data[lightning]~=0.9.0",
   "transformers>=4.48,<5",
   "torch>=2.6,<3",
