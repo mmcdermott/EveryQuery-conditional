@@ -110,11 +110,11 @@ EQ_generate_query_sequences \
 	out_dir="$TRAINING_TASKS_DIR" \
 	query_codes="$TENSORIZED_COHORT_DIR" \
 	split=train \
-	num_sequences=4096 \
+	num_training_sequence_examples=4096 \
 	ontology_dir="$ONTOLOGY_DIR" # omit for leaf codes only
 ```
 
-Samples `num_sequences` random `(subject, prediction_time)` contexts across the whole split, draws
+Samples `num_training_sequence_examples` random `(subject, prediction_time)` contexts across the whole split, draws
 an i.i.d. query sequence for each, and labels every query by observed occurrence. Output:
 `{out_dir}/{split}/{shard}.parquet` in `QuerySeqSchema` — one row per context with aligned list
 columns `queries`, `durations` (float days), `answers` (bool) and, when `eventbound_fraction > 0`,
@@ -123,7 +123,7 @@ columns `queries`, `durations` (float days), `answers` (bool) and, when `eventbo
 | Knob                                                      | Default                 | Meaning                                                                                                                       |
 | --------------------------------------------------------- | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
 | `query_codes`                                             | required                | query universe: a tensorized-cohort root (reads `metadata/codes.parquet`), an inline list `[HR,TEMP]`, or a YAML/parquet path |
-| `num_sequences`                                           | 4096                    | total sequences over the split (global budget, not per shard)                                                                 |
+| `num_training_sequence_examples`                                           | 4096                    | total sequences over the split (global budget, not per shard)                                                                 |
 | `min_queries` / `max_queries`                             | 1 / 5                   | sequence length ~ Uniform{min..max}                                                                                           |
 | `duration_min` / `duration_max` / `duration_distribution` | 1 / 731 / `log-uniform` | per-query horizon draw, continuous days                                                                                       |
 | `eventbound_fraction`                                     | 0.5                     | fraction of queries bounded by the next occurrence of a random boundary event instead of a horizon                            |
@@ -151,7 +151,7 @@ EQ_generate_evaluation_query_sequences \
 	query_codes="$TENSORIZED_COHORT_DIR" \
 	split=held_out \
 	prediction_times_per_subject=1 \
-	n_sequences=64 \
+	num_evaluation_sequences=64 \
 	ontology_dir="$ONTOLOGY_DIR"
 ```
 

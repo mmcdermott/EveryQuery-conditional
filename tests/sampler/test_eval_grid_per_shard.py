@@ -63,7 +63,7 @@ def _run_seq(data_dir: Path, out_dir: Path, codes_yaml: Path, **overrides) -> No
         "out_dir": out_dir,
         "query_codes": codes_yaml,
         "split": SPLIT,
-        "n_sequences": N_SEQ,
+        "num_evaluation_sequences": N_SEQ,
         "min_queries": LEN,
         "max_queries": LEN,
         "prediction_times_per_subject": 3,
@@ -366,7 +366,7 @@ def test_changed_specs_relabel_instead_of_skipping(tmp_path: Path, data_dir: Pat
     _run_seq(data_dir, out_dir, codes_yaml)
     before = _inodes(out_dir)
 
-    _run_seq(data_dir, out_dir, codes_yaml, n_sequences=N_SEQ + 1)
+    _run_seq(data_dir, out_dir, codes_yaml, num_evaluation_sequences=N_SEQ + 1)
     assert all(a != b for a, b in zip(_inodes(out_dir), before, strict=True)), "more sequences must relabel"
     assert all(_labels(out_dir, s).height == _unique(out_dir, s).height * (N_SEQ + 1) for s in SHARDS)
 

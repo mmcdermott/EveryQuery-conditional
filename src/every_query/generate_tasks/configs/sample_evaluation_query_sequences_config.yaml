@@ -41,7 +41,7 @@ seed: 1
 
 # --- The cohort (identical to sample_evaluation_tasks_config.yaml) ----------------------------
 # How many prediction times to sample per subject.  The grid is
-# `prediction_times_per_subject x n_sequences` rows per subject.
+# `prediction_times_per_subject x num_evaluation_sequences` rows per subject.
 prediction_times_per_subject: 1
 
 # Minimum prior events a subject must have accumulated before a prediction time is valid.
@@ -64,7 +64,7 @@ contexts_path: null
 write_unique_prediction_times: true
 
 # --- The N query sequences ------------------------------------------------
-# Path to designed sequences.  Leave null to instead draw `n_sequences` of them from the
+# Path to designed sequences.  Leave null to instead draw `num_evaluation_sequences` of them from the
 # training query distribution (see the sampling knobs below).
 sequences_path: null
 #
@@ -90,7 +90,7 @@ sequences_path: null
 # Number of sequences to draw.  They are drawn once, seeded on `(seed, "eval_seq_specs", split)`
 # alone, and shared across every context of every shard — so the same `(seed, split)` yields the
 # same `N` sequences for any cohort, and two cohorts' metrics are comparable query-for-query.
-n_sequences: 64
+num_evaluation_sequences: 64
 
 # Sequence length ~ Uniform{min_queries..max_queries} inclusive, per sequence.  Fixed at 3
 # rather than training's 1..5 range: one length keeps the grid simple and makes per-position

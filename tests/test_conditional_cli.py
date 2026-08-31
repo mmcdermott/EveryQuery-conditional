@@ -61,7 +61,7 @@ def cq_sequence_tasks_dir(eq_preprocessed_dataset: Path, tmp_path_factory) -> Pa
                 f"out_dir={out_dir!s}",
                 f"query_codes={eq_preprocessed_dataset!s}",
                 f"split={split}",
-                "num_sequences=8",
+                "num_training_sequence_examples=8",
                 "min_queries=1",
                 "max_queries=5",
                 "duration_min=1",
@@ -98,7 +98,7 @@ def test_sampled_run_writes_exactly_num_sequences_across_shards(cq_sequence_task
     """The global budget is honoured: one output row per sampled sequence, split-wide."""
     for split in (train_split, tuning_split):
         total = sum(pl.read_parquet(fp).height for fp in (cq_sequence_tasks_dir / split).glob("*.parquet"))
-        assert total == 8, f"{split}: expected num_sequences=8 rows, found {total}"
+        assert total == 8, f"{split}: expected num_training_sequence_examples=8 rows, found {total}"
 
 
 def test_sampled_run_keeps_the_two_artifact_roots_disjoint(cq_sequence_tasks_dir: Path):
@@ -140,7 +140,7 @@ def test_dense_grid_sampled_sequences(eq_preprocessed_dataset: Path, cq_cohort_f
             f"query_codes={eq_preprocessed_dataset!s}",
             f"split={train_split}",
             f"contexts_path={cq_cohort_fp!s}",
-            "n_sequences=3",
+            "num_evaluation_sequences=3",
             "min_queries=4",
             "max_queries=4",
             "duration_min=1",
@@ -188,7 +188,7 @@ def test_dense_grid_skips_existing_output(eq_preprocessed_dataset: Path, cq_coho
         f"query_codes={eq_preprocessed_dataset!s}",
         f"split={train_split}",
         f"contexts_path={cq_cohort_fp!s}",
-        "n_sequences=2",
+        "num_evaluation_sequences=2",
         "min_queries=2",
         "max_queries=2",
         "duration_min=1",
@@ -363,7 +363,7 @@ def test_dense_grid_is_scoreable_by_predict_sequences(
             f"query_codes={eq_preprocessed_dataset!s}",
             f"split={tuning_split}",
             f"contexts_path={cohort_fp!s}",
-            "n_sequences=2",
+            "num_evaluation_sequences=2",
             "min_queries=3",
             "max_queries=3",
             "duration_min=1",
@@ -418,7 +418,7 @@ def test_eval_v3_scores_supplied_sequences(
             f"out_dir={tasks_dir!s}",
             f"query_codes={eq_preprocessed_dataset!s}",
             f"split={tuning_split}",
-            "num_sequences=6",
+            "num_training_sequence_examples=6",
             "min_queries=3",
             "max_queries=3",
             "duration_min=1",
@@ -474,7 +474,7 @@ def test_eval_v3_scores_supplied_sequences(
     )
 
     summary = json.loads((out_dir / "summary.json").read_text())
-    assert summary["n_sequences"] == n_seqs
+    assert summary["num_evaluation_sequences"] == n_seqs
     assert summary["split"] == tuning_split
     assert summary["force_prior"] == "none"
     # Per-conditional accounting is always reported, even when the cohort is too small to score:

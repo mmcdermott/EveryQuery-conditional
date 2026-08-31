@@ -20,7 +20,7 @@ subject_subsample_fraction)`` the two generators score the **identical** ``(subj
 Pipeline, one worker per shard of ``{data_dir}/data/{split}/*.parquet`` (all shards, no knob):
 
     1. Resolve the ``N`` :class:`SequenceSpec` s **once**: read designed ones from
-       ``sequences_path``, or draw ``n_sequences`` from the training query distribution
+       ``sequences_path``, or draw ``num_evaluation_sequences`` from the training query distribution
        (:func:`sample_sequence_specs`, seeded on ``(seed, "eval_seq_specs", split)`` alone so the
        same specs come out for any cohort).  Validate every code against the model vocabulary.
     2. Per shard: read its events; take the cohort either from ``contexts_path`` (this shard's
@@ -52,7 +52,7 @@ Output layout, the same as ``sample_evaluation_tasks``':
 Every output parquet gets a provenance sidecar under ``{out_dir}_artifacts/_labeled/`` recording the
 three inputs that determine its rows — the ontology, the specs and the cohort source — and
 ``overwrite=false`` skips a shard only when all three match (:func:`_run_fingerprint`).  Re-running
-into the same ``out_dir`` with a different ``sequences_path``/``n_sequences``/``seed``/cohort therefore
+into the same ``out_dir`` with a different ``sequences_path``/``num_evaluation_sequences``/``seed``/cohort therefore
 relabels rather than silently keeping the previous grid.
 
 ``{out_dir}/eval`` is directly consumable as ``EQ_predict_sequences tasks_dir=...`` (MEDS-TorchData
@@ -1000,7 +1000,7 @@ def main(cfg: DictConfig) -> None:
 
         EQ_generate_evaluation_query_sequences \\
             data_dir=... out_dir=... query_codes=... split=held_out \\
-            prediction_times_per_subject=2 n_sequences=64
+            prediction_times_per_subject=2 num_evaluation_sequences=64
 
     Usage (designed sequences on a supplied cohort):
 
@@ -1026,7 +1026,7 @@ def main(cfg: DictConfig) -> None:
     specs = resolve_specs(
         sequences_path=sequences_path,
         query_codes=query_codes,
-        n_sequences=int(cfg.n_sequences),
+        n_sequences=int(cfg.num_evaluation_sequences),
         min_queries=int(cfg.min_queries),
         max_queries=int(cfg.max_queries),
         duration_min=float(cfg.duration_min),

@@ -63,7 +63,7 @@ def featured_tasks_dir(eq_preprocessed_dataset: Path, ontology_dir: Path, tmp_pa
                 f"out_dir={out_dir!s}",
                 f"query_codes={eq_preprocessed_dataset!s}",
                 f"split={split}",
-                "num_sequences=64",
+                "num_training_sequence_examples=64",
                 "min_queries=2",
                 "max_queries=4",
                 "duration_min=1",

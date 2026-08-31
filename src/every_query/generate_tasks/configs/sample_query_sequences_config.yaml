@@ -31,7 +31,7 @@ seed: 1
 # One sampled patient context = one sequence = one output row.  This is a *global* budget, not a
 # per-shard one — Stage 2 draws contexts across the whole split weighted by each subject's
 # prediction-time count — so it supersedes the fork's per-shard `n_contexts`.
-num_sequences: 1000000
+num_training_sequence_examples: 1000000
 
 # Each sequence is Uniform{min..max} i.i.d. queries (random code incl. TIMELINE//END, random
 # duration), fully random order — no privileged censor position.

@@ -5,9 +5,9 @@ emitting, per sampled patient context, an ordered *sequence* of queries rather t
 ``(code, duration)``::
 
     Stage 0   build + cache the canonical prediction-time map and subject counts (reused as-is)
-    Stage 1'  sample ``num_sequences`` variable-length query sequences (QuerySequenceDistribution),
+    Stage 1'  sample ``num_training_sequence_examples`` variable-length query sequences (QuerySequenceDistribution),
               each query either horizon-bounded or event-bounded
-    Stage 2   sample ``num_sequences`` patient contexts (reused as-is)
+    Stage 2   sample ``num_training_sequence_examples`` patient contexts (reused as-is)
     Stage 3'  resolve ``prediction_time_index -> prediction_time``, zip, write per-shard index
     Stage 4'  binary-label each index shard independently and write the final dataset parquet
 
@@ -1072,7 +1072,7 @@ def run(cfg: DictConfig) -> None:
     )
     logger.info("Stage 0: %s eligible subject(s) for split=%s.", f"{n_subjects:,}", cfg.split)
 
-    num_sequences = int(cfg.num_sequences)
+    num_sequences = int(cfg.num_training_sequence_examples)
 
     # Independent RNG streams per axis (invariant 5): "queries" matches the training sampler's draw
     # exactly (parity), "contexts" matches its context draw, "sequences" carries the structure-only

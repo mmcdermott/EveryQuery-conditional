@@ -297,7 +297,7 @@ def test_an_ontology_puts_every_ancestor_node_in_the_sampled_query_universe(
         query_codes=codes_yaml,
         contexts_path=cohort,
         split=SPLIT,
-        n_sequences=96,
+        num_evaluation_sequences=96,
         ontology_dir=ontology_dir,
     )
 
@@ -330,7 +330,7 @@ def test_no_ontology_keeps_the_universe_leaf_only(
         query_codes=codes_yaml,
         contexts_path=cohort,
         split=SPLIT,
-        n_sequences=96,
+        num_evaluation_sequences=96,
     )
 
     queries = set(_all_queries(out_dir))
@@ -477,7 +477,7 @@ def test_eval_and_training_paths_agree_on_the_same_ancestor_query(
         out_dir=train_out,
         query_codes=ancestor_codes,
         split=SPLIT,
-        num_sequences=64,
+        num_training_sequence_examples=64,
         min_prediction_times_per_subject=1,
         min_queries=1,
         max_queries=1,
@@ -493,7 +493,7 @@ def test_eval_and_training_paths_agree_on_the_same_ancestor_query(
         k: v for k, v in _answers_by_context_and_query(train_df).items() if k[2] == ANCESTOR_ONLY_NODE
     }
     key = (1, datetime(2020, 6, 6), ANCESTOR_ONLY_NODE)
-    assert key in train_answers, "the one context whose answer is True was not sampled; raise num_sequences"
+    assert key in train_answers, "the one context whose answer is True was not sampled; raise num_training_sequence_examples"
 
     # Take the horizon the training path actually emitted (post float32 round-trip) so the eval
     # spec cannot differ from it by an epsilon at the window boundary.
@@ -517,7 +517,7 @@ def test_eval_and_training_paths_agree_on_the_same_ancestor_query(
     )
     eval_answers = _answers_by_context_and_query(_grid(eval_out))
 
-    assert train_answers, "no MED//STATIN query was drawn at all; raise num_sequences"
+    assert train_answers, "no MED//STATIN query was drawn at all; raise num_training_sequence_examples"
     assert {k: eval_answers[k] for k in train_answers} == train_answers, (
         "the two samplers disagree about the same ancestor query on the same contexts: "
         f"eval={eval_answers}, training={train_answers}"
@@ -544,7 +544,7 @@ def test_ontology_off_records_a_null_ontology_and_keeps_the_output_tree_clean(
         query_codes=codes_yaml,
         contexts_path=cohort,
         split=SPLIT,
-        n_sequences=8,
+        num_evaluation_sequences=8,
         seed=7,
     )
     for fp in _grid_fps(out_dir):
@@ -911,7 +911,7 @@ def test_reordering_the_query_universe_relabels_the_grid(
         "out_dir": out_dir,
         "contexts_path": cohort,
         "split": SPLIT,
-        "n_sequences": 96,
+        "num_evaluation_sequences": 96,
         "ontology_dir": ontology_dir,
     }
     _run_eval(**common, query_codes=straight)

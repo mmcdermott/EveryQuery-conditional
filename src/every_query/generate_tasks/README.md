@@ -72,7 +72,7 @@ families of (scattered-for-training, dense-for-evaluation) pairs — one per mod
     overrides the sampled cohort with a supplied one. The `N` sequences are designed
     (`sequences_path=tasks.yaml`, a mapping of `name -> [[code, duration], ...]`, with
     `[code, -1, bound_event]` for an event-bounded position) or drawn once from the training query
-    distribution (`n_sequences=64`, 50% event-bounded by default) and shared by every shard. Reuses
+    distribution (`num_evaluation_sequences=64`, 50% event-bounded by default) and shared by every shard. Reuses
     `sample_evaluation_tasks`'s cohort sampler and `sample_query_sequences`'s
     `label_query_sequences` labeler; only the grid build is its own. Registered as
     `EQ_generate_evaluation_query_sequences`.
@@ -204,7 +204,7 @@ every validation pass, without paying the cost of scoring the full tuning split.
 # out-of-distribution horizon shows up as an unexplained metric shift, not as an error:
 EQ_generate_evaluation_query_sequences \
 	data_dir=$TOKENIZED_EVENTS_DIR out_dir=$EVAL_SEQ_TASKS_DIR query_codes=$TENSORIZED_COHORT_DIR \
-	split=held_out prediction_times_per_subject=2 n_sequences=64
+	split=held_out prediction_times_per_subject=2 num_evaluation_sequences=64
 
 # Or designed sequences on a supplied cohort (`contexts_path` bypasses the cohort knobs; every
 # subject must be in the split). Event-bounded positions use `[query, -1, bound_event]`; long-format

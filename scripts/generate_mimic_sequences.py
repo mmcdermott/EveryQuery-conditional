@@ -17,7 +17,7 @@ Equivalent command::
         out_dir=$TRAINING_TASKS_DIR \\
         query_codes=$TENSORIZED_COHORT_DIR \\
         split=train \\
-        num_sequences=... \\
+        num_training_sequence_examples=... \\
         min_queries=1 max_queries=5 \\
         duration_min=1 duration_max=731 \\
         min_prediction_times_per_subject=50 \\
@@ -25,7 +25,7 @@ Equivalent command::
 
 Note the two semantic changes, both of which shift the training distribution (see §3 of the plan):
 
-- ``--n-contexts`` was a **per-shard** count; ``num_sequences`` is a **global** budget across the
+- ``--n-contexts`` was a **per-shard** count; ``num_training_sequence_examples`` is a **global** budget across the
   split, with contexts drawn weighted by each subject's prediction-time count.
 - ``--min-context-per-subject`` counted *events*; ``min_prediction_times_per_subject`` counts
   distinct prediction times.  Carrying the old number across is a silent behaviour change.
