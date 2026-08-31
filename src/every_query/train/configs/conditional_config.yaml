@@ -130,10 +130,16 @@ lightning_module:
 trainer:
   _target_: lightning.pytorch.trainer.Trainer
   logger:
-    _target_: lightning.pytorch.loggers.CSVLogger
+    _target_: pytorch_lightning.loggers.wandb.WandbLogger
+    name: null # standard wandb auto-naming; runs are told apart by auto-logged hyperparameters
     save_dir: "${trainer.default_root_dir}/loggers"
-    name: "csv"
-    flush_logs_every_n_steps: 50
+    offline: False
+    id: null # pass correct id to resume experiment!
+    anonymous: null # enable anonymous logging
+    project: ${oc.env:WANDB_PROJECT,null}
+    log_model: False # upload lightning ckpts
+    prefix: "" # a string to put at the beginning of metric keys
+    entity: ${oc.env:WANDB_ENTITY,null}
   callbacks:
     _target_: every_query.train.train.values_as_list
     learning_rate_monitor:
