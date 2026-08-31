@@ -86,7 +86,7 @@ lightning_module:
     # elapsed time carried by the TIMELINE//DELTA* tokens in the stream.  true = rotary
     # positions are elapsed hours and the delta tokens are stripped
     # (`datamodule.dataset_kwargs.strip_delta_tokens` interpolates from here).
-    use_rope_time: false
+    use_rope_time: true
     # Ontology-mixed code embeddings: each code embeds as the weighted average of its own row and
     # its ancestors' ((A @ W)[ids]).  null = ordinary embeddings.  When set, train.py sizes the
     # encoder to the ontology's V_ext instead of the cohort vocab, since ancestor indices sit
