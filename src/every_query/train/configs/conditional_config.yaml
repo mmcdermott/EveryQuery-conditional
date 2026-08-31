@@ -98,7 +98,7 @@ lightning_module:
     # able to ASK about an ancestor, not in mixing improving ordinary leaf queries.
     ontology_dir: null
     config_overrides:
-      hidden_size: 256
+      hidden_size: 384
       num_attention_heads: 6
       intermediate_size: 1536
       # Dictated by the data — filled in by train.py from the datamodule config.
