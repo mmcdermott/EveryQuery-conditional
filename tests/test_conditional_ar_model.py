@@ -337,6 +337,95 @@ def test_rope_time_positions_are_consumed():
     assert not torch.allclose(out_close.answer_logits, out_spread.answer_logits)
 
 
+def _combined_position_ids(model, batch) -> torch.Tensor:
+    """Reproduce ``forward``'s bookkeeping and return the model's combined rotary positions."""
+    n_patient = (batch.code != batch.PAD_INDEX).sum(dim=1)
+    n_query_tokens = TOKENS_PER_QUERY * batch.q_codes.shape[1]
+    query_positions = n_patient.unsqueeze(1) + torch.arange(n_query_tokens).unsqueeze(0)
+    total_len = batch.code.shape[1] + n_query_tokens
+    return model._position_ids(batch, n_patient, query_positions, total_len)
+
+
+def test_query_tokens_share_the_prediction_time_rope_position():
+    """Every query token sits at the final real patient event's hour — clinical time does not advance while
+    the queries are asked, and rows with different lengths use their own hour."""
+    model = _tiny_ar_model(use_rope_time=True)
+    batch = make_batch(
+        [[ANSWER_YES, ANSWER_NO]] * 2,
+        patient_codes=[[3, 4, 5], [10, 11, 0]],
+        time_pos_ids=torch.tensor([[0, 24, 72], [0, 10, 0]]),
+    )
+    pos = _combined_position_ids(model, batch)
+
+    # Row 0: 3 real events (last hour 72) then 6 query tokens, all at 72.
+    assert pos[0].tolist() == [0, 24, 72, 72, 72, 72, 72, 72, 72]
+    # Row 1 is shorter and ends at hour 10; its query stream packs at index 2.
+    assert pos[1, 2:8].tolist() == [10] * 6
+    # No artificial +1, +2, ... progression anywhere in either query stream.
+    n_patient = (batch.code != batch.PAD_INDEX).sum(dim=1)
+    for row, n in enumerate(n_patient.tolist()):
+        q = pos[row, n : n + 6]
+        assert q.unique().numel() == 1
+
+
+def test_query_blocks_get_shared_block_position_embeddings(tiny_model):
+    """c_i, d_i and a_i share one block embedding; different blocks differ; patients get none."""
+    B, L = 1, 3
+    batch = make_batch([[ANSWER_YES, ANSWER_NO, ANSWER_YES]][:B])
+    with torch.no_grad():
+        tokens = tiny_model._query_tokens(batch).view(B, L, TOKENS_PER_QUERY, -1)
+        # Same code/duration/answer content in every block would confound this, so instead
+        # compare against the same model with the block table zeroed.
+        saved = tiny_model.block_pos_embed.weight.clone()
+        tiny_model.block_pos_embed.weight.zero_()
+        base = tiny_model._query_tokens(batch).view(B, L, TOKENS_PER_QUERY, -1)
+        tiny_model.block_pos_embed.weight.copy_(saved)
+
+    delta = tokens - base  # (1, L, 3, H) — exactly the block-position contribution
+    for block in range(L):
+        for slot in range(1, TOKENS_PER_QUERY):
+            assert torch.allclose(delta[0, block, 0], delta[0, block, slot], atol=1e-6)
+    assert not torch.allclose(delta[0, 0, 0], delta[0, 1, 0])
+    assert not torch.allclose(delta[0, 1, 0], delta[0, 2, 0])
+    assert torch.allclose(delta[0, 0, 0], saved[0], atol=1e-6)
+
+
+def test_patient_tokens_carry_no_block_position_embedding(tiny_model):
+    """Patient positions of the packed stream are code + patient-type embedding, nothing more."""
+    from every_query.model.conditional_ar_model import TYPE_PATIENT
+
+    batch = make_batch([[ANSWER_YES, ANSWER_NO, ANSWER_YES]])
+    captured = {}
+
+    def _capture(_module, _args, kwargs):
+        captured["inputs_embeds"] = kwargs["inputs_embeds"]
+
+    handle = tiny_model.HF_model.register_forward_pre_hook(_capture, with_kwargs=True)
+    try:
+        with torch.no_grad():
+            tiny_model(batch)
+    finally:
+        handle.remove()
+
+    n_patient = (batch.code != batch.PAD_INDEX).sum(dim=1)
+    with torch.no_grad():
+        expected = tiny_model.HF_model.get_input_embeddings()(batch.code)
+        expected = expected + tiny_model.token_type_embed.weight[TYPE_PATIENT]
+    for row, n in enumerate(n_patient.tolist()):
+        assert torch.allclose(captured["inputs_embeds"][row, :n], expected[row, :n], atol=1e-6)
+
+
+def test_block_position_embeddings_receive_finite_nonzero_gradients():
+    model = _tiny_ar_model()
+    batch = make_batch([[ANSWER_YES, ANSWER_NO, ANSWER_NO], [ANSWER_NO, ANSWER_YES, ANSWER_NO]])
+    model.train()
+    loss, _ = model(batch)
+    loss.backward()
+    grad = model.block_pos_embed.weight.grad
+    assert grad is not None and grad.isfinite().all()
+    assert grad.abs().sum() > 0
+
+
 def _uniform_mix(vocab: int) -> torch.Tensor:
     """Sparse mix matrix mapping *every* node's row to raw row 0 — all codes embed identically."""
     idx = torch.tensor([list(range(vocab)), [0] * vocab], dtype=torch.long)
@@ -474,6 +563,7 @@ def test_ar_checkpoint_round_trip(tiny_model, tmp_path):
     assert isinstance(loaded.model, ConditionalQueryARModel)
     assert loaded.model.hparams["max_queries"] == tiny_model.hparams["max_queries"]
     assert torch.equal(loaded.model.token_type_embed.weight, tiny_model.token_type_embed.weight)
+    assert torch.equal(loaded.model.block_pos_embed.weight, tiny_model.block_pos_embed.weight)
     # The dispatch key must not leak into (or get popped from) the live module's hparams.
     assert module.hparams["model"]["architecture"] == "autoregressive"
 

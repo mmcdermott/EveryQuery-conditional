@@ -67,11 +67,18 @@ name remains as a backward-compatible alias, and pre-rename checkpoints load unc
     model, queries attend to patient tokens directly (self-attention) rather than through
     cross-attention onto a bidirectionally encoded summary, and patient tokens are themselves
     encoded causally.
-- **Position encoding.** Llama's RoPE covers everything; there is no block-position table (RoPE
-    makes it redundant). A learned **token-type** embedding (patient/code/duration/answer) keeps
-    the flat stream role-aware. With `use_rope_time=true` the rotary positions are the dataset's
-    elapsed-hour `time_pos_ids` (delta tokens stripped), and query tokens continue at unit steps
-    after the last real event's hour.
+- **Position encoding.** Four mechanisms with disjoint jobs. **Clinical-time RoPE**: with
+    `use_rope_time=true` the rotary positions are the dataset's elapsed-hour `time_pos_ids`
+    (delta tokens stripped), and *every* query token repeats the final real patient event's hour
+    — that event is the prediction time and every conditional query is asked at it, so no
+    clinical time passes across `c_i, d_i, a_i` or between blocks (earlier answers are logical
+    conditioning, not later observations). **Block-position** embeddings (learned, `max_queries`
+    entries) carry query order, added identically to all three tokens of a block and never to
+    patient tokens. **Token-type** embeddings (patient/code/duration/answer) carry the slot role.
+    The **causal mask** — derived from physical token order, not from RoPE — enforces
+    autoregressive visibility, so repeated rotary positions are safe. Example: patient
+    `time_pos_ids = [0, 24, 72]` with two query blocks gives combined positions
+    `[0, 24, 72, 72, 72, 72, 72, 72, 72]`.
 - **Conditioning semantics.** The logit at `d_i` estimates
     `P(a_i = 1 | patient, c₁, d₁, a₁, …, c_i, d_i)`; earlier answers are caller-supplied
     conditioning values (teacher-forced in training). Feeding the model's own predictions back in

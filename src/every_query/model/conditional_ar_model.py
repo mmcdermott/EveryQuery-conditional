@@ -42,9 +42,17 @@ go through ``get_input_embeddings()``, so ontology mixing composes unchanged), t
 duration MLP, the boundary-code + learned-marker event-bound representation, the answer
 embedding, binary answers with censoring-as-a-``TIMELINE//END``-query, and the
 ``(answer_logits, valid_mask)`` output contract.  New here are learned **token-type**
-embeddings (patient / code / duration / answer) so the flat stream stays role-aware; the
-encoder-decoder model's block-position embedding is dropped — Llama's RoPE already encodes
-position, and each block's boundaries are recoverable from the type pattern.
+embeddings (patient / code / duration / answer) so the flat stream stays role-aware.
+
+The four positional mechanisms have disjoint jobs:
+
+- **Clinical-time RoPE** (``use_rope_time``): actual elapsed hours.  Every query token repeats
+  the *final real patient event's* hour — that event is the prediction time and all queries are
+  asked at it, so no clinical time passes across ``c_i, d_i, a_i`` or between blocks.
+- **Block-position embedding**: query order, added identically to all three tokens of a block.
+- **Token-type embedding**: the patient / code / duration / answer role.
+- **Causal mask**: what each token may see — derived from physical token order, not from RoPE,
+  so repeated rotary positions are safe.
 """
 
 import logging
@@ -88,13 +96,14 @@ class ConditionalQueryARModel(torch.nn.Module):
             ``num_attention_heads``, ``num_key_value_heads``, ``max_position_embeddings``,
             ``attention_dropout``, ``vocab_size``, ``pad_token_id``.  ``use_cache`` is forced
             off — training never decodes incrementally.
-        max_queries: Maximum query blocks per sequence.  Unlike the encoder-decoder model this
-            allocates no block-position table (RoPE covers position); it sizes the per-position
-            metrics in the Lightning module and the ``max_position_embeddings`` budget that
-            ``train.py`` computes (``max_seq_len + 3 * max_queries``).
+        max_queries: Maximum query blocks per sequence.  Sizes the learned block-position
+            table (query order), the per-position metrics in the Lightning module and the
+            ``max_position_embeddings`` budget that ``train.py`` computes
+            (``max_seq_len + 3 * max_queries``).
         use_rope_time: Drive rotary positions from ``batch.time_pos_ids`` (elapsed integer
             hours) instead of token index, exactly as the encoder-decoder model does for its
-            encoder.  Query tokens continue at unit steps after the last patient event's hour.
+            encoder.  Every query token shares the last patient event's hour — the prediction
+            time — since no clinical time passes while the queries are asked.
             Must be paired with ``ConditionalQueryPytorchDataset(strip_delta_tokens=True)``;
             a mismatch in either direction is a hard error (see
             :func:`~every_query.model.conditional_model.validate_rope_time_pair`).
@@ -142,6 +151,9 @@ class ConditionalQueryARModel(torch.nn.Module):
         self.duration_embed = MLP(layers=[1, 64, H], dropout_prob=0)
         self.answer_embed = torch.nn.Embedding(N_ANSWER_CLASSES, H)
         self.token_type_embed = torch.nn.Embedding(N_TOKEN_TYPES, H)
+        # Query *order* only.  RoPE carries clinical time (all query tokens share the
+        # prediction-time hour), so ordering needs its own learned table.  Patient tokens get none.
+        self.block_pos_embed = torch.nn.Embedding(max_queries, H)
         # Same role as the encoder-decoder model's marker: distinguishes "window ends at the
         # next X" from "is X observed" while both read the shared code-embedding table.  Always
         # allocated so the parameter set does not depend on the data.
@@ -207,9 +219,10 @@ class ConditionalQueryARModel(torch.nn.Module):
     def _query_tokens(self, batch) -> torch.Tensor:
         """Interleaved ``(B, 3L, H)`` query-stream embeddings ``[c₁, d₁, a₁, c₂, …]``.
 
-        Each slot carries its content embedding plus the matching token-type embedding.  No
-        block-position embedding is added: Llama's rotary positions already order the stream,
-        and the issue-#14 design drops the redundant table.
+        Each slot carries its content embedding + token-type embedding + the block-position
+        embedding of its query block (the same vector for ``c_i``, ``d_i`` and ``a_i``), which
+        is what encodes query order — clinical-time RoPE cannot, since every query token sits
+        at the prediction time.
         """
         B, L = batch.q_codes.shape
         tt = self.token_type_embed.weight
@@ -226,6 +239,8 @@ class ConditionalQueryARModel(torch.nn.Module):
             ],
             dim=2,
         )  # (B, L, 3, H)
+        block_idx = torch.arange(L, device=tokens.device).clamp(max=self.max_queries - 1)
+        tokens = tokens + self.block_pos_embed(block_idx).view(1, L, 1, -1).to(tokens.dtype)
         return tokens.reshape(B, L * TOKENS_PER_QUERY, -1)
 
     def _position_ids(
@@ -238,11 +253,12 @@ class ConditionalQueryARModel(torch.nn.Module):
         """``(B, T)`` rotary position ids, or ``None`` for Llama's default token-index arange.
 
         With ``use_rope_time`` the patient part carries the dataset's elapsed-hour
-        ``time_pos_ids`` and the query stream continues at unit steps from the last real
-        event's hour — every query is asked *at* the prediction time, so its tokens sit just
-        "after" the history on the time axis while keeping the strict monotone order the
-        causal factorization relies on.  Padding keeps position 0; it is attention-masked, so
-        its rotary angle never matters.
+        ``time_pos_ids`` and **every** query token repeats the last real event's hour: the
+        final event *is* the prediction time and all queries are asked at that instant, so no
+        clinical time passes across ``c_i, d_i, a_i`` or between blocks.  Repeated positions
+        are harmless — causality comes from the physical token order under Llama's causal
+        mask, and query order is carried by ``block_pos_embed``.  Padding keeps position 0; it
+        is attention-masked, so its rotary angle never matters.
 
         Without rope time the combined stream is left-packed (patient prefix, then queries),
         so Llama's own ``arange`` positions are exactly right and nothing is passed.
@@ -260,7 +276,7 @@ class ConditionalQueryARModel(torch.nn.Module):
         last_hour = torch.where(n_patient > 0, last_hour, torch.zeros_like(last_hour))
 
         n_query_tokens = query_positions.shape[1]
-        query_hours = last_hour.unsqueeze(1) + 1 + torch.arange(n_query_tokens, device=device).unsqueeze(0)
+        query_hours = last_hour.unsqueeze(1).expand(-1, n_query_tokens)
 
         position_ids = torch.zeros(B, total_len, dtype=torch.long, device=device)
         position_ids[:, :S] = time_pos

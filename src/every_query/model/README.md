@@ -21,8 +21,11 @@ shape, no Hydra entry points, no configs.
 - **`conditional_ar_model.py`** — `ConditionalQueryARModel`: the decoder-only conditional
     architecture. One Hugging Face `LlamaModel` (trained from scratch) jointly attends over
     `[patient events, c₁, d₁, a₁, …]` under a plain token-level causal mask; predictions are
-    read from each block's duration token. See `docs/CONDITIONAL_QUERIES.md` §1 for how the two
-    architectures' attention behaviors differ.
+    read from each block's duration token. Every query is asked *at* the prediction time, so
+    all query tokens share the final real patient event's clinical-time RoPE position; query
+    order is carried by learned block-position embeddings, roles by token-type embeddings, and
+    visibility by the causal mask (not RoPE). See `docs/CONDITIONAL_QUERIES.md` §1 for how the
+    two architectures' attention behaviors differ.
 - **`conditional_lightning.py`** — `ConditionalQueryLightningModule`. One Lightning wrapper for
     both conditional architectures; checkpoints record which one they hold via the model's
     `architecture` hparam (absent = encoder–decoder, so pre-rename checkpoints load unchanged).
