@@ -18,7 +18,18 @@ conditional structure (see [Results](#results)).
 
 ## 1. Model design
 
-`src/every_query/model/conditional_model.py` — `ConditionalQueryModel`
+Two interchangeable architectures learn the same factorization
+`P(A_j | patient, Q_1..Q_j, A_1..A_{j-1})`, share the same batch/output contract
+(`answer_logits` / `valid_mask`, both `(batch, n_queries)`), the same binary-answer semantics,
+and the same input representations (shared code-embedding table, duration MLP, event-bound
+boundary codes + learned marker, answer embedding, optional ontology mixing and rope-time
+positions). They differ in *how attention is wired*. Select one via
+`lightning_module.model._target_` (`conditional_config.yaml` vs `conditional_ar_config.yaml`).
+
+### 1a. Encoder–decoder (`ConditionalQueryEncoderDecoderModel`)
+
+`src/every_query/model/conditional_model.py` — previously named `ConditionalQueryModel`; that
+name remains as a backward-compatible alias, and pre-rename checkpoints load unchanged.
 
 - **Patient encoder.** A ModernBERT encoder (bidirectional) embeds the tokenized MEDS event
   sequence up to the prediction time `t`. No query token is mixed into the patient sequence; the
@@ -36,6 +47,35 @@ conditional structure (see [Results](#results)).
 - **Binary answers.** Every query asks *"is `code` observed in `(t, t+d)`?"* and the answer is
   binary YES/NO. There is no separate "censored" answer class and nothing is masked from the loss
   except padding. Loss is one BCE over all real query positions.
+
+### 1b. Decoder-only (`ConditionalQueryARModel`)
+
+`src/every_query/model/conditional_ar_model.py` — added by issue #14.
+
+- **One backbone.** A single Hugging Face `LlamaModel` (from a configurable `LlamaConfig`,
+  trained from scratch; `use_cache=False`) processes the combined sequence
+  `[p₁..pₘ, c₁, d₁, a₁, c₂, d₂, a₂, …]` — patient events, then interleaved query blocks. Each
+  patient row's query stream starts **immediately after its last real event** (no padding gap),
+  and `max_position_embeddings` is sized by `train.py` to `max_seq_len + 3 · max_queries`.
+- **Plain causal attention.** No ported block mask: the model passes only a 2-D padding mask and
+  lets Llama's standard token-level causal mask do the rest. The one behavioral difference from
+  the block mask is that `c_i` can no longer attend *forward* to `d_i`; the prediction is still
+  read from `d_i`, which sees `c_i` and itself, so the complete current query is available at
+  every prediction point. The invariant is unchanged: `d_i` sees the whole patient history,
+  every earlier `(c, d, a)` block, `c_i` and itself — never `a_i` or anything later — so all
+  query logits come out of one forward pass with no label leakage. Unlike the encoder–decoder
+  model, queries attend to patient tokens directly (self-attention) rather than through
+  cross-attention onto a bidirectionally encoded summary, and patient tokens are themselves
+  encoded causally.
+- **Position encoding.** Llama's RoPE covers everything; there is no block-position table (RoPE
+  makes it redundant). A learned **token-type** embedding (patient/code/duration/answer) keeps
+  the flat stream role-aware. With `use_rope_time=true` the rotary positions are the dataset's
+  elapsed-hour `time_pos_ids` (delta tokens stripped), and query tokens continue at unit steps
+  after the last real event's hour.
+- **Conditioning semantics.** The logit at `d_i` estimates
+  `P(a_i = 1 | patient, c₁, d₁, a₁, …, c_i, d_i)`; earlier answers are caller-supplied
+  conditioning values (teacher-forced in training). Feeding the model's own predictions back in
+  as later conditions is a separate sampling capability, deliberately not implemented here.
 
 ### Censoring is expressed as a query, not a label
 
@@ -69,7 +109,8 @@ The conditional pipeline mirrors the single-query one. New console scripts (in `
 | CLI | Purpose |
 |---|---|
 | `EQ_generate_query_sequences` | Sample fully-random query sequences per patient context; binary-label every query (`QuerySeqSchema` parquets). |
-| `EQ_train --config-name=conditional_config` | Train `ConditionalQueryModel` (`conditional_lightning.ConditionalQueryLightningModule`). |
+| `EQ_train --config-name=conditional_config` | Train the encoder–decoder `ConditionalQueryEncoderDecoderModel` (`conditional_lightning.ConditionalQueryLightningModule`). |
+| `EQ_train --config-name=conditional_ar_config` | Train the decoder-only `ConditionalQueryARModel` (same Lightning module; see §1b). |
 | `EQ_predict_sequences` | Teacher-forced per-position inference → flat per-query-position parquet. |
 | `EQ_evaluate_sequences` | Per-position and per-(query, horizon) metric tables. |
 
@@ -97,8 +138,10 @@ Key source modules:
   from the same `QuerySequenceDistribution` on the same seed axes.
 - `src/every_query/model/conditional_lightning.py` — Lightning module; metrics = pooled
   `answer_auc` + per-position breakdowns (training-time diagnostics only).
-- `src/every_query/train/configs/conditional_config.yaml` — the training config (8-layer encoder,
-  hidden 384, 4-layer decoder, bf16; vocab/positions are sized from the data by `train.py`).
+- `src/every_query/train/configs/conditional_config.yaml` — the encoder–decoder training config
+  (8-layer encoder, hidden 384, 4-layer decoder, bf16; vocab/positions are sized from the data by
+  `train.py`); `conditional_ar_config.yaml` — the decoder-only counterpart (12-layer Llama,
+  hidden 384; `max_position_embeddings` sized to `max_seq_len + 3 · max_queries`).
 
 ### Helper scripts (`scripts/`)
 

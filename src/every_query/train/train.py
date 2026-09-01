@@ -38,6 +38,38 @@ def int_prod(x: int, y: int) -> int:
     return round(x * y)
 
 
+def required_position_embeddings(model_cfg: DictConfig, max_seq_len: int) -> int:
+    """The ``max_position_embeddings`` a model config needs for a ``max_seq_len`` data window.
+
+    The decoder-only :class:`~every_query.model.conditional_ar_model.ConditionalQueryARModel`
+    runs patient history and query stream through **one** backbone, so its position budget must
+    cover both: ``max_seq_len`` patient tokens plus three tokens (code, duration, answer) per
+    query block up to ``max_queries``.  Every other model only ever feeds the backbone the
+    patient window plus the two tokens the single-query model splices in (query + duration),
+    which also safely covers the encoder-decoder conditional model (its encoder sees the
+    patient window alone).
+
+    Examples:
+        >>> ar = OmegaConf.create(
+        ...     {"_target_": "every_query.model.conditional_ar_model.ConditionalQueryARModel",
+        ...      "max_queries": 8}
+        ... )
+        >>> required_position_embeddings(ar, 256)
+        280
+        >>> encdec = OmegaConf.create(
+        ...     {"_target_": "every_query.model.conditional_model.ConditionalQueryEncoderDecoderModel"}
+        ... )
+        >>> required_position_embeddings(encdec, 256)
+        258
+    """
+    target = str(model_cfg.get("_target_", ""))
+    if target.rsplit(".", 1)[-1] == "ConditionalQueryARModel":
+        from every_query.model.conditional_model import TOKENS_PER_QUERY
+
+        return max_seq_len + TOKENS_PER_QUERY * int(model_cfg.max_queries)
+    return max_seq_len + 2
+
+
 def values_as_list(**kwargs) -> list[Any]:
     # Drop None so an optional callback can be toggled off with `<name>: null` instead of
     # deleting/commenting its config block.
@@ -271,9 +303,10 @@ def main(cfg: DictConfig) -> float | None:
     validate_training_config(cfg)
 
     # Size the model from the data: vocab from metadata/codes.parquet, positions from the
-    # datamodule window plus the two tokens the model adds — the query token (prepended in
-    # ``EveryQueryPytorchDataset._seeded_getitem``) and the duration token (spliced in
-    # ``EveryQueryModel._hf_inputs``).  Done here, before the config is saved and before
+    # datamodule window plus what the selected architecture adds on top of it (two spliced
+    # tokens for the single-query model; three tokens per query block for the decoder-only
+    # conditional model — see ``required_position_embeddings``).  Done here, before the config
+    # is saved and before
     # ``validate_resume_directory`` diffs it, so the run dir records the real numbers and a
     # resumed run compares like with like.
     ds_cfg = instantiate(cfg.datamodule.config)
@@ -298,7 +331,9 @@ def main(cfg: DictConfig) -> float | None:
         vocab_size = v_ext
 
     cfg.lightning_module.model.config_overrides.vocab_size = vocab_size
-    cfg.lightning_module.model.config_overrides.max_position_embeddings = ds_cfg.max_seq_len + 2
+    cfg.lightning_module.model.config_overrides.max_position_embeddings = required_position_embeddings(
+        cfg.lightning_module.model, ds_cfg.max_seq_len
+    )
 
     if cfg.do_overwrite and cfg.do_resume:
         logger.warning(

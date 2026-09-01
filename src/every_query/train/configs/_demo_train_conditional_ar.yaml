@@ -1,8 +1,10 @@
-# Minimal Hydra config for CPU-only integration tests of the conditional query-sequence model.
+# Minimal Hydra config for CPU-only integration tests of the decoder-only (Llama) conditional
+# query-sequence model.  Mirrors _demo_train_conditional.yaml with the AR architecture selected;
+# see conditional_ar_config.yaml for the production counterpart.
 #
 # Usage (tests override the ??? paths via Hydra CLI):
-#   EQ_train --config-name=_demo_train_conditional \
-#       output_dir=/tmp/cq_test \
+#   EQ_train --config-name=_demo_train_conditional_ar \
+#       output_dir=/tmp/cq_ar_test \
 #       datamodule.config.task_labels_dir=/tmp/seq_tasks \
 #       datamodule.config.tensorized_cohort_dir=/tmp/cohort
 
@@ -15,8 +17,8 @@ do_resume: false
 seed: 1
 
 datamodule:
-  # Match production (conditional_config.yaml): the stateful loader, so the demo run exercises
-  # the same train_dataloader path.
+  # Match production (conditional_ar_config.yaml): the stateful loader, so the demo run
+  # exercises the same train_dataloader path.
   _target_: every_query.data.datamodule.ResumableDatamodule
   data_class: every_query.data.seq_dataset.ConditionalQueryPytorchDataset
   config:
@@ -39,21 +41,20 @@ datamodule:
 lightning_module:
   _target_: every_query.model.conditional_lightning.ConditionalQueryLightningModule
   model:
-    _target_: every_query.model.conditional_model.ConditionalQueryEncoderDecoderModel
+    _target_: every_query.model.conditional_ar_model.ConditionalQueryARModel
     precision: ${trainer.precision}
     mlp_dropout: 0.1
     use_rope_time: false
     ontology_dir: null
-    decoder_layers: 2
-    decoder_heads: 2
-    decoder_ffn_mult: 2
     max_queries: 8
     config_overrides:
       hidden_size: 64
       num_hidden_layers: 2
       num_attention_heads: 2
+      num_key_value_heads: 2
       intermediate_size: 128
-      # Dictated by the data — filled in by train.py from the datamodule config.
+      attention_dropout: 0.0
+      # Dictated by the data — filled in by train.py as max_seq_len + 3 * max_queries.
       max_position_embeddings: ???
       vocab_size: ???
       pad_token_id: 0

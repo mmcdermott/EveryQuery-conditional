@@ -328,8 +328,8 @@ def test_seq_collate_answer_classes(seq_dataset, seq_sample_batch):
     batch = seq_sample_batch
     raw = seq_dataset.schema_df[ANSWERS_COL].to_list()
     for i, answers in enumerate(raw):
-        for j, ans in enumerate(answers):
-            expected = ANSWER_YES if ans else ANSWER_NO
+        for j, answer in enumerate(answers):
+            expected = ANSWER_YES if answer else ANSWER_NO
             assert batch.q_answers[i, j].item() == expected, f"row {i} pos {j}"
         # padding beyond the real length is ANSWER_NO
         for j in range(len(answers), batch.n_queries):
@@ -924,7 +924,15 @@ def test_conditional_configs_leave_encoder_sizing_to_the_data(name):
     assert overrides["max_position_embeddings"] == "???"
 
 
-@pytest.mark.parametrize("name", ["conditional_config.yaml", "_demo_train_conditional.yaml"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "conditional_config.yaml",
+        "_demo_train_conditional.yaml",
+        "conditional_ar_config.yaml",
+        "_demo_train_conditional_ar.yaml",
+    ],
+)
 def test_conditional_configs_have_one_source_of_truth_for_precision_and_steps(name):
     cfg = _train_config(name)
     assert cfg["lightning_module"]["model"]["precision"] == "${trainer.precision}"
@@ -934,18 +942,20 @@ def test_conditional_configs_have_one_source_of_truth_for_precision_and_steps(na
     assert cfg["trainer"]["max_epochs"] == 1
 
 
-def test_conditional_config_writes_into_the_hydra_run_dir():
+@pytest.mark.parametrize("name", ["conditional_config.yaml", "conditional_ar_config.yaml"])
+def test_conditional_config_writes_into_the_hydra_run_dir(name):
     """``${output_dir}`` is the shared base; a second run there would raise FileExistsError."""
-    cfg = _train_config("conditional_config.yaml")
+    cfg = _train_config(name)
     assert cfg["trainer"]["default_root_dir"] == "${hydra:runtime.output_dir}"
     assert cfg["hydra"]["run"]["dir"].startswith("${output_dir}/")
     for key in ("logger", "callbacks"):
         assert "${trainer.default_root_dir}" in yaml.safe_dump(cfg["trainer"][key])
 
 
-def test_conditional_config_declares_warmup_ratio_not_dead_step_counts():
+@pytest.mark.parametrize("name", ["conditional_config.yaml", "conditional_ar_config.yaml"])
+def test_conditional_config_declares_warmup_ratio_not_dead_step_counts(name):
     """``configure_optimizers`` overrides these as call-site kwargs, so declaring them is dead."""
-    lm = _train_config("conditional_config.yaml")["lightning_module"]
+    lm = _train_config(name)["lightning_module"]
     assert lm["warmup_ratio"] == 0.05
     assert "num_warmup_steps" not in lm["LR_scheduler"]
     assert "num_training_steps" not in lm["LR_scheduler"]
