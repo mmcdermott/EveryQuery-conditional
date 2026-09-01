@@ -105,10 +105,6 @@ lightning_module:
       max_position_embeddings: ???
       vocab_size: ???
       pad_token_id: 0
-      cls_token_id: 1
-      bos_token_id: 1
-      sep_token_id: 2
-      eos_token_id: 2
   optimizer:
     _target_: torch.optim.AdamW
     _partial_: true
