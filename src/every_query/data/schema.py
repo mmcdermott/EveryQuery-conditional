@@ -154,6 +154,39 @@ class QuerySeqSchema(LabelSchema):
     bound_events: Optional(pa.large_list(pa.large_string()), nullable=True)
 
 
+class MultitaskBoundarySchema(LabelSchema):
+    """One multitask-boundary context: a ``(subject_id, prediction_time)`` plus exactly ``K`` boundaries.
+
+    The all-vocabulary targets are **not** in the parquet; they live row-aligned in the bit-packed
+    ``<shard>.labels.npy`` sidecar next to it (see
+    :mod:`~every_query.generate_tasks.sample_multitask_sequences`).  This schema only carries the
+    boundary definitions:
+
+    Attributes:
+        durations: ``K`` horizons in days (``float32``).  A duration-bounded slot holds ``>= 0``; an
+            event-bounded slot holds ``EVENT_BOUND_DURATION_SENTINEL`` (``-1.0``).
+        bound_events: ``K`` boundary codes aligned with ``durations``: null for a duration-bounded
+            slot, a base-vocabulary code for an event-bounded one.  Exactly one representation is
+            active per slot.
+
+    Examples:
+        >>> from datetime import datetime
+        >>> import pyarrow as pa
+        >>> data = pa.Table.from_pylist([
+        ...     {"subject_id": 1, "prediction_time": datetime(2023, 1, 1),
+        ...      "durations": [30.0, -1.0], "bound_events": [None, "ICD//I10"]},
+        ... ])
+        >>> aligned = MultitaskBoundarySchema.align(data)
+        >>> [f.name for f in aligned.schema]
+        ['subject_id', 'prediction_time', 'durations', 'bound_events']
+        >>> aligned.column("bound_events").to_pylist()
+        [[None, 'ICD//I10']]
+    """
+
+    durations: Required(pa.large_list(pa.float32()), nullable=False)
+    bound_events: Required(pa.large_list(pa.large_string()), nullable=False)
+
+
 def empty_task_query_df() -> pl.DataFrame:
     """Build an empty polars DataFrame shaped like ``TaskQuerySchema``'s required columns plus the inherited
     ``boolean_value`` (the collapsed label column).

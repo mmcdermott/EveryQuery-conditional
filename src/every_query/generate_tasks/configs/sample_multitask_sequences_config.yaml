@@ -1,0 +1,71 @@
+# Hydra config for the all-vocabulary, multi-bound *multitask* label generator
+# (`EQ_generate_multitask_sequences`, issue #20).
+#
+# For every sampled patient context the sampler draws a fixed sequence of `num_bounds` boundaries and
+# labels EVERY base-vocabulary code at every boundary:
+#
+#   target[i, k, v] = prediction_time[i] < first occurrence of v strictly after prediction_time[i]
+#                                          < resolved_boundary[i, k]
+#
+# The window is open at both ends; an event boundary that never recurs is +infinity.  Targets are
+# written bit-packed (`uint8`, little bit order, shape `(rows, num_bounds, ceil(V / 8))`) to a
+# `<shard>.labels.npy` sidecar row-aligned with the `<shard>.parquet` metadata; the driver writes a
+# `_multitask_manifest.json` per split describing the vocabulary and semantics the labels were built
+# under.
+#
+# Path roots are machine-specific, **required** Hydra args — no `.env`/env-var fallback.  Pass them on
+# the CLI as shell-expanded vars:
+#   data_dir=$TOKENIZED_EVENTS_DIR out_dir=$MULTITASK_TASKS_DIR query_codes=$TENSORIZED_COHORT_DIR
+#
+#   data_dir     MEDS dataset root (event shards under `{data_dir}/data/{split}/*.parquet`)
+#   out_dir      final-output-only root; `{split}/{shard}.parquet` + `{split}/{shard}.labels.npy` +
+#                `{split}/_multitask_manifest.json` and nothing else, so it is directly usable as
+#                MTD's `task_labels_dir`
+#   query_codes  the cohort's vocabulary: a metadata root dir (loads `{dir}/metadata/codes.parquet`)
+#                or a direct `codes.parquet` path.  Bits are aligned to that file's unchanged
+#                `code/vocab_index` (V = max index + 1); an explicit code list is NOT accepted here
+#                because it carries no indices.
+#
+# Intermediates live in the sibling `{parent}/{name}_artifacts` of out_dir (Stage 0 prediction-time
+# map, Stage 3M index, per-shard label-provenance sidecars).
+
+data_dir: ???
+out_dir: ???
+query_codes: ???
+
+split: train
+seed: 1
+
+# Sampling budget: total contexts drawn across the whole split (one context = one output row).
+num_training_examples: 10000000
+# Boundaries per context.  Fixed, not sampled: every row has exactly this many slots.
+num_bounds: 5
+
+# Duration draw for duration-bounded slots (float days, no rounding).
+duration_min: 1
+duration_max: 1826
+duration_distribution: log-uniform # uniform | log-uniform
+
+# Per slot, independently: Bernoulli(eventbound_fraction) decides event- vs duration-bounded.  An
+# event-bounded slot draws its boundary code iid uniform WITH replacement from `boundary_codes`;
+# null => every base observable code (vocab index >= 1) of `query_codes`.  Repeated durations and
+# repeated boundary codes within one context are allowed.
+eventbound_fraction: 0.5
+boundary_codes: null
+
+# Minimum prior prediction times a subject needs before a prediction time is eligible (Stage 0).
+min_prediction_times_per_subject: 50
+# Cap on the Stage 4M worker pool; null => cores on this node.  Each worker holds one event shard,
+# its interval table, a `label_chunk_rows x num_bounds x V` boolean scratch (~110 MB at 2000 x 5 x
+# 11k) and the packed output memmap — size the pool for memory, not only cores.
+max_workers: null
+label_chunk_rows: 2000
+
+# MVP: observable leaf codes only.  Any non-null value raises NotImplementedError before Stage 0.
+ontology_dir: null
+overwrite: false
+
+hydra:
+  output_subdir: null
+  job:
+    chdir: false

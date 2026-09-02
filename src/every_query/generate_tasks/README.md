@@ -218,6 +218,66 @@ EQ_generate_evaluation_query_sequences \
 `EQ_generate_query_sequences` takes the same three path args and only ever samples its contexts;
 to label a supplied cohort use `EQ_generate_evaluation_query_sequences contexts_path=...`.
 
+### Multitask boundary labels — every code at every boundary
+
+`EQ_generate_multitask_sequences` (issue #20) samples, per patient context, a fixed sequence of
+`num_bounds` (default 5) boundaries — each duration-bounded (`prediction_time + duration_days`) or
+event-bounded (first occurrence of a boundary code strictly after the prediction time, `+inf` if it
+never recurs) — and labels **every base-vocabulary code** at every boundary:
+
+```
+target[i, k, v] = prediction_time[i] < first occurrence of v after prediction_time[i] < boundary[i, k]
+```
+
+Both ends are open, exactly as `label_with_event_bounds` defines the scalar window (the tests are
+differential against it).  Stages 0 and 2 are the shared sampler stages; Stage 1M draws the boundary
+sequences from three independent RNG streams (`bound_forms`, `bound_durations`, `bound_codes`), Stage 3M
+partitions by event shard and sorts each partition by `(subject_id, prediction_time, _ctx_id)`, and
+Stage 4M builds an interval table per shard (`interval_table.py`) and labels each subject's contexts by
+scanning that subject's interval rows once per bounded chunk — never one lookup per
+`(context, boundary, code)`.
+
+```bash
+EQ_generate_multitask_sequences \
+	data_dir=$TOKENIZED_EVENTS_DIR out_dir=$MULTITASK_TASKS_DIR query_codes=$TENSORIZED_COHORT_DIR \
+	split=train num_training_examples=100000 max_workers=8 label_chunk_rows=2000
+```
+
+`query_codes` must be the cohort's metadata root (or a `codes.parquet` path): bits are aligned to the
+unchanged `code/vocab_index`, `V = max(index) + 1`, and an explicit code list is rejected.  Output per
+shard:
+
+```
+{out_dir}/{split}/{shard}.parquet             MultitaskBoundarySchema: subject_id, prediction_time,
+                                              durations[K] (float32), bound_events[K] (str | null)
+{out_dir}/{split}/{shard}.labels.npy          uint8 (rows, K, ceil(V / 8)), bitorder="little",
+                                              row-aligned with the parquet
+{out_dir}/{split}/_multitask_manifest.json    written by the driver before any worker starts:
+                                              K, V, packed width, bit order, window semantics,
+                                              vocabulary fingerprint, ontology_mode: "none"
+```
+
+Unpack with `np.unpackbits(packed, axis=-1, count=V, bitorder="little")`; bit 0 (PAD) is always false
+and must be masked from the loss.  Each worker's dense scratch is `label_chunk_rows x K x V` booleans
+(~110 MB at 2000 x 5 x 11k); packed rows are written incrementally through a temporary memmap that is
+flushed and atomically renamed, then the parquet, then the `_labeled/{shard}.json` provenance sidecar.
+An output is reused only when both files exist with agreeing row counts, the packed shape is right,
+and the index, config and vocabulary fingerprints all match — a changed duration distribution,
+event-bound fraction, `num_bounds`, boundary pool or `codes.parquet` relabels.  Per shard, the worker
+logs event/interval/context counts, build / boundary-resolution / labeling seconds, contexts per
+second, peak RSS, output bytes, the fraction of event boundaries resolving to `+inf`, and mean
+positives per context-boundary.
+
+`MultitaskBoundaryPytorchDataset` (`every_query.data.multitask_dataset`) consumes the layout as MTD's
+`task_labels_dir`: it reads only the metadata parquets at init, opens the sidecars read-only via
+`mmap_mode="r"`, tags each row with its source shard and physical row so a global shuffle keeps the
+alignment, unpacks once per batch in `collate`, and refuses to load when the cohort's `codes.parquet`
+(or an explicit `expected_vocab_size` / `expected_vocab_fingerprint`) disagrees with the manifest.
+
+**MVP scope:** observable leaf codes only.  A non-null `ontology_dir` raises before Stage 0; events are
+never closure-expanded.  Ancestor targets and boundaries plug in later through the seams
+`build_target_vocabulary`, `prepare_events_for_labeling` and `resolve_event_boundaries`.
+
 ## Determinism & restartability
 
 All training draws derive from `seed` via `utils.seeds.derive_seed`, splitting the **query

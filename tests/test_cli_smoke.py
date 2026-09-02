@@ -39,6 +39,8 @@ _ENTRYPOINTS: list[str] = [
     "EQ_generate_evaluation_query_sequences",
     "EQ_predict_sequences",
     "EQ_evaluate_sequences",
+    # All-vocabulary multi-bound multitask sampler (#20).
+    "EQ_generate_multitask_sequences",
 ]
 
 # Third-party modules a ``scripts/`` driver needs that this project does not depend on.  The script
