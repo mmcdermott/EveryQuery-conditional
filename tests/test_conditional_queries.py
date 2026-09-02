@@ -165,6 +165,24 @@ def make_batch(
     )
 
 
+def test_decoder_layers_are_independently_initialized(tiny_model):
+    a, b = tiny_model.decoder.layers[0], tiny_model.decoder.layers[1]
+    assert not torch.equal(a.self_attn.in_proj_weight, b.self_attn.in_proj_weight)
+    assert not torch.equal(a.linear1.weight, b.linear1.weight)
+
+
+def test_construction_is_deterministic_per_seed():
+    def build():
+        torch.manual_seed(0)
+        return ConditionalQueryModel(
+            config_overrides=MODEL_OVERRIDES, decoder_layers=2, decoder_heads=2, max_queries=8
+        ).state_dict()
+
+    first, second = build(), build()
+    assert first.keys() == second.keys()
+    assert all(torch.equal(first[k], second[k]) for k in first)
+
+
 def test_forward_shapes_and_finite_loss(tiny_model):
     batch = make_batch([[ANSWER_YES, ANSWER_NO, ANSWER_YES], [ANSWER_NO, ANSWER_NO, ANSWER_NO]])
     loss, out = tiny_model(batch)
