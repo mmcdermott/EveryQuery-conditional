@@ -134,10 +134,10 @@ class ConditionalQueryARModel(torch.nn.Module):
     ):
         super().__init__()
 
-        self.HF_model_config = LlamaConfig()
-        if config_overrides:
-            for key, value in config_overrides.items():
-                setattr(self.HF_model_config, key, value)
+        # Pass overrides through the constructor: ``head_dim`` is derived there from
+        # ``hidden_size // num_attention_heads``, so setattr-after-the-fact would leave Llama's
+        # default head_dim=128 (2x wider attention than intended).
+        self.HF_model_config = LlamaConfig(**(config_overrides or {}))
 
         self.HF_model_config.use_cache = False
         self.HF_model_config.output_hidden_states = False
