@@ -67,6 +67,7 @@ from every_query.model.conditional_model import (
     TOKEN_DURATION,
     TOKENS_PER_QUERY,
     ConditionalQueryOutput,
+    _init_aux_embeddings,
     masked_bce,
     validate_rope_time_pair,
 )
@@ -157,8 +158,19 @@ class ConditionalQueryARModel(torch.nn.Module):
         # Same role as the encoder-decoder model's marker: distinguishes "window ends at the
         # next X" from "is X observed" while both read the shared code-embedding table.  Always
         # allocated so the parameter set does not depend on the data.
-        self.bound_marker = torch.nn.Parameter(torch.randn(H) * 0.02)
+        self.bound_marker = torch.nn.Parameter(torch.randn(H) * self.HF_model_config.initializer_range)
         self.answer_mlp = MLP(layers=[H, 128, 1], dropout_prob=mlp_dropout)
+
+        # These tables live outside the backbone, so LlamaModel.post_init() never touched them
+        # and they kept nn.Embedding's default N(0, 1) -- ~50x the code embeddings' std, which
+        # lets the shared type/position vectors swamp code identity in the summed input.
+        # Re-init here, not via self.apply(), which would reset the already-initialized backbone.
+        _init_aux_embeddings(
+            self.HF_model_config.initializer_range,
+            self.answer_embed,
+            self.token_type_embed,
+            self.block_pos_embed,
+        )
 
         self.max_queries = max_queries
         self.use_rope_time = use_rope_time
