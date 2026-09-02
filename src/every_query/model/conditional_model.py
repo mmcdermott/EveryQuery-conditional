@@ -347,17 +347,24 @@ class ConditionalQueryEncoderDecoderModel(torch.nn.Module):
         H = self.HF_model_config.hidden_size
         n_heads = decoder_heads if decoder_heads is not None else self.HF_model_config.num_attention_heads
 
-        decoder_layer = torch.nn.TransformerDecoderLayer(
-            d_model=H,
-            nhead=n_heads,
-            dim_feedforward=decoder_ffn_mult * H,
-            dropout=mlp_dropout,
-            batch_first=True,
-            norm_first=True,
-        )
+        def make_decoder_layer() -> torch.nn.TransformerDecoderLayer:
+            return torch.nn.TransformerDecoderLayer(
+                d_model=H,
+                nhead=n_heads,
+                dim_feedforward=decoder_ffn_mult * H,
+                dropout=mlp_dropout,
+                batch_first=True,
+                norm_first=True,
+            )
+
         self.decoder = torch.nn.TransformerDecoder(
-            decoder_layer, num_layers=decoder_layers, norm=torch.nn.LayerNorm(H)
+            make_decoder_layer(), num_layers=decoder_layers, norm=torch.nn.LayerNorm(H)
         )
+        # nn.TransformerDecoder deep-copies its template layer, so every layer would start from
+        # byte-identical weights (PyTorch's own docs recommend re-initializing).  Build each layer
+        # freshly instead of picking a blanket re-init policy: each submodule keeps its native
+        # initializer, just with independent draws.
+        self.decoder.layers = torch.nn.ModuleList(make_decoder_layer() for _ in range(decoder_layers))
 
         self.duration_embed = MLP(layers=[1, 64, H], dropout_prob=0)
         self.answer_embed = torch.nn.Embedding(N_ANSWER_CLASSES, H)
