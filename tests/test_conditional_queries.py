@@ -165,6 +165,24 @@ def make_batch(
     )
 
 
+def test_decoder_layers_are_independently_initialized(tiny_model):
+    a, b = tiny_model.decoder.layers[0], tiny_model.decoder.layers[1]
+    assert not torch.equal(a.self_attn.in_proj_weight, b.self_attn.in_proj_weight)
+    assert not torch.equal(a.linear1.weight, b.linear1.weight)
+
+
+def test_construction_is_deterministic_per_seed():
+    def build():
+        torch.manual_seed(0)
+        return ConditionalQueryModel(
+            config_overrides=MODEL_OVERRIDES, decoder_layers=2, decoder_heads=2, max_queries=8
+        ).state_dict()
+
+    first, second = build(), build()
+    assert first.keys() == second.keys()
+    assert all(torch.equal(first[k], second[k]) for k in first)
+
+
 def test_forward_shapes_and_finite_loss(tiny_model):
     batch = make_batch([[ANSWER_YES, ANSWER_NO, ANSWER_YES], [ANSWER_NO, ANSWER_NO, ANSWER_NO]])
     loss, out = tiny_model(batch)
@@ -301,8 +319,12 @@ def test_seq_dataset_loads_and_encodes(seq_dataset):
 def test_seq_dataset_getitem_carries_sequences(seq_dataset):
     item = seq_dataset[0]
     assert len(item["queries"]) == len(item["durations"]) == len(item["answers"])
-    assert all(isinstance(a, bool) for a in item["answers"]), "answers are binary, never None"
+    assert item["answers"].dtype == bool, "answers are binary, never None"
     assert "dynamic" in item
+    last = seq_dataset[-1]
+    assert len(last["queries"]) == len(seq_dataset.queries[len(seq_dataset) - 1]), (
+        "negative index slices offsets"
+    )
 
 
 def test_seq_collate_shapes_and_padding(seq_dataset, seq_sample_batch):
@@ -328,8 +350,8 @@ def test_seq_collate_answer_classes(seq_dataset, seq_sample_batch):
     batch = seq_sample_batch
     raw = seq_dataset.schema_df[ANSWERS_COL].to_list()
     for i, answers in enumerate(raw):
-        for j, ans in enumerate(answers):
-            expected = ANSWER_YES if ans else ANSWER_NO
+        for j, answer in enumerate(answers):
+            expected = ANSWER_YES if answer else ANSWER_NO
             assert batch.q_answers[i, j].item() == expected, f"row {i} pos {j}"
         # padding beyond the real length is ANSWER_NO
         for j in range(len(answers), batch.n_queries):
@@ -924,7 +946,15 @@ def test_conditional_configs_leave_encoder_sizing_to_the_data(name):
     assert overrides["max_position_embeddings"] == "???"
 
 
-@pytest.mark.parametrize("name", ["conditional_config.yaml", "_demo_train_conditional.yaml"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "conditional_config.yaml",
+        "_demo_train_conditional.yaml",
+        "conditional_ar_config.yaml",
+        "_demo_train_conditional_ar.yaml",
+    ],
+)
 def test_conditional_configs_have_one_source_of_truth_for_precision_and_steps(name):
     cfg = _train_config(name)
     assert cfg["lightning_module"]["model"]["precision"] == "${trainer.precision}"
@@ -934,18 +964,20 @@ def test_conditional_configs_have_one_source_of_truth_for_precision_and_steps(na
     assert cfg["trainer"]["max_epochs"] == 1
 
 
-def test_conditional_config_writes_into_the_hydra_run_dir():
+@pytest.mark.parametrize("name", ["conditional_config.yaml", "conditional_ar_config.yaml"])
+def test_conditional_config_writes_into_the_hydra_run_dir(name):
     """``${output_dir}`` is the shared base; a second run there would raise FileExistsError."""
-    cfg = _train_config("conditional_config.yaml")
+    cfg = _train_config(name)
     assert cfg["trainer"]["default_root_dir"] == "${hydra:runtime.output_dir}"
     assert cfg["hydra"]["run"]["dir"].startswith("${output_dir}/")
     for key in ("logger", "callbacks"):
         assert "${trainer.default_root_dir}" in yaml.safe_dump(cfg["trainer"][key])
 
 
-def test_conditional_config_declares_warmup_ratio_not_dead_step_counts():
+@pytest.mark.parametrize("name", ["conditional_config.yaml", "conditional_ar_config.yaml"])
+def test_conditional_config_declares_warmup_ratio_not_dead_step_counts(name):
     """``configure_optimizers`` overrides these as call-site kwargs, so declaring them is dead."""
-    lm = _train_config("conditional_config.yaml")["lightning_module"]
+    lm = _train_config(name)["lightning_module"]
     assert lm["warmup_ratio"] == 0.05
     assert "num_warmup_steps" not in lm["LR_scheduler"]
     assert "num_training_steps" not in lm["LR_scheduler"]

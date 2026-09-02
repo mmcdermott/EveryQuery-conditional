@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
 
+import numpy as np
 import polars as pl
 import pyarrow.parquet as pq
 import torch
@@ -146,6 +147,24 @@ class ConditionalQueryBatch(MEDSTorchBatch):
                 raise ValueError(f"Expected shape {expected} for {name}, but got {got}!")
 
 
+def _ragged(series: pl.Series) -> tuple[np.ndarray, np.ndarray]:
+    """``(offsets, values)`` of a list column: row ``i`` is ``values[offsets[i]:offsets[i+1]]``.
+
+    Examples:
+        >>> offsets, values = _ragged(pl.Series([["a", "b"], [], ["c"]]))
+        >>> offsets.tolist(), values.tolist()
+        ([0, 2, 2, 3], ['a', 'b', 'c'])
+    """
+    lengths = series.list.len().fill_null(0).to_numpy()
+    offsets = np.zeros(len(lengths) + 1, dtype=np.int64)
+    np.cumsum(lengths, out=offsets[1:])
+    # Drop empty/null lists before exploding: they would otherwise yield a null row each.
+    values = series.filter(series.list.len() > 0).explode().to_numpy()
+    if len(values) != offsets[-1]:
+        raise ValueError(f"list column exploded to {len(values)} values but lengths sum to {offsets[-1]}")
+    return offsets, values
+
+
 class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
     """MEDS dataset over query-sequence label parquets (see module docstring for tensor shapes)."""
 
@@ -254,6 +273,30 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
 
         self.eos_query_index: int | None = self.code_to_index.get(EOS_CODE)
 
+        # Pre-encode the list columns to flat numpy here, in the parent, so DataLoader workers
+        # only ever slice plain arrays.  A 10M-row run died in a forked worker on a query code
+        # that read back as '' from a polars list-of-strings Series that scans clean in-process
+        # (parquet, exploded column, and a full single-process getitem walk all agree); the
+        # vocabulary check above already guarantees every code encodes, so this also makes an
+        # out-of-vocabulary KeyError at collate time impossible.
+        self._q_offsets, q = _ragged(self.queries)
+        self._q_codes = np.fromiter((self.code_to_index[c] for c in q), dtype=np.int64, count=len(q))
+        d_offsets, self._q_durations = _ragged(self.durations)
+        a_offsets, self._q_answers = _ragged(self.answers)
+        if not (np.array_equal(self._q_offsets, d_offsets) and np.array_equal(self._q_offsets, a_offsets)):
+            raise ValueError("queries/durations/answers list lengths disagree in the labels.")
+        self._q_durations = self._q_durations.astype(np.float32)  # copy: polars arrays are read-only
+        self._q_answers = self._q_answers.astype(bool)
+        if self.has_bound_events:
+            b_offsets, b = _ragged(self.bound_events)
+            if not np.array_equal(self._q_offsets, b_offsets):
+                raise ValueError("queries/bound_events list lengths disagree in the labels.")
+            self._q_bound_codes = np.fromiter(
+                (NO_BOUND_INDEX if c is None else self.code_to_index[c] for c in b),
+                dtype=np.int64,
+                count=len(b),
+            )
+
         self.strip_delta_tokens = strip_delta_tokens
         self.delta_ids = rope_time.delta_vocab_ids(self.code_to_index)
         if strip_delta_tokens:
@@ -271,7 +314,10 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
 
     @property
     def labels_df(self) -> pl.DataFrame:
-        """Task label rows incl. the query-sequence list columns, in MEDS Label schema order."""
+        """Task label rows incl.
+
+        the query-sequence list columns, in MEDS Label schema order.
+        """
         if not self.has_task_index:
             return None
 
@@ -297,11 +343,13 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
 
     def _seeded_getitem(self, idx: int, seed: int | None = None) -> dict[str, torch.Tensor]:
         out = super()._seeded_getitem(idx, seed)
-        out["queries"] = self.queries[idx].to_list()
-        out["durations"] = self.durations[idx].to_list()
-        out["answers"] = self.answers[idx].to_list()
+        idx = range(len(self._q_offsets) - 1)[idx]  # normalize negative indices
+        s, e = self._q_offsets[idx], self._q_offsets[idx + 1]
+        out["queries"] = self._q_codes[s:e]
+        out["durations"] = self._q_durations[s:e]
+        out["answers"] = self._q_answers[s:e]
         if self.has_bound_events:
-            out["bound_events"] = self.bound_events[idx].to_list()
+            out["bound_events"] = self._q_bound_codes[s:e]
         return out
 
     def _apply_rope_time(self, out: dict) -> torch.LongTensor | None:
@@ -369,9 +417,8 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
         )
 
         for i, item in enumerate(batch):
-            codes = [self.encode_query(c) for c in item["queries"]]
-            n = len(codes)
-            q_codes[i, :n] = torch.as_tensor(codes, dtype=torch.long)
+            n = len(item["queries"])
+            q_codes[i, :n] = torch.as_tensor(item["queries"], dtype=torch.long)
             q_durations[i, :n] = torch.as_tensor(item["durations"], dtype=torch.float)
             q_answers[i, :n] = torch.as_tensor(
                 [ANSWER_YES if a else ANSWER_NO for a in item["answers"]],
@@ -379,14 +426,9 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
             )
             q_mask[i, :n] = True
             if q_bound_codes is not None:
-                # A null entry is a time-bounded query.  Non-null goes through the *strict*
-                # encode_query, so a boundary code outside the vocabulary raises here rather
-                # than silently PAD-encoding into "no bound" and quietly turning the query
-                # back into an ordinary horizon query.
-                q_bound_codes[i, :n] = torch.as_tensor(
-                    [NO_BOUND_INDEX if b is None else self.encode_query(b) for b in item["bound_events"]],
-                    dtype=torch.long,
-                )
+                # Pre-encoded at init: NO_BOUND_INDEX for a time-bounded query, else the strict
+                # vocab index (an unknown boundary code fails there, never silently PAD-encodes).
+                q_bound_codes[i, :n] = torch.as_tensor(item["bound_events"], dtype=torch.long)
 
         return ConditionalQueryBatch(
             **out,

@@ -299,6 +299,65 @@ def test_conditional_train_produces_checkpoint(cq_trained_model_dir: Path):
     assert (cq_trained_model_dir / "resolved_config.yaml").exists()
 
 
+@pytest.fixture(scope="session")
+def cq_ar_trained_model_dir(
+    eq_preprocessed_dataset: Path, cq_sequence_tasks_dir: Path, tmp_path_factory
+) -> Path:
+    """The decoder-only architecture through the same ``EQ_train`` surface, selected by config."""
+    output_dir = tmp_path_factory.mktemp("cq_ar_train_out")
+    run_and_check(
+        [
+            "EQ_train",
+            "--config-name=_demo_train_conditional_ar",
+            f"output_dir={output_dir!s}",
+            f"datamodule.config.tensorized_cohort_dir={eq_preprocessed_dataset!s}",
+            f"datamodule.config.task_labels_dir={cq_sequence_tasks_dir!s}",
+        ],
+        timeout=300.0,
+    )
+    return output_dir
+
+
+def test_conditional_ar_train_produces_checkpoint_and_position_budget(cq_ar_trained_model_dir: Path):
+    """AR training runs end to end, and train.py sized the combined-stream position budget."""
+    assert (cq_ar_trained_model_dir / "checkpoints" / "last.ckpt").exists()
+
+    cfg = yaml.safe_load((cq_ar_trained_model_dir / "resolved_config.yaml").read_text())
+    model_cfg = cfg["lightning_module"]["model"]
+    assert model_cfg["_target_"].endswith("ConditionalQueryARModel")
+    # max_seq_len + 3 * max_queries — the decoder-only stream holds patient AND query tokens.
+    expected = cfg["datamodule"]["config"]["max_seq_len"] + 3 * model_cfg["max_queries"]
+    assert model_cfg["config_overrides"]["max_position_embeddings"] == expected
+
+
+def test_conditional_ar_predict_sequences(
+    cq_ar_trained_model_dir: Path, cq_sequence_tasks_dir: Path, tmp_path: Path
+):
+    """An AR checkpoint restores through the shared Lightning module and scores sequences."""
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    src = sorted((cq_sequence_tasks_dir / tuning_split).glob("*.parquet"))[0]
+    (tasks_dir / "tasks.parquet").write_bytes(src.read_bytes())
+
+    predictions_fp = tmp_path / "predictions.parquet"
+    run_and_check(
+        [
+            "EQ_predict_sequences",
+            f"model_run_dir={cq_ar_trained_model_dir!s}",
+            f"tasks_dir={tasks_dir!s}",
+            f"output_parquet={predictions_fp!s}",
+            f"split={tuning_split}",
+        ],
+        timeout=300.0,
+    )
+
+    preds = pl.read_parquet(predictions_fp)
+    tasks = pl.read_parquet(tasks_dir / "tasks.parquet")
+    assert preds.height == int(tasks["queries"].list.len().sum()), "one output row per query position"
+    assert preds["answer_prob"].is_between(0.0, 1.0).all()
+    assert preds["answer"].null_count() == 0
+
+
 def test_conditional_predict_and_evaluate(
     cq_trained_model_dir: Path, cq_sequence_tasks_dir: Path, tmp_path: Path
 ):

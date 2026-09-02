@@ -1,15 +1,15 @@
-# Training config for the conditional query-sequence model, **encoder–decoder architecture**
-# (ConditionalQueryEncoderDecoderModel).  For the decoder-only Llama architecture use
-# conditional_ar_config.yaml instead — the architecture is selected by
-# `lightning_module.model._target_`.
+# Training config for the conditional query-sequence model, **decoder-only architecture**
+# (ConditionalQueryARModel): a single Llama backbone jointly attends over the patient history
+# and the [code, duration, answer] query stream under an ordinary token-level causal mask.
+# For the original encoder–decoder architecture use conditional_config.yaml — the architecture
+# is selected by `lightning_module.model._target_`.
 #
-# Differences vs. config.yaml (single-query EveryQuery):
-#   - datamodule.data_class points at ConditionalQueryPytorchDataset (query-sequence labels);
-#   - lightning_module instantiates ConditionalQueryLightningModule /
-#     ConditionalQueryEncoderDecoderModel;
-#   - encoder is sized from config_overrides for a from-scratch EHR vocabulary (the
-#     ModernBERT-base defaults are for a 50k-token text vocab and 22 layers);
-#   - logger is a local CSVLogger (training-stability curves are read from metrics.csv).
+# Differences vs. conditional_config.yaml:
+#   - lightning_module.model instantiates ConditionalQueryARModel with LlamaConfig overrides
+#     (no ModernBERT model_name / decoder_* knobs; num_key_value_heads and attention_dropout
+#     are Llama-specific);
+#   - train.py sizes max_position_embeddings to max_seq_len + 3 * max_queries — the combined
+#     stream holds the patient window PLUS three tokens per query block.
 #
 # `vocab_size` / `max_position_embeddings` are `???` on purpose: train.py sizes them from the
 # tensorized cohort (metadata/codes.parquet and datamodule.config.max_seq_len) before the config
@@ -61,7 +61,7 @@ datamodule:
   # interpolated from the model-side knob that consumes them, so set each feature once under
   # `lightning_module.model` and the dataset follows.
   dataset_kwargs:
-    # Drops the quantized TIMELINE//DELTA* tokens from the encoder input and emits per-token
+    # Drops the quantized TIMELINE//DELTA* tokens from the model input and emits per-token
     # elapsed-hour `time_pos_ids` for `use_rope_time`.
     strip_delta_tokens: ${lightning_module.model.use_rope_time}
     # Ontology artifacts directory (EQ_build_ontology output).  Adds ancestor node names to the
@@ -78,34 +78,33 @@ lightning_module:
   # `on_before_optimizer_step` — not upstream's two extra autograd passes.  Every step is fine.
   grad_norm_log_every_n_steps: 1
   model:
-    _target_: every_query.model.conditional_model.ConditionalQueryEncoderDecoderModel
+    _target_: every_query.model.conditional_ar_model.ConditionalQueryARModel
     precision: ${trainer.precision} # single source of truth: the Trainer owns AMP
     mlp_dropout: 0.1
-    num_hidden_layers: 12
-    decoder_layers: 4
-    decoder_heads: 6
-    decoder_ffn_mult: 4
     max_queries: 8
-    # Time representation.  false = ModernBERT's default token-index rotary positions, with
-    # elapsed time carried by the TIMELINE//DELTA* tokens in the stream.  true = rotary
-    # positions are elapsed hours and the delta tokens are stripped
-    # (`datamodule.dataset_kwargs.strip_delta_tokens` interpolates from here).
+    # Time representation.  false = token-index rotary positions, with elapsed time carried by
+    # the TIMELINE//DELTA* tokens in the stream.  true = rotary positions are elapsed hours,
+    # the delta tokens are stripped (`datamodule.dataset_kwargs.strip_delta_tokens`
+    # interpolates from here), and the query tokens continue at unit steps after the last real
+    # event's hour.
     use_rope_time: true
     # Ontology-mixed code embeddings: each code embeds as the weighted average of its own row and
     # its ancestors' ((A @ W)[ids]).  null = ordinary embeddings.  When set, train.py sizes the
-    # encoder to the ontology's V_ext instead of the cohort vocab, since ancestor indices sit
+    # backbone to the ontology's V_ext instead of the cohort vocab, since ancestor indices sit
     # above the highest leaf index.  `datamodule.dataset_kwargs.ontology_dir` interpolates from here.
-    #
-    # Note on what to expect: upstream found the *embedding* effect on leaf tasks did not
-    # replicate (a second seed reversed it; the unbundling suite scored it null), while the DAG
-    # structure was worth ~+0.039 AUROC on ancestor queries.  The demonstrated value is in being
-    # able to ASK about an ancestor, not in mixing improving ordinary leaf queries.
     ontology_dir: null
+    # Applied to a fresh LlamaConfig; the backbone always trains from scratch.  Sized to match
+    # the encoder–decoder config's encoder (hidden 384, 12 layers) so the two architectures
+    # compare on roughly equal parameter budgets.
     config_overrides:
       hidden_size: 384
+      num_hidden_layers: 12
       num_attention_heads: 6
+      # Full multi-head attention (no grouped-query sharing) at this small head count.
+      num_key_value_heads: 6
       intermediate_size: 1536
-      # Dictated by the data — filled in by train.py from the datamodule config.
+      attention_dropout: 0.0
+      # Dictated by the data — filled in by train.py as max_seq_len + 3 * max_queries.
       max_position_embeddings: ???
       vocab_size: ???
       pad_token_id: 0

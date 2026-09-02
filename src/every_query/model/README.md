@@ -12,6 +12,26 @@ shape, no Hydra entry points, no configs.
     PyTorch Lightning with `training_step` / `validation_step` / `predict_step`. Shared between
     training and inference — the same LightningModule's `predict_step` is what `predict/` will
     use at inference time.
+- **`conditional_model.py`** — `ConditionalQueryEncoderDecoderModel` (alias
+    `ConditionalQueryModel`): the conditional query-sequence architecture with a bidirectional
+    ModernBERT patient encoder, a cross-attending `nn.TransformerDecoder` over
+    `[code, duration, answer]` query blocks and the custom `build_block_causal_mask`. Also home
+    to the pieces both conditional architectures share (`ConditionalQueryOutput`, answer
+    constants, `masked_bce`, `validate_rope_time_pair`).
+- **`conditional_ar_model.py`** — `ConditionalQueryARModel`: the decoder-only conditional
+    architecture. One Hugging Face `LlamaModel` (trained from scratch) jointly attends over
+    `[patient events, c₁, d₁, a₁, …]` under a plain token-level causal mask; predictions are
+    read from each block's duration token. Every query is asked *at* the prediction time, so
+    all query tokens share the final real patient event's clinical-time RoPE position; query
+    order is carried by learned block-position embeddings, roles by token-type embeddings, and
+    visibility by the causal mask (not RoPE). See `docs/CONDITIONAL_QUERIES.md` §1 for how the
+    two architectures' attention behaviors differ.
+- **`conditional_lightning.py`** — `ConditionalQueryLightningModule`. One Lightning wrapper for
+    both conditional architectures; checkpoints record which one they hold via the model's
+    `architecture` hparam (absent = encoder–decoder, so pre-rename checkpoints load unchanged).
+- **`ontology_embedding.py`** — `OntologyEmbedding` + `wrap_tok_embeddings`: ancestor-mixed
+    code embeddings installed through `get_input_embeddings()`/`set_input_embeddings()`, shared
+    by every architecture's patient, query-code and boundary-code lookups.
 
 Call through the package so stage submodules don't need to know the file layout:
 

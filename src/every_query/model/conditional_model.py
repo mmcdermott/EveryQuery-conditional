@@ -1,5 +1,13 @@
 """Conditional query-sequence model: bidirectional patient encoder + block-autoregressive query decoder.
 
+This module holds the **encoder-decoder** architecture
+(:class:`ConditionalQueryEncoderDecoderModel`, aliased as ``ConditionalQueryModel`` for backward
+compatibility) plus the pieces both conditional architectures share: the answer/token-type
+constants, :class:`ConditionalQueryOutput`, :func:`masked_bce` and
+:func:`validate_rope_time_pair`.  The alternative **decoder-only** architecture — one Llama
+backbone jointly attending over patient history and query stream — lives in
+:mod:`every_query.model.conditional_ar_model`.
+
 Where :class:`~every_query.model.EveryQueryModel` answers a *single* ``(code, duration)`` query by
 prepending the query to the patient sequence, this model answers a *sequence* of queries
 ``[Q1][A1][Q2][A2]...[QL][AL]`` against one patient context:
@@ -128,9 +136,94 @@ def build_block_causal_mask(n_queries: int, device: torch.device | None = None) 
     return ~allowed
 
 
+def masked_bce(
+    criterion: torch.nn.BCEWithLogitsLoss,
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """BCE-with-logits over ``mask``-selected positions; differentiable zero when empty.
+
+    Shared by both conditional architectures: every real query position is an
+    equally-weighted binary prediction point, and padding is the only exclusion.
+
+    Examples:
+        >>> crit = torch.nn.BCEWithLogitsLoss()
+        >>> logits = torch.tensor([[0.0, 5.0]])
+        >>> target = torch.tensor([[1.0, 0.0]])
+        >>> only_first = torch.tensor([[True, False]])
+        >>> torch.testing.assert_close(
+        ...     masked_bce(crit, logits, target, only_first),
+        ...     crit(torch.tensor([0.0]), torch.tensor([1.0])),
+        ... )
+
+        An all-padding batch yields a differentiable zero rather than NaN:
+
+        >>> masked_bce(crit, logits, target, torch.zeros(1, 2, dtype=torch.bool))
+        tensor(0.)
+    """
+    logits, target = logits[mask], target[mask].float()
+    if logits.numel() == 0:
+        return logits.sum() * 0.0
+    return criterion(logits, target)
+
+
+def validate_rope_time_pair(use_rope_time: bool, time_pos: torch.Tensor | None) -> torch.Tensor | None:
+    """Enforce that ``use_rope_time`` (model) and ``time_pos_ids`` (batch) arrive as a pair.
+
+    Returns the validated ``time_pos`` tensor (``None`` when rope-time is off).  Both
+    half-configurations are hard errors rather than silent fallbacks — either direction yields a
+    model that trains, validates and checkpoints with normal-looking numbers while its backbone
+    is missing the elapsed-time signal (see
+    :meth:`ConditionalQueryEncoderDecoderModel._encoder_position_kwargs` for the full
+    post-mortem this guard encodes).  Shared by both conditional architectures so the AR model
+    cannot silently drift from the encoder-decoder model's contract.
+    """
+    if not use_rope_time:
+        if time_pos is not None:
+            raise ValueError(
+                "use_rope_time=False but the batch carries time_pos_ids, which only "
+                "ConditionalQueryPytorchDataset(..., strip_delta_tokens=True) emits — so the "
+                "TIMELINE//DELTA* tokens have already been stripped from the model input, "
+                "and token-index positions would leave the model with no elapsed-time "
+                "information at all.  Either half of the pair fixes it: set "
+                "`lightning_module.model.use_rope_time=true` to consume the positions (most "
+                "likely what was meant, since the strip was switched on deliberately), or "
+                "`datamodule.dataset_kwargs.strip_delta_tokens=false` to keep the delta "
+                "tokens in the stream.  Refusing to silently discard elapsed time."
+            )
+        return None
+    if time_pos is None:
+        raise ValueError(
+            "use_rope_time=True but the batch carries no time_pos_ids.  Build the dataset "
+            "with ConditionalQueryPytorchDataset(..., strip_delta_tokens=True) — via "
+            "`datamodule.dataset_kwargs.strip_delta_tokens=true` — so elapsed-hour positions "
+            "are emitted.  Refusing to fall back to token-index positions silently."
+        )
+    return time_pos
+
+
+def _init_aux_embeddings(std: float, *embeddings: torch.nn.Embedding) -> None:
+    """Re-init embedding tables built outside the HF backbone to the backbone's scale.
+
+    HF models initialize their own submodules in ``post_init()`` with
+    ``config.initializer_range`` (0.02).  Tables constructed afterwards on the wrapper keep
+    ``nn.Embedding``'s default ``N(0, 1)``, ~50x wider, so shared type/position vectors
+    dominate the summed input at init.  Call this instead of ``self.apply(...)``, which would
+    also reinitialize the already-initialized backbone.
+
+        >>> emb = torch.nn.Embedding(1000, 64)
+        >>> _init_aux_embeddings(0.02, emb)
+        >>> bool(0.015 < emb.weight.std().item() < 0.025)
+        True
+    """
+    for embedding in embeddings:
+        torch.nn.init.normal_(embedding.weight, mean=0.0, std=std)
+
+
 @dataclass
 class ConditionalQueryOutput(BaseModelOutput):
-    """Output container for :class:`ConditionalQueryModel`.
+    """Output container for both conditional query-sequence architectures.
 
     Attributes:
         answer_logits: ``(batch, n_queries)`` logits, one binary occurrence prediction per query
@@ -173,8 +266,13 @@ class ConditionalQueryOutput(BaseModelOutput):
         return torch.sigmoid(self.answer_logits.float())
 
 
-class ConditionalQueryModel(torch.nn.Module):
+class ConditionalQueryEncoderDecoderModel(torch.nn.Module):
     """Encoder/decoder model for conditional query sequences.
+
+    This is the original conditional architecture (previously named ``ConditionalQueryModel``;
+    that name survives as a module-level alias so existing imports, Hydra configs and
+    checkpoints keep working).  For the decoder-only alternative see
+    :class:`~every_query.model.conditional_ar_model.ConditionalQueryARModel`.
 
     Args:
         precision: Lightning precision string; sets initial weight dtype like ``EveryQueryModel``.
@@ -249,17 +347,24 @@ class ConditionalQueryModel(torch.nn.Module):
         H = self.HF_model_config.hidden_size
         n_heads = decoder_heads if decoder_heads is not None else self.HF_model_config.num_attention_heads
 
-        decoder_layer = torch.nn.TransformerDecoderLayer(
-            d_model=H,
-            nhead=n_heads,
-            dim_feedforward=decoder_ffn_mult * H,
-            dropout=mlp_dropout,
-            batch_first=True,
-            norm_first=True,
-        )
+        def make_decoder_layer() -> torch.nn.TransformerDecoderLayer:
+            return torch.nn.TransformerDecoderLayer(
+                d_model=H,
+                nhead=n_heads,
+                dim_feedforward=decoder_ffn_mult * H,
+                dropout=mlp_dropout,
+                batch_first=True,
+                norm_first=True,
+            )
+
         self.decoder = torch.nn.TransformerDecoder(
-            decoder_layer, num_layers=decoder_layers, norm=torch.nn.LayerNorm(H)
+            make_decoder_layer(), num_layers=decoder_layers, norm=torch.nn.LayerNorm(H)
         )
+        # nn.TransformerDecoder deep-copies its template layer, so every layer would start from
+        # byte-identical weights (PyTorch's own docs recommend re-initializing).  Build each layer
+        # freshly instead of picking a blanket re-init policy: each submodule keeps its native
+        # initializer, just with independent draws.
+        self.decoder.layers = torch.nn.ModuleList(make_decoder_layer() for _ in range(decoder_layers))
 
         self.duration_embed = MLP(layers=[1, 64, H], dropout_prob=0)
         self.answer_embed = torch.nn.Embedding(N_ANSWER_CLASSES, H)
@@ -269,8 +374,17 @@ class ConditionalQueryModel(torch.nn.Module):
         # so the model can tell "window ends at the next X" from "is X observed" — both use the
         # same embedding table.  Always allocated (not gated on a flag) so the parameter set does
         # not depend on the data, which would make checkpoints silently incompatible.
-        self.bound_marker = torch.nn.Parameter(torch.randn(H) * 0.02)
+        self.bound_marker = torch.nn.Parameter(torch.randn(H) * self.HF_model_config.initializer_range)
         self.answer_mlp = MLP(layers=[H, 128, 1], dropout_prob=mlp_dropout)
+
+        # See _init_aux_embeddings: built outside the backbone, so ModernBertModel's own init
+        # never reached them and they kept nn.Embedding's default N(0, 1).
+        _init_aux_embeddings(
+            self.HF_model_config.initializer_range,
+            self.answer_embed,
+            self.token_type_embed,
+            self.block_pos_embed,
+        )
 
         self.max_queries = max_queries
         self.use_rope_time = use_rope_time
@@ -309,10 +423,7 @@ class ConditionalQueryModel(torch.nn.Module):
 
     def _masked_bce(self, logits: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """BCE-with-logits over ``mask``-selected positions; differentiable zero when empty."""
-        logits, target = logits[mask], target[mask].float()
-        if logits.numel() == 0:
-            return logits.sum() * 0.0
-        return self.criterion(logits, target)
+        return masked_bce(self.criterion, logits, target, mask)
 
     def _encoder_position_kwargs(self, batch) -> dict[str, torch.Tensor]:
         """Extra ``HF_model`` kwargs carrying the encoder's rotary positions.
@@ -354,28 +465,9 @@ class ConditionalQueryModel(torch.nn.Module):
         well-defined.  Only the *local*-attention sliding-window mask is token-index based, and
         it is deliberately left that way — windows are over neighbouring events, not hours.
         """
-        time_pos = getattr(batch, "time_pos_ids", None)
-        if not self.use_rope_time:
-            if time_pos is not None:
-                raise ValueError(
-                    "use_rope_time=False but the batch carries time_pos_ids, which only "
-                    "ConditionalQueryPytorchDataset(..., strip_delta_tokens=True) emits — so the "
-                    "TIMELINE//DELTA* tokens have already been stripped from the encoder input, "
-                    "and token-index positions would leave the encoder with no elapsed-time "
-                    "information at all.  Either half of the pair fixes it: set "
-                    "`lightning_module.model.use_rope_time=true` to consume the positions (most "
-                    "likely what was meant, since the strip was switched on deliberately), or "
-                    "`datamodule.dataset_kwargs.strip_delta_tokens=false` to keep the delta "
-                    "tokens in the stream.  Refusing to silently discard elapsed time."
-                )
-            return {}
+        time_pos = validate_rope_time_pair(self.use_rope_time, getattr(batch, "time_pos_ids", None))
         if time_pos is None:
-            raise ValueError(
-                "use_rope_time=True but the batch carries no time_pos_ids.  Build the dataset "
-                "with ConditionalQueryPytorchDataset(..., strip_delta_tokens=True) — via "
-                "`datamodule.dataset_kwargs.strip_delta_tokens=true` — so elapsed-hour positions "
-                "are emitted.  Refusing to fall back to token-index positions silently."
-            )
+            return {}
         return {"position_ids": time_pos.to(batch.code.device)}
 
     def _query_code_embeds(self, batch) -> torch.Tensor:
@@ -480,3 +572,10 @@ class ConditionalQueryModel(torch.nn.Module):
             valid_mask=valid,
         )
         return loss, outputs
+
+
+# Backward-compatible alias: the class was named ``ConditionalQueryModel`` before the
+# decoder-only architecture existed (issue #14).  Existing imports, Hydra ``_target_`` strings
+# and checkpoint-restore paths that reference the old name resolve to the same class — same
+# parameters, same state-dict keys — so pre-rename checkpoints load unchanged.
+ConditionalQueryModel = ConditionalQueryEncoderDecoderModel

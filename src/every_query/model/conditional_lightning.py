@@ -1,4 +1,10 @@
-"""LightningModule for :class:`~every_query.model.conditional_model.ConditionalQueryModel`.
+"""LightningModule for the conditional query-sequence models (both architectures).
+
+Wraps either :class:`~every_query.model.conditional_model.ConditionalQueryEncoderDecoderModel`
+or :class:`~every_query.model.conditional_ar_model.ConditionalQueryARModel` — the two share the
+``(loss, ConditionalQueryOutput)`` forward contract, so one Lightning module covers both; the
+checkpoint records which architecture it holds via the model's ``architecture`` hparam
+(absent on encoder-decoder checkpoints, old and new, which is itself the discriminator).
 
 Reuses the optimizer / LR-scheduler factory plumbing of
 :class:`~every_query.model.lightning_module.EveryQueryLightningModule`; overrides the metric and
@@ -12,14 +18,19 @@ Metric conventions:
 
 import logging
 from collections.abc import Callable, Iterator
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 import torch
 from meds import held_out_split, train_split, tuning_split
 from torchmetrics.classification import BinaryAUROC
 
 from every_query.data.seq_dataset import ConditionalQueryBatch
-from every_query.model.conditional_model import ANSWER_YES, ConditionalQueryModel, ConditionalQueryOutput
+from every_query.model.conditional_ar_model import ConditionalQueryARModel
+from every_query.model.conditional_model import (
+    ANSWER_YES,
+    ConditionalQueryEncoderDecoderModel,
+    ConditionalQueryOutput,
+)
 from every_query.model.lightning_module import EveryQueryLightningModule, _dict_to_factory
 
 logger = logging.getLogger(__name__)
@@ -42,7 +53,7 @@ class ConditionalQueryLightningModule(EveryQueryLightningModule):
 
     def __init__(
         self,
-        model: ConditionalQueryModel,
+        model: ConditionalQueryEncoderDecoderModel | ConditionalQueryARModel,
         optimizer: Callable[[Iterator[torch.nn.parameter.Parameter]], torch.optim.Optimizer] | None = None,
         LR_scheduler: Callable[..., Any] | None = None,
         warmup_ratio: float = 0.0,
@@ -166,6 +177,15 @@ class ConditionalQueryLightningModule(EveryQueryLightningModule):
             "q_durations": batch.q_durations.detach().cpu(),
         }
 
+    #: Restore-time dispatch table.  The ``architecture`` model-hparam names the class; its
+    #: absence means an encoder-decoder checkpoint — every checkpoint written before the
+    #: decoder-only architecture existed (when the class was still named
+    #: ``ConditionalQueryModel``) lacks the key, so those load unchanged under the new name.
+    ARCHITECTURES: ClassVar[dict[str, type]] = {
+        "encoder_decoder": ConditionalQueryEncoderDecoderModel,
+        "autoregressive": ConditionalQueryARModel,
+    }
+
     @classmethod
     def load_from_checkpoint(cls, ckpt_path: str | None = None) -> "ConditionalQueryLightningModule":
         """Restore from a Lightning checkpoint (conditional-model variant of the parent's loader)."""
@@ -176,11 +196,15 @@ class ConditionalQueryLightningModule(EveryQueryLightningModule):
             if k not in hparams:
                 raise KeyError(f"Checkpoint does not contain {k} hyperparameters. Got {list(hparams.keys())}")
 
-        model = (
-            ConditionalQueryModel(**hparams["model"])
-            if isinstance(hparams.get("model"), dict)
-            else ConditionalQueryModel()
-        )
+        model_hparams = dict(hparams["model"]) if isinstance(hparams.get("model"), dict) else None
+        arch = (model_hparams or {}).pop("architecture", "encoder_decoder")
+        if arch not in cls.ARCHITECTURES:
+            raise KeyError(
+                f"Checkpoint declares unknown conditional architecture {arch!r}; "
+                f"expected one of {sorted(cls.ARCHITECTURES)}."
+            )
+        model_cls = cls.ARCHITECTURES[arch]
+        model = model_cls(**model_hparams) if model_hparams is not None else model_cls()
         optimizer = _dict_to_factory(hparams["optimizer"])
         LR_scheduler = _dict_to_factory(hparams["LR_scheduler"])
 
