@@ -285,8 +285,8 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
         a_offsets, self._q_answers = _ragged(self.answers)
         if not (np.array_equal(self._q_offsets, d_offsets) and np.array_equal(self._q_offsets, a_offsets)):
             raise ValueError("queries/durations/answers list lengths disagree in the labels.")
-        self._q_durations = self._q_durations.astype(np.float32, copy=False)
-        self._q_answers = self._q_answers.astype(bool, copy=False)
+        self._q_durations = self._q_durations.astype(np.float32)  # copy: polars arrays are read-only
+        self._q_answers = self._q_answers.astype(bool)
         if self.has_bound_events:
             b_offsets, b = _ragged(self.bound_events)
             if not np.array_equal(self._q_offsets, b_offsets):
