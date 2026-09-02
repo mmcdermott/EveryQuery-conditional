@@ -65,6 +65,21 @@ def test_unknown_subject_and_unknown_code_resolve_to_inf() -> None:
     ]
 
 
+@pytest.mark.parametrize("vocab_size", [None, 4])
+def test_absent_high_code_never_aliases_another_subjects_group(vocab_size: int | None) -> None:
+    # Two subjects, only code 1 observed in the shard -> a shard-local code field is 1 bit wide.  A
+    # globally valid code 3 (= 0b11) for subject 1 must NOT resolve to subject 2's code-1 group: with a
+    # 1-bit field ``(0 << 1) | 3 == (1 << 1) | 1``.  Regression for the PR #21 review, blocker 1.
+    t = build_interval_table(np.array([1, 2]), np.array([5, 5]), np.array([1, 1]), vocab_size=vocab_size)
+    got = next_occurrence_after(t, np.array([1, 2, 1]), np.array([0, 0, 0]), np.array([3, 3, 1]))
+    assert got.tolist() == [INF, INF, 5]
+    bt = resolve_bound_times(t, np.array([1]), np.array([0]), np.array([[0.0]]), np.array([[3]]))
+    assert bt.tolist() == [[INF]]
+    if vocab_size is not None:
+        with pytest.raises(ValueError, match="outside the vocabulary"):
+            build_interval_table(np.array([1]), np.array([5]), np.array([4]), vocab_size=4)
+
+
 def test_duplicate_events_do_not_change_labels() -> None:
     plain = build_interval_table(np.array([1, 1]), np.array([3, 6]), np.array([0, 0]))
     dup = build_interval_table(np.array([1, 1, 1, 1]), np.array([3, 3, 6, 6]), np.array([0, 0, 0, 0]))

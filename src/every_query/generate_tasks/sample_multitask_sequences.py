@@ -378,9 +378,15 @@ class BoundaryDistribution:
 
 
 def _bounds_to_columns(sample: BoundarySample) -> dict[str, pl.Series]:
+    """``(N, K)`` arrays -> ``List`` columns via a flat series + reshape: no per-slot Python objects."""
+    n, k = sample.durations.shape
+    durations = pl.Series(DURATIONS_COL, sample.durations.ravel(), dtype=pl.Float32)
+    # A flat list of references to the (shared) pool strings; an object ndarray would be inferred as
+    # polars Object when every slot is None.
+    bound_events = pl.Series(BOUND_EVENTS_COL, sample.bound_events.ravel().tolist(), dtype=pl.Utf8)
     return {
-        DURATIONS_COL: pl.Series(DURATIONS_COL, sample.durations.tolist(), dtype=pl.List(pl.Float32)),
-        BOUND_EVENTS_COL: pl.Series(BOUND_EVENTS_COL, sample.bound_events.tolist(), dtype=pl.List(pl.Utf8)),
+        DURATIONS_COL: durations.reshape((n, k)).arr.to_list(),
+        BOUND_EVENTS_COL: bound_events.reshape((n, k)).arr.to_list(),
     }
 
 
@@ -594,7 +600,10 @@ def validate_index(index_df: pl.DataFrame, num_bounds: int) -> None:
 def _encode_events(
     events_df: pl.DataFrame, vocab: TargetVocabulary
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
-    """``(subject_id, time_us, code_index)`` of the non-null-time, in-vocabulary events + drop count."""
+    """``(subject_id, time_us, code_index)`` of the non-null-time, in-vocabulary events + drop count.
+
+    Index 0 (PAD) is excluded before the table is built, so target bit 0 is false by construction.
+    """
     codes_df = pl.DataFrame({"code": list(vocab.codes), "_code_index": vocab.indices})
     ev = (
         events_df.select(SID, DataSchema.time_name, DataSchema.code_name)
@@ -603,7 +612,7 @@ def _encode_events(
         .join(codes_df, on="code", how="left")
     )
     n_unknown = int(ev["_code_index"].null_count())
-    ev = ev.filter(pl.col("_code_index").is_not_null())
+    ev = ev.filter(pl.col("_code_index") > 0)  # drops unknown (null) and PAD (0)
     sid = ev[SID].to_numpy().astype(np.int64)
     t = ev[DataSchema.time_name].cast(pl.Datetime("us")).cast(pl.Int64).to_numpy().astype(np.int64)
     ci = ev["_code_index"].to_numpy().astype(np.int64)
@@ -722,7 +731,7 @@ def label_multitask_index(
     ev_sid, ev_t, ev_ci, n_unknown = _encode_events(events_df, vocab)
     stats.n_events = int(ev_sid.size)
     stats.n_unknown_code_events = n_unknown
-    table = build_interval_table(ev_sid, ev_t, ev_ci)
+    table = build_interval_table(ev_sid, ev_t, ev_ci, vocab_size=vocab.size)
     stats.n_intervals = table.n_rows
     stats.build_seconds = time.perf_counter() - t0
 
@@ -751,7 +760,7 @@ def label_multitask_index(
         table, subject_ids, prediction_times, bound_times, vocab.size, chunk_rows
     ):
         out[lo:hi] = packed
-        positives += int(np.unpackbits(packed, axis=-1, bitorder=BITORDER).sum())
+        positives += int(np.bitwise_count(packed).sum())  # popcount on packed bytes: no unpacked scratch
     stats.label_seconds = time.perf_counter() - t2
     stats.contexts_per_second = n / stats.label_seconds if stats.label_seconds > 0 else float("inf")
     stats.mean_positives_per_context_boundary = positives / (n * num_bounds) if n else 0.0

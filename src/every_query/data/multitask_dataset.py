@@ -282,30 +282,40 @@ class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
             if n
             else np.zeros((0, self.num_bounds), dtype=np.float32)
         )
-        flat_bounds = bound_events.explode().to_list() if n else []
-        unknown = sorted({c for c in flat_bounds if c is not None and c not in self.code_to_index})
+        # Map codes -> indices in polars (no per-slot Python objects): null slots -> NO_BOUND_INDEX,
+        # non-null codes outside the vocabulary -> -1, which is an error.
+        flat_bounds = bound_events.explode()
+        mapped = pl.select(
+            pl.when(flat_bounds.is_null())
+            .then(NO_BOUND_INDEX)
+            .otherwise(flat_bounds.replace_strict(self.code_to_index, default=-1, return_dtype=pl.Int64))
+        ).to_series()
+        unknown = flat_bounds.filter(mapped == -1).unique().sort().to_list()
         if unknown:
             raise ValueError(
                 f"{len(unknown)} boundary code(s) in the labels are not in this cohort's vocabulary: "
                 f"{unknown[:10]}. Regenerate the labels against this cohort's codes.parquet."
             )
-        self._q_bound_codes = np.fromiter(
-            (NO_BOUND_INDEX if c is None else self.code_to_index[c] for c in flat_bounds),
-            dtype=np.int64,
-            count=len(flat_bounds),
-        ).reshape(n, self.num_bounds)
+        self._q_bound_codes = mapped.to_numpy().astype(np.int64).reshape(n, self.num_bounds)
         sentinel_ok = (self._q_bound_codes != NO_BOUND_INDEX) == (
             self._q_durations == EVENT_BOUND_DURATION_SENTINEL
         )
         if not sentinel_ok.all():
             raise ValueError("durations/bound_events disagree on which slots are event-bounded")
 
-        self._source_shard = np.asarray(self.schema_df[SOURCE_SHARD_COL].to_list(), dtype=object)
+        # Shard keys are stored once; each row carries a compact integer id, not a Python string.
+        self._shard_keys: list[str] = sorted(self._label_files)
+        self._source_shard = (
+            self.schema_df[SOURCE_SHARD_COL]
+            .replace_strict({k: i for i, k in enumerate(self._shard_keys)}, return_dtype=pl.Int32)
+            .to_numpy()
+        )
         self._source_row = self.schema_df[SOURCE_ROW_COL].to_numpy().astype(np.int64)
 
         # Every referenced sidecar must exist and have the manifest's packed shape; check the header
         # only (np.load with mmap_mode reads no payload).
-        for key in dict.fromkeys(self._source_shard.tolist()):
+        for shard_id in np.unique(self._source_shard).tolist():
+            key = self._shard_keys[shard_id]
             fp = self._label_files[key]
             if not fp.exists():
                 raise FileNotFoundError(f"packed labels sidecar {fp} for metadata shard {key!r} is missing")
@@ -314,7 +324,7 @@ class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
                 raise ValueError(
                     f"{fp} has packed shape {shape}, expected (rows, {self.num_bounds}, {self.packed_width})"
                 )
-            rows = self._source_row[self._source_shard == key]
+            rows = self._source_row[self._source_shard == shard_id]
             if rows.size and int(rows.max()) >= shape[0]:
                 raise ValueError(
                     f"{fp} has {shape[0]} rows but the metadata references row {int(rows.max())}"
@@ -379,7 +389,7 @@ class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
         idx = range(len(self._source_row))[idx]
         out["q_durations"] = self._q_durations[idx]
         out["q_bound_codes"] = self._q_bound_codes[idx]
-        out[SOURCE_SHARD_COL] = self._source_shard[idx]
+        out[SOURCE_SHARD_COL] = self._shard_keys[self._source_shard[idx]]
         out[SOURCE_ROW_COL] = int(self._source_row[idx])
         return out
 

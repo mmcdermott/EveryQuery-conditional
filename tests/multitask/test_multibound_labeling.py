@@ -145,10 +145,8 @@ def test_pad_bit_stays_false_and_unknown_event_codes_are_ignored() -> None:
     )
     _, packed, stats = label_multitask_index(make_index([(1, T0)], [[(5.0, None)]]), ev, vocab, 1)
     d = np.unpackbits(packed, axis=-1, count=vocab.size, bitorder="little").astype(bool)
-    assert d[0, 0].tolist() == [True, True]  # the kernel labels what it is given ...
+    assert d[0, 0].tolist() == [False, True]  # an observed PAD event never sets bit 0
     assert stats.n_unknown_code_events == 1
-    # ... but the sampler's vocabulary never sources PAD as a target: index 0 is masked by the loss and
-    # the boundary pool excludes it.
     assert vocab.boundary_candidates() == ["A"]
 
 

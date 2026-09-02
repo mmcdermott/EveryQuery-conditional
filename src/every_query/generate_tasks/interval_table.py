@@ -108,7 +108,7 @@ class IntervalTable(NamedTuple):
 
 
 def build_interval_table(
-    subject_id: np.ndarray, time_us: np.ndarray, code_index: np.ndarray
+    subject_id: np.ndarray, time_us: np.ndarray, code_index: np.ndarray, vocab_size: int | None = None
 ) -> IntervalTable:
     """Build the interval table from one shard's (non-null-time) events in ``O(E log E)``.
 
@@ -117,6 +117,10 @@ def build_interval_table(
         time_us: ``(E,)`` occurrence time per event, ``int64`` microseconds (no nulls - drop static rows
             before calling; their vocabulary indices are not reassigned, they simply never fire).
         code_index: ``(E,)`` vocabulary index per event (``>= 0``).
+        vocab_size: Size of the *global* vocabulary.  Sizes the code field of the group key so any
+            valid code - including ones absent from this shard - fits without aliasing another
+            ``(subject, code)`` group.  Defaults to the shard's own max code; lookups for wider codes
+            then resolve to :data:`INF` instead of aliasing (see :func:`next_occurrence_after`).
 
     Duplicate events (same subject, code and timestamp) produce a zero-width interval ``(t, t)`` that
     no prediction time can satisfy (``t <= pt < t`` is empty), so they never change a label.
@@ -136,7 +140,12 @@ def build_interval_table(
     if code_index.size and code_index.min() < 0:
         raise ValueError("code_index must be non-negative")
 
-    code_bits = max(int(code_index.max()).bit_length(), 1) if code_index.size else 1
+    max_code = int(code_index.max()) if code_index.size else 0
+    if vocab_size is not None:
+        if max_code >= vocab_size:
+            raise ValueError(f"code_index {max_code} is outside the vocabulary of size {vocab_size}")
+        max_code = vocab_size - 1
+    code_bits = max(max_code.bit_length(), 1)
     subjects, s_idx = np.unique(subject_id, return_inverse=True)
     s_idx = s_idx.astype(np.int64)
     group = (s_idx << code_bits) | code_index
@@ -203,7 +212,9 @@ def next_occurrence_after(
         return out
 
     s_idx = table.subject_index(subject_ids)
-    known = s_idx >= 0
+    # A code too wide for the group key's code field cannot be in the table; without this guard its
+    # high bits would spill into the subject field and alias another subject's group.
+    known = (s_idx >= 0) & (code_index < (1 << table.code_bits))
     if not known.any():
         return out
     qgroup = (s_idx[known] << table.code_bits) | code_index[known]
