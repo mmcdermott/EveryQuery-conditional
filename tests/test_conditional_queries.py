@@ -301,8 +301,12 @@ def test_seq_dataset_loads_and_encodes(seq_dataset):
 def test_seq_dataset_getitem_carries_sequences(seq_dataset):
     item = seq_dataset[0]
     assert len(item["queries"]) == len(item["durations"]) == len(item["answers"])
-    assert all(isinstance(a, bool) for a in item["answers"]), "answers are binary, never None"
+    assert item["answers"].dtype == bool, "answers are binary, never None"
     assert "dynamic" in item
+    last = seq_dataset[-1]
+    assert len(last["queries"]) == len(seq_dataset.queries[len(seq_dataset) - 1]), (
+        "negative index slices offsets"
+    )
 
 
 def test_seq_collate_shapes_and_padding(seq_dataset, seq_sample_batch):
