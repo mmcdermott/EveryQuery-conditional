@@ -203,6 +203,24 @@ def validate_rope_time_pair(use_rope_time: bool, time_pos: torch.Tensor | None) 
     return time_pos
 
 
+def _init_aux_embeddings(std: float, *embeddings: torch.nn.Embedding) -> None:
+    """Re-init embedding tables built outside the HF backbone to the backbone's scale.
+
+    HF models initialize their own submodules in ``post_init()`` with
+    ``config.initializer_range`` (0.02).  Tables constructed afterwards on the wrapper keep
+    ``nn.Embedding``'s default ``N(0, 1)``, ~50x wider, so shared type/position vectors
+    dominate the summed input at init.  Call this instead of ``self.apply(...)``, which would
+    also reinitialize the already-initialized backbone.
+
+        >>> emb = torch.nn.Embedding(1000, 64)
+        >>> _init_aux_embeddings(0.02, emb)
+        >>> bool(0.015 < emb.weight.std().item() < 0.025)
+        True
+    """
+    for embedding in embeddings:
+        torch.nn.init.normal_(embedding.weight, mean=0.0, std=std)
+
+
 @dataclass
 class ConditionalQueryOutput(BaseModelOutput):
     """Output container for both conditional query-sequence architectures.
@@ -349,8 +367,17 @@ class ConditionalQueryEncoderDecoderModel(torch.nn.Module):
         # so the model can tell "window ends at the next X" from "is X observed" — both use the
         # same embedding table.  Always allocated (not gated on a flag) so the parameter set does
         # not depend on the data, which would make checkpoints silently incompatible.
-        self.bound_marker = torch.nn.Parameter(torch.randn(H) * 0.02)
+        self.bound_marker = torch.nn.Parameter(torch.randn(H) * self.HF_model_config.initializer_range)
         self.answer_mlp = MLP(layers=[H, 128, 1], dropout_prob=mlp_dropout)
+
+        # See _init_aux_embeddings: built outside the backbone, so ModernBertModel's own init
+        # never reached them and they kept nn.Embedding's default N(0, 1).
+        _init_aux_embeddings(
+            self.HF_model_config.initializer_range,
+            self.answer_embed,
+            self.token_type_embed,
+            self.block_pos_embed,
+        )
 
         self.max_queries = max_queries
         self.use_rope_time = use_rope_time

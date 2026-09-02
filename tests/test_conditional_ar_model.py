@@ -500,6 +500,36 @@ def test_gradients_flow_and_are_finite(tiny_model):
     tiny_model.eval()
 
 
+def test_aux_embeddings_match_backbone_init_scale(tmp_path):
+    """Issue #16: tables built outside the HF backbone kept nn.Embedding's default N(0, 1).
+
+    At ~50x the backbone's ``initializer_range``, the shared token-type/block-position vectors
+    swamped code identity in the summed input.  Both architectures build these tables the same
+    way, so both are checked.
+    """
+    from transformers import ModernBertConfig
+
+    encoder_dir = tmp_path / "encoder"
+    ModernBertConfig(**ENCDEC_OVERRIDES).save_pretrained(encoder_dir)
+    encdec = ConditionalQueryModel(
+        model_name=str(encoder_dir),
+        config_overrides=ENCDEC_OVERRIDES,
+        decoder_layers=1,
+        decoder_heads=2,
+        decoder_ffn_mult=2,
+        mlp_dropout=0.0,
+    )
+
+    for model in (_tiny_ar_model(), encdec):
+        std = model.HF_model_config.initializer_range
+        code_std = model.HF_model.get_input_embeddings().weight.std().item()
+        assert code_std == pytest.approx(std, rel=0.3), f"backbone init moved: {code_std}"
+        for name in ("answer_embed", "token_type_embed", "block_pos_embed"):
+            got = getattr(model, name).weight.std().item()
+            assert got == pytest.approx(std, rel=0.3), f"{name} std {got} != {std}"
+        assert model.bound_marker.std().item() == pytest.approx(std, rel=0.4)
+
+
 def test_tiny_model_overfits_one_batch():
     """Sanity training signal: a tiny model should drive loss down on one fixed batch."""
     torch.manual_seed(1)
