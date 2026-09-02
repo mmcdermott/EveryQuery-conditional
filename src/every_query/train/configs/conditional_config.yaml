@@ -150,7 +150,7 @@ trainer:
       monitor: "tuning/loss"
       verbose: False
       save_last: True
-      save_top_k: 2
+      save_top_k: 1
       mode: "min"
       save_weights_only: False
       every_n_train_steps: null
