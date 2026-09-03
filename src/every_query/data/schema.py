@@ -168,23 +168,30 @@ class MultitaskBoundarySchema(LabelSchema):
         bound_events: ``K`` boundary codes aligned with ``durations``: null for a duration-bounded
             slot, a base-vocabulary code for an event-bounded one.  Exactly one representation is
             active per slot.
+        condition_codes: ``K-1`` conditioning codes (non-PAD base vocabulary, never null); code ``j``
+            is the query whose answer at boundary ``j`` is teacher-forced into later boundaries.
+        condition_answers: ``K-1`` booleans; ``answers[j]`` is the all-vocabulary target bit of
+            ``condition_codes[j]`` at boundary ``j`` (open-window semantics).
 
     Examples:
         >>> from datetime import datetime
         >>> import pyarrow as pa
         >>> data = pa.Table.from_pylist([
         ...     {"subject_id": 1, "prediction_time": datetime(2023, 1, 1),
-        ...      "durations": [30.0, -1.0], "bound_events": [None, "ICD//I10"]},
+        ...      "durations": [30.0, -1.0], "bound_events": [None, "ICD//I10"],
+        ...      "condition_codes": ["LAB//X"], "condition_answers": [True]},
         ... ])
         >>> aligned = MultitaskBoundarySchema.align(data)
         >>> [f.name for f in aligned.schema]
-        ['subject_id', 'prediction_time', 'durations', 'bound_events']
+        ['subject_id', 'prediction_time', 'durations', 'bound_events', 'condition_codes', 'condition_answers']
         >>> aligned.column("bound_events").to_pylist()
         [[None, 'ICD//I10']]
     """
 
     durations: Required(pa.large_list(pa.float32()), nullable=False)
     bound_events: Required(pa.large_list(pa.large_string()), nullable=False)
+    condition_codes: Required(pa.large_list(pa.large_string()), nullable=False)
+    condition_answers: Required(pa.large_list(pa.bool_()), nullable=False)
 
 
 def empty_task_query_df() -> pl.DataFrame:

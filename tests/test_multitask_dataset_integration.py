@@ -64,7 +64,7 @@ def multitask_labels_dir(tensorized_cohort_dir: Path, tmp_path_factory: pytest.T
         pl.col("time").cast(pl.Datetime("us")), pl.col("subject_id").cast(pl.Int64)
     )
 
-    dist = sms.BoundaryDistribution(K, 1.0, 60.0, "log-uniform", 0.5, tuple(cands))
+    dist = sms.BoundaryDistribution(K, 1.0, 60.0, "log-uniform", 0.5, tuple(cands), tuple(cands))
     root = tmp_path_factory.mktemp("multitask_labels")
     split_dir = root / train_split
     manifest = sms.write_manifest(split_dir, sms.build_manifest(dist, vocab))
@@ -74,13 +74,14 @@ def multitask_labels_dir(tensorized_cohort_dir: Path, tmp_path_factory: pytest.T
     shards = {"0": _SUBJECTS[:2], "1": _SUBJECTS[2:]}
     for shard, subjects in shards.items():
         contexts = [(s, _naive(_PRED_TIMES[s])) for s in subjects for _ in range(3)]
-        sample = dist.sample(len(contexts), *[np.random.default_rng(i + int(shard)) for i in range(3)])
+        sample = dist.sample(len(contexts), *[np.random.default_rng(i + int(shard)) for i in range(4)])
         index = pl.DataFrame(
             {
                 "subject_id": pl.Series([c[0] for c in contexts], dtype=pl.Int64),
                 "prediction_time": pl.Series([c[1] for c in contexts], dtype=pl.Datetime("us")),
                 "durations": pl.Series(sample.durations.tolist(), dtype=pl.List(pl.Float32)),
                 "bound_events": pl.Series(sample.bound_events.tolist(), dtype=pl.List(pl.Utf8)),
+                "condition_codes": pl.Series(sample.condition_codes.tolist(), dtype=pl.List(pl.Utf8)),
             }
         )
         shape = (index.height, K, vocab.packed_width)
@@ -127,6 +128,8 @@ def test_metadata_row_maps_to_matching_packed_row(
         assert np.array_equal(
             item["q_durations"], np.asarray(meta["durations"][row].to_list(), dtype=np.float32)
         )
+        assert item["condition_codes"].tolist() == [ds.code_to_index[c] for c in meta["condition_codes"][row]]
+        assert item["condition_answers"].tolist() == meta["condition_answers"][row].to_list()
 
 
 def test_global_shuffle_preserves_alignment_and_batch_shape(
@@ -150,6 +153,13 @@ def test_global_shuffle_preserves_alignment_and_batch_shape(
         expect = np.unpackbits(packed, axis=-1, count=ds.vocab_size, bitorder="little").astype(bool)
         assert np.array_equal(batch.targets[b].numpy(), expect)
         assert (batch.q_bound_codes[b] != 0).tolist() == (batch.q_durations[b] == -1.0).tolist()
+    # Issue #22: (B, K-1) conditioning tensors, answers == the matching unpacked target bit.
+    assert batch.condition_codes.shape == (len(perm), K - 1) and batch.condition_codes.dtype == torch.long
+    assert batch.condition_answers.shape == (len(perm), K - 1) and batch.condition_answers.dtype == torch.bool
+    assert (batch.condition_codes > 0).all()
+    expect = batch.targets[:, : K - 1].gather(2, batch.condition_codes.unsqueeze(-1)).squeeze(-1)
+    assert torch.equal(expect, batch.condition_answers)
+    assert batch.condition_answers.any() and not batch.condition_answers.all()
 
 
 def test_memmaps_are_read_only(tensorized_cohort_dir: Path, multitask_labels_dir: Path) -> None:
@@ -198,9 +208,9 @@ def test_end_to_end_cli_run_to_batch_matches_raw_events(
 ) -> None:
     """Raw MEDS events -> ``run()`` -> dataset -> batch: targets and the input window agree with the events.
 
-    Unlike the fixtures above, the labels here come from the real sampler driver over the fixture
-    cohort's own events, subjects carry several distinct prediction times, and the expected values
-    are recomputed from the raw event table rather than read back from the sidecars.
+    Unlike the fixtures above, the labels here come from the real sampler driver over the fixture cohort's own
+    events, subjects carry several distinct prediction times, and the expected values are recomputed from the
+    raw event table rather than read back from the sidecars.
     """
     from omegaconf import OmegaConf
 
@@ -258,3 +268,49 @@ def test_end_to_end_cli_run_to_batch_matches_raw_events(
         )
         got = sorted(batch.code[b][batch.code[b] != batch.PAD_INDEX].tolist())
         assert got == sorted(code_to_index[c] for c in visible["code"])
+
+
+def _tampered(labels_dir: Path, tmp_path: Path, edit) -> Path:
+    """Copy the labels dir and rewrite shard ``0``'s metadata through ``edit(df) -> df``."""
+    import shutil
+
+    bad = tmp_path / "bad_labels"
+    shutil.copytree(labels_dir, bad)
+    fp = bad / train_split / "0.parquet"
+    edit(pl.read_parquet(fp)).write_parquet(fp)
+    return bad
+
+
+def test_corrupted_condition_answers_fail_in_collate(
+    tensorized_cohort_dir: Path, multitask_labels_dir: Path, tmp_path: Path
+) -> None:
+    flip = lambda df: df.with_columns(pl.col("condition_answers").list.eval(~pl.element()))  # noqa: E731
+    ds = _dataset(tensorized_cohort_dir, _tampered(multitask_labels_dir, tmp_path, flip))
+    bad_rows = [i for i in range(len(ds)) if ds[i]["_source_shard"].endswith("/0")]
+    assert "targets" not in ds[bad_rows[0]]  # __getitem__ still never unpacks
+    with pytest.raises(ValueError, match="condition_answers disagree with the packed targets"):
+        ds.collate([ds[i] for i in bad_rows])
+
+
+@pytest.mark.parametrize(
+    ("what", "edit"),
+    [
+        ("exactly", lambda df: df.with_columns(pl.col("condition_codes").list.slice(0, K - 2))),
+        ("exactly", lambda df: df.with_columns(pl.col("condition_answers").list.slice(0, 1))),
+        (
+            "PAD, or not in",
+            lambda df: df.with_columns(pl.col("condition_codes").list.eval(pl.lit("NOPE//X"))),
+        ),
+        (
+            "PAD, or not in",
+            lambda df: df.with_columns(pl.col("condition_codes").list.eval(pl.lit(None, dtype=pl.Utf8))),
+        ),
+        ("missing", lambda df: df.drop("condition_codes")),
+    ],
+)
+def test_bad_condition_metadata_fails_at_init(
+    tensorized_cohort_dir: Path, multitask_labels_dir: Path, tmp_path: Path, what: str, edit
+) -> None:
+    bad = _tampered(multitask_labels_dir, tmp_path, edit)
+    with pytest.raises(ValueError, match=what):
+        _dataset(tensorized_cohort_dir, bad)

@@ -52,6 +52,10 @@ duration_distribution: log-uniform # uniform | log-uniform
 # repeated boundary codes within one context are allowed.
 eventbound_fraction: 0.5
 boundary_codes: null
+# Issue #22: every context also carries `num_bounds - 1` conditioning codes (iid uniform with
+# replacement over every non-PAD base code, from a dedicated RNG stream) and their materialized
+# answers (`condition_answers[j]` = target bit of `condition_codes[j]` at boundary `j`).  Not
+# configurable in the MVP.
 
 # Minimum prior prediction times a subject needs before a prediction time is eligible (Stage 0).
 min_prediction_times_per_subject: 50

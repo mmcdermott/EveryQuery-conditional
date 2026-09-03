@@ -22,7 +22,15 @@ from every_query.generate_tasks.sample_multitask_sequences import (
     read_manifest,
 )
 from every_query.generate_tasks.sample_tasks import INDEX_DIRNAME, LABELED_DIRNAME, default_artifacts_dir
-from tests.multitask.conftest import CODES, K, base_cfg, make_codes_parquet, make_index, scalar_oracle
+from tests.multitask.conftest import (
+    CODES,
+    K,
+    base_cfg,
+    condition_answers_oracle,
+    make_codes_parquet,
+    make_index,
+    scalar_oracle,
+)
 
 
 def _run(cohort: Path, out_dir: Path, **overrides) -> dict:
@@ -50,13 +58,16 @@ def _dist(**kw) -> BoundaryDistribution:
         "duration_distribution": "log-uniform",
         "eventbound_fraction": 0.5,
         "boundary_codes": tuple(CODES),
+        "condition_codes": tuple(CODES),
     }
     base.update(kw)
     return BoundaryDistribution(**base)
 
 
-def _rngs(seed: int = 0):
-    return [np.random.default_rng(seed * 10 + i) for i in range(3)]
+def _rngs(seed: int = 0, condition_seed: int | None = None):
+    rngs = [np.random.default_rng(seed * 10 + i) for i in range(3)]
+    rngs.append(np.random.default_rng(seed * 10 + 3 if condition_seed is None else condition_seed))
+    return rngs
 
 
 def test_boundary_distribution_fixed_seed_reproducible() -> None:
@@ -64,7 +75,11 @@ def test_boundary_distribution_fixed_seed_reproducible() -> None:
     b = _dist().sample(50, *_rngs())
     assert np.array_equal(a.durations, b.durations)
     assert np.array_equal(a.bound_events, b.bound_events)
+    assert np.array_equal(a.condition_codes, b.condition_codes)
     assert a.durations.shape == (50, K) and a.durations.dtype == np.float32
+    assert a.condition_codes.shape == (50, K - 1)
+    assert set(a.condition_codes.ravel().tolist()) <= set(CODES)
+    assert any(len(set(row)) < K - 1 for row in a.condition_codes.tolist())  # repeats allowed
     assert ((a.durations == -1.0) == (a.bound_events != None)).all()  # noqa: E711
 
 
@@ -84,6 +99,14 @@ def test_boundary_distribution_streams_are_independent() -> None:
     pool = _dist(boundary_codes=tuple(CODES[:3])).sample(200, *_rngs())
     assert np.array_equal(ref.durations, pool.durations)
     assert np.array_equal(ref.bound_events == None, pool.bound_events == None)  # noqa: E711
+    # None of the boundary-axis changes above perturb the conditioning-code stream ...
+    for other_sample in (other, wider, pool):
+        assert np.array_equal(ref.condition_codes, other_sample.condition_codes)
+    # ... and a different conditioning stream changes no boundary draw.
+    cond = _dist().sample(200, *_rngs(condition_seed=999))
+    assert not np.array_equal(ref.condition_codes, cond.condition_codes)
+    assert np.array_equal(ref.durations, cond.durations)
+    assert np.array_equal(ref.bound_events, cond.bound_events)
 
 
 def test_boundary_distribution_validation() -> None:
@@ -95,6 +118,9 @@ def test_boundary_distribution_validation() -> None:
         _dist(boundary_codes=())
     with pytest.raises(ValueError, match="duration_distribution"):
         _dist(duration_distribution="normal")
+    with pytest.raises(ValueError, match="condition_codes"):
+        _dist(condition_codes=())
+    assert _dist(num_bounds=1, condition_codes=()).sample(3, *_rngs()).condition_codes.shape == (3, 0)
 
 
 # --- vocabulary -----------------------------------------------------------------------------------
@@ -134,7 +160,8 @@ def test_run_writes_layout_manifest_and_exact_count(synthetic_cohort: Path, tmp_
     assert manifest["datetime_unit"] == "us"
     assert manifest["vocab_fingerprint"] == vocab.fingerprint
     assert manifest["ontology_mode"] == "none"
-    assert manifest["format_version"] == 1
+    assert manifest["format_version"] == 2
+    assert manifest["num_condition_codes"] == K - 1
 
     shards = _load_split(out, vocab)
     total = 0
@@ -155,6 +182,12 @@ def test_run_writes_layout_manifest_and_exact_count(synthetic_cohort: Path, tmp_
         dense = np.unpackbits(packed, axis=-1, count=vocab.size, bitorder="little").astype(bool)
         assert dense[:, :, 0].sum() == 0
         assert np.array_equal(dense[:, :, vocab.indices], scalar_oracle(meta, events, list(vocab.codes), K))
+        # Issue #22: exactly K-1 non-PAD base-vocabulary conditioning codes, answers == target bits.
+        assert (meta["condition_codes"].list.len() == K - 1).all()
+        assert (meta["condition_answers"].list.len() == K - 1).all()
+        assert set(meta["condition_codes"].explode().to_list()) <= set(vocab.boundary_candidates())
+        answers = np.array(meta["condition_answers"].to_list(), dtype=bool)
+        assert np.array_equal(answers, condition_answers_oracle(meta, dense, vocab))
     assert total == cfg.num_training_examples
 
 

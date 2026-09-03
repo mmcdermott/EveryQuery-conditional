@@ -15,7 +15,9 @@ The parquet and the ``.npy`` are row-aligned; that alignment **is** the contract
    explicitly rather than inferred from a concatenation order;
 4. gathers packed rows in :meth:`MultitaskBoundaryPytorchDataset.collate` and unpacks **once per batch**
    with ``bitorder="little"``; ``__getitem__`` never unpacks;
-5. keeps targets boolean until the loss casts them.
+5. keeps targets boolean until the loss casts them;
+6. loads the ``K-1`` sampler-materialized conditioning codes/answers (issue #22) and, in ``collate``,
+   checks every stored answer against the unpacked target bit.  It never samples either.
 
 It fails loudly at init when the cohort's ``codes.parquet`` (or an explicit ``expected_vocab_size`` /
 ``expected_vocab_fingerprint``) disagrees with the manifest.
@@ -41,7 +43,9 @@ logger = logging.getLogger(__name__)
 
 DURATIONS_COL = "durations"
 BOUND_EVENTS_COL = "bound_events"
-MULTITASK_LABEL_COLS = (DURATIONS_COL, BOUND_EVENTS_COL)
+CONDITION_CODES_COL = "condition_codes"
+CONDITION_ANSWERS_COL = "condition_answers"
+MULTITASK_LABEL_COLS = (DURATIONS_COL, BOUND_EVENTS_COL, CONDITION_CODES_COL, CONDITION_ANSWERS_COL)
 
 SOURCE_SHARD_COL = "_source_shard"
 SOURCE_ROW_COL = "_source_row"
@@ -66,6 +70,10 @@ class MultitaskBoundaryBatch(MEDSTorchBatch):
         targets: ``(B, K, V)`` bool - ``targets[b, k, v]`` is "code ``v`` occurs strictly inside the
             open window of boundary ``k``".  Bit ``0`` (PAD) is always False and must be masked from
             the loss.
+        condition_codes: ``(B, K-1)`` long - vocabulary index of the sampler-drawn conditioning code
+            for boundaries ``0..K-2`` (never PAD).
+        condition_answers: ``(B, K-1)`` bool - ``targets[b, j, condition_codes[b, j]]``, materialized
+            by the sampler and verified in ``collate``.
 
     Examples:
         >>> batch = MultitaskBoundaryBatch(
@@ -77,6 +85,8 @@ class MultitaskBoundaryBatch(MEDSTorchBatch):
         ...     q_bound_codes=torch.tensor([[0, 4], [0, 0]]),
         ...     q_mask=torch.ones(2, 2, dtype=torch.bool),
         ...     targets=torch.zeros(2, 2, 6, dtype=torch.bool),
+        ...     condition_codes=torch.tensor([[3], [5]]),
+        ...     condition_answers=torch.zeros(2, 1, dtype=torch.bool),
         ... )
         >>> batch.num_bounds, batch.vocab_size
         (2, 6)
@@ -92,6 +102,8 @@ class MultitaskBoundaryBatch(MEDSTorchBatch):
         ...     q_bound_codes=torch.tensor([[0, 4], [0, 0]]),
         ...     q_mask=torch.ones(2, 2, dtype=torch.bool),
         ...     targets=torch.zeros(2, 3, 6, dtype=torch.bool),
+        ...     condition_codes=torch.tensor([[3], [5]]),
+        ...     condition_answers=torch.zeros(2, 1, dtype=torch.bool),
         ... )
         Traceback (most recent call last):
             ...
@@ -102,6 +114,8 @@ class MultitaskBoundaryBatch(MEDSTorchBatch):
     q_bound_codes: torch.LongTensor | None = None
     q_mask: torch.BoolTensor | None = None
     targets: torch.BoolTensor | None = None
+    condition_codes: torch.LongTensor | None = None
+    condition_answers: torch.BoolTensor | None = None
     # Per-patient-token elapsed hours for rotary time encoding; ``None`` unless the dataset strips
     # delta tokens (mirrors ``ConditionalQueryBatch.time_pos_ids``).
     time_pos_ids: torch.LongTensor | None = None
@@ -111,6 +125,8 @@ class MultitaskBoundaryBatch(MEDSTorchBatch):
         "q_durations",
         "q_bound_codes",
         "targets",
+        "condition_codes",
+        "condition_answers",
     )
 
     @property
@@ -138,6 +154,14 @@ class MultitaskBoundaryBatch(MEDSTorchBatch):
             )
         if self.targets.dtype != torch.bool:
             raise TypeError(f"targets must be boolean, got {self.targets.dtype}")
+        cond_shape = (self.batch_size, self.q_durations.shape[1] - 1)
+        for name in ("condition_codes", "condition_answers"):
+            tensor = getattr(self, name)
+            if tensor is None or tuple(tensor.shape) != cond_shape:
+                got = None if tensor is None else tensor.shape
+                raise ValueError(f"Expected shape {cond_shape} for {name}, but got {got}!")
+        if self.condition_answers.dtype != torch.bool:
+            raise TypeError(f"condition_answers must be boolean, got {self.condition_answers.dtype}")
 
 
 def read_manifest(split_dir: Path) -> dict:
@@ -303,6 +327,31 @@ class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
         if not sentinel_ok.all():
             raise ValueError("durations/bound_events disagree on which slots are event-bounded")
 
+        # Issue #22: K-1 sampler-materialized conditioning codes/answers. Loaded and validated only;
+        # never sampled here. Answers are cross-checked against the unpacked bits in ``collate``.
+        kc = self.num_bounds - 1
+        cond_codes = self.schema_df[CONDITION_CODES_COL]
+        cond_answers = self.schema_df[CONDITION_ANSWERS_COL]
+        if n and not ((cond_codes.list.len() == kc) & (cond_answers.list.len() == kc)).all():
+            raise ValueError(f"every label row must carry exactly {kc} condition_codes/condition_answers")
+        if n and kc:
+            flat_cond = cond_codes.explode()
+            cond_mapped = flat_cond.replace_strict(self.code_to_index, default=-1, return_dtype=pl.Int64)
+            bad = flat_cond.filter(cond_mapped.is_null() | (cond_mapped <= 0)).unique().sort().to_list()
+            if bad:
+                raise ValueError(
+                    f"{len(bad)} condition code(s) in the labels are null, PAD, or not in this cohort's "
+                    f"vocabulary: {bad[:10]}. Regenerate the labels against this cohort's codes.parquet."
+                )
+            self._condition_codes = cond_mapped.to_numpy().astype(np.int64).reshape(n, kc)
+            flat_ans = cond_answers.explode()
+            if flat_ans.null_count():
+                raise ValueError("condition_answers must not contain nulls")
+            self._condition_answers = flat_ans.to_numpy().astype(bool).reshape(n, kc)
+        else:
+            self._condition_codes = np.zeros((n, kc), dtype=np.int64)
+            self._condition_answers = np.zeros((n, kc), dtype=bool)
+
         # Shard keys are stored once; each row carries a compact integer id, not a Python string.
         self._shard_keys: list[str] = sorted(self._label_files)
         self._source_shard = (
@@ -353,6 +402,12 @@ class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
         for fp in fps:
             key = self._source_key(fp)
             self._label_files[key] = fp.with_name(fp.name[: -len(fp.suffix)] + LABELS_SUFFIX)
+            missing = [c for c in (*required, *MULTITASK_LABEL_COLS) if c not in pl.read_parquet_schema(fp)]
+            if missing:
+                raise ValueError(
+                    f"{fp} is missing required column(s) {missing}; regenerate the labels with the "
+                    "current EQ_generate_multitask_sequences."
+                )
             df = pl.read_parquet(fp, columns=[*required, *MULTITASK_LABEL_COLS], use_pyarrow=True)
             frames.append(
                 df.with_row_index(SOURCE_ROW_COL).with_columns(
@@ -389,6 +444,8 @@ class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
         idx = range(len(self._source_row))[idx]
         out["q_durations"] = self._q_durations[idx]
         out["q_bound_codes"] = self._q_bound_codes[idx]
+        out["condition_codes"] = self._condition_codes[idx]
+        out["condition_answers"] = self._condition_answers[idx]
         out[SOURCE_SHARD_COL] = self._shard_keys[self._source_shard[idx]]
         out[SOURCE_ROW_COL] = int(self._source_row[idx])
         return out
@@ -423,6 +480,21 @@ class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
         q_bound_codes = torch.from_numpy(np.stack([item["q_bound_codes"] for item in batch]).astype(np.int64))
         q_mask = torch.ones(B, self.num_bounds, dtype=torch.bool)
         targets = self.unpack_targets(self.gather_packed(batch))
+        condition_codes = torch.from_numpy(
+            np.stack([item["condition_codes"] for item in batch]).astype(np.int64)
+        )
+        condition_answers = torch.from_numpy(np.stack([item["condition_answers"] for item in batch]))
+
+        # The stored answer must be the target bit of its code at its boundary (the sampler's contract).
+        kc = self.num_bounds - 1
+        if kc:
+            expect = targets[:, :kc].gather(2, condition_codes.unsqueeze(-1)).squeeze(-1)
+            if not torch.equal(expect, condition_answers):
+                bad = (expect != condition_answers).nonzero()[:5].tolist()
+                raise ValueError(
+                    f"condition_answers disagree with the packed targets at (batch, slot) {bad}; the "
+                    "metadata and .labels.npy sidecar are inconsistent. Regenerate the labels."
+                )
 
         return MultitaskBoundaryBatch(
             **out,
@@ -430,5 +502,7 @@ class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
             q_bound_codes=q_bound_codes,
             q_mask=q_mask,
             targets=targets,
+            condition_codes=condition_codes,
+            condition_answers=condition_answers,
             time_pos_ids=time_pos_ids,
         )

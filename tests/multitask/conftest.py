@@ -117,16 +117,34 @@ def base_cfg(cohort: Path, out_dir: Path, **overrides) -> dict:
 def make_index(
     contexts: list[tuple[int, datetime]],
     bounds: list[list[tuple[float, str | None]]],
+    conditions: list[list[str]] | None = None,
+    *,
+    fill_condition: str = "A",
 ) -> pl.DataFrame:
-    """Build a supplied multitask index; ``bounds[i][k]`` is ``(duration_days, bound_event)``."""
+    """Build a supplied multitask index; ``bounds[i][k]`` is ``(duration_days, bound_event)``.
+
+    ``conditions[i]`` holds the ``K-1`` conditioning codes; by default every slot is ``fill_condition``.
+    """
+    if conditions is None:
+        conditions = [[fill_condition] * (len(row) - 1) for row in bounds]
     return pl.DataFrame(
         {
             "subject_id": pl.Series([c[0] for c in contexts], dtype=pl.Int64),
             "prediction_time": pl.Series([c[1] for c in contexts], dtype=pl.Datetime("us")),
             "durations": pl.Series([[b[0] for b in row] for row in bounds], dtype=pl.List(pl.Float32)),
             "bound_events": pl.Series([[b[1] for b in row] for row in bounds], dtype=pl.List(pl.Utf8)),
+            "condition_codes": pl.Series(conditions, dtype=pl.List(pl.Utf8)),
         }
     )
+
+
+def condition_answers_oracle(meta: pl.DataFrame, dense: np.ndarray, vocab) -> np.ndarray:
+    """``(N, K-1)`` bool: ``dense[i, j, index(condition_codes[i, j])]``, computed slot by slot."""
+    c2i = vocab.code_to_index()
+    rows = meta["condition_codes"].to_list()
+    return np.array(
+        [[bool(dense[i, j, c2i[c]]) for j, c in enumerate(row)] for i, row in enumerate(rows)], dtype=bool
+    ).reshape(meta.height, -1)
 
 
 def scalar_oracle(

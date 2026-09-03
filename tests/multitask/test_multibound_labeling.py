@@ -17,7 +17,7 @@ from every_query.generate_tasks.sample_multitask_sequences import (
     label_multitask_index,
     validate_index,
 )
-from tests.multitask.conftest import CODES, make_events, make_index, scalar_oracle
+from tests.multitask.conftest import CODES, condition_answers_oracle, make_events, make_index, scalar_oracle
 
 T0 = datetime(2024, 1, 1)
 VOCAB = TargetVocabulary.from_pairs(["A", "B", "DISCHARGE", "TIMELINE//END"], [1, 2, 3, 4])
@@ -212,7 +212,8 @@ def test_output_identical_for_different_initial_context_order_and_chunk_sizes() 
         ]
         for _ in contexts
     ]
-    idx = make_index(contexts, bounds)
+    conds = [[CODES[int(rng.integers(0, len(CODES)))] for _ in range(2)] for _ in contexts]
+    idx = make_index(contexts, bounds, conds)
     meta_a, packed_a, _ = label_multitask_index(idx, events, vocab, 3, chunk_rows=4)
     perm = rng.permutation(idx.height)
     shuffled = idx.with_row_index("_ctx_id").with_columns(pl.col("_ctx_id").cast(pl.Int64))[perm.tolist()]
@@ -267,11 +268,54 @@ def test_differential_against_scalar_label_with_event_bounds(seed: int) -> None:
         return -1.0, pool[int(rng.integers(0, len(pool)))]
 
     bounds = [[pick_bound() for _ in range(k)] for _ in range(n)]
-    idx = make_index(contexts, bounds)
+    conds = [[CODES[int(rng.integers(0, len(CODES)))] for _ in range(k - 1)] for _ in range(n)]
+    idx = make_index(contexts, bounds, conds)
     meta, packed, stats = label_multitask_index(idx, events, vocab, k, chunk_rows=5)
-    got = np.unpackbits(packed, axis=-1, count=vocab.size, bitorder="little").astype(bool)[
-        :, :, vocab.indices
-    ]
+    dense = np.unpackbits(packed, axis=-1, count=vocab.size, bitorder="little").astype(bool)
+    got = dense[:, :, vocab.indices]
     expect = scalar_oracle(meta, events, list(vocab.codes), k)
     assert np.array_equal(got, expect)
     assert stats.n_contexts == n
+    # condition_answers[i, j] == targets[i, j, index(condition_codes[i, j])], with repeats allowed.
+    answers = np.array(meta["condition_answers"].to_list(), dtype=bool)
+    assert answers.shape == (n, k - 1)
+    assert np.array_equal(answers, condition_answers_oracle(meta, dense, vocab))
+    assert answers.any() and not answers.all()
+
+
+# --- conditioning codes (issue #22) ---------------------------------------------------------------
+
+
+def test_condition_answer_is_the_target_bit_at_the_matching_boundary() -> None:
+    ev = _events([(1, T0 + timedelta(days=2), "A"), (1, T0 + timedelta(days=8), "B")])
+    idx = make_index([(1, T0)], [[(5.0, None), (10.0, None), (1.0, None)]], [["A", "A"]])
+    meta, _ = _dense(idx, ev, k=3)
+    assert meta["condition_answers"].to_list() == [[True, True]]
+    idx = make_index([(1, T0)], [[(5.0, None), (10.0, None), (1.0, None)]], [["B", "B"]])
+    meta, _ = _dense(idx, ev, k=3)
+    assert meta["condition_answers"].to_list() == [[False, True]]  # B at day 8: outside 5d, inside 10d
+    assert meta["condition_codes"].to_list() == [["B", "B"]]  # repeats are allowed and carried through
+
+
+def test_single_bound_has_no_condition_slots() -> None:
+    ev = _events([(1, T0 + timedelta(days=1), "A")])
+    meta, _ = _dense(make_index([(1, T0)], [[(5.0, None)]]), ev)
+    assert meta["condition_codes"].to_list() == [[]] and meta["condition_answers"].to_list() == [[]]
+
+
+def test_bad_condition_codes_are_hard_errors() -> None:
+    ev = _events([(1, T0 + timedelta(days=1), "A")])
+    two = [[(5.0, None), (6.0, None)]]
+    with pytest.raises(ValueError, match="exactly 1 condition_codes"):
+        validate_index(make_index([(1, T0)], two, [["A", "B"]]), 2)
+    with pytest.raises(ValueError, match="exactly 1 condition_codes"):
+        validate_index(make_index([(1, T0)], two, [[]]), 2)
+    with pytest.raises(ValueError, match="missing required column 'condition_codes'"):
+        validate_index(make_index([(1, T0)], two).drop("condition_codes"), 2)
+    with pytest.raises(ValueError, match="must not contain nulls"):
+        validate_index(make_index([(1, T0)], two, [[None]]), 2)
+    with pytest.raises(ValueError, match="condition code\\(s\\) are not in the base vocabulary"):
+        label_multitask_index(make_index([(1, T0)], two, [["NOPE"]]), ev, VOCAB, 2)
+    vocab = TargetVocabulary.from_pairs(["PAD", "A"], [0, 1])
+    with pytest.raises(ValueError, match="condition code\\(s\\) at vocab index 0"):
+        label_multitask_index(make_index([(1, T0)], two, [["PAD"]]), ev, vocab, 2)

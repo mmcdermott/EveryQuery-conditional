@@ -22,6 +22,11 @@ The staged sampler architecture is reused::
     Stage 4M   per shard: build the interval table, resolve the (N, K) boundary matrix, label every
                vocabulary code with the subject-sorted interval-range kernel, pack, and write
 
+Issue #22 adds ``K-1`` **conditioning** code/answer pairs per context for teacher forcing the planned
+decoder-only model: Stage 1M draws ``condition_codes`` iid uniform over all non-PAD base codes from a
+dedicated RNG stream (never perturbing the boundary streams), Stage 3M carries them through the index,
+and Stage 4M materializes ``condition_answers[i, j] = target[i, j, vocab_index(condition_codes[i, j])]``.
+
 Output, per event shard of the split::
 
     out_dir/{split}/{shard}.parquet             MultitaskBoundarySchema metadata, one row per context
@@ -98,7 +103,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 MANIFEST_NAME = "_multitask_manifest.json"
 LABELS_SUFFIX = ".labels.npy"
 ONTOLOGY_MODE_NONE = "none"
@@ -106,15 +111,20 @@ BITORDER = "little"
 WINDOW_SEMANTICS = "open_open"
 MISSING_EVENT_BOUNDARY = "inf"
 DATETIME_UNIT = "us"
+# Issue #22: K-1 conditioning codes per context, iid uniform with replacement over all non-PAD base
+# codes, from a dedicated RNG stream; answer j is the target bit of that code at boundary j.
+CONDITION_POLICY = "uniform_base_vocab_no_pad"
 
 CTX_ID_COL = "_ctx_id"
 DURATIONS_COL = "durations"
 BOUND_EVENTS_COL = "bound_events"
+CONDITION_CODES_COL = "condition_codes"
+CONDITION_ANSWERS_COL = "condition_answers"
 SID = TaskQuerySchema.subject_id_name
 PT = TaskQuerySchema.prediction_time_name
 
-INDEX_COLUMNS = [CTX_ID_COL, SID, PT, DURATIONS_COL, BOUND_EVENTS_COL]
-METADATA_COLUMNS = [SID, PT, DURATIONS_COL, BOUND_EVENTS_COL]
+INDEX_COLUMNS = [CTX_ID_COL, SID, PT, DURATIONS_COL, BOUND_EVENTS_COL, CONDITION_CODES_COL]
+METADATA_COLUMNS = [SID, PT, DURATIONS_COL, BOUND_EVENTS_COL, CONDITION_CODES_COL]
 
 ONTOLOGY_NOT_SUPPORTED = (
     "The multitask sampler currently supports observable leaf codes only. "
@@ -264,10 +274,16 @@ def read_boundary_codes(spec: object, vocab: TargetVocabulary) -> list[str]:
 
 @dataclass(frozen=True)
 class BoundarySample:
-    """``num_contexts x K`` boundary draws: ``durations`` (float32) and ``bound_events`` (object, None)."""
+    """``num_contexts x K`` boundary draws plus ``num_contexts x (K-1)`` conditioning codes.
+
+    ``durations`` (float32) and ``bound_events`` (object, None) describe the boundaries;
+    ``condition_codes`` (object) holds the code whose answer at boundary ``j`` is revealed to boundaries
+    ``j+1..K-1`` (issue #22).
+    """
 
     durations: np.ndarray
     bound_events: np.ndarray
+    condition_codes: np.ndarray
 
     @property
     def n(self) -> int:
@@ -280,27 +296,29 @@ class BoundarySample:
 
 @dataclass(frozen=True)
 class BoundaryDistribution:
-    """Stage 1M: draw one fixed-length sequence of ``K`` boundaries per context.
+    """Stage 1M: one fixed-length sequence of ``K`` boundaries (+ ``K-1`` conditioning codes) per context.
 
     Every slot is drawn independently: a Bernoulli(``eventbound_fraction``) form draw, a duration from
     the configured distribution, and a boundary code iid uniform with replacement over
-    ``boundary_codes``.  The three axes use three caller-owned generators and every stream is drawn
-    in full for all ``n x K`` slots before masking, so changing ``eventbound_fraction`` (or the code
-    pool) perturbs neither the duration stream nor the code stream, and vice versa.
+    ``boundary_codes``.  Conditioning codes are iid uniform with replacement over ``condition_codes``
+    (every non-PAD base code).  The four axes use four caller-owned generators and every stream is
+    drawn in full before masking, so changing one axis perturbs none of the others.
 
     Examples:
         >>> dist = BoundaryDistribution(num_bounds=3, min_duration=1.0, max_duration=10.0,
-        ...     duration_distribution="uniform", eventbound_fraction=0.5, boundary_codes=("A", "B"))
-        >>> rngs = lambda: [np.random.default_rng(i) for i in range(3)]
+        ...     duration_distribution="uniform", eventbound_fraction=0.5, boundary_codes=("A", "B"),
+        ...     condition_codes=("A", "B", "C"))
+        >>> rngs = lambda: [np.random.default_rng(i) for i in range(4)]
         >>> s = dist.sample(4, *rngs())
-        >>> s.durations.shape, s.bound_events.shape, s.durations.dtype
-        ((4, 3), (4, 3), dtype('float32'))
+        >>> s.durations.shape, s.bound_events.shape, s.condition_codes.shape, s.durations.dtype
+        ((4, 3), (4, 3), (4, 2), dtype('float32'))
         >>> bool(((s.durations == -1.0) == (s.bound_events != None)).all())  # noqa: E711
         True
 
         Durations of duration-bounded slots are unaffected by the event fraction:
 
-        >>> off = BoundaryDistribution(3, 1.0, 10.0, "uniform", 0.0, ("A", "B")).sample(4, *rngs())
+        >>> off = BoundaryDistribution(3, 1.0, 10.0, "uniform", 0.0, ("A", "B"), ("A", "B", "C"))
+        >>> off = off.sample(4, *rngs())
         >>> keep = s.bound_events == None  # noqa: E711
         >>> bool((s.durations[keep] == off.durations[keep]).all())
         True
@@ -312,12 +330,15 @@ class BoundaryDistribution:
     duration_distribution: str
     eventbound_fraction: float
     boundary_codes: tuple[str, ...]
+    condition_codes: tuple[str, ...]
 
     _VALID_DISTRIBUTIONS = ("uniform", "log-uniform")
 
     def __post_init__(self) -> None:
         if self.num_bounds < 1:
             raise ValueError(f"num_bounds must be >= 1 (got {self.num_bounds})")
+        if self.num_bounds > 1 and not self.condition_codes:
+            raise ValueError("num_bounds > 1 requires a non-empty condition_codes pool")
         if self.min_duration <= 0:
             raise ValueError(f"min_duration must be > 0 (got {self.min_duration})")
         if self.max_duration < self.min_duration:
@@ -335,7 +356,9 @@ class BoundaryDistribution:
             raise ValueError("eventbound_fraction > 0 requires a non-empty boundary_codes pool")
 
     @classmethod
-    def from_config(cls, cfg: DictConfig, boundary_codes: Sequence[str]) -> BoundaryDistribution:
+    def from_config(
+        cls, cfg: DictConfig, boundary_codes: Sequence[str], condition_codes: Sequence[str]
+    ) -> BoundaryDistribution:
         return cls(
             num_bounds=int(cfg.get("num_bounds", 5)),
             min_duration=float(cfg.duration_min),
@@ -343,6 +366,7 @@ class BoundaryDistribution:
             duration_distribution=str(cfg.get("duration_distribution", "log-uniform")),
             eventbound_fraction=float(cfg.get("eventbound_fraction", 0.0) or 0.0),
             boundary_codes=tuple(boundary_codes),
+            condition_codes=tuple(condition_codes),
         )
 
     def sample(
@@ -351,10 +375,16 @@ class BoundaryDistribution:
         form_rng: np.random.Generator,
         duration_rng: np.random.Generator,
         code_rng: np.random.Generator,
+        condition_rng: np.random.Generator,
     ) -> BoundarySample:
         if num_contexts < 0:
             raise ValueError(f"num_contexts must be >= 0 (got {num_contexts})")
         shape = (num_contexts, self.num_bounds)
+        cond_shape = (num_contexts, self.num_bounds - 1)
+        condition_codes = np.full(cond_shape, None, dtype=object)
+        if self.condition_codes:
+            pool = np.array(self.condition_codes, dtype=object)
+            condition_codes = pool[condition_rng.integers(0, len(pool), size=cond_shape)]
         is_event = form_rng.random(shape) < self.eventbound_fraction
         if self.duration_distribution == "log-uniform":
             durations = np.exp(
@@ -369,7 +399,7 @@ class BoundaryDistribution:
             pool = np.array(self.boundary_codes, dtype=object)
             bound_events[is_event] = pool[picks[is_event]]
         durations[is_event] = EVENT_BOUND_DURATION_SENTINEL
-        return BoundarySample(durations=durations, bound_events=bound_events)
+        return BoundarySample(durations=durations, bound_events=bound_events, condition_codes=condition_codes)
 
 
 # ---------------------------------------------------------------------------
@@ -377,16 +407,22 @@ class BoundaryDistribution:
 # ---------------------------------------------------------------------------
 
 
+def _list_column(name: str, values: np.ndarray, dtype: pl.DataType) -> pl.Series:
+    """``(N, M)`` array -> ``List`` column via a flat series + reshape: no per-slot Python objects."""
+    n, m = values.shape
+    if m == 0:  # K == 1: zero conditioning slots; polars cannot reshape to a zero-width array
+        return pl.Series(name, [[] for _ in range(n)], dtype=pl.List(dtype))
+    # Object arrays go through a flat list of references to the (shared) pool strings; an object
+    # ndarray would be inferred as polars Object when every slot is None.
+    flat = values.ravel().tolist() if values.dtype == object else values.ravel()
+    return pl.Series(name, flat, dtype=dtype).reshape((n, m)).arr.to_list()
+
+
 def _bounds_to_columns(sample: BoundarySample) -> dict[str, pl.Series]:
-    """``(N, K)`` arrays -> ``List`` columns via a flat series + reshape: no per-slot Python objects."""
-    n, k = sample.durations.shape
-    durations = pl.Series(DURATIONS_COL, sample.durations.ravel(), dtype=pl.Float32)
-    # A flat list of references to the (shared) pool strings; an object ndarray would be inferred as
-    # polars Object when every slot is None.
-    bound_events = pl.Series(BOUND_EVENTS_COL, sample.bound_events.ravel().tolist(), dtype=pl.Utf8)
     return {
-        DURATIONS_COL: durations.reshape((n, k)).arr.to_list(),
-        BOUND_EVENTS_COL: bound_events.reshape((n, k)).arr.to_list(),
+        DURATIONS_COL: _list_column(DURATIONS_COL, sample.durations, pl.Float32),
+        BOUND_EVENTS_COL: _list_column(BOUND_EVENTS_COL, sample.bound_events, pl.Utf8),
+        CONDITION_CODES_COL: _list_column(CONDITION_CODES_COL, sample.condition_codes, pl.Utf8),
     }
 
 
@@ -463,6 +499,8 @@ def config_fingerprint(dist: BoundaryDistribution, vocab: TargetVocabulary) -> s
             "duration_distribution": dist.duration_distribution,
             "eventbound_fraction": dist.eventbound_fraction,
             "boundary_codes": _sha256_json(list(dist.boundary_codes)),
+            "condition_codes": _sha256_json(list(dist.condition_codes)),
+            "condition_policy": CONDITION_POLICY,
             "vocab_fingerprint": vocab.fingerprint,
             "vocab_size": vocab.size,
             "window": WINDOW_SEMANTICS,
@@ -486,6 +524,8 @@ def build_manifest(dist: BoundaryDistribution, vocab: TargetVocabulary) -> dict:
         "event_bound_duration_sentinel": EVENT_BOUND_DURATION_SENTINEL,
         "vocab_fingerprint": vocab.fingerprint,
         "ontology_mode": ONTOLOGY_MODE_NONE,
+        "condition_policy": CONDITION_POLICY,
+        "num_condition_codes": dist.num_bounds - 1,
         "config_fingerprint": config_fingerprint(dist, vocab),
         "labels_suffix": LABELS_SUFFIX,
     }
@@ -574,17 +614,24 @@ def resolve_event_boundaries(
 
 
 def validate_index(index_df: pl.DataFrame, num_bounds: int) -> None:
-    """Check the Stage 3M / supplied index contract: K slots per row, one active representation each."""
-    for col in (SID, PT, DURATIONS_COL, BOUND_EVENTS_COL):
+    """Check the Stage 3M / supplied index contract: K slots per row, one active representation each, and
+    exactly K-1 non-null conditioning codes."""
+    for col in (SID, PT, DURATIONS_COL, BOUND_EVENTS_COL, CONDITION_CODES_COL):
         if col not in index_df.columns:
             raise ValueError(f"index is missing required column {col!r}")
     if index_df.height == 0:
         return
     lens = index_df.select(
-        pl.col(DURATIONS_COL).list.len().alias("d"), pl.col(BOUND_EVENTS_COL).list.len().alias("b")
+        pl.col(DURATIONS_COL).list.len().alias("d"),
+        pl.col(BOUND_EVENTS_COL).list.len().alias("b"),
+        pl.col(CONDITION_CODES_COL).list.len().alias("c"),
     )
     if not ((lens["d"] == num_bounds) & (lens["b"] == num_bounds)).all():
         raise ValueError(f"every index row must carry exactly {num_bounds} durations and bound_events")
+    if not (lens["c"] == num_bounds - 1).all():
+        raise ValueError(f"every index row must carry exactly {num_bounds - 1} condition_codes")
+    if index_df[CONDITION_CODES_COL].explode().null_count() and num_bounds > 1:
+        raise ValueError("condition_codes must not contain nulls")
     flat = index_df.select(
         pl.col(DURATIONS_COL).explode().alias("d"), pl.col(BOUND_EVENTS_COL).explode().alias("b")
     )
@@ -619,35 +666,44 @@ def _encode_events(
     return sid, t, ci, n_unknown
 
 
-def _encode_bounds(
-    index_df: pl.DataFrame, vocab: TargetVocabulary, num_bounds: int
-) -> tuple[np.ndarray, np.ndarray]:
-    """``(durations (N, K) float32, bound_code_index (N, K) int64 with -1 for duration slots)``."""
-    n = index_df.height
-    durations = np.asarray(index_df[DURATIONS_COL].explode().to_numpy(), dtype=np.float32).reshape(
-        n, num_bounds
-    )
-    bound_events = index_df[BOUND_EVENTS_COL].explode()
+def _map_codes(codes: pl.Series, vocab: TargetVocabulary, what: str) -> np.ndarray:
+    """Flat code series -> ``int64`` vocab indices (``-1`` for nulls); unknown / PAD codes are hard errors."""
     c2i = vocab.code_to_index()
-    distinct = bound_events.drop_nulls().unique().to_list()
+    distinct = codes.drop_nulls().unique().to_list()
     unknown = sorted(c for c in distinct if c not in c2i)
     if unknown:
-        raise ValueError(f"{len(unknown)} boundary code(s) are not in the base vocabulary: {unknown[:10]}")
+        raise ValueError(f"{len(unknown)} {what} code(s) are not in the base vocabulary: {unknown[:10]}")
     pad = [c for c in distinct if c2i[c] == 0]
     if pad:
-        raise ValueError(f"boundary code(s) at vocab index 0 (PAD) are not allowed: {pad}")
+        raise ValueError(f"{what} code(s) at vocab index 0 (PAD) are not allowed: {pad}")
     mapping = pl.DataFrame(
         {"code": distinct, "_i": [c2i[c] for c in distinct]}, schema={"code": pl.Utf8, "_i": pl.Int64}
     )
-    encoded = (
-        pl.DataFrame({"code": bound_events.cast(pl.Utf8)})
+    return (
+        pl.DataFrame({"code": codes.cast(pl.Utf8)})
         .join(mapping, on="code", how="left", maintain_order="left")["_i"]
         .fill_null(-1)
         .to_numpy()
         .astype(np.int64)
-        .reshape(n, num_bounds)
     )
-    return durations, encoded
+
+
+def _encode_bounds(
+    index_df: pl.DataFrame, vocab: TargetVocabulary, num_bounds: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """``(durations (N, K) float32, bound_code_index (N, K) int64 with -1 for duration slots,
+    condition_code_index (N, K-1) int64)``."""
+    n = index_df.height
+    durations = np.asarray(index_df[DURATIONS_COL].explode().to_numpy(), dtype=np.float32).reshape(
+        n, num_bounds
+    )
+    bounds = _map_codes(index_df[BOUND_EVENTS_COL].explode(), vocab, "boundary").reshape(n, num_bounds)
+    if num_bounds > 1:
+        conds = _map_codes(index_df[CONDITION_CODES_COL].explode(), vocab, "condition")
+        conds = conds.reshape(n, num_bounds - 1)
+    else:
+        conds = np.zeros((n, 0), dtype=np.int64)
+    return durations, bounds, conds
 
 
 @dataclass
@@ -710,13 +766,19 @@ def label_multitask_index(
         ...     "time": [datetime(2024, 1, 3), datetime(2024, 1, 6), datetime(2024, 1, 9)],
         ...     "code": ["A", "B", "END"]}).with_columns(pl.col("time").cast(pl.Datetime("us")))
         >>> idx = pl.DataFrame({"subject_id": [1], "prediction_time": [datetime(2024, 1, 1)],
-        ...     "durations": [[30.0, -1.0]], "bound_events": [[None, "B"]]}).with_columns(
+        ...     "durations": [[30.0, -1.0]], "bound_events": [[None, "B"]],
+        ...     "condition_codes": [["END"]]}).with_columns(
         ...     pl.col("prediction_time").cast(pl.Datetime("us")),
         ...     pl.col("durations").cast(pl.List(pl.Float32)),
         ...     pl.col("bound_events").cast(pl.List(pl.Utf8)))
         >>> meta, packed, stats = label_multitask_index(idx, events, vocab, 2)
         >>> np.unpackbits(packed, axis=-1, count=vocab.size, bitorder="little").tolist()
         [[[0, 1, 1, 1], [0, 1, 0, 0]]]
+
+        The conditioning answer is the target bit of the conditioning code at the matching boundary:
+
+        >>> meta["condition_answers"].to_list()
+        [[True]]
     """
     reject_ontology(ontology_dir)
     validate_index(index_df, num_bounds)
@@ -737,7 +799,7 @@ def label_multitask_index(
 
     subject_ids = index_df[SID].to_numpy().astype(np.int64)
     prediction_times = index_df[PT].cast(pl.Datetime("us")).cast(pl.Int64).to_numpy().astype(np.int64)
-    durations, bound_code_index = _encode_bounds(index_df, vocab, num_bounds)
+    durations, bound_code_index, condition_index = _encode_bounds(index_df, vocab, num_bounds)
 
     t1 = time.perf_counter()
     bound_times = resolve_event_boundaries(
@@ -756,18 +818,26 @@ def label_multitask_index(
 
     t2 = time.perf_counter()
     positives = 0
+    answers = np.zeros((n, num_bounds - 1), dtype=bool)
+    j = np.arange(num_bounds - 1)[None, :]
     for lo, hi, packed in iter_packed_label_chunks(
         table, subject_ids, prediction_times, bound_times, vocab.size, chunk_rows
     ):
         out[lo:hi] = packed
         positives += int(np.bitwise_count(packed).sum())  # popcount on packed bytes: no unpacked scratch
+        # answers[i, j] = targets[i, j, condition_index[i, j]], read straight off the packed bytes.
+        ci = condition_index[lo:hi]
+        rows = np.arange(hi - lo)[:, None]
+        answers[lo:hi] = (packed[rows, j, ci >> 3] >> (ci & 7)) & 1
     stats.label_seconds = time.perf_counter() - t2
     stats.contexts_per_second = n / stats.label_seconds if stats.label_seconds > 0 else float("inf")
     stats.mean_positives_per_context_boundary = positives / (n * num_bounds) if n else 0.0
     stats.output_bytes = int(np.prod(shape))
     stats.peak_rss_bytes = _peak_rss_bytes()
 
-    metadata = index_df.select(METADATA_COLUMNS)
+    metadata = index_df.select(METADATA_COLUMNS).with_columns(
+        _list_column(CONDITION_ANSWERS_COL, answers, pl.Boolean)
+    )
     return metadata, out, stats
 
 
@@ -893,7 +963,11 @@ def label_one_multitask_shard(
     labels_tmp = _unique_tmp_path(final_labels)
     try:
         if index_df.height == 0:
-            metadata = sort_index_for_labeling(index_df).select(METADATA_COLUMNS)
+            metadata = (
+                sort_index_for_labeling(index_df)
+                .select(METADATA_COLUMNS)
+                .with_columns(pl.Series(CONDITION_ANSWERS_COL, [], dtype=pl.List(pl.Boolean)))
+            )
             # np.save would append '.npy' to a suffix-less temp name; write through the handle.
             with open(labels_tmp, "wb") as f:
                 np.save(f, np.zeros(shape, dtype=np.uint8))
@@ -1092,7 +1166,7 @@ def run(cfg: DictConfig) -> None:
 
     vocab = build_target_vocabulary(cfg.get("query_codes"))
     boundary_codes = read_boundary_codes(cfg.get("boundary_codes"), vocab)
-    dist = BoundaryDistribution.from_config(cfg, boundary_codes)
+    dist = BoundaryDistribution.from_config(cfg, boundary_codes, vocab.boundary_candidates())
     logger.info(
         "Vocabulary: %s codes, V=%s (packed width %s bytes), fingerprint %s; %s boundary candidate(s).",
         f"{len(vocab.codes):,}",
@@ -1116,12 +1190,13 @@ def run(cfg: DictConfig) -> None:
     form_rng = np.random.default_rng(derive_seed(cfg.seed, "bound_forms"))
     duration_rng = np.random.default_rng(derive_seed(cfg.seed, "bound_durations"))
     code_rng = np.random.default_rng(derive_seed(cfg.seed, "bound_codes"))
+    condition_rng = np.random.default_rng(derive_seed(cfg.seed, "condition_codes"))
 
-    sample = dist.sample(num_contexts, form_rng, duration_rng, code_rng)
+    sample = dist.sample(num_contexts, form_rng, duration_rng, code_rng, condition_rng)
     n_event = int((sample.bound_events != None).sum())  # noqa: E711
     logger.info(
         "Stage 1M: sampled %s boundary sequence(s) of K=%d (%s event-bounded slots, %.1f%%; %s durations "
-        "over [%g, %g] days).",
+        "over [%g, %g] days) + %d conditioning code(s) per context from %s candidate(s).",
         f"{num_contexts:,}",
         dist.num_bounds,
         f"{n_event:,}",
@@ -1129,6 +1204,8 @@ def run(cfg: DictConfig) -> None:
         dist.duration_distribution,
         dist.min_duration,
         dist.max_duration,
+        dist.num_bounds - 1,
+        f"{len(dist.condition_codes):,}",
     )
 
     counts = pl.read_parquet(prediction_time_counts_path(artifacts_dir, cfg.split)).sort("subject_id")
