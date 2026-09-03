@@ -283,7 +283,11 @@ def resolve_start_times(
     prediction_times = np.asarray(prediction_times, dtype=np.int64)
     start_durations_days = np.asarray(start_durations_days, dtype=np.float64)
     start_code_index = np.asarray(start_code_index, dtype=np.int64)
-    _check_nk("start", subject_ids, prediction_times, start_durations_days, start_code_index)
+    n, _ = _check_nk("start", subject_ids, prediction_times, start_durations_days, start_code_index)
+    if prediction_times.shape != (n,):
+        # Broadcast below assumes one prediction time per context; an (N, K) array would silently
+        # produce a wrongly-shaped result instead of raising.
+        raise ValueError("prediction_times must be (N,), one per context")
 
     by_event = start_code_index >= 0
     start_times = prediction_times[:, None] + _duration_offsets_us(start_durations_days, by_event)

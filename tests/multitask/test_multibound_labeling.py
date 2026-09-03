@@ -691,3 +691,21 @@ def test_chunked_equals_unchunked_and_supplied_order_invariance_with_starts() ->
         "condition_codes",
         "condition_answers",
     ]
+
+
+def test_many_windows_do_not_wrap_the_window_position_index() -> None:
+    """Regression: a uint8 window position wrapped at ``num_bounds >= 256``, scattering a window's
+    packed bits onto slot ``k % 256`` of the same context."""
+    k = 260
+    ev = _events([(1, _day(d), "X") for d in range(1, 40)])
+    # Window k opens at day k/10 and closes 0.05 days later, so exactly the windows whose open/close
+    # straddle an integer day hold X.  Slots 0..3 (which a uint8 cast would collide with 256..259)
+    # deliberately differ from those late slots.
+    starts = [[(round(0.1 * j, 4), None) for j in range(k)]]
+    bounds = [[(0.95, None) for _ in range(k)]]
+    idx = make_index([(1, T0)], bounds, [["X"] * (k - 1)], starts=starts)
+    _, packed, _ = label_multitask_index(idx, ev, VOCAB24, k, chunk_rows=3)
+    d = np.unpackbits(packed, axis=-1, count=VOCAB24.size, bitorder="little").astype(bool)
+    x = VOCAB24.code_to_index()["X"]
+    expected = [any(0.1 * j < day < 0.1 * j + 0.95 for day in range(1, 40)) for j in range(k)]
+    assert d[0, :, x].tolist() == expected

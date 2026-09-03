@@ -1067,12 +1067,13 @@ def label_multitask_index(
 
     # Flatten the (N, K) windows to N*K logical rows (row-major: flat = ctx_row * K + k) and sort them
     # by (subject_id, resolved_start); the stable lexsort keeps (ctx_row, k) order among ties.  Only
-    # the sorted copies survive: int32 context row + uint8 window position per flattened row.
+    # the sorted copies survive: int32 context row + int32 window position per flattened row (a uint8
+    # position would silently wrap at num_bounds >= 256 and scatter a window's bits onto another slot).
     kc = num_bounds - 1
     subj_flat = np.repeat(subject_ids, num_bounds)
     order = np.lexsort((start_times.ravel(), subj_flat))
     ctx_sorted = (order // num_bounds).astype(np.int32)
-    k_sorted = (order % num_bounds).astype(np.uint8)
+    k_sorted = (order % num_bounds).astype(np.int32)
     subj_sorted = subj_flat[order]
     start_sorted = start_times.ravel()[order]
     end_sorted = end_times.ravel()[order][:, None]

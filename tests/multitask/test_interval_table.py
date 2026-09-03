@@ -233,6 +233,10 @@ def test_resolve_start_times_duration_and_event_forms() -> None:
     assert st.tolist() == [[0, 7 * DAY, INF]]
     with pytest.raises(ValueError, match="shape mismatch"):
         it.resolve_start_times(t, np.array([1]), np.array([0]), np.zeros((1, 2)), np.zeros((1, 3), int))
+    # One prediction time per context: an (N, K) reference would broadcast to a wrongly-shaped result
+    # instead of raising (resolve_end_times legitimately takes the (N, K) resolved starts).
+    with pytest.raises(ValueError, match=r"prediction_times must be \(N,\)"):
+        it.resolve_start_times(t, np.array([1]), np.zeros((1, 3), int), np.zeros((1, 3)), np.full((1, 3), -1))
 
 
 def test_resolve_end_times_is_relative_to_start_and_strictly_after_it() -> None:
