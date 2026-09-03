@@ -191,3 +191,70 @@ def test_dataset_matches_manifest_vocabulary(tensorized_cohort_dir: Path, multit
         expected_vocab_fingerprint=vocab.fingerprint,
     )
     assert ds.vocab_size == vocab.size and ds.num_bounds == K
+
+
+def test_end_to_end_cli_run_to_batch_matches_raw_events(
+    simple_static_MEDS: Path, tensorized_cohort_dir: Path, tmp_path: Path
+) -> None:
+    """Raw MEDS events -> ``run()`` -> dataset -> batch: targets and the input window agree with the events.
+
+    Unlike the fixtures above, the labels here come from the real sampler driver over the fixture
+    cohort's own events, subjects carry several distinct prediction times, and the expected values
+    are recomputed from the raw event table rather than read back from the sidecars.
+    """
+    from omegaconf import OmegaConf
+
+    from tests.multitask.conftest import scalar_oracle
+
+    out = tmp_path / "mt"
+    k = 4
+    cfg = OmegaConf.create(
+        {
+            "data_dir": str(simple_static_MEDS),
+            "out_dir": str(out),
+            "query_codes": str(tensorized_cohort_dir),
+            "split": train_split,
+            "seed": 3,
+            "num_training_examples": 40,
+            "num_bounds": k,
+            "duration_min": 0.01,  # the fixture's events span hours, so keep horizons short
+            "duration_max": 2.0,
+            "duration_distribution": "log-uniform",
+            "eventbound_fraction": 0.5,
+            "boundary_codes": None,
+            "min_prediction_times_per_subject": 1,
+            "max_workers": 1,
+            "label_chunk_rows": 7,
+            "ontology_dir": None,
+            "overwrite": False,
+        }
+    )
+    sms.run(cfg)
+
+    events = pl.concat(
+        [pl.read_parquet(fp) for fp in sorted((simple_static_MEDS / "data" / train_split).glob("*.parquet"))]
+    ).select("subject_id", "time", "code")
+    vocab = sms.build_target_vocabulary(tensorized_cohort_dir)
+    code_to_index = dict(zip(vocab.codes, vocab.indices, strict=True))
+
+    ds = _dataset(tensorized_cohort_dir, out)
+    assert len(ds) == cfg.num_training_examples
+    assert ds.schema_df.group_by("subject_id").n_unique()["prediction_time"].max() > 1
+
+    perm = np.random.default_rng(0).permutation(len(ds)).tolist()
+    items = [ds[i] for i in perm]
+    batch = ds.collate(items)
+    meta = ds.schema_df[perm]
+
+    expect = scalar_oracle(meta, events, list(vocab.codes), k)
+    assert np.array_equal(batch.targets[:, :, vocab.indices].numpy(), expect)
+    assert expect.any() and not expect.all()  # the fixture actually exercises both label values
+
+    # Input window: the tokens the encoder sees are exactly the subject's timed events at or before
+    # the prediction time (SM mode, one token per measurement; static rows are omitted).
+    for b, (sid, pt) in enumerate(zip(meta["subject_id"], meta["prediction_time"], strict=True)):
+        visible = events.filter(
+            (pl.col("subject_id") == sid) & pl.col("time").is_not_null() & (pl.col("time") <= pt)
+        )
+        got = sorted(batch.code[b][batch.code[b] != batch.PAD_INDEX].tolist())
+        assert got == sorted(code_to_index[c] for c in visible["code"])
