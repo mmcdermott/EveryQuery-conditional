@@ -1,0 +1,79 @@
+# Small CPU config used by the ConditionalMultitaskARModel CLI integration test.
+defaults:
+  - _self_
+
+output_dir: ???
+do_overwrite: true
+do_resume: false
+seed: 1
+
+datamodule:
+  _target_: every_query.data.datamodule.ResumableDatamodule
+  data_class: every_query.data.multitask_dataset.MultitaskBoundaryPytorchDataset
+  config:
+    _target_: meds_torchdata.MEDSTorchDataConfig
+    tensorized_cohort_dir: ???
+    task_labels_dir: ???
+    static_inclusion_mode: omit
+    seq_sampling_strategy: to_end
+    max_seq_len: 64
+    batch_mode: SM
+  dataset_kwargs:
+    strip_delta_tokens: false
+    expected_vocab_size: ${lightning_module.model.config_overrides.vocab_size}
+  batch_size: 2
+  num_workers: 0
+  pin_memory: false
+
+lightning_module:
+  _target_: every_query.model.conditional_multitask_lightning.ConditionalMultitaskLightningModule
+  model:
+    _target_: every_query.model.conditional_multitask_ar_model.ConditionalMultitaskARModel
+    precision: ${trainer.precision}
+    max_windows: 5
+    use_rope_time: false
+    ontology_dir: null
+    config_overrides:
+      hidden_size: 64
+      num_hidden_layers: 2
+      num_attention_heads: 2
+      num_key_value_heads: 2
+      intermediate_size: 128
+      attention_dropout: 0.0
+      max_position_embeddings: ???
+      vocab_size: ???
+      pad_token_id: 0
+  optimizer:
+    _target_: torch.optim.AdamW
+    _partial_: true
+    lr: 1e-4
+    weight_decay: 0.01
+  LR_scheduler: null
+
+trainer:
+  _target_: lightning.pytorch.trainer.Trainer
+  logger: false
+  callbacks:
+    _target_: every_query.train.train.values_as_list
+    model_checkpoint:
+      _target_: lightning.pytorch.callbacks.ModelCheckpoint
+      dirpath: ${output_dir}/checkpoints
+      monitor: "tuning/loss"
+      verbose: false
+      save_last: true
+      save_top_k: 1
+      mode: min
+      save_weights_only: false
+  default_root_dir: ${output_dir}
+  min_epochs: 0
+  max_epochs: 1
+  accelerator: cpu
+  devices: 1
+  precision: bf16-mixed
+  accumulate_grad_batches: 1
+  log_every_n_steps: 1
+  check_val_every_n_epoch: null
+  val_check_interval: 1
+  limit_val_batches: 2
+  deterministic: true
+  gradient_clip_val: 1.0

@@ -63,7 +63,10 @@ def required_position_embeddings(model_cfg: DictConfig, max_seq_len: int) -> int
         258
     """
     target = str(model_cfg.get("_target_", ""))
-    if target.rsplit(".", 1)[-1] == "ConditionalQueryARModel":
+    target_name = target.rsplit(".", 1)[-1]
+    if target_name == "ConditionalMultitaskARModel":
+        return max_seq_len + 3 * int(model_cfg.max_windows)
+    if target_name == "ConditionalQueryARModel":
         from every_query.model.conditional_model import TOKENS_PER_QUERY
 
         return max_seq_len + TOKENS_PER_QUERY * int(model_cfg.max_queries)

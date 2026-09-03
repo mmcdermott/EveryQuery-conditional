@@ -1,13 +1,18 @@
 # Hydra config for the all-vocabulary, multi-bound *multitask* label generator
 # (`EQ_generate_multitask_sequences`, issue #20).
 #
-# For every sampled patient context the sampler draws a fixed sequence of `num_bounds` boundaries and
-# labels EVERY base-vocabulary code at every boundary:
+# For every sampled patient context the sampler draws a fixed sequence of `num_bounds` windows - each
+# with an explicit start and end specification (issue #24) - and labels EVERY base-vocabulary code at
+# every window:
 #
-#   target[i, k, v] = prediction_time[i] < first occurrence of v strictly after prediction_time[i]
-#                                          < resolved_boundary[i, k]
+#   start[i, k] = prediction_time[i] + start_duration            (0 => the prediction time itself)
+#                 OR first occurrence of start_event strictly after prediction_time[i]
+#   end[i, k]   = start[i, k] + duration
+#                 OR first occurrence of bound_event strictly after start[i, k]
+#   target[i, k, v] = start[i, k] < some occurrence of v < end[i, k]
 #
-# The window is open at both ends; an event boundary that never recurs is +infinity.  Targets are
+# The window is open at both ends; an event boundary that never recurs is +infinity; an event start
+# that never occurs leaves the window empty (every target false).  Targets are
 # written bit-packed (`uint8`, little bit order, shape `(rows, num_bounds, ceil(V / 8))`) to a
 # `<shard>.labels.npy` sidecar row-aligned with the `<shard>.parquet` metadata; the driver writes a
 # `_multitask_manifest.json` per split describing the vocabulary and semantics the labels were built
@@ -41,7 +46,8 @@ num_training_examples: 10000000
 # Boundaries per context.  Fixed, not sampled: every row has exactly this many slots.
 num_bounds: 5
 
-# Duration draw for duration-bounded slots (float days, no rounding).
+# End specification.  Duration draw for duration-bounded slots (float days after the RESOLVED START,
+# no rounding).
 duration_min: 1
 duration_max: 1826
 duration_distribution: log-uniform # uniform | log-uniform
@@ -52,6 +58,26 @@ duration_distribution: log-uniform # uniform | log-uniform
 # repeated boundary codes within one context are allowed.
 eventbound_fraction: 0.5
 boundary_codes: null
+
+# Start specification (issue #24).  Per slot, independently, one uniform draw picks the form:
+#   u < eventstart_fraction                                     => event-defined start
+#   eventstart_fraction <= u < eventstart_fraction + prediction_time_start_fraction
+#                                                               => the prediction time (start 0)
+#   otherwise                                                   => a positive start duration
+# Both fractions must be >= 0 and sum to <= 1.  Omitting every start key reproduces the pre-#24
+# behaviour (every window opens at the prediction time).
+# Total probability of an event-defined start.
+eventstart_fraction: 0.2
+# Total probability that the start remains prediction_time; the remainder is a positive duration.
+prediction_time_start_fraction: 0.4
+# Positive start-duration draw (float days after prediction_time).
+start_duration_min: 1
+start_duration_max: 180
+start_duration_distribution: log-uniform # uniform | log-uniform
+# Pool for event-defined starts, drawn iid uniform with replacement; null => every base observable
+# non-PAD code.  Drawn from its own RNG streams (`start_forms`, `start_durations`, `start_codes`), so
+# changing any start setting perturbs neither the contexts nor the end / conditioning draws.
+start_event_codes: null
 # Issue #22: every context also carries `num_bounds - 1` conditioning codes (iid uniform with
 # replacement over every non-PAD base code, from a dedicated RNG stream) and their materialized
 # answers (`condition_answers[j]` = target bit of `condition_codes[j]` at boundary `j`).  Not

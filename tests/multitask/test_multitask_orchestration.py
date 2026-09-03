@@ -64,9 +64,13 @@ def _dist(**kw) -> BoundaryDistribution:
     return BoundaryDistribution(**base)
 
 
-def _rngs(seed: int = 0, condition_seed: int | None = None):
+def _rngs(seed: int = 0, condition_seed: int | None = None, start_seed: int | None = None):
+    """The seven caller-owned generators of ``BoundaryDistribution.sample``: three end axes, the conditioning
+    axis, then the three start axes (issue #24)."""
     rngs = [np.random.default_rng(seed * 10 + i) for i in range(3)]
     rngs.append(np.random.default_rng(seed * 10 + 3 if condition_seed is None else condition_seed))
+    base = seed * 10 if start_seed is None else start_seed
+    rngs.extend(np.random.default_rng(base + i) for i in range(4, 7))
     return rngs
 
 
@@ -156,12 +160,19 @@ def test_run_writes_layout_manifest_and_exact_count(synthetic_cohort: Path, tmp_
     assert manifest["packed_width_bytes"] == vocab.packed_width
     assert manifest["bitorder"] == "little"
     assert manifest["window"] == "open_open"
-    assert manifest["missing_event_boundary"] == "inf"
+    assert manifest["missing_event_boundary"] == "infinity"
     assert manifest["datetime_unit"] == "us"
     assert manifest["vocab_fingerprint"] == vocab.fingerprint
     assert manifest["ontology_mode"] == "none"
-    assert manifest["format_version"] == 2
+    assert manifest["format_version"] == 3
     assert manifest["num_condition_codes"] == K - 1
+    # Issue #24 semantics keys (the legacy ``window`` / ``missing_event_boundary`` keys are retained).
+    assert manifest["window_semantics"] == "open_open"
+    assert manifest["start_reference"] == "prediction_time"
+    assert manifest["duration_end_reference"] == "resolved_start"
+    assert manifest["missing_event_start"] == "empty_window"
+    assert manifest["missing_event_end"] == "infinity"
+    assert manifest["event_bound_duration_sentinel"] == -1.0
 
     shards = _load_split(out, vocab)
     total = 0
@@ -408,7 +419,9 @@ def test_empty_shard(synthetic_cohort: Path, tmp_path: Path) -> None:
     _run(synthetic_cohort, out, num_training_examples=30)
     art = default_artifacts_dir(out) / "train"
     empty = (
-        make_index([], []).with_columns(pl.Series("_ctx_id", [], dtype=pl.Int64)).select(sms.INDEX_COLUMNS)
+        sms.normalize_index(make_index([], []), K)
+        .with_columns(pl.Series("_ctx_id", [], dtype=pl.Int64))
+        .select(sms.INDEX_COLUMNS)
     )
     empty.write_parquet(art / INDEX_DIRNAME / "9.parquet")
     events_dir = synthetic_cohort / "data" / "train"
@@ -454,3 +467,284 @@ def test_index_sorting_gives_stable_ids(tmp_path: Path) -> None:
     sorted_idx = sms.sort_index_for_labeling(idx)
     assert sorted_idx["_ctx_id"].to_list() == [2, 1, 0]
     assert sorted_idx["subject_id"].to_list() == [1, 1, 2]
+
+
+# --- issue #24: window starts -----------------------------------------------------------------------
+
+
+def _dist24(**kw) -> BoundaryDistribution:
+    base = {
+        "eventstart_fraction": 0.3,
+        "prediction_time_start_fraction": 0.3,
+        "start_min_duration": 1.0,
+        "start_max_duration": 180.0,
+        "start_duration_distribution": "log-uniform",
+        "start_event_codes": tuple(CODES),
+    }
+    base.update(kw)
+    return _dist(**base)
+
+
+def _start_kind(sample) -> np.ndarray:
+    """0 = prediction time, 1 = positive duration, 2 = event."""
+    ev = sample.start_events != None  # noqa: E711
+    return np.where(ev, 2, np.where(sample.start_durations > 0, 1, 0))
+
+
+def test_start_sampling_forms_and_fixed_seed_reproducibility() -> None:
+    a = _dist24().sample(400, *_rngs())
+    b = _dist24().sample(400, *_rngs())
+    assert np.array_equal(a.start_durations, b.start_durations)
+    assert np.array_equal(a.start_events, b.start_events)
+    assert a.start_durations.shape == (400, K) and a.start_durations.dtype == np.float32
+    assert a.start_events.shape == (400, K)
+    # Exactly one start representation per slot; positive durations inside the configured bounds.
+    ev = a.start_events != None  # noqa: E711
+    assert ((a.start_durations == -1.0) == ev).all()
+    pos = a.start_durations[~ev]
+    assert ((pos == 0) | ((pos >= 1.0) & (pos <= 180.0))).all()
+    assert set(a.start_events[ev].tolist()) <= set(CODES)
+    kinds = _start_kind(a)
+    frac = np.bincount(kinds.ravel(), minlength=3) / kinds.size
+    assert abs(frac[2] - 0.3) < 0.06 and abs(frac[0] - 0.3) < 0.06 and abs(frac[1] - 0.4) < 0.06
+    # All six start/end combinations are sampled.
+    end_ev = a.bound_events != None  # noqa: E711
+    combos = {(int(s), bool(e)) for s, e in zip(kinds.ravel(), end_ev.ravel(), strict=True)}
+    assert combos == {(s, e) for s in (0, 1, 2) for e in (False, True)}
+
+
+def test_legacy_defaults_put_every_start_at_the_prediction_time() -> None:
+    s = _dist().sample(50, *_rngs())
+    assert (s.start_durations == 0).all() and (s.start_events == None).all()  # noqa: E711
+
+
+def test_start_streams_are_independent_of_end_and_condition_streams() -> None:
+    ref = _dist24().sample(300, *_rngs())
+    # Any start-axis change leaves every end and conditioning draw bit-identical ...
+    variants = {
+        "eventstart_fraction": _dist24(eventstart_fraction=0.0, prediction_time_start_fraction=0.5),
+        "prediction_time_start_fraction": _dist24(prediction_time_start_fraction=0.6),
+        "start_duration_bounds": _dist24(start_min_duration=5.0, start_max_duration=10.0),
+        "start_duration_distribution": _dist24(start_duration_distribution="uniform"),
+        "start_event_codes": _dist24(start_event_codes=tuple(CODES[:2])),
+    }
+    for name, dist in variants.items():
+        other = dist.sample(300, *_rngs())
+        assert np.array_equal(ref.durations, other.durations), name
+        assert np.array_equal(ref.bound_events, other.bound_events), name
+        assert np.array_equal(ref.condition_codes, other.condition_codes), name
+    # ... a different start seed changes the starts but nothing else ...
+    other = _dist24().sample(300, *_rngs(start_seed=777))
+    assert not np.array_equal(ref.start_durations, other.start_durations)
+    assert np.array_equal(ref.durations, other.durations)
+    assert np.array_equal(ref.bound_events, other.bound_events)
+    assert np.array_equal(ref.condition_codes, other.condition_codes)
+    # ... and end / conditioning changes leave every start draw bit-identical.
+    for other in (
+        _dist24(eventbound_fraction=0.1).sample(300, *_rngs()),
+        _dist24(max_duration=1000.0).sample(300, *_rngs()),
+        _dist24(boundary_codes=tuple(CODES[:3])).sample(300, *_rngs()),
+        _dist24().sample(300, *_rngs(condition_seed=999)),
+    ):
+        assert np.array_equal(ref.start_durations, other.start_durations)
+        assert np.array_equal(ref.start_events, other.start_events)
+    # Within the start axes: the pool only changes which code, the bounds only the positive durations.
+    pool = _dist24(start_event_codes=tuple(CODES[:2])).sample(300, *_rngs())
+    assert np.array_equal(ref.start_durations, pool.start_durations)
+    bounds = _dist24(start_min_duration=5.0, start_max_duration=10.0).sample(300, *_rngs())
+    assert np.array_equal(ref.start_events, bounds.start_events)
+    assert np.array_equal(ref.start_durations <= 0, bounds.start_durations <= 0)
+
+
+def test_start_parameter_validation() -> None:
+    with pytest.raises(ValueError, match="eventstart_fraction must be >= 0"):
+        _dist24(eventstart_fraction=-0.1)
+    with pytest.raises(ValueError, match="prediction_time_start_fraction must be >= 0"):
+        _dist24(prediction_time_start_fraction=-0.1)
+    with pytest.raises(ValueError, match="must be <= 1"):
+        _dist24(eventstart_fraction=0.7, prediction_time_start_fraction=0.4)
+    with pytest.raises(ValueError, match="start_event_codes"):
+        _dist24(start_event_codes=())
+    with pytest.raises(ValueError, match="start_min_duration"):
+        _dist24(start_min_duration=0.0)
+    with pytest.raises(ValueError, match="start_max_duration"):
+        _dist24(start_max_duration=0.5)
+    with pytest.raises(ValueError, match="start_duration_distribution"):
+        _dist24(start_duration_distribution="normal")
+    assert _dist24(eventstart_fraction=0.0, start_event_codes=()).sample(3, *_rngs()).start_events.shape == (
+        3,
+        K,
+    )
+    assert _dist24(eventstart_fraction=0.6, prediction_time_start_fraction=0.4).eventstart_fraction == 0.6
+
+
+def test_from_config_start_defaults_and_overrides() -> None:
+    legacy = OmegaConf.create({"num_bounds": 3, "duration_min": 1, "duration_max": 10})
+    d = BoundaryDistribution.from_config(legacy, CODES, CODES)
+    assert d.eventstart_fraction == 0.0 and d.prediction_time_start_fraction == 1.0
+    assert (d.start_min_duration, d.start_max_duration, d.start_duration_distribution) == (
+        1.0,
+        180.0,
+        "log-uniform",
+    )
+    assert d.start_event_codes == ()
+    cfg = OmegaConf.create(
+        {
+            "num_bounds": 3,
+            "duration_min": 1,
+            "duration_max": 10,
+            "eventstart_fraction": 0.2,
+            "prediction_time_start_fraction": 0.0,
+            "start_duration_min": 2,
+            "start_duration_max": 20,
+            "start_duration_distribution": "uniform",
+        }
+    )
+    d = BoundaryDistribution.from_config(cfg, CODES, CODES, CODES[:2])
+    assert d.eventstart_fraction == 0.2 and d.prediction_time_start_fraction == 0.0
+    assert (d.start_min_duration, d.start_max_duration, d.start_duration_distribution) == (
+        2.0,
+        20.0,
+        "uniform",
+    )
+    assert d.start_event_codes == tuple(CODES[:2])
+
+
+def test_read_start_event_codes(tmp_path: Path) -> None:
+    make_codes_parquet(tmp_path, ["PAD", "A", "B"], first_index=0)
+    vocab = build_target_vocabulary(tmp_path)
+    assert sms.read_start_event_codes(None, vocab) == ["A", "B"]
+    assert sms.read_start_event_codes(["B", "B", "A"], vocab) == ["B", "A"]
+    with pytest.raises(ValueError, match="start_event code\\(s\\) are not in the base vocabulary"):
+        sms.read_start_event_codes(["NOPE"], vocab)
+    with pytest.raises(ValueError, match="PAD"):
+        sms.read_start_event_codes(["PAD"], vocab)
+    with pytest.raises(ValueError, match="empty"):
+        sms.read_start_event_codes([], vocab)
+
+
+def test_config_fingerprint_covers_every_start_parameter_and_vocab_salt_is_pinned(tmp_path: Path) -> None:
+    import hashlib
+
+    make_codes_parquet(tmp_path, ["A", "B"], first_index=1)
+    vocab = build_target_vocabulary(tmp_path)
+    ref = sms.config_fingerprint(_dist24(), vocab)
+    changes = {
+        "eventstart_fraction": _dist24(eventstart_fraction=0.31),
+        "prediction_time_start_fraction": _dist24(prediction_time_start_fraction=0.31),
+        "start_min_duration": _dist24(start_min_duration=2.0),
+        "start_max_duration": _dist24(start_max_duration=181.0),
+        "start_duration_distribution": _dist24(start_duration_distribution="uniform"),
+        "start_event_codes": _dist24(start_event_codes=tuple(CODES[:3])),
+        "num_bounds": _dist24(num_bounds=K + 1),
+        "eventbound_fraction": _dist24(eventbound_fraction=0.4),
+    }
+    seen = {ref}
+    for name, dist in changes.items():
+        fp = sms.config_fingerprint(dist, vocab)
+        assert fp not in seen, name
+        seen.add(fp)
+    assert sms.config_fingerprint(_dist24(), vocab) == ref
+    # The vocabulary fingerprint salt is the constant "multitask-vocab-v2", not FORMAT_VERSION.
+    assert sms.FORMAT_VERSION == 3 and sms.VOCAB_FINGERPRINT_VERSION == 2
+    h = hashlib.sha256(b"multitask-vocab-v2:3\n" + b"1\tA\n" + b"2\tB\n")
+    assert vocab.fingerprint == h.hexdigest()
+    manifest = sms.build_manifest(_dist24(), vocab)
+    assert manifest["format_version"] == 3 and manifest["missing_event_end"] == "infinity"
+    assert manifest["missing_event_start"] == "empty_window"
+    assert manifest["start_reference"] == "prediction_time"
+    assert manifest["duration_end_reference"] == "resolved_start"
+    assert manifest["window_semantics"] == "open_open"
+    sms.validate_manifest(manifest)
+    with pytest.raises(ValueError, match="format_version"):
+        sms.validate_manifest({**manifest, "format_version": 2})
+
+
+def _naive_from_run(meta: pl.DataFrame, events: pl.DataFrame, vocab: TargetVocabulary, k: int):
+    from tests.multitask.test_multibound_labeling import _naive_from_frames
+
+    return _naive_from_frames(meta, events, vocab, k)
+
+
+START_CFG = {
+    "eventstart_fraction": 0.3,
+    "prediction_time_start_fraction": 0.3,
+    "start_duration_min": 1,
+    "start_duration_max": 60,
+    "start_duration_distribution": "log-uniform",
+    "start_event_codes": None,
+}
+
+
+def test_run_with_explicit_starts_labels_all_six_combinations(synthetic_cohort: Path, tmp_path: Path) -> None:
+    out = tmp_path / "mt"
+    cfg = _run(synthetic_cohort, out, **START_CFG)
+    vocab = build_target_vocabulary(synthetic_cohort)
+    manifest = read_manifest(out / "train")
+    assert manifest["format_version"] == 3
+    shards = _load_split(out, vocab)
+    total = 0
+    combos = set()
+    stats = json.loads((default_artifacts_dir(out) / "train" / LABELED_DIRNAME / "0.json").read_text())[
+        "stats"
+    ]
+    for key in (
+        "n_event_starts",
+        "frac_event_starts_unresolved",
+        "frac_empty_windows",
+        "mean_positives_per_window",
+    ):
+        assert key in stats
+    assert stats["n_event_starts"] > 0 and 0 < stats["frac_empty_windows"] < 1
+    for shard, (meta, packed) in shards.items():
+        MultitaskBoundarySchema.validate(meta.to_arrow())
+        total += meta.height
+        sd = meta["start_durations"].explode()
+        se = meta["start_events"].explode()
+        assert ((sd == -1.0) == se.is_not_null()).all()
+        assert (sd.filter(sd != -1.0) >= 0).all()
+        assert set(se.drop_nulls().to_list()) <= set(vocab.boundary_candidates())
+        kinds = np.where(se.is_not_null().to_numpy(), 2, np.where(sd.to_numpy() > 0, 1, 0))
+        ends = meta["bound_events"].explode().is_not_null().to_numpy()
+        combos |= {(int(a), bool(b)) for a, b in zip(kinds, ends, strict=True)}
+        events = pl.read_parquet(synthetic_cohort / "data" / "train" / f"{shard}.parquet")
+        dense = np.unpackbits(packed, axis=-1, count=vocab.size, bitorder="little").astype(bool)
+        assert dense[:, :, 0].sum() == 0
+        _, _, expect = _naive_from_run(meta, events, vocab, K)
+        assert np.array_equal(dense, expect)
+        answers = np.array(meta["condition_answers"].to_list(), dtype=bool)
+        assert np.array_equal(answers, condition_answers_oracle(meta, dense, vocab))
+    assert total == cfg.num_training_examples
+    assert combos == {(s, e) for s in (0, 1, 2) for e in (False, True)}
+
+
+def test_start_config_change_invalidates_labels_but_not_end_draws(
+    synthetic_cohort: Path, tmp_path: Path, monkeypatch
+) -> None:
+    out = tmp_path / "mt"
+    _run(synthetic_cohort, out, num_training_examples=30, **START_CFG)
+    vocab = build_target_vocabulary(synthetic_cohort)
+    before = {s: m for s, (m, _) in _load_split(out, vocab).items()}
+    statuses = {}
+    real = sms._label_multitask_shards
+
+    def spy(*args, **kwargs):
+        statuses.update(real(*args, **kwargs))
+        return statuses
+
+    monkeypatch.setattr(sms, "_label_multitask_shards", spy)
+    _run(synthetic_cohort, out, num_training_examples=30, **{**START_CFG, "start_duration_max": 90})
+    assert set(statuses.values()) == {"labeled"}
+    after = {s: m for s, (m, _) in _load_split(out, vocab).items()}
+    for s in before:
+        # Same contexts, ends and conditioning codes; only the start draws moved.
+        for col in ("subject_id", "prediction_time", "durations", "bound_events", "condition_codes"):
+            assert before[s][col].equals(after[s][col]), col
+        assert not before[s]["start_durations"].equals(after[s]["start_durations"])
+    # Legacy config (no start keys) produces a format-3 manifest with zero starts.
+    statuses.clear()
+    _run(synthetic_cohort, tmp_path / "legacy", num_training_examples=30)
+    meta = next(iter(_load_split(tmp_path / "legacy", vocab).values()))[0]
+    assert (meta["start_durations"].explode() == 0).all() and meta[
+        "start_events"
+    ].explode().null_count() == meta.height * K

@@ -319,3 +319,393 @@ def test_bad_condition_codes_are_hard_errors() -> None:
     vocab = TargetVocabulary.from_pairs(["PAD", "A"], [0, 1])
     with pytest.raises(ValueError, match="condition code\\(s\\) at vocab index 0"):
         label_multitask_index(make_index([(1, T0)], two, [["PAD"]]), ev, vocab, 2)
+
+
+# --- issue #24: explicit window starts -------------------------------------------------------------
+
+VOCAB24 = TargetVocabulary.from_pairs(["A", "B", "X", "Y", "Z", "DISCHARGE"], [1, 2, 3, 4, 5, 6])
+
+
+def _day(n: float) -> datetime:
+    return T0 + timedelta(days=n)
+
+
+def _dense24(index_df, events_df, k: int = 1, **kw):
+    return _dense(index_df, events_df, VOCAB24, k, **kw)
+
+
+def _labels(dense: np.ndarray, k: int = 0, vocab: TargetVocabulary = VOCAB24) -> dict[str, bool]:
+    return {c: bool(dense[0, k, i]) for c, i in vocab.code_to_index().items()}
+
+
+def test_issue_fixture_event_start_event_end_only_y_is_true() -> None:
+    """The issue's day-3/5/5/6/8/8 fixture: start A, end B -> window (day 5, day 8) -> only Y."""
+    ev = _events(
+        [
+            (1, _day(3), "B"),
+            (1, _day(5), "A"),
+            (1, _day(5), "X"),
+            (1, _day(6), "Y"),
+            (1, _day(8), "B"),
+            (1, _day(8), "Z"),
+        ]
+    )
+    idx = make_index([(1, T0)], [[(-1.0, "B")]], starts=[[(-1.0, "A")]])
+    meta, d = _dense24(idx, ev)
+    got = _labels(d)
+    assert got == {"A": False, "X": False, "Y": True, "B": False, "Z": False, "DISCHARGE": False}
+    assert meta["start_durations"].to_list() == [[-1.0]] and meta["start_events"].to_list() == [["A"]]
+
+
+def test_zero_start_duration_reproduces_existing_labels_byte_identically() -> None:
+    rng = np.random.default_rng(11)
+    events = make_events(rng, [1, 2, 3], codes=CODES)
+    vocab = TargetVocabulary.from_pairs(CODES, list(range(1, len(CODES) + 1)))
+    contexts = [(int(rng.integers(1, 4)), T0 + timedelta(days=int(rng.integers(0, 400)))) for _ in range(30)]
+    bounds = [
+        [
+            (-1.0, CODES[int(rng.integers(0, 11))])
+            if rng.random() < 0.5
+            else (float(rng.uniform(1, 60)), None)
+            for _ in range(3)
+        ]
+        for _ in contexts
+    ]
+    conds = [[CODES[int(rng.integers(0, len(CODES)))] for _ in range(2)] for _ in contexts]
+    legacy = make_index(contexts, bounds, conds)  # no start columns at all
+    explicit = make_index(contexts, bounds, conds, starts=[[(0.0, None)] * 3 for _ in contexts])
+    meta_a, packed_a, _ = label_multitask_index(legacy, events, vocab, 3, chunk_rows=4)
+    meta_b, packed_b, _ = label_multitask_index(explicit, events, vocab, 3, chunk_rows=4)
+    assert packed_a.tobytes() == packed_b.tobytes()
+    assert meta_a.equals(meta_b)
+    assert meta_a["start_durations"].to_list() == [[0.0, 0.0, 0.0]] * 30
+    assert meta_a["start_events"].to_list() == [[None, None, None]] * 30
+    # ... and both equal the scalar (prediction-time-start) oracle bit for bit.
+    dense = np.unpackbits(packed_a, axis=-1, count=vocab.size, bitorder="little").astype(bool)
+    assert np.array_equal(dense[:, :, vocab.indices], scalar_oracle(meta_a, events, list(vocab.codes), 3))
+
+
+def test_positive_duration_start_and_duration_end_relative_to_start() -> None:
+    """Pt = day 0, start 7 days, duration 30 -> window (day 7, day 37), never (day 7, day 30)."""
+    ev = _events(
+        [(1, _day(5), "A"), (1, _day(10), "B"), (1, _day(36), "X"), (1, _day(37), "Y"), (1, _day(38), "Z")]
+    )
+    _, d = _dense24(make_index([(1, T0)], [[(30.0, None)]], starts=[[(7.0, None)]]), ev)
+    assert _labels(d) == {"A": False, "B": True, "X": True, "Y": False, "Z": False, "DISCHARGE": False}
+    # Exactly at the start instant is excluded, just after is included.
+    ev = _events([(1, _day(7), "A"), (1, _day(7) + timedelta(microseconds=1), "B")])
+    _, d = _dense24(make_index([(1, T0)], [[(30.0, None)]], starts=[[(7.0, None)]]), ev)
+    assert _labels(d)["A"] is False and _labels(d)["B"] is True
+
+
+def test_duration_end_is_relative_to_an_event_start() -> None:
+    ev = _events(
+        [(1, _day(3), "X"), (1, _day(10), "A"), (1, _day(12), "B"), (1, _day(15), "Y"), (1, _day(16), "Z")]
+    )
+    _, d = _dense24(make_index([(1, T0)], [[(5.0, None)]], starts=[[(-1.0, "A")]]), ev)
+    # (day 10, day 15): X at day 3 is before the start, Y sits on the endpoint.
+    assert _labels(d) == {"A": False, "B": True, "X": False, "Y": False, "Z": False, "DISCHARGE": False}
+
+
+def test_event_end_is_strictly_after_the_resolved_start_not_the_prediction_time() -> None:
+    """Start A at day 10; B at days 8 and 20 -> (day 10, day 20): the day-8 boundary is ignored."""
+    ev = _events(
+        [
+            (1, _day(8), "B"),
+            (1, _day(10), "A"),
+            (1, _day(15), "X"),
+            (1, _day(20), "B"),
+            (1, _day(20), "Y"),
+            (1, _day(25), "Z"),
+        ]
+    )
+    _, d = _dense24(make_index([(1, T0)], [[(-1.0, "B")]], starts=[[(-1.0, "A")]]), ev)
+    assert _labels(d) == {"A": False, "B": False, "X": True, "Y": False, "Z": False, "DISCHARGE": False}
+
+
+def test_start_event_exactly_at_prediction_time_is_skipped() -> None:
+    ev = _events([(1, T0, "A"), (1, _day(2), "X"), (1, _day(3), "A"), (1, _day(5), "Y")])
+    _, d = _dense24(make_index([(1, T0)], [[(10.0, None)]], starts=[[(-1.0, "A")]]), ev)
+    # The window opens at the day-3 occurrence: X at day 2 is outside, Y at day 5 inside.
+    assert _labels(d) == {"A": False, "B": False, "X": False, "Y": True, "Z": False, "DISCHARGE": False}
+
+
+def test_co_timestamped_start_and_end_events_are_excluded() -> None:
+    ev = _events(
+        [(1, _day(5), "A"), (1, _day(5), "X"), (1, _day(6), "Y"), (1, _day(8), "B"), (1, _day(8), "Z")]
+    )
+    _, d = _dense24(make_index([(1, T0)], [[(-1.0, "B")]], starts=[[(-1.0, "A")]]), ev)
+    assert _labels(d)["X"] is False and _labels(d)["Z"] is False and _labels(d)["Y"] is True
+    # Same instants under a duration end landing exactly on day 8.
+    _, d = _dense24(make_index([(1, T0)], [[(3.0, None)]], starts=[[(-1.0, "A")]]), ev)
+    assert _labels(d) == {"A": False, "B": False, "X": False, "Y": True, "Z": False, "DISCHARGE": False}
+
+
+def test_missing_start_event_gives_an_empty_all_false_window() -> None:
+    """DISCHARGE never occurs after pt: no fallback to the prediction time, both end forms empty."""
+    ev = _events([(1, _day(-1), "DISCHARGE"), (1, _day(1), "A"), (1, _day(2), "B"), (1, _day(900), "X")])
+    idx = make_index(
+        [(1, T0)],
+        [[(30.0, None), (-1.0, "B"), (1826.0, None)]],
+        [["A", "A"]],
+        starts=[[(-1.0, "DISCHARGE")] * 3],
+    )
+    meta, packed, stats = label_multitask_index(idx, ev, VOCAB24, 3)
+    assert packed.sum() == 0
+    assert meta["condition_answers"].to_list() == [[False, False]]
+    assert stats.n_event_starts == 3 and stats.frac_event_starts_unresolved == 1.0
+    assert stats.frac_empty_windows == 1.0 and stats.mean_positives_per_window == 0.0
+    assert stats.n_event_bounds == 1 and stats.frac_event_bounds_inf == 0.0  # only over resolved starts
+
+
+def test_missing_end_event_after_an_event_start_is_unbounded() -> None:
+    ev = _events([(1, _day(2), "X"), (1, _day(5), "A"), (1, _day(900), "Y"), (1, _day(901), "Z")])
+    _, d = _dense24(make_index([(1, T0)], [[(-1.0, "DISCHARGE")]], starts=[[(-1.0, "A")]]), ev)
+    assert _labels(d) == {"A": False, "B": False, "X": False, "Y": True, "Z": True, "DISCHARGE": False}
+
+
+def test_finite_start_after_every_event_is_an_empty_window() -> None:
+    ev = _events([(1, _day(1), "A"), (1, _day(2), "B")])
+    idx = make_index([(1, T0)], [[(30.0, None), (-1.0, "B")]], [["A"]], starts=[[(500.0, None)] * 2])
+    _, packed, stats = label_multitask_index(idx, ev, VOCAB24, 2)
+    assert packed.sum() == 0
+    assert stats.n_event_starts == 0 and stats.frac_event_starts_unresolved == 0.0
+    assert stats.frac_empty_windows == 1.0
+    assert stats.frac_event_bounds_inf == 1.0  # the start resolved (day 500) but B never recurs after it
+
+
+def test_equal_start_and_end_codes_select_consecutive_occurrences() -> None:
+    ev = _events(
+        [(1, _day(2), "A"), (1, _day(4), "X"), (1, _day(6), "A"), (1, _day(7), "Y"), (1, _day(9), "A")]
+    )
+    _, d = _dense24(make_index([(1, T0)], [[(-1.0, "A")]], starts=[[(-1.0, "A")]]), ev)
+    # (day 2, day 6): X inside, Y after the second A, A itself never inside.
+    assert _labels(d) == {"A": False, "B": False, "X": True, "Y": False, "Z": False, "DISCHARGE": False}
+    # From a prediction time between the first two A's the pair shifts to (day 6, day 9).
+    _, d = _dense24(make_index([(1, _day(3))], [[(-1.0, "A")]], starts=[[(-1.0, "A")]]), ev)
+    assert _labels(d) == {"A": False, "B": False, "X": False, "Y": True, "Z": False, "DISCHARGE": False}
+
+
+def test_all_six_start_end_combinations_in_one_context() -> None:
+    from every_query.generate_tasks.interval_table import US_PER_DAY, naive_window_labels
+
+    rows = [
+        (1, _day(1), "X"),
+        (1, _day(3), "A"),
+        (1, _day(4), "Y"),
+        (1, _day(6), "B"),
+        (1, _day(8), "Z"),
+        (1, _day(10), "A"),
+        (1, _day(12), "B"),
+        (1, _day(20), "DISCHARGE"),
+    ]
+    ev = _events(rows)
+    starts = [(0.0, None), (0.0, None), (2.0, None), (2.0, None), (-1.0, "A"), (-1.0, "A")]
+    bounds = [(5.0, None), (-1.0, "B"), (5.0, None), (-1.0, "B"), (5.0, None), (-1.0, "B")]
+    idx = make_index([(1, T0)], [bounds], [["X"] * 5], starts=[starts])
+    meta, d = _dense24(idx, ev, k=6, chunk_rows=1)
+    c2i = VOCAB24.code_to_index()
+    events = [(s, int((t - datetime(1970, 1, 1)).total_seconds() * 1_000_000), c2i[c]) for s, t, c in rows]
+    windows = [
+        [
+            ((sd, None) if se is None else (None, c2i[se]), (ed, None) if be is None else (None, c2i[be]))
+            for (sd, se), (ed, be) in zip(starts, bounds, strict=True)
+        ]
+    ]
+    pt_us = int((T0 - datetime(1970, 1, 1)).total_seconds() * 1_000_000)
+    st, en, expect = naive_window_labels(events, [(1, pt_us)], windows, VOCAB24.size, 6)
+    assert np.array_equal(d, expect)
+    day = US_PER_DAY
+    assert ((st - pt_us) // day).tolist() == [[0, 0, 2, 2, 3, 3]]
+    assert ((en - pt_us) // day).tolist() == [[5, 6, 7, 6, 8, 6]]
+    # Spot checks: (0,5) X,A,Y; (0,6) X,A,Y; (2,7) A,Y,B; (2,6) A,Y; (3,8) Y,B; (3,6) Y.
+    names = [sorted(c for c, i in c2i.items() if d[0, k, i]) for k in range(6)]
+    assert names == [["A", "X", "Y"], ["A", "X", "Y"], ["A", "B", "Y"], ["A", "Y"], ["B", "Y"], ["Y"]]
+    # Conditioning answers come from the resolved windows: X (day 1) is only inside the two
+    # prediction-time-start windows.
+    assert meta["condition_answers"].to_list() == [[True, True, False, False, False]]
+
+
+def test_conditioning_answers_use_the_resolved_window() -> None:
+    ev = _events([(1, _day(3), "X"), (1, _day(10), "A"), (1, _day(12), "Y")])
+    # Windows: (pt, 30d) and (A -> +5d).  X at day 3 is inside the first but not the second.
+    idx = make_index([(1, T0)], [[(30.0, None), (5.0, None)]], [["X"]], starts=[[(0.0, None), (-1.0, "A")]])
+    meta, d = _dense24(idx, ev, k=2)
+    assert meta["condition_answers"].to_list() == [[True]]
+    idx = make_index([(1, T0)], [[(5.0, None), (30.0, None)]], [["X"]], starts=[[(-1.0, "A"), (0.0, None)]])
+    meta, d = _dense24(idx, ev, k=2)
+    assert meta["condition_answers"].to_list() == [[False]]
+    assert bool(d[0, 0, VOCAB24.code_to_index()["Y"]]) is True
+
+
+def test_identical_resolved_starts_for_two_contexts_of_one_subject() -> None:
+    ev = _events([(1, _day(5), "A"), (1, _day(7), "X"), (1, _day(9), "B"), (1, _day(11), "Y")])
+    idx = make_index(
+        [(1, T0), (1, _day(1))],
+        [[(-1.0, "B"), (10.0, None)], [(10.0, None), (-1.0, "B")]],
+        [["X"], ["Y"]],
+        starts=[[(-1.0, "A")] * 2, [(-1.0, "A")] * 2],
+    )
+    meta, packed, _ = label_multitask_index(idx, ev, VOCAB24, 2, chunk_rows=1)
+    d = np.unpackbits(packed, axis=-1, count=VOCAB24.size, bitorder="little").astype(bool)
+    x, y = VOCAB24.code_to_index()["X"], VOCAB24.code_to_index()["Y"]
+    # Both contexts open at day 5; (5, 9) holds X only, (5, 15) holds X and Y.
+    assert d[0, 0, [x, y]].tolist() == [True, False] and d[0, 1, [x, y]].tolist() == [True, True]
+    assert d[1, 0, [x, y]].tolist() == [True, True] and d[1, 1, [x, y]].tolist() == [True, False]
+    assert meta["condition_answers"].to_list() == [[True], [True]]
+
+
+def test_resolved_start_order_differs_from_prediction_time_order() -> None:
+    ev = _events([(1, _day(2), "X"), (1, _day(15), "Y"), (1, _day(25), "Z")])
+    # ctx 0 (pt day 0) opens at day 20; ctx 1 (pt day 1) opens at day 1: start order is reversed.
+    idx = make_index(
+        [(1, T0), (1, _day(1))], [[(10.0, None)], [(10.0, None)]], starts=[[(20.0, None)], [(0.0, None)]]
+    )
+    meta, packed, _ = label_multitask_index(idx, ev, VOCAB24, 1, chunk_rows=1)
+    d = np.unpackbits(packed, axis=-1, count=VOCAB24.size, bitorder="little").astype(bool)
+    assert meta["prediction_time"].to_list() == [T0, _day(1)]  # metadata stays in prediction-time order
+    assert _labels(d[:1]) == {"A": False, "B": False, "X": False, "Y": False, "Z": True, "DISCHARGE": False}
+    assert _labels(d[1:]) == {"A": False, "B": False, "X": True, "Y": False, "Z": False, "DISCHARGE": False}
+
+
+def test_validate_index_start_pair_rules() -> None:
+    two = [[(5.0, None), (6.0, None)]]
+    with pytest.raises(ValueError, match="each start slot"):
+        validate_index(make_index([(1, T0)], two, starts=[[(5.0, "A"), (0.0, None)]]), 2)
+    with pytest.raises(ValueError, match="each start slot"):
+        validate_index(make_index([(1, T0)], two, starts=[[(-1.0, None), (0.0, None)]]), 2)
+    with pytest.raises(ValueError, match="exactly 2 start_durations"):
+        validate_index(make_index([(1, T0)], two, starts=[[(0.0, None)]]), 2)
+    with pytest.raises(ValueError, match="not all of"):
+        validate_index(make_index([(1, T0)], two, starts=[[(0.0, None)] * 2]).drop("start_events"), 2)
+    validate_index(make_index([(1, T0)], two), 2)  # no start columns: legacy prediction-time starts
+    validate_index(make_index([(1, T0)], two, starts=[[(0.0, None), (-1.0, "A")]]), 2)
+
+
+def test_unknown_and_pad_start_codes_are_hard_errors() -> None:
+    ev = _events([(1, _day(1), "A")])
+    with pytest.raises(ValueError, match="start_event code\\(s\\) are not in the base vocabulary"):
+        label_multitask_index(
+            make_index([(1, T0)], [[(5.0, None)]], starts=[[(-1.0, "NOPE")]]), ev, VOCAB24, 1
+        )
+    vocab = TargetVocabulary.from_pairs(["PAD", "A"], [0, 1])
+    with pytest.raises(ValueError, match="start_event code\\(s\\) at vocab index 0"):
+        label_multitask_index(make_index([(1, T0)], [[(5.0, None)]], starts=[[(-1.0, "PAD")]]), ev, vocab, 1)
+
+
+def _random_window_index(rng: np.random.Generator, n: int, k: int, subjects: list[int], horizon: int):
+    obs = CODES[:11]
+    contexts = [
+        (int(rng.integers(subjects[0], subjects[-1] + 2)), T0 + timedelta(days=int(rng.integers(0, horizon))))
+        for _ in range(n)
+    ]
+
+    def pick_start():
+        u = rng.random()
+        if u < 0.3:
+            return -1.0, obs[int(rng.integers(0, len(obs)))]
+        if u < 0.6:
+            return 0.0, None
+        return float(rng.uniform(0.1, 30)), None
+
+    def pick_end():
+        if rng.random() < 0.5:
+            return float(rng.uniform(0.1, 40)), None
+        pool = CODES if rng.random() < 0.2 else obs
+        return -1.0, pool[int(rng.integers(0, len(pool)))]
+
+    starts = [[pick_start() for _ in range(k)] for _ in range(n)]
+    bounds = [[pick_end() for _ in range(k)] for _ in range(n)]
+    conds = [[CODES[int(rng.integers(0, len(CODES)))] for _ in range(k - 1)] for _ in range(n)]
+    return make_index(contexts, bounds, conds, starts=starts)
+
+
+def _naive_from_frames(index_df: pl.DataFrame, events_df: pl.DataFrame, vocab: TargetVocabulary, k: int):
+    from every_query.generate_tasks.interval_table import naive_window_labels
+
+    c2i = vocab.code_to_index()
+    ev = events_df.filter(pl.col("time").is_not_null()).with_columns(pl.col("time").cast(pl.Int64))
+    events = [(int(s), int(t), c2i[c]) for s, t, c in ev.select("subject_id", "time", "code").iter_rows()]
+    pts = index_df["prediction_time"].cast(pl.Int64).to_list()
+    contexts = list(zip(index_df["subject_id"].to_list(), pts, strict=True))
+    windows = []
+    for r in index_df.iter_rows(named=True):
+        row = []
+        for j in range(k):
+            sd, se = r["start_durations"][j], r["start_events"][j]
+            ed, be = r["durations"][j], r["bound_events"][j]
+            row.append(
+                ((sd, None) if se is None else (None, c2i[se]), (ed, None) if be is None else (None, c2i[be]))
+            )
+        windows.append(row)
+    return naive_window_labels(events, contexts, windows, vocab.size, k)
+
+
+@pytest.mark.parametrize("seed", range(8))
+@pytest.mark.parametrize("chunk_rows", [1, 2, 3, 1000])
+def test_fuzz_window_starts_against_naive_and_scalar_oracles(seed: int, chunk_rows: int) -> None:
+    from every_query.generate_tasks.interval_table import INF
+    from tests.multitask.conftest import resolved_start_scalar_oracle
+
+    rng = np.random.default_rng(seed)
+    k = 4
+    events = make_events(rng, [1, 2, 3], n_times=(5, 25), horizon_days=60, codes=CODES)
+    vocab = TargetVocabulary.from_pairs(CODES, list(range(1, len(CODES) + 1)))
+    idx = _random_window_index(rng, 20, k, [1, 3], 60)
+    meta, packed, stats = label_multitask_index(idx, events, vocab, k, chunk_rows=chunk_rows)
+    dense = np.unpackbits(packed, axis=-1, count=vocab.size, bitorder="little").astype(bool)
+
+    st, _, expect = _naive_from_frames(meta, events, vocab, k)
+    assert np.array_equal(dense, expect)
+    assert not dense[:, :, 0].any()
+    # Scalar differential: label_with_event_bounds fed the resolved start as its prediction time.
+    scalar = resolved_start_scalar_oracle(meta, events, list(vocab.codes), k, st)
+    assert np.array_equal(dense[:, :, vocab.indices], scalar)
+    assert (dense[st == INF] == 0).all()
+    # Condition answers are read per flattened row off the packed chunk.
+    answers = np.array(meta["condition_answers"].to_list(), dtype=bool)
+    assert np.array_equal(answers, condition_answers_oracle(meta, dense, vocab))
+    assert stats.n_event_starts == int((meta["start_events"].explode().is_not_null()).sum())
+    assert 0.0 <= stats.frac_empty_windows <= 1.0 and stats.mean_positives_per_window >= 0
+
+
+def test_chunked_equals_unchunked_and_supplied_order_invariance_with_starts() -> None:
+    rng = np.random.default_rng(21)
+    events = make_events(rng, [1, 2, 3], codes=CODES)
+    vocab = TargetVocabulary.from_pairs(CODES, list(range(1, len(CODES) + 1)))
+    idx = _random_window_index(rng, 30, 3, [1, 3], 400)
+    meta_a, packed_a, _ = label_multitask_index(idx, events, vocab, 3, chunk_rows=1)
+    perm = rng.permutation(idx.height)
+    shuffled = idx.with_row_index("_ctx_id").with_columns(pl.col("_ctx_id").cast(pl.Int64))[perm.tolist()]
+    meta_b, packed_b, _ = label_multitask_index(shuffled, events, vocab, 3, chunk_rows=1000)
+    assert meta_a.equals(meta_b)
+    assert np.array_equal(packed_a, packed_b)
+    assert meta_a.sort("subject_id", "prediction_time").equals(meta_a)
+    assert list(meta_a.columns) == [
+        "subject_id",
+        "prediction_time",
+        "start_durations",
+        "start_events",
+        "durations",
+        "bound_events",
+        "condition_codes",
+        "condition_answers",
+    ]
+
+
+def test_many_windows_do_not_wrap_the_window_position_index() -> None:
+    """Regression: a uint8 window position wrapped at ``num_bounds >= 256``, scattering a window's
+    packed bits onto slot ``k % 256`` of the same context."""
+    k = 260
+    ev = _events([(1, _day(d), "X") for d in range(1, 40)])
+    # Window k opens at day k/10 and closes 0.05 days later, so exactly the windows whose open/close
+    # straddle an integer day hold X.  Slots 0..3 (which a uint8 cast would collide with 256..259)
+    # deliberately differ from those late slots.
+    starts = [[(round(0.1 * j, 4), None) for j in range(k)]]
+    bounds = [[(0.95, None) for _ in range(k)]]
+    idx = make_index([(1, T0)], bounds, [["X"] * (k - 1)], starts=starts)
+    _, packed, _ = label_multitask_index(idx, ev, VOCAB24, k, chunk_rows=3)
+    d = np.unpackbits(packed, axis=-1, count=VOCAB24.size, bitorder="little").astype(bool)
+    x = VOCAB24.code_to_index()["X"]
+    expected = [any(0.1 * j < day < 0.1 * j + 0.95 for day in range(1, 40)) for j in range(k)]
+    assert d[0, :, x].tolist() == expected

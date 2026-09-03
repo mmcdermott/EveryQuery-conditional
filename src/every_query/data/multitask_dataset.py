@@ -17,7 +17,11 @@ The parquet and the ``.npy`` are row-aligned; that alignment **is** the contract
    with ``bitorder="little"``; ``__getitem__`` never unpacks;
 5. keeps targets boolean until the loss casts them;
 6. loads the ``K-1`` sampler-materialized conditioning codes/answers (issue #22) and, in ``collate``,
-   checks every stored answer against the unpacked target bit.  It never samples either.
+   checks every stored answer against the unpacked target bit.  It never samples either;
+7. loads the sampler-materialized window starts (issue #24: ``start_durations`` / ``start_events``),
+   reading parquets written before #24 - which lack both columns - as prediction-time starts
+   (``[0.0] * K`` / ``[null] * K``), and maps start codes through the same base vocabulary as the
+   targets.  No start is ever sampled here.
 
 It fails loudly at init when the cohort's ``codes.parquet`` (or an explicit ``expected_vocab_size`` /
 ``expected_vocab_fingerprint``) disagrees with the manifest.
@@ -41,11 +45,17 @@ from every_query.data.seq_dataset import EVENT_BOUND_DURATION_SENTINEL, NO_BOUND
 
 logger = logging.getLogger(__name__)
 
+START_DURATIONS_COL = "start_durations"
+START_EVENTS_COL = "start_events"
 DURATIONS_COL = "durations"
 BOUND_EVENTS_COL = "bound_events"
 CONDITION_CODES_COL = "condition_codes"
 CONDITION_ANSWERS_COL = "condition_answers"
-MULTITASK_LABEL_COLS = (DURATIONS_COL, BOUND_EVENTS_COL, CONDITION_CODES_COL, CONDITION_ANSWERS_COL)
+# The two start columns are optional per parquet (absent before issue #24); the rest are required.
+START_COLS = (START_DURATIONS_COL, START_EVENTS_COL)
+REQUIRED_LABEL_COLS = (DURATIONS_COL, BOUND_EVENTS_COL, CONDITION_CODES_COL, CONDITION_ANSWERS_COL)
+MULTITASK_LABEL_COLS = (*START_COLS, *REQUIRED_LABEL_COLS)
+SUPPORTED_FORMAT_VERSIONS = (2, 3)
 
 SOURCE_SHARD_COL = "_source_shard"
 SOURCE_ROW_COL = "_source_row"
@@ -58,18 +68,26 @@ BITORDER = "little"
 
 @dataclass
 class MultitaskBoundaryBatch(MEDSTorchBatch):
-    """MEDS batch extended with ``K`` boundaries per sample and all-vocabulary boolean targets.
+    """MEDS batch extended with ``K`` windows per sample and all-vocabulary boolean targets.
 
     Attributes:
-        q_durations: ``(B, K)`` float - horizon in days; ``EVENT_BOUND_DURATION_SENTINEL`` at
-            event-bounded slots.
+        q_start_durations: ``(B, K)`` float32 - days after ``prediction_time`` the window opens;
+            ``0.0`` opens it at the prediction time (legacy), ``EVENT_BOUND_DURATION_SENTINEL``
+            (``-1.0``) marks an event-defined start.  Always filled by ``collate`` (zeros for files
+            written before issue #24); ``None`` only on a hand-built batch, which the model reads as
+            zero-duration starts.
+        q_start_codes: ``(B, K)`` int64 - vocabulary index of the start event; ``NO_BOUND_INDEX`` (0)
+            for duration / prediction-time starts, never PAD when active.  Filled together with
+            ``q_start_durations``: exactly one of the two being ``None`` is an error.
+        q_durations: ``(B, K)`` float - horizon in days after the **resolved start**;
+            ``EVENT_BOUND_DURATION_SENTINEL`` at event-bounded slots.
         q_bound_codes: ``(B, K)`` long - boundary vocabulary index; ``NO_BOUND_INDEX`` (0) for a
             duration-bounded slot.
         q_mask: ``(B, K)`` bool - True at real slots (all True: ``K`` is fixed; kept for the model
             contract).
         targets: ``(B, K, V)`` bool - ``targets[b, k, v]`` is "code ``v`` occurs strictly inside the
-            open window of boundary ``k``".  Bit ``0`` (PAD) is always False and must be masked from
-            the loss.
+            open window ``(resolved_start, resolved_end)`` of window ``k``".  Bit ``0`` (PAD) is
+            always False and must be masked from the loss.
         condition_codes: ``(B, K-1)`` long - vocabulary index of the sampler-drawn conditioning code
             for boundaries ``0..K-2`` (never PAD).
         condition_answers: ``(B, K-1)`` bool - ``targets[b, j, condition_codes[b, j]]``, materialized
@@ -81,6 +99,8 @@ class MultitaskBoundaryBatch(MEDSTorchBatch):
         ...     numeric_value=torch.zeros(2, 3),
         ...     numeric_value_mask=torch.zeros(2, 3, dtype=torch.bool),
         ...     time_delta_days=torch.zeros(2, 3),
+        ...     q_start_durations=torch.tensor([[0.0, -1.0], [7.0, 0.0]]),
+        ...     q_start_codes=torch.tensor([[0, 2], [0, 0]]),
         ...     q_durations=torch.tensor([[30.0, -1.0], [7.0, 2.0]]),
         ...     q_bound_codes=torch.tensor([[0, 4], [0, 0]]),
         ...     q_mask=torch.ones(2, 2, dtype=torch.bool),
@@ -90,6 +110,22 @@ class MultitaskBoundaryBatch(MEDSTorchBatch):
         ... )
         >>> batch.num_bounds, batch.vocab_size
         (2, 6)
+
+        The start fields may both be omitted (legacy: every window opens at the prediction time) but
+        never just one of them:
+
+        >>> kw = dict(code=torch.tensor([[1, 2], [3, 4]]), numeric_value=torch.zeros(2, 2),
+        ...     numeric_value_mask=torch.zeros(2, 2, dtype=torch.bool),
+        ...     time_delta_days=torch.zeros(2, 2), q_durations=torch.tensor([[30.0, -1.0], [7.0, 2.0]]),
+        ...     q_bound_codes=torch.tensor([[0, 4], [0, 0]]), q_mask=torch.ones(2, 2, dtype=torch.bool),
+        ...     targets=torch.zeros(2, 2, 6, dtype=torch.bool), condition_codes=torch.tensor([[3], [5]]),
+        ...     condition_answers=torch.zeros(2, 1, dtype=torch.bool))
+        >>> MultitaskBoundaryBatch(**kw).q_start_durations is None
+        True
+        >>> MultitaskBoundaryBatch(**kw, q_start_codes=torch.zeros(2, 2, dtype=torch.long))
+        Traceback (most recent call last):
+            ...
+        ValueError: q_start_durations and q_start_codes must be given together (got q_start_durations=None)
 
         Mismatched shapes raise:
 
@@ -116,12 +152,17 @@ class MultitaskBoundaryBatch(MEDSTorchBatch):
     targets: torch.BoolTensor | None = None
     condition_codes: torch.LongTensor | None = None
     condition_answers: torch.BoolTensor | None = None
+    # Issue #24 window starts; ``collate`` always fills both.
+    q_start_durations: torch.FloatTensor | None = None
+    q_start_codes: torch.LongTensor | None = None
     # Per-patient-token elapsed hours for rotary time encoding; ``None`` unless the dataset strips
     # delta tokens (mirrors ``ConditionalQueryBatch.time_pos_ids``).
     time_pos_ids: torch.LongTensor | None = None
 
     LABEL_TENSOR_NAMES: ClassVar[tuple[str]] = (
         "boolean_value",
+        "q_start_durations",
+        "q_start_codes",
         "q_durations",
         "q_bound_codes",
         "targets",
@@ -139,6 +180,11 @@ class MultitaskBoundaryBatch(MEDSTorchBatch):
 
     def __post_init__(self):
         super().__post_init__()
+        if (self.q_start_durations is None) != (self.q_start_codes is None):
+            missing = "q_start_durations" if self.q_start_durations is None else "q_start_codes"
+            raise ValueError(
+                f"q_start_durations and q_start_codes must be given together (got {missing}=None)"
+            )
         if self.q_durations is None:
             return
         expected = (self.batch_size, self.q_durations.shape[1])
@@ -147,6 +193,10 @@ class MultitaskBoundaryBatch(MEDSTorchBatch):
             if tensor is None or tuple(tensor.shape) != expected:
                 got = None if tensor is None else tensor.shape
                 raise ValueError(f"Expected shape {expected} for {name}, but got {got}!")
+        for name in ("q_start_durations", "q_start_codes"):
+            tensor = getattr(self, name)
+            if tensor is not None and tuple(tensor.shape) != expected:
+                raise ValueError(f"Expected shape {expected} for {name}, but got {tensor.shape}!")
         if self.targets is None or self.targets.dim() != 3 or tuple(self.targets.shape[:2]) != expected:
             got = None if self.targets is None else self.targets.shape
             raise ValueError(
@@ -184,6 +234,15 @@ def read_manifest(split_dir: Path) -> dict:
             raise ValueError(f"multitask manifest {fp} is missing {key!r}")
     if manifest["bitorder"] != BITORDER:
         raise ValueError(f"multitask manifest bitorder must be {BITORDER!r}, got {manifest['bitorder']!r}")
+    # Format 2 (issue #20/#22: every window opens at the prediction time, no start columns) and
+    # format 3 (issue #24: explicit starts) are both readable; a missing key means legacy format 2.
+    version = manifest.get("format_version", 2)
+    if version not in SUPPORTED_FORMAT_VERSIONS:
+        raise ValueError(
+            f"multitask manifest {fp} has format_version {version!r}; this dataset reads "
+            f"{list(SUPPORTED_FORMAT_VERSIONS)}. Regenerate the labels with the current "
+            "EQ_generate_multitask_sequences."
+        )
     return manifest
 
 
@@ -327,6 +386,52 @@ class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
         if not sentinel_ok.all():
             raise ValueError("durations/bound_events disagree on which slots are event-bounded")
 
+        # Issue #24: sampler-materialized window starts (``labels_df`` filled prediction-time starts
+        # for legacy parquets).  Same vocabulary as the targets; PAD / unknown start codes are errors.
+        start_durations = self.schema_df[START_DURATIONS_COL]
+        start_events = self.schema_df[START_EVENTS_COL]
+        if (
+            n
+            and not (
+                (start_durations.list.len() == self.num_bounds) & (start_events.list.len() == self.num_bounds)
+            ).all()
+        ):
+            raise ValueError(
+                f"every label row must carry exactly {self.num_bounds} start_durations/start_events"
+            )
+        self._q_start_durations = (
+            np.asarray(start_durations.explode().to_numpy(), dtype=np.float32).reshape(n, self.num_bounds)
+            if n
+            else np.zeros((0, self.num_bounds), dtype=np.float32)
+        )
+        flat_starts = start_events.explode()
+        start_mapped = flat_starts.replace_strict(self.code_to_index, default=-1, return_dtype=pl.Int64)
+        bad = flat_starts.filter(flat_starts.is_not_null() & (start_mapped <= 0)).unique().sort().to_list()
+        if bad:
+            raise ValueError(
+                f"{len(bad)} start-event code(s) in the labels are PAD or not in this cohort's vocabulary: "
+                f"{bad[:10]}. Regenerate the labels against this cohort's codes.parquet."
+            )
+        self._q_start_codes = (
+            pl.select(pl.when(flat_starts.is_null()).then(NO_BOUND_INDEX).otherwise(start_mapped))
+            .to_series()
+            .to_numpy()
+            .astype(np.int64)
+            .reshape(n, self.num_bounds)
+        )
+        by_event = self._q_start_codes != NO_BOUND_INDEX
+        start_ok = np.where(
+            by_event,
+            self._q_start_durations == EVENT_BOUND_DURATION_SENTINEL,
+            self._q_start_durations >= 0,
+        )
+        if not start_ok.all():
+            raise ValueError(
+                "start_durations/start_events disagree on which slots are event-defined: each slot must be "
+                f"either start_duration >= 0 with a null start_event, or start_duration == "
+                f"{EVENT_BOUND_DURATION_SENTINEL} with a non-null start_event"
+            )
+
         # Issue #22: K-1 sampler-materialized conditioning codes/answers. Loaded and validated only;
         # never sampled here. Answers are cross-checked against the unpacked bits in ``collate``.
         kc = self.num_bounds - 1
@@ -402,15 +507,30 @@ class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
         for fp in fps:
             key = self._source_key(fp)
             self._label_files[key] = fp.with_name(fp.name[: -len(fp.suffix)] + LABELS_SUFFIX)
-            missing = [c for c in (*required, *MULTITASK_LABEL_COLS) if c not in pl.read_parquet_schema(fp)]
+            schema = pl.read_parquet_schema(fp)
+            missing = [c for c in (*required, *REQUIRED_LABEL_COLS) if c not in schema]
             if missing:
                 raise ValueError(
                     f"{fp} is missing required column(s) {missing}; regenerate the labels with the "
                     "current EQ_generate_multitask_sequences."
                 )
-            df = pl.read_parquet(fp, columns=[*required, *MULTITASK_LABEL_COLS], use_pyarrow=True)
+            # Issue #24 start columns: optional per parquet.  A pre-#24 file lacks both and is read as
+            # prediction-time starts, typed here so a split mixing v2 and v3 shards concatenates.
+            present = [c for c in START_COLS if c in schema]
+            if present and len(present) != len(START_COLS):
+                raise ValueError(
+                    f"{fp} has {present} but not all of {list(START_COLS)}; regenerate the labels."
+                )
+            df = pl.read_parquet(fp, columns=[*required, *REQUIRED_LABEL_COLS, *present], use_pyarrow=True)
+            if not present:
+                df = df.with_columns(
+                    pl.repeat(0.0, self.num_bounds, dtype=pl.Float32).implode().alias(START_DURATIONS_COL),
+                    pl.repeat(None, self.num_bounds, dtype=pl.Utf8).implode().alias(START_EVENTS_COL),
+                )
             frames.append(
-                df.with_row_index(SOURCE_ROW_COL).with_columns(
+                df.select(*required, *MULTITASK_LABEL_COLS)
+                .with_row_index(SOURCE_ROW_COL)
+                .with_columns(
                     pl.col(SOURCE_ROW_COL).cast(pl.Int64),
                     pl.lit(key).alias(SOURCE_SHARD_COL),
                 )
@@ -442,6 +562,8 @@ class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
     def _seeded_getitem(self, idx: int, seed: int | None = None) -> dict[str, torch.Tensor]:
         out = super()._seeded_getitem(idx, seed)
         idx = range(len(self._source_row))[idx]
+        out["q_start_durations"] = self._q_start_durations[idx]
+        out["q_start_codes"] = self._q_start_codes[idx]
         out["q_durations"] = self._q_durations[idx]
         out["q_bound_codes"] = self._q_bound_codes[idx]
         out["condition_codes"] = self._condition_codes[idx]
@@ -476,6 +598,11 @@ class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
             time_pos_ids = ConditionalQueryPytorchDataset._apply_rope_time(self, out)
 
         B = len(batch)
+        # Start tensors are always emitted (zeros / NO_BOUND_INDEX for legacy files), exactly float32 / int64.
+        q_start_durations = torch.from_numpy(
+            np.stack([item["q_start_durations"] for item in batch]).astype(np.float32)
+        )
+        q_start_codes = torch.from_numpy(np.stack([item["q_start_codes"] for item in batch]).astype(np.int64))
         q_durations = torch.from_numpy(np.stack([item["q_durations"] for item in batch]).astype(np.float32))
         q_bound_codes = torch.from_numpy(np.stack([item["q_bound_codes"] for item in batch]).astype(np.int64))
         q_mask = torch.ones(B, self.num_bounds, dtype=torch.bool)
@@ -498,6 +625,8 @@ class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
 
         return MultitaskBoundaryBatch(
             **out,
+            q_start_durations=q_start_durations,
+            q_start_codes=q_start_codes,
             q_durations=q_durations,
             q_bound_codes=q_bound_codes,
             q_mask=q_mask,

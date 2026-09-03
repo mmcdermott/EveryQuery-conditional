@@ -2,25 +2,29 @@
 
 The multitask sampler (:mod:`~every_query.generate_tasks.sample_multitask_sequences`) needs, for every
 sampled context and every vocabulary code, *"does the code occur strictly inside the open window
-``(prediction_time, boundary_time)``?"*.  Answering that with one lookup per ``(context, boundary,
-code)`` is ``O(N x K x V)``; this module answers it in cost proportional to the subject's interval rows
-plus the emitted ``(interval, context)`` matches.
+``(resolved_start, resolved_end)``?"*.  Answering that with one lookup per ``(context, window, code)``
+is ``O(N x K x V)``; this module answers it in cost proportional to the subject's interval rows plus
+the emitted ``(interval, window)`` matches.
 
 Build from the event stream once; the prediction times are never an input::
 
     table = build_interval_table(subject_id, time_us, code_index)   # one row per event
 
-Every row ``(subject, code, start, end)`` claims: for any prediction time ``pt`` with
-``start <= pt < end``, the next occurrence of ``code`` for ``subject`` **strictly after** ``pt`` is at
-``end``.  Rows chain per ``(subject, code)`` (one row's ``end`` is the next row's ``start``), so they
-tile the timeline; a ``pt`` inside no row of a code has no future occurrence of it.  A code therefore
-fires for a boundary iff ``end < boundary_time`` - the strict comparison is the open upper endpoint.
+Every row ``(subject, code, start, end)`` claims: for any lookup time ``t`` with ``start <= t < end``,
+the next occurrence of ``code`` for ``subject`` **strictly after** ``t`` is at ``end``.  Rows chain per
+``(subject, code)`` (one row's ``end`` is the next row's ``start``), so they tile the timeline; a ``t``
+inside no row of a code has no future occurrence of it.  A code therefore fires for a window opening
+at ``t`` iff ``end < window_end`` - the strict comparison is the open upper endpoint, and the strict
+"after ``t``" is the open lower one.
 
-The two production entry points are :func:`resolve_bound_times` (``N x K`` point searches, one
-vectorised ``searchsorted`` on a composite key built once at construction) and
+The production entry points are :func:`resolve_start_times` / :func:`resolve_end_times` (``N x K``
+point searches each, one vectorised ``searchsorted`` on a composite key built once at construction;
+issue #24 resolves every window's start first and its end relative to that start) and
 :func:`label_sorted_contexts_packed` (subject-sorted interval-range labeling that packs and writes
-each bounded chunk as it goes).  :func:`label_dense_reference` is the small, unbounded helper the unit
-tests compare both against; it is not used in production.
+each bounded chunk as it goes; the lookup time of a row is its resolved window start).
+:func:`resolve_bound_times` is the #20 form (every start at the prediction time), kept as a thin
+wrapper.  :func:`label_dense_reference` is the small, unbounded helper the unit tests compare against;
+it is not used in production.
 
 Times are ``int64`` microseconds (cast MEDS ``datetime[us]`` columns with ``.astype("int64")``); codes
 are integer vocabulary indices aligned to the cohort's ``code/vocab_index``.
@@ -190,8 +194,8 @@ def build_interval_table(
 def next_occurrence_after(
     table: IntervalTable, subject_ids: np.ndarray, prediction_times: np.ndarray, code_index: np.ndarray
 ) -> np.ndarray:
-    """Time of the first occurrence of ``code_index`` for ``subject_ids`` **strictly after** each
-    prediction time, or :data:`INF` when there is none.
+    """Time of the first occurrence of ``code_index`` for ``subject_ids`` **strictly after** each prediction
+    time, or :data:`INF` when there is none.
 
     One vectorised ``searchsorted`` over the composite ``lookup_key``: the query key ranks the
     prediction time with ``side="right"`` over ``unique_times`` (so an occurrence exactly *at* the
@@ -202,6 +206,11 @@ def next_occurrence_after(
         >>> t = build_interval_table(np.array([1, 1, 1]), np.array([3, 6, 9]), np.array([0, 1, 0]))
         >>> next_occurrence_after(t, np.array([1, 1, 1, 1, 2]), np.array([4, 4, 10, 3, 4]),
         ...                       np.array([0, 1, 0, 0, 0])).tolist() == [9, 6, INF, 9, INF]
+        True
+
+        A lookup at :data:`INF` (an unresolved event-defined start) has no occurrence after it:
+
+        >>> next_occurrence_after(t, np.array([1]), np.array([INF]), np.array([0])).tolist() == [INF]
         True
     """
     subject_ids = np.asarray(subject_ids, dtype=np.int64)
@@ -228,6 +237,117 @@ def next_occurrence_after(
     return out
 
 
+def _duration_offsets_us(durations_days: np.ndarray, by_event: np.ndarray) -> np.ndarray:
+    """``round(days * US_PER_DAY)`` as ``int64``, zero at event slots (their days value is ignored)."""
+    return np.rint(np.where(by_event, 0.0, durations_days) * US_PER_DAY).astype(np.int64)
+
+
+def _check_nk(name: str, subject_ids: np.ndarray, reference: np.ndarray, days: np.ndarray, codes: np.ndarray):
+    n, k = codes.shape
+    if days.shape != (n, k) or subject_ids.shape != (n,) or reference.shape not in ((n,), (n, k)):
+        raise ValueError(f"shape mismatch between contexts and (N, K) {name} arrays")
+    return n, k
+
+
+def resolve_start_times(
+    table: IntervalTable,
+    subject_ids: np.ndarray,
+    prediction_times: np.ndarray,
+    start_durations_days: np.ndarray,
+    start_code_index: np.ndarray,
+) -> np.ndarray:
+    """Resolve the ``(N, K)`` ``int64`` window-start matrix (issue #24).
+
+    Args:
+        table: Interval table of the shard the contexts live in.
+        subject_ids: ``(N,)``.
+        prediction_times: ``(N,)`` ``int64`` µs.
+        start_durations_days: ``(N, K)`` float days after the prediction time (``0`` = the prediction
+            time itself); ignored where ``start_code_index >= 0``.
+        start_code_index: ``(N, K)`` ``int64``; ``-1`` marks a duration-defined start, otherwise the
+            vocabulary index of the start event.
+
+    Duration start: ``prediction_time + round(days * US_PER_DAY)``.  Event start: the first occurrence
+    of the start code strictly after the prediction time (an occurrence *at* it does not open the
+    window), or :data:`INF` when there is none - the window then never opens.
+
+    Examples:
+        >>> t = build_interval_table(np.array([1, 1, 1]), np.array([3, 6, 9]), np.array([0, 1, 0]))
+        >>> d = np.array([[0.0, 1e-11, 0.0, 0.0]]); c = np.array([[-1, -1, 1, 0]])
+        >>> resolve_start_times(t, np.array([1]), np.array([4]), d, c).tolist() == [[4, 5, 6, 9]]
+        True
+        >>> resolve_start_times(t, np.array([1]), np.array([9]), d[:, :1], c[:, 3:]).tolist() == [[INF]]
+        True
+    """
+    subject_ids = np.asarray(subject_ids, dtype=np.int64)
+    prediction_times = np.asarray(prediction_times, dtype=np.int64)
+    start_durations_days = np.asarray(start_durations_days, dtype=np.float64)
+    start_code_index = np.asarray(start_code_index, dtype=np.int64)
+    n, _ = _check_nk("start", subject_ids, prediction_times, start_durations_days, start_code_index)
+    if prediction_times.shape != (n,):
+        # Broadcast below assumes one prediction time per context; an (N, K) array would silently
+        # produce a wrongly-shaped result instead of raising.
+        raise ValueError("prediction_times must be (N,), one per context")
+
+    by_event = start_code_index >= 0
+    start_times = prediction_times[:, None] + _duration_offsets_us(start_durations_days, by_event)
+    if by_event.any():
+        rows = np.nonzero(by_event)[0]
+        start_times[by_event] = next_occurrence_after(
+            table, subject_ids[rows], prediction_times[rows], start_code_index[by_event]
+        )
+    return start_times
+
+
+def resolve_end_times(
+    table: IntervalTable,
+    subject_ids: np.ndarray,
+    start_times: np.ndarray,
+    durations_days: np.ndarray,
+    bound_code_index: np.ndarray,
+) -> np.ndarray:
+    """Resolve the ``(N, K)`` ``int64`` window-end matrix relative to the resolved starts.
+
+    Args:
+        table: Interval table of the shard the contexts live in.
+        subject_ids: ``(N,)``.
+        start_times: ``(N, K)`` ``int64`` µs from :func:`resolve_start_times` (:data:`INF` = unresolved).
+        durations_days: ``(N, K)`` float days after the *resolved start*; ignored where
+            ``bound_code_index >= 0``.
+        bound_code_index: ``(N, K)`` ``int64``; ``-1`` marks a duration-bounded slot, otherwise the
+            vocabulary index of the boundary code.
+
+    Duration slot: ``start + round(days * US_PER_DAY)``, saturating so an unresolved start stays
+    exactly :data:`INF` (never ``INF + offset``).  Event slot: the first occurrence of the boundary code
+    strictly after the resolved start (occurrences before or at the start are ignored; an unresolved
+    start yields :data:`INF`), or :data:`INF` when it never recurs.  At most ``N x K`` point searches.
+
+    Examples:
+        >>> t = build_interval_table(np.array([1, 1, 1]), np.array([3, 6, 9]), np.array([0, 1, 0]))
+        >>> st = np.array([[4, 4, INF, INF]]); d = np.array([[1e-11, 0.0, 5.0, 0.0]])
+        >>> b = np.array([[-1, 0, -1, 0]])
+        >>> resolve_end_times(t, np.array([1]), st, d, b).tolist() == [[5, 9, INF, INF]]
+        True
+    """
+    subject_ids = np.asarray(subject_ids, dtype=np.int64)
+    start_times = np.asarray(start_times, dtype=np.int64)
+    durations_days = np.asarray(durations_days, dtype=np.float64)
+    bound_code_index = np.asarray(bound_code_index, dtype=np.int64)
+    n, k = _check_nk("bound", subject_ids, start_times, durations_days, bound_code_index)
+    if start_times.shape != (n, k):
+        raise ValueError("shape mismatch between contexts and (N, K) bound arrays")
+
+    by_event = bound_code_index >= 0
+    offsets = _duration_offsets_us(durations_days, by_event)
+    end_times = np.where(start_times == INF, INF, start_times + offsets)
+    if by_event.any():
+        rows = np.nonzero(by_event)[0]
+        end_times[by_event] = next_occurrence_after(
+            table, subject_ids[rows], start_times[by_event], bound_code_index[by_event]
+        )
+    return end_times
+
+
 def resolve_bound_times(
     table: IntervalTable,
     subject_ids: np.ndarray,
@@ -235,19 +355,10 @@ def resolve_bound_times(
     durations_days: np.ndarray,
     bound_code_index: np.ndarray,
 ) -> np.ndarray:
-    """Resolve the ``(N, K)`` ``int64`` boundary-time matrix.
+    """Resolve the ``(N, K)`` ``int64`` boundary-time matrix for windows opening at the prediction time.
 
-    Args:
-        table: Interval table of the shard the contexts live in.
-        subject_ids: ``(N,)``.
-        prediction_times: ``(N,)`` ``int64`` µs.
-        durations_days: ``(N, K)`` float days; ignored (any value) where ``bound_code_index >= 0``.
-        bound_code_index: ``(N, K)`` ``int64``; ``-1`` marks a duration-bounded slot, otherwise the
-            vocabulary index of the boundary code.
-
-    Duration slot: ``prediction_time + round(duration_days * US_PER_DAY)``.  Event slot: the first
-    occurrence of the boundary code strictly after the prediction time, or :data:`INF` when it never
-    recurs (see :func:`next_occurrence_after`).  At most ``N x K`` point searches.
+    The issue #20 form: every window starts at ``prediction_times`` (broadcast over ``K``) and the
+    ends are resolved by :func:`resolve_end_times` relative to it.
 
     Examples:
         >>> t = build_interval_table(np.array([1, 1, 1]), np.array([3, 6, 9]), np.array([0, 1, 0]))
@@ -259,19 +370,11 @@ def resolve_bound_times(
     prediction_times = np.asarray(prediction_times, dtype=np.int64)
     durations_days = np.asarray(durations_days, dtype=np.float64)
     bound_code_index = np.asarray(bound_code_index, dtype=np.int64)
-    n, k = bound_code_index.shape
-    if durations_days.shape != (n, k) or subject_ids.shape != (n,) or prediction_times.shape != (n,):
+    n, k = _check_nk("bound", subject_ids, prediction_times, durations_days, bound_code_index)
+    if prediction_times.shape != (n,):
         raise ValueError("shape mismatch between contexts and (N, K) bound arrays")
-
-    by_event = bound_code_index >= 0
-    offsets = np.rint(np.where(by_event, 0.0, durations_days) * US_PER_DAY).astype(np.int64)
-    bound_times = prediction_times[:, None] + offsets
-    if by_event.any():
-        rows = np.nonzero(by_event)[0]
-        bound_times[by_event] = next_occurrence_after(
-            table, subject_ids[rows], prediction_times[rows], bound_code_index[by_event]
-        )
-    return bound_times
+    start_times = np.broadcast_to(prediction_times[:, None], (n, k)).copy()
+    return resolve_end_times(table, subject_ids, start_times, durations_days, bound_code_index)
 
 
 # ---------------------------------------------------------------------------
@@ -299,12 +402,13 @@ def _fill_dense_for_subject(
     bound_times: np.ndarray,
     max_matches: int,
 ) -> int:
-    """Set ``dense[row_lo:row_hi, :, code]`` for one subject's contexts by scanning its intervals once.
+    """Set ``dense[row_lo:row_hi, :, code]`` for one subject's rows by scanning its intervals once.
 
-    ``prediction_times[row_lo:row_hi]`` must be ascending (the chunk is subject/time sorted).  For every
-    interval ``(code, start, end)`` of the subject the matching contexts are exactly
-    ``searchsorted(p, start, "left") : searchsorted(p, end, "left")`` (``start <= pt < end``), and each
-    of those rows fires ``code`` for every boundary with ``end < bound_time``.
+    ``prediction_times[row_lo:row_hi]`` are the rows' lookup times (window starts) and must be
+    ascending (the chunk is subject/time sorted).  For every interval ``(code, start, end)`` of the
+    subject the matching rows are exactly ``searchsorted(p, start, "left") : searchsorted(p, end,
+    "left")`` (``start <= t < end``), and each of those rows fires ``code`` for every bound with
+    ``end < bound_time``.  A lookup time of :data:`INF` matches no interval, so its bits stay false.
 
     Matches are emitted in blocks of at most ``max_matches`` ``(interval, context)`` pairs so the
     scratch for the expansion stays bounded independently of how many distinct codes the subject has.
@@ -358,14 +462,16 @@ def iter_packed_label_chunks(
     *,
     max_matches: int | None = None,
 ) -> Iterator[tuple[int, int, np.ndarray]]:
-    """Yield ``(row_lo, row_hi, packed)`` for consecutive chunks of at most ``chunk_rows`` contexts.
+    """Yield ``(row_lo, row_hi, packed)`` for consecutive chunks of at most ``chunk_rows`` rows.
 
-    ``subject_ids`` / ``prediction_times`` / ``bound_times`` must already be sorted by
-    ``(subject_id, prediction_time)``.  One ``(chunk_rows, K, V)`` boolean scratch is allocated per
-    call and reused; each subject's interval slice is scanned once per chunk that holds any of its
-    contexts (a subject with more than ``chunk_rows`` contexts is split across chunks and its slice
-    rescanned per chunk - never expanded to its unbounded context count).  ``packed`` is
-    ``np.packbits(dense, axis=-1, bitorder="little")`` with shape ``(rows, K, ceil(V / 8))``.
+    A row is a lookup time (the window start: the prediction time in the #20 form, the resolved start
+    of a flattened window in the #24 form) with ``K`` bound times.  ``subject_ids`` /
+    ``prediction_times`` / ``bound_times`` must already be sorted by ``(subject_id, lookup time)``.
+    One ``(chunk_rows, K, V)`` boolean scratch is allocated per call and reused; each subject's
+    interval slice is scanned once per chunk that holds any of its rows (a subject with more than
+    ``chunk_rows`` rows is split across chunks and its slice rescanned per chunk - never expanded to
+    its unbounded row count).  ``packed`` is ``np.packbits(dense, axis=-1, bitorder="little")`` with
+    shape ``(rows, K, ceil(V / 8))``.
     """
     subject_ids = np.asarray(subject_ids, dtype=np.int64)
     prediction_times = np.asarray(prediction_times, dtype=np.int64)
@@ -380,7 +486,7 @@ def iter_packed_label_chunks(
             (subject_ids[1:] == subject_ids[:-1]) & (prediction_times[1:] >= prediction_times[:-1])
         )
         if not order_ok.all():
-            raise ValueError("contexts must be sorted by (subject_id, prediction_time)")
+            raise ValueError("rows must be sorted by (subject_id, lookup time)")
     if max_matches is None:
         max_matches = max(chunk_rows * k * 8, 1 << 16)
 
@@ -496,3 +602,46 @@ def naive_multibound_labels(
                 if t < bt:
                     targets[i, j, c] = True
     return bound_times, targets
+
+
+def naive_window_labels(
+    events: list[tuple[int, int, int]],
+    contexts: list[tuple[int, int]],
+    windows: list[list[tuple[tuple[float | None, int | None], tuple[float | None, int | None]]]],
+    vocab_size: int,
+    num_bounds: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Plain-Python oracle for issue #24 windows: ``(start_times, end_times, targets)``.
+
+    ``events`` are ``(subject_id, time_us, code_index)``; ``contexts`` are ``(subject_id,
+    prediction_time_us)``; ``windows[i][k]`` is ``(start_spec, end_spec)`` where each spec is
+    ``(duration_days, None)`` or ``(None, code_index)``.  The start resolves against the prediction
+    time (duration: ``pt + days``; event: first occurrence strictly after ``pt``, else :data:`INF`);
+    the end against the resolved start (duration: ``start + days``, :data:`INF` if the start is; event:
+    first occurrence strictly after the start, else :data:`INF`).  ``targets[i, k, v]`` is
+    ``start < t_v < end`` for some occurrence ``t_v`` of ``v``.  Shares no code with the table.
+    """
+    n, k = len(contexts), num_bounds
+    start_times = np.full((n, k), INF, dtype=np.int64)
+    end_times = np.full((n, k), INF, dtype=np.int64)
+    targets = np.zeros((n, k, vocab_size), dtype=bool)
+    for i, (sid, pt) in enumerate(contexts):
+        subj = [(t, c) for s, t, c in events if s == sid]
+        for j, ((s_dur, s_code), (e_dur, e_code)) in enumerate(windows[i]):
+            if s_code is None:
+                st = pt + round(s_dur * US_PER_DAY)
+            else:
+                hits = [t for t, c in subj if c == s_code and t > pt]
+                st = min(hits) if hits else INF
+            if st == INF:
+                et = INF
+            elif e_code is None:
+                et = st + round(e_dur * US_PER_DAY)
+            else:
+                hits = [t for t, c in subj if c == e_code and t > st]
+                et = min(hits) if hits else INF
+            start_times[i, j], end_times[i, j] = st, et
+            for t, c in subj:
+                if st < t < et:
+                    targets[i, j, c] = True
+    return start_times, end_times, targets
