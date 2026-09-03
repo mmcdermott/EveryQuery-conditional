@@ -218,24 +218,45 @@ EQ_generate_evaluation_query_sequences \
 `EQ_generate_query_sequences` takes the same three path args and only ever samples its contexts;
 to label a supplied cohort use `EQ_generate_evaluation_query_sequences contexts_path=...`.
 
-### Multitask boundary labels — every code at every boundary
+### Multitask boundary labels — every code at every window
 
-`EQ_generate_multitask_sequences` (issue #20) samples, per patient context, a fixed sequence of
-`num_bounds` (default 5) boundaries — each duration-bounded (`prediction_time + duration_days`) or
-event-bounded (first occurrence of a boundary code strictly after the prediction time, `+inf` if it
-never recurs) — and labels **every base-vocabulary code** at every boundary:
+`EQ_generate_multitask_sequences` (issues #20, #22, #24) samples, per patient context, a fixed sequence
+of `num_bounds` (default 5) windows — each with an explicit **start** and **end** specification — and
+labels **every base-vocabulary code** at every window:
 
 ```
-target[i, k, v] = prediction_time[i] < first occurrence of v after prediction_time[i] < boundary[i, k]
+start[i, k] = prediction_time[i] + start_duration        (0 => the prediction time itself)
+              OR first occurrence of start_event strictly after prediction_time[i]  (+inf if none)
+end[i, k]   = start[i, k] + duration
+              OR first occurrence of bound_event strictly after start[i, k]         (+inf if none)
+target[i, k, v] = start[i, k] < some occurrence of v < end[i, k]
 ```
 
-Both ends are open, exactly as `label_with_event_bounds` defines the scalar window (the tests are
-differential against it).  Stages 0 and 2 are the shared sampler stages; Stage 1M draws the boundary
-sequences from three independent RNG streams (`bound_forms`, `bound_durations`, `bound_codes`), Stage 3M
-partitions by event shard and sorts each partition by `(subject_id, prediction_time, _ctx_id)`, and
-Stage 4M builds an interval table per shard (`interval_table.py`) and labels each subject's contexts by
-scanning that subject's interval rows once per bounded chunk — never one lookup per
-`(context, boundary, code)`.
+The start is resolved first and the end relative to it (`7 days after prediction time for 30 days`
+is `(day 7, day 37)`; `the 30 days following the next admission` opens at the admission). Both ends
+are open — the events at the start instant and at the end instant are excluded — exactly as
+`label_with_event_bounds` defines the scalar `(prediction_time, boundary)` window (the tests are
+differential against it, feeding the resolved start as its prediction time). An event end that never
+recurs is `+inf` (rest of the record); an event start that never occurs leaves the window **empty**
+(every target false — it never falls back to the prediction time), and `INF + duration` saturates to
+`INF`. Equal start and end codes select consecutive occurrences.
+
+Stages 0 and 2 are the shared sampler stages. Stage 1M draws the window sequences from seven
+independent RNG streams — the end axes `bound_forms`, `bound_durations`, `bound_codes`, the #22
+`condition_codes` axis, and the #24 start axes `start_forms`, `start_durations`, `start_codes` — so
+changing any start setting perturbs neither the contexts nor the end / conditioning draws. Per slot
+one uniform picks the start form: `eventstart_fraction` of event-defined starts (codes iid from
+`start_event_codes`, null => every non-PAD base code), `prediction_time_start_fraction` at the
+prediction time, the rest a positive `start_duration_min..max` draw (`start_duration_distribution`);
+the two fractions must be `>= 0` and sum to `<= 1`, and omitting every start key reproduces the pre-#24
+prediction-time starts. Stage 3M partitions by event shard and sorts each partition by
+`(subject_id, prediction_time, _ctx_id)`. Stage 4M builds an interval table per shard
+(`interval_table.py`), resolves the `(N, K)` starts then ends, flattens the `N x K` windows into
+logical rows sorted by `(subject_id, resolved_start)` — a context's `K` windows may open at different
+times — and labels them in one shared stream by scanning each subject's interval rows once per bounded
+chunk (`label_chunk_rows x K` flattened rows, the same `C x K x V` scratch), scattering each packed
+chunk back to `(context_row, k)` — never one lookup per `(context, window, code)`, never `K` separate
+pipelines.
 
 ```bash
 EQ_generate_multitask_sequences \
@@ -244,38 +265,56 @@ EQ_generate_multitask_sequences \
 ```
 
 `query_codes` must be the cohort's metadata root (or a `codes.parquet` path): bits are aligned to the
-unchanged `code/vocab_index`, `V = max(index) + 1`, and an explicit code list is rejected.  Output per
+unchanged `code/vocab_index`, `V = max(index) + 1`, and an explicit code list is rejected. Output per
 shard:
 
 ```
 {out_dir}/{split}/{shard}.parquet             MultitaskBoundarySchema: subject_id, prediction_time,
-                                              durations[K] (float32), bound_events[K] (str | null)
+                                              start_durations[K] (float32; 0 = prediction time,
+                                              -1.0 = event start), start_events[K] (str | null),
+                                              durations[K] (float32, days after the resolved start;
+                                              -1.0 = event end), bound_events[K] (str | null),
+                                              condition_codes[K-1], condition_answers[K-1]
 {out_dir}/{split}/{shard}.labels.npy          uint8 (rows, K, ceil(V / 8)), bitorder="little",
                                               row-aligned with the parquet
 {out_dir}/{split}/_multitask_manifest.json    written by the driver before any worker starts:
-                                              K, V, packed width, bit order, window semantics,
-                                              vocabulary fingerprint, ontology_mode: "none"
+                                              format_version 3, K, V, packed width, bit order, the
+                                              window semantics (window_semantics: open_open,
+                                              start_reference: prediction_time,
+                                              duration_end_reference: resolved_start,
+                                              missing_event_start: empty_window,
+                                              missing_event_end: infinity), vocabulary fingerprint,
+                                              ontology_mode: "none"
 ```
 
 Unpack with `np.unpackbits(packed, axis=-1, count=V, bitorder="little")`; bit 0 (PAD) is always false
-and must be masked from the loss.  Each worker's dense scratch is `label_chunk_rows x K x V` booleans
+and must be masked from the loss. Each worker's dense scratch is `label_chunk_rows x K x V` booleans
 (~110 MB at 2000 x 5 x 11k); packed rows are written incrementally through a temporary memmap that is
 flushed and atomically renamed, then the parquet, then the `_labeled/{shard}.json` provenance sidecar.
 An output is reused only when both files exist with agreeing row counts, the packed shape is right,
 and the index, config and vocabulary fingerprints all match — a changed duration distribution,
-event-bound fraction, `num_bounds`, boundary pool or `codes.parquet` relabels.  Per shard, the worker
-logs event/interval/context counts, build / boundary-resolution / labeling seconds, contexts per
-second, peak RSS, output bytes, the fraction of event boundaries resolving to `+inf`, and mean
-positives per context-boundary.
+event-bound fraction, `num_bounds`, boundary pool, any start fraction / start-duration setting /
+start-event pool, the window semantics or `codes.parquet` relabels (outputs built under different
+start semantics are never reused). Per shard, the worker logs event/interval/context counts, build /
+boundary-resolution / labeling seconds, contexts per second, peak RSS, output bytes, the number of
+event-defined starts and the fraction that do not resolve, the fraction of event ends resolving to
+`+inf` (over windows whose start resolved), the fraction of empty windows, and mean positives per
+window.
 
 `MultitaskBoundaryPytorchDataset` (`every_query.data.multitask_dataset`) consumes the layout as MTD's
 `task_labels_dir`: it reads only the metadata parquets at init, opens the sidecars read-only via
 `mmap_mode="r"`, tags each row with its source shard and physical row so a global shuffle keeps the
 alignment, unpacks once per batch in `collate`, and refuses to load when the cohort's `codes.parquet`
 (or an explicit `expected_vocab_size` / `expected_vocab_fingerprint`) disagrees with the manifest.
+Its batch carries `q_start_durations` / `q_start_codes` `(B, K)` (float32 / int64; `0.0` / `0` for a
+prediction-time start, `-1.0` / vocab index for an event start) next to `q_durations` /
+`q_bound_codes`; start codes go through the same base vocabulary as the targets (PAD / unknown codes
+are rejected), exactly one start and one end representation must be active per slot, and metadata
+parquets written before #24 (format 2, no start columns) load as prediction-time starts — a split may
+mix format 2 and 3 shards. No start is ever sampled in the dataset.
 
-**MVP scope:** observable leaf codes only.  A non-null `ontology_dir` raises before Stage 0; events are
-never closure-expanded.  Ancestor targets and boundaries plug in later through the seams
+**MVP scope:** observable leaf codes only. A non-null `ontology_dir` raises before Stage 0; events are
+never closure-expanded. Ancestor targets and boundaries plug in later through the seams
 `build_target_vocabulary`, `prepare_events_for_labeling` and `resolve_event_boundaries`.
 
 ## Determinism & restartability

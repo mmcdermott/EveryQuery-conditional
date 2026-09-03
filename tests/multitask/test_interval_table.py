@@ -215,3 +215,162 @@ def test_packbits_roundtrip_with_non_multiple_of_eight_vocab() -> None:
     packed = np.packbits(dense, axis=-1, bitorder="little")
     assert packed.shape == (4, 5, 2)
     assert np.array_equal(np.unpackbits(packed, axis=-1, count=v, bitorder="little").astype(bool), dense)
+
+
+# --- issue #24: explicit window starts -------------------------------------------------------------
+
+
+def test_resolve_start_times_duration_and_event_forms() -> None:
+    # Subject 1: code 0 at days 3 and 9, code 1 at day 6.  pt = day 3 (an occurrence of code 0 sits
+    # exactly at pt and must not open the window).
+    t = build_interval_table(np.array([1, 1, 1]), np.array([3 * DAY, 6 * DAY, 9 * DAY]), np.array([0, 1, 0]))
+    d = np.array([[0.0, 7.0, 0.0, 0.0, 0.0]])
+    c = np.array([[-1, -1, 0, 1, 5]])
+    st = it.resolve_start_times(t, np.array([1]), np.array([3 * DAY]), d, c)
+    assert st.tolist() == [[3 * DAY, 10 * DAY, 9 * DAY, 6 * DAY, INF]]
+    # Unknown subject: every event start is unresolved, duration starts still resolve.
+    st = it.resolve_start_times(t, np.array([7]), np.array([0]), d[:, :3], c[:, :3])
+    assert st.tolist() == [[0, 7 * DAY, INF]]
+    with pytest.raises(ValueError, match="shape mismatch"):
+        it.resolve_start_times(t, np.array([1]), np.array([0]), np.zeros((1, 2)), np.zeros((1, 3), int))
+
+
+def test_resolve_end_times_is_relative_to_start_and_strictly_after_it() -> None:
+    # code 0 at days 8 and 20, code 1 at day 15.
+    t = build_interval_table(
+        np.array([1, 1, 1]), np.array([8 * DAY, 20 * DAY, 15 * DAY]), np.array([0, 0, 1])
+    )
+    st = np.array([[10 * DAY, 10 * DAY, 10 * DAY, 8 * DAY, 20 * DAY]])
+    d = np.array([[30.0, 0.0, 0.0, 0.0, 0.0]])
+    b = np.array([[-1, 0, 1, 0, 0]])
+    et = it.resolve_end_times(t, np.array([1]), st, d, b)
+    # day 10 + 30 = day 40 (never day 30); the day-8 occurrence of code 0 is ignored -> day 20;
+    # a boundary occurrence exactly at the start does not close the window -> day 20; none after
+    # day 20 -> INF.
+    assert et.tolist() == [[40 * DAY, 20 * DAY, 15 * DAY, 20 * DAY, INF]]
+    with pytest.raises(ValueError, match="shape mismatch"):
+        it.resolve_end_times(t, np.array([1]), np.zeros((1, 2), int), np.zeros((1, 3)), np.zeros((1, 3), int))
+
+
+def test_inf_start_plus_duration_is_exactly_inf() -> None:
+    t = build_interval_table(np.array([1]), np.array([DAY]), np.array([0]))
+    st = np.array([[INF, INF, INF]])
+    d = np.array([[1826.0, 1e6, 0.0]])
+    b = np.array([[-1, -1, 0]])
+    et = it.resolve_end_times(t, np.array([1]), st, d, b)
+    assert et.tolist() == [[INF, INF, INF]]
+    assert et.dtype == np.int64
+    # And the point search at INF itself is INF (no wraparound into a negative rank).
+    assert next_occurrence_after(t, np.array([1]), np.array([INF]), np.array([0])).tolist() == [INF]
+
+
+def test_resolve_bound_times_is_the_prediction_time_start_wrapper() -> None:
+    rng = np.random.default_rng(3)
+    es, et, ec, qs, qt, dur, bc, v = _random_case(rng)
+    t = build_interval_table(es, et, ec)
+    k = bc.shape[1]
+    st = np.broadcast_to(qt[:, None], (len(qs), k))
+    assert np.array_equal(resolve_bound_times(t, qs, qt, dur, bc), it.resolve_end_times(t, qs, st, dur, bc))
+    assert np.array_equal(
+        it.resolve_start_times(t, qs, qt, np.zeros((len(qs), k)), np.full((len(qs), k), -1)), st
+    )
+
+
+def test_labeling_sort_error_names_the_lookup_time() -> None:
+    t = build_interval_table(np.array([1, 2]), np.array([1, 1]), np.array([0, 0]))
+    with pytest.raises(ValueError, match="sorted by \\(subject_id, lookup time\\)"):
+        list(iter_packed_label_chunks(t, np.array([1, 1]), np.array([5, 0]), np.zeros((2, 1), int), 1, 4))
+
+
+def _random_window_case(rng: np.random.Generator, k: int = 4):
+    """Events + contexts + per-position (start, end) specs covering all six combinations."""
+    n_ev, n_ctx, v = int(rng.integers(0, 150)), int(rng.integers(0, 40)), int(rng.integers(1, 10))
+    es = rng.integers(0, 6, n_ev)
+    et = rng.integers(0, 40, n_ev) * DAY // 2
+    ec = rng.integers(0, v, n_ev)
+    qs = rng.integers(0, 8, n_ctx)
+    qt = rng.integers(0, 40, n_ctx) * DAY // 2
+    form = rng.integers(0, 3, (n_ctx, k))  # 0 = prediction time, 1 = positive duration, 2 = event
+    s_dur = np.where(form == 1, rng.uniform(0.5, 20, (n_ctx, k)), 0.0)
+    s_code = np.where(form == 2, rng.integers(0, v, (n_ctx, k)), -1)
+    e_dur = rng.uniform(0, 25, (n_ctx, k))
+    e_code = np.where(rng.random((n_ctx, k)) < 0.5, rng.integers(0, v, (n_ctx, k)), -1)
+    return es, et, ec, qs, qt, s_dur, s_code, e_dur, e_code, v
+
+
+def _flatten_sort_label_scatter(t, qs, st, et, v, chunk_rows: int) -> np.ndarray:
+    """The #24 labeling path at kernel level: flatten (N, K) windows, sort by (subject, start), run the K'=1
+    packed kernel, scatter back.
+
+    Mirrors ``label_multitask_index``; returns dense (N, K, V).
+    """
+    n, k = st.shape
+    subj_flat = np.repeat(qs, k)
+    order = np.lexsort((st.ravel(), subj_flat))
+    packed = np.zeros((n, k, (v + 7) // 8), np.uint8)
+    for lo, hi, chunk in iter_packed_label_chunks(
+        t, subj_flat[order], st.ravel()[order], et.ravel()[order][:, None], v, chunk_rows, max_matches=5
+    ):
+        sel = order[lo:hi]
+        packed[sel // k, sel % k] = chunk[:, 0]
+    return np.unpackbits(packed, axis=-1, count=v, bitorder="little").astype(bool)
+
+
+@pytest.mark.parametrize("seed", range(25))
+def test_fuzz_window_starts_against_naive_oracle(seed: int) -> None:
+    rng = np.random.default_rng(seed)
+    es, et, ec, qs, qt, s_dur, s_code, e_dur, e_code, v = _random_window_case(rng)
+    n, k = s_code.shape
+    t = build_interval_table(es, et, ec)
+    st = it.resolve_start_times(t, qs, qt, s_dur, s_code)
+    en = it.resolve_end_times(t, qs, st, e_dur, e_code)
+
+    events = list(zip(es.tolist(), et.tolist(), ec.tolist(), strict=True))
+    windows = [
+        [
+            (
+                (None, int(s_code[i, j])) if s_code[i, j] >= 0 else (float(s_dur[i, j]), None),
+                (None, int(e_code[i, j])) if e_code[i, j] >= 0 else (float(e_dur[i, j]), None),
+            )
+            for j in range(k)
+        ]
+        for i in range(n)
+    ]
+    naive_st, naive_en, naive_targets = it.naive_window_labels(
+        events, list(zip(qs.tolist(), qt.tolist(), strict=True)), windows, v, k
+    )
+    assert np.array_equal(naive_st, st)
+    assert np.array_equal(naive_en, en)
+    # Point-search reference on the flattened windows (start as the lookup time).
+    ref = label_dense_reference(t, np.repeat(qs, k), st.ravel(), en.ravel()[:, None], v).reshape(n, k, v)
+    assert np.array_equal(ref, naive_targets)
+    # Range kernel: flatten / sort / scatter, chunk sizes forcing one context's windows across chunks.
+    for chunk_rows in (1, 2, 3, 1000):
+        assert np.array_equal(_flatten_sort_label_scatter(t, qs, st, en, v, chunk_rows), naive_targets)
+
+
+def test_windows_of_one_context_straddle_chunks_and_unresolved_starts_are_all_false() -> None:
+    # One subject, one context, K=3 windows whose resolved starts interleave with a second context's.
+    es = np.zeros(6, int)
+    et = np.array([1, 2, 3, 4, 5, 6]) * DAY
+    ec = np.array([0, 1, 2, 0, 2, 2])  # code 1 occurs only at day 2
+    t = build_interval_table(es, et, ec)
+    qs = np.array([0, 0])
+    qt = np.array([0, 0])
+    s_dur = np.array([[0.0, 3.5, 0.0], [1.5, 0.0, 0.0]])
+    s_code = np.array([[-1, -1, 7], [-1, 1, -1]])  # code 7 never occurs -> INF start
+    e_dur = np.array([[10.0, 10.0, 10.0], [10.0, 10.0, 10.0]])
+    e_code = np.full((2, 3), -1)
+    st = it.resolve_start_times(t, qs, qt, s_dur, s_code)
+    assert st.tolist() == [[0, 3 * DAY + DAY // 2, INF], [DAY + DAY // 2, 2 * DAY, 0]]
+    en = it.resolve_end_times(t, qs, st, e_dur, e_code)
+    assert en[0, 2] == INF
+    expect = np.zeros((2, 3, 3), bool)
+    expect[0, 0] = [True, True, True]  # (0, 10): everything
+    expect[0, 1] = [True, False, True]  # (3.5, 13.5): days 4, 5, 6 -> codes 0, 2
+    expect[0, 2] = [False, False, False]  # never opens
+    expect[1, 0] = [True, True, True]  # (1.5, 11.5): days 2..6
+    expect[1, 1] = [True, False, True]  # (2, 12): the code-1 start event at day 2 itself is excluded
+    expect[1, 2] = [True, True, True]
+    for chunk_rows in (1, 2, 3):
+        assert np.array_equal(_flatten_sort_label_scatter(t, qs, st, en, 3, chunk_rows), expect), chunk_rows

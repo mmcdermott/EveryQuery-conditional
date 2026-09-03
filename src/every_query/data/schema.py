@@ -155,19 +155,29 @@ class QuerySeqSchema(LabelSchema):
 
 
 class MultitaskBoundarySchema(LabelSchema):
-    """One multitask-boundary context: a ``(subject_id, prediction_time)`` plus exactly ``K`` boundaries.
+    """One multitask-boundary context: a ``(subject_id, prediction_time)`` plus exactly ``K`` windows.
 
     The all-vocabulary targets are **not** in the parquet; they live row-aligned in the bit-packed
     ``<shard>.labels.npy`` sidecar next to it (see
     :mod:`~every_query.generate_tasks.sample_multitask_sequences`).  This schema only carries the
-    boundary definitions:
+    window definitions - a start and an end specification per slot (issue #24):
 
     Attributes:
-        durations: ``K`` horizons in days (``float32``).  A duration-bounded slot holds ``>= 0``; an
-            event-bounded slot holds ``EVENT_BOUND_DURATION_SENTINEL`` (``-1.0``).
+        start_durations: ``K`` window starts in days after ``prediction_time`` (``float32``).  ``0``
+            opens the window at the prediction time (the pre-#24 behaviour), ``> 0`` at
+            ``prediction_time + start_duration``; an event-defined start holds
+            ``EVENT_BOUND_DURATION_SENTINEL`` (``-1.0``).
+        start_events: ``K`` start codes aligned with ``start_durations``: null for a duration-defined
+            start, a base-vocabulary code for an event-defined one (the window opens at its first
+            occurrence strictly after ``prediction_time``; if there is none the window is empty).
+            Exactly one representation is active per slot.  Parquets written before #24 lack both
+            start columns and are read as ``[0.0] * K`` / ``[null] * K``.
+        durations: ``K`` horizons in days after the **resolved start** (``float32``).  A
+            duration-bounded slot holds ``>= 0``; an event-bounded slot holds
+            ``EVENT_BOUND_DURATION_SENTINEL`` (``-1.0``).
         bound_events: ``K`` boundary codes aligned with ``durations``: null for a duration-bounded
-            slot, a base-vocabulary code for an event-bounded one.  Exactly one representation is
-            active per slot.
+            slot, a base-vocabulary code for an event-bounded one (the first occurrence strictly after
+            the resolved start).  Exactly one representation is active per slot.
         condition_codes: ``K-1`` conditioning codes (non-PAD base vocabulary, never null); code ``j``
             is the query whose answer at boundary ``j`` is teacher-forced into later boundaries.
         condition_answers: ``K-1`` booleans; ``answers[j]`` is the all-vocabulary target bit of
@@ -178,16 +188,20 @@ class MultitaskBoundarySchema(LabelSchema):
         >>> import pyarrow as pa
         >>> data = pa.Table.from_pylist([
         ...     {"subject_id": 1, "prediction_time": datetime(2023, 1, 1),
+        ...      "start_durations": [7.0, -1.0], "start_events": [None, "ADMISSION"],
         ...      "durations": [30.0, -1.0], "bound_events": [None, "ICD//I10"],
         ...      "condition_codes": ["LAB//X"], "condition_answers": [True]},
         ... ])
         >>> aligned = MultitaskBoundarySchema.align(data)
-        >>> [f.name for f in aligned.schema]
-        ['subject_id', 'prediction_time', 'durations', 'bound_events', 'condition_codes', 'condition_answers']
-        >>> aligned.column("bound_events").to_pylist()
-        [[None, 'ICD//I10']]
+        >>> [f.name for f in aligned.schema]  # doctest: +NORMALIZE_WHITESPACE
+        ['subject_id', 'prediction_time', 'start_durations', 'start_events', 'durations', 'bound_events',
+         'condition_codes', 'condition_answers']
+        >>> aligned.column("start_events").to_pylist(), aligned.column("bound_events").to_pylist()
+        ([[None, 'ADMISSION']], [[None, 'ICD//I10']])
     """
 
+    start_durations: Required(pa.large_list(pa.float32()), nullable=False)
+    start_events: Required(pa.large_list(pa.large_string()), nullable=False)
     durations: Required(pa.large_list(pa.float32()), nullable=False)
     bound_events: Required(pa.large_list(pa.large_string()), nullable=False)
     condition_codes: Required(pa.large_list(pa.large_string()), nullable=False)

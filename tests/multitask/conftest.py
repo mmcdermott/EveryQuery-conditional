@@ -120,22 +120,29 @@ def make_index(
     conditions: list[list[str]] | None = None,
     *,
     fill_condition: str = "A",
+    starts: list[list[tuple[float, str | None]]] | None = None,
 ) -> pl.DataFrame:
     """Build a supplied multitask index; ``bounds[i][k]`` is ``(duration_days, bound_event)``.
 
     ``conditions[i]`` holds the ``K-1`` conditioning codes; by default every slot is ``fill_condition``.
+    ``starts[i][k]`` is the issue #24 ``(start_duration_days, start_event)``; when ``None`` (default)
+    the start columns are omitted entirely, which the labeler reads as prediction-time starts.
     """
     if conditions is None:
         conditions = [[fill_condition] * (len(row) - 1) for row in bounds]
-    return pl.DataFrame(
-        {
-            "subject_id": pl.Series([c[0] for c in contexts], dtype=pl.Int64),
-            "prediction_time": pl.Series([c[1] for c in contexts], dtype=pl.Datetime("us")),
-            "durations": pl.Series([[b[0] for b in row] for row in bounds], dtype=pl.List(pl.Float32)),
-            "bound_events": pl.Series([[b[1] for b in row] for row in bounds], dtype=pl.List(pl.Utf8)),
-            "condition_codes": pl.Series(conditions, dtype=pl.List(pl.Utf8)),
-        }
-    )
+    cols = {
+        "subject_id": pl.Series([c[0] for c in contexts], dtype=pl.Int64),
+        "prediction_time": pl.Series([c[1] for c in contexts], dtype=pl.Datetime("us")),
+    }
+    if starts is not None:
+        cols["start_durations"] = pl.Series(
+            [[s[0] for s in row] for row in starts], dtype=pl.List(pl.Float32)
+        )
+        cols["start_events"] = pl.Series([[s[1] for s in row] for row in starts], dtype=pl.List(pl.Utf8))
+    cols["durations"] = pl.Series([[b[0] for b in row] for row in bounds], dtype=pl.List(pl.Float32))
+    cols["bound_events"] = pl.Series([[b[1] for b in row] for row in bounds], dtype=pl.List(pl.Utf8))
+    cols["condition_codes"] = pl.Series(conditions, dtype=pl.List(pl.Utf8))
+    return pl.DataFrame(cols)
 
 
 def condition_answers_oracle(meta: pl.DataFrame, dense: np.ndarray, vocab) -> np.ndarray:
@@ -152,8 +159,50 @@ def scalar_oracle(
 ) -> np.ndarray:
     """Every ``(context, boundary, code)`` through ``label_with_event_bounds``; ``(N, K, len(codes))`` bool.
 
-    Rows follow ``index_df``'s order.
+    Rows follow ``index_df``'s order.  The scalar oracle knows only ``(prediction_time, boundary)``
+    windows, so ``index_df`` must have prediction-time starts (no start columns, or all
+    ``start_durations == 0``); :func:`resolved_start_scalar_oracle` covers explicit starts.
     """
+    if "start_durations" in index_df.columns:
+        assert (index_df["start_durations"].explode() == 0).all(), (
+            "scalar_oracle needs prediction-time starts"
+        )
+    return _scalar_oracle_rows(index_df, events_df, codes, num_bounds, index_df["prediction_time"].to_list())
+
+
+def resolved_start_scalar_oracle(
+    index_df: pl.DataFrame,
+    events_df: pl.DataFrame,
+    codes: list[str],
+    num_bounds: int,
+    resolved_starts: np.ndarray,
+) -> np.ndarray:
+    """Issue #24 differential: ``label_with_event_bounds`` fed each window's *resolved start* as its
+    prediction time.
+
+    ``resolved_starts`` is ``(N, K)`` int64 µs; windows whose start is ``INF`` are
+    returned all-false (the scalar path has no notion of a window that never opens).
+    """
+    from every_query.generate_tasks.interval_table import INF
+
+    n = index_df.height
+    out = np.zeros((n, num_bounds, len(codes)), dtype=bool)
+    for k in range(num_bounds):
+        rows = [i for i in range(n) if resolved_starts[i, k] != INF]
+        if not rows:
+            continue
+        sub = index_df[rows].with_columns(
+            pl.Series("prediction_time", resolved_starts[rows, k].astype(np.int64)).cast(pl.Datetime("us")),
+            pl.col("durations").list.slice(k, 1),
+            pl.col("bound_events").list.slice(k, 1),
+        )
+        out[rows, k] = _scalar_oracle_rows(sub, events_df, codes, 1, sub["prediction_time"].to_list())[:, 0]
+    return out
+
+
+def _scalar_oracle_rows(
+    index_df: pl.DataFrame, events_df: pl.DataFrame, codes: list[str], num_bounds: int, pts: list
+) -> np.ndarray:
     from every_query.generate_tasks.sample_query_sequences import label_with_event_bounds
 
     recs = []
@@ -165,7 +214,7 @@ def scalar_oracle(
                         "_ctx_id": i * num_bounds + k,
                         "_position": j,
                         "subject_id": r["subject_id"],
-                        "prediction_time": r["prediction_time"],
+                        "prediction_time": pts[i],
                         "query": code,
                         "duration_days": r["durations"][k],
                         "bound_event": r["bound_events"][k],
