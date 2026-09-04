@@ -100,26 +100,60 @@ class TaskQuerySchema(LabelSchema):
 class QuerySeqSchema(LabelSchema):
     """A conditional query-sequence row: one patient context plus an ordered list of queries.
 
-    Each row is a ``(subject_id, prediction_time)`` context with three aligned list columns:
+    Each row is a ``(subject_id, prediction_time)`` context with three aligned list columns plus
+    up to three optional ones (``bound_events``, ``start_durations``, ``start_events``) that
+    refine each query's window.  For query position ``j`` the window is::
+
+        start[j] = prediction_time + start_durations[j]
+                   OR the first occurrence of start_events[j] strictly after prediction_time
+        end[j]   = start[j] + durations[j]
+                   OR the first occurrence of bound_events[j] strictly after start[j]
+        answers[j] = some occurrence of queries[j] satisfies  start[j] < occurrence < end[j]
+
+    The start is resolved first and the end **relative to the resolved start** — a duration end
+    is measured from it, and an event end is searched strictly after it, never after
+    ``prediction_time``.  Both endpoints are open.  A start event that never occurs after the
+    prediction time leaves the window empty (answer ``False``, even if the end is also
+    unresolved); an end event that never occurs after a resolved start lets the window run to
+    the end of the record.  With the default prediction-time start this is exactly the legacy
+    ``(prediction_time, prediction_time + duration)`` / ``(prediction_time, boundary)`` window.
 
     Attributes:
         queries: Ordered list of MEDS code strings (any vocabulary code, random order — including
             the end-of-timeline code ``TIMELINE//END``, which is an ordinary code).
-        durations: Per-query horizons in days (``float32``), aligned with ``queries``.
+        durations: Per-query horizons in days (``float32``) after the **resolved start**, aligned
+            with ``queries``.
         answers: Per-query booleans aligned with ``queries`` — *"was ``queries[j]`` observed in
-            ``(prediction_time, prediction_time + durations[j])``?"*.  The window is **open at
-            both ends**: an occurrence exactly at ``prediction_time`` is outside it, and so is one
-            landing exactly on the horizon ``prediction_time + durations[j]``.  Binary, never
-            null; an unobservable event (record ends first) is ``False``.  Censoring is carried
-            by a ``TIMELINE//END`` query rather than a null answer.
+            ``(start[j], end[j])``?"*; with the default prediction-time start that window is
+            ``(prediction_time, prediction_time + durations[j])``.  The window is **open at both
+            ends**: an occurrence exactly at the start instant is outside it, and so is one landing
+            exactly on the end instant.  Binary, never null; an unobservable event (record ends
+            first) is ``False``.  Censoring is carried by a ``TIMELINE//END`` query rather than a
+            null answer.
         bound_events: Optional per-query boundary-event codes.  ``bound_events[j]`` is null for
             an ordinary time-bounded query (``durations[j]`` is the horizon), and a vocabulary
-            code for an **event-bounded** one — the window is then ``(prediction_time, boundary)``
-            where ``boundary`` is the next occurrence of that code, open at both ends exactly as
-            the time-bounded window is, so a query code sharing the boundary event's instant does
-            NOT count.  ``durations[j]`` holds the
-            ``EVENT_BOUND_DURATION_SENTINEL`` (-1.0) rather than a horizon.  The whole column is
-            absent from bound-free parquets, which stay valid.
+            code for an **event-bounded** one — the window then ends at the first occurrence of
+            that code strictly after the resolved start, open at both ends exactly as the
+            time-bounded window is, so a query code sharing the boundary event's instant does NOT
+            count.  ``durations[j]`` holds the ``EVENT_BOUND_DURATION_SENTINEL`` (-1.0) rather than
+            a horizon.  The whole column is absent from bound-free parquets, which stay valid.
+        start_durations: Optional per-query window starts in days after ``prediction_time``
+            (``float32``).  ``0.0`` opens the window at the prediction time (the legacy and default
+            form), ``> 0`` at ``prediction_time + start_durations[j]``; an event-defined start
+            holds ``EVENT_BOUND_DURATION_SENTINEL`` (-1.0).  Must be finite; negative values other
+            than the sentinel are invalid.
+        start_events: Optional per-query start-event codes aligned with ``start_durations``: null
+            for a duration-defined start, a vocabulary code for an **event-defined** one (the
+            window opens at its first occurrence strictly after ``prediction_time``; none ⇒ the
+            window is empty).  Exactly one representation is active per position: a non-null
+            ``start_events[j]`` requires ``start_durations[j] == -1.0`` and a null one requires
+            ``start_durations[j] >= 0``.  The two start columns are present together or absent
+            together; absent means ``[0.0] * K`` / ``[None] * K``.  Parquets written before starts
+            existed carry neither and remain valid.  ``align`` itself only types the columns; the
+            pairing, alignment and representation rules are enforced by the readers
+            (``ConditionalQueryPytorchDataset`` and the ``label_query_sequences`` dispatch).  The
+            ordinary sequence models (``EQ_predict_sequences``) accept only the default form;
+            active starts are consumed by the multitask predictor.
 
     Examples:
         >>> from datetime import datetime
@@ -146,12 +180,31 @@ class QuerySeqSchema(LabelSchema):
         ['subject_id', 'prediction_time', 'queries', 'durations', 'answers', 'bound_events']
         >>> aligned.column("bound_events").to_pylist()
         [[None, 'HOSPITAL_DISCHARGE//HOME']]
+
+        Explicit window starts are optional in the same way.  Here the first query's window opens
+        seven days after the prediction time and the second's at the next admission (its start
+        duration is the ``-1.0`` sentinel):
+
+        >>> started = pa.Table.from_pylist([
+        ...     {"subject_id": 1, "prediction_time": datetime(2023, 1, 1),
+        ...      "queries": ["ICD//I10", "LAB//X"], "durations": [30.0, 30.0],
+        ...      "answers": [False, True], "bound_events": [None, None],
+        ...      "start_durations": [7.0, -1.0], "start_events": [None, "HOSPITAL_ADMISSION"]},
+        ... ])
+        >>> aligned = QuerySeqSchema.align(started)
+        >>> [f.name for f in aligned.schema]  # doctest: +NORMALIZE_WHITESPACE
+        ['subject_id', 'prediction_time', 'queries', 'durations', 'answers', 'bound_events',
+         'start_durations', 'start_events']
+        >>> aligned.column("start_events").to_pylist()
+        [[None, 'HOSPITAL_ADMISSION']]
     """
 
     queries: Required(pa.large_list(pa.large_string()), nullable=False)
     durations: Required(pa.large_list(pa.float32()), nullable=False)
     answers: Required(pa.large_list(pa.bool_()), nullable=False)
     bound_events: Optional(pa.large_list(pa.large_string()), nullable=True)
+    start_durations: Optional(pa.large_list(pa.float32()), nullable=True)
+    start_events: Optional(pa.large_list(pa.large_string()), nullable=True)
 
 
 class MultitaskBoundarySchema(LabelSchema):

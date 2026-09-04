@@ -69,17 +69,35 @@ write_unique_prediction_times: true
 sequences_path: null
 #
 # `sequences_path` accepts any of:
-#   YAML/JSON mapping    name -> [[code, duration], ...]
-#   YAML/JSON list       [[[code, duration], ...], ...]      (names auto-generated)
-#   long-format parquet  (seq_id, position, query, duration_days[, bound_event])
-# e.g. designed.yaml:
+#   YAML/JSON mapping    name -> [entry, ...]
+#   YAML/JSON list       [[entry, ...], ...]                 (names auto-generated)
+#   long-format parquet  (seq_id, position, query, duration_days[, bound_event]
+#                         [, start_duration_days][, start_event])
+# where an entry is `[code, duration_days]`, `[code, -1, bound_event]`, or a mapping
+# `{query, duration_days[, bound_event][, start_duration_days][, start_event]}` — the mapping
+# form is the readable one for a window that opens later than the prediction time (see the
+# window rule under "Window starts" below).  e.g. designed.yaml:
 #   mortality_30d:
 #     - [TIMELINE//END, 1]
 #     - [MEDS_DEATH, 30]
 #   sepsis_before_discharge:
 #     - [SEPSIS, -1, HOSPITAL_DISCHARGE//HOME]
-# On this path nothing is sampled: the codes and durations are exactly what you wrote, and
-# `query_codes` is used only to reject query and boundary codes outside the model's vocabulary.
+#   post_admission:                        # opens at the next admission, closes 30d after it
+#     - query: LAB//X
+#       start_event: HOSPITAL_ADMISSION
+#       duration_days: 30
+#   delayed:                               # opens 7d after the prediction time, closes 30d later
+#     - query: ICD//I10
+#       start_duration_days: 7
+#       duration_days: 30
+#   between_events:                        # opens at the admission, closes at the next discharge
+#     - query: PROCEDURE//X
+#       start_event: HOSPITAL_ADMISSION
+#       duration_days: -1
+#       bound_event: HOSPITAL_DISCHARGE
+# Missing start keys mean a prediction-time start.  On this path nothing is sampled: the codes,
+# durations and starts are exactly what you wrote, and `query_codes` is used only to reject query,
+# boundary and start codes outside the model's vocabulary.
 
 # --- Sampling knobs (all `sequences_path: null` only) ---------------------
 # The code and duration distributions below mirror `sample_query_sequences_config.yaml` so a
@@ -129,6 +147,51 @@ duration_mode: random
 # bounds explicitly instead, via a `[code, -1, bound_event]` triple or the parquet `bound_event`
 # column; this fraction is ignored when `sequences_path` is set.
 eventbound_fraction: 0.5
+
+# --- Window starts (issue #27) ------------------------------------------------------------------
+# Each query's window may open later than the prediction time.  For query position j:
+#
+#   start = prediction_time + start_duration            (start_event null)
+#         | first occurrence of start_event STRICTLY AFTER prediction_time   (else: empty window)
+#   end   = start + duration                             (bound_event null)
+#         | first occurrence of bound_event STRICTLY AFTER the RESOLVED START (else: end of record)
+#   answer = start < some occurrence of the query code < end          (both endpoints open)
+#
+# The end is measured from the resolved start, never from the prediction time; a start event that
+# never occurs leaves the window empty (answer False, even if the end is also unresolved).  This is
+# exactly `sample_multitask_sequences_config.yaml`'s window rule (open_open / prediction_time /
+# resolved_start / empty_window / infinity), so a multitask model can be scored on this grid.
+#
+# The defaults below (`eventstart_fraction: 0`, `prediction_time_start_fraction: 1`) open every
+# sampled window at the prediction time and reproduce the pre-#27 grid exactly: the same specs on
+# the same seed, and no `start_durations` / `start_events` columns in the output.  Only the START
+# component below mirrors the multitask sampler; the query / duration / end draw above stays
+# parity-anchored to `sample_query_sequences_config.yaml`, and the start draw uses its own three
+# seed axes ("start_forms", "start_durations", "start_codes"), so changing any start knob perturbs
+# none of the other draws.  Designed specs (`sequences_path`) set their starts explicitly and ignore
+# these knobs.
+#
+# NOTE: the ordinary sequence models (EQ_predict_sequences) accept only prediction-time starts —
+# their dataset rejects a grid with any active start.  Active starts are for EQ_predict_multitask.
+#
+# Per sampled query one uniform u picks the start form (the multitask sampler's cumulative split):
+#   u < eventstart_fraction                                     => event-defined start
+#   u < eventstart_fraction + prediction_time_start_fraction    => the prediction time itself
+#   otherwise                                                   => a positive start delay
+# Both fractions must be in [0, 1] and sum to at most 1.
+eventstart_fraction: 0.0
+prediction_time_start_fraction: 1.0
+
+# Start-delay draw for the "positive delay" form, in days after the prediction time.
+start_duration_min: 1
+start_duration_max: 180
+start_duration_distribution: log-uniform # uniform | log-uniform
+
+# Start-event pool for the "event-defined" form: null draws uniformly from the whole query universe
+# (leaves plus, with `ontology_dir`, ancestor nodes); or an explicit Hydra list / YAML / parquet
+# path of codes, every one of which must be in the effective vocabulary.  A nonzero
+# `eventstart_fraction` requires a non-empty pool.
+start_event_codes: null
 
 # --- Ontology / hierarchical embeddings ---------------------------------------------------------
 # Directory of ontology artifacts written by EQ_build_ontology (nodes/mix/closure parquets).

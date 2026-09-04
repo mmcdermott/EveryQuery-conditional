@@ -52,8 +52,8 @@ Output layout, the same as ``sample_evaluation_tasks``':
 Every output parquet gets a provenance sidecar under ``{out_dir}_artifacts/_labeled/`` recording the
 three inputs that determine its rows — the ontology, the specs and the cohort source — and
 ``overwrite=false`` skips a shard only when all three match (:func:`_run_fingerprint`).  Re-running
-into the same ``out_dir`` with a different ``sequences_path``/``num_evaluation_sequences``/``seed``/cohort therefore
-relabels rather than silently keeping the previous grid.
+into the same ``out_dir`` with a different ``sequences_path``/``num_evaluation_sequences``/``seed``/cohort
+therefore relabels rather than silently keeping the previous grid.
 
 ``{out_dir}/eval`` is directly consumable as ``EQ_predict_sequences tasks_dir=...`` (MEDS-TorchData
 rglobs it, so point it at ``eval/`` — never at ``out_dir`` itself, or the ``eval_unique/`` frames
@@ -61,8 +61,27 @@ are read as labels).  Give this generator and ``EQ_generate_evaluation_tasks`` d
 roots: both write ``eval/{split}/{shard}.parquet``, in incompatible schemas.
 
 Within one shard file spec identity is recoverable two ways: the ``queries``/``durations`` columns
-(plus ``bound_events`` when present) *are* the spec, and row order is context-major — row ``i`` is
-``(contexts[i // N], specs[i % N])``.
+(plus ``bound_events`` / ``start_durations`` / ``start_events`` when present) *are* the spec, and row
+order is context-major — row ``i`` is ``(contexts[i // N], specs[i % N])``.
+
+Window starts (issue #27).  A query's window may open later than the prediction time — after a
+delay (``start_duration_days``) or at the next occurrence of a start event — with the end then
+measured from the *resolved start*::
+
+    start  = prediction_time + start_duration  |  first start_event strictly after prediction_time
+    end    = start + duration                  |  first bound_event strictly after the resolved start
+    answer = start < occurrence(query) < end   (both endpoints open; no start event => empty window;
+                                                no end event after a resolved start => end of record)
+
+These are the multitask sampler's semantics, labeled here through the same ``interval_table``
+(:func:`~every_query.generate_tasks.sample_query_sequences.label_with_explicit_starts`), so a
+multitask model can be scored on this grid.  Designed specs set starts explicitly (the mapping entry
+form, or the parquet ``start_duration_days`` / ``start_event`` columns); sampled specs draw them from
+the ``eventstart_fraction`` / ``prediction_time_start_fraction`` / ``start_duration_*`` /
+``start_event_codes`` knobs on three seed axes of their own.  With the default knobs every window
+opens at the prediction time and the output carries no start columns, exactly as before.  The
+ordinary sequence models do not encode starts: ``EQ_predict_sequences`` rejects a grid with any
+active start, and only ``EQ_predict_multitask`` consumes one.
 
 Answers follow the module-wide sequence contract: binary, never null; an unobservable occurrence
 (record ends before the window does) is ``False``, and censoring is carried by an explicit
@@ -72,6 +91,7 @@ than counted as negatives, that filtering belongs downstream (see
 ``scripts/eval_occurs_uncensored.py``).
 """
 
+import dataclasses
 import hashlib
 import json
 import logging
@@ -99,6 +119,8 @@ from every_query.generate_tasks.sample_query_sequences import (
     BOUND_COL,
     CTX_ID_COL,
     POSITION_COL,
+    START_DURATION_COL,
+    START_EVENT_COL,
     QuerySequenceDistribution,
     build_query_universe,
     label_query_sequences,
@@ -133,14 +155,21 @@ class SequenceSpec:
     Attributes:
         name: Identifier, used as the output directory name under ``per_spec_dirs``.
         queries: Ordered MEDS code strings.
-        durations: Per-query horizons in days, aligned with ``queries``.
+        durations: Per-query horizons in days after the resolved start, aligned with ``queries``.
         bounds: Optional per-query boundary codes aligned with ``queries``. Null entries are
             horizon-bounded; non-null entries require the event-bound duration sentinel.
+        start_durations: Optional per-query window starts in days after the prediction time
+            (issue #27), aligned with ``queries``: ``0.0`` opens the window at the prediction time
+            (the default when the tuple is empty), ``> 0`` later, and the event-bound sentinel
+            (``-1.0``) marks an event-defined start named in ``start_events``.
+        start_events: Optional per-query start-event codes aligned with ``start_durations`` (null
+            for a duration-defined start).  Both start tuples are empty together (every window
+            opens at the prediction time) or aligned together.
 
     Examples:
         >>> SequenceSpec("mortality_30d", ("TIMELINE//END", "MEDS_DEATH"), (1.0, 30.0))
         SequenceSpec(name='mortality_30d', queries=('TIMELINE//END', 'MEDS_DEATH'),
-                     durations=(1.0, 30.0), bounds=())
+                     durations=(1.0, 30.0), bounds=(), start_durations=(), start_events=())
 
         A position may instead be bounded by an *event*: its window runs to the next occurrence
         of that code, so it carries the duration sentinel rather than a horizon.
@@ -150,13 +179,36 @@ class SequenceSpec:
         >>> spec.bound_at(0)
         'HOSPITAL_DISCHARGE//HOME'
 
-        A bounded position with a real horizon is a contradiction and is rejected:
+        A position may also *open* later than the prediction time — after a delay, or at the next
+        occurrence of a start event (the sentinel marks the event form).  The end is then measured
+        from that resolved start.  A spec without start tuples opens every window at the prediction
+        time, so ``start_at`` is always answerable:
+
+        >>> post = SequenceSpec("post_admission", ("LAB//X", "ICD//I10"), (30.0, 30.0),
+        ...                     start_durations=(-1.0, 7.0), start_events=("HOSPITAL_ADMISSION", None))
+        >>> post.start_at(0), post.start_at(1), post.has_active_starts
+        ((-1.0, 'HOSPITAL_ADMISSION'), (7.0, None), True)
+        >>> spec.start_at(0), spec.has_active_starts
+        ((0.0, None), False)
+
+        A bounded position with a real horizon is a contradiction and is rejected, as is a start
+        event without the sentinel or a sentinel without a start event:
 
         >>> SequenceSpec("bad", ("SEPSIS",), (30.0,), ("DISCHARGE",))
         Traceback (most recent call last):
             ...
         ValueError: spec 'bad' position 0 is bounded by 'DISCHARGE', so its duration must be
         the -1.0 sentinel, got 30.0
+        >>> SequenceSpec("bad", ("A",), (1.0,), start_durations=(7.0,), start_events=("ADMIT",))
+        Traceback (most recent call last):
+            ...
+        ValueError: spec 'bad' position 0 starts at 'ADMIT', so its start duration must be the
+        -1.0 sentinel, got 7.0
+        >>> SequenceSpec("bad", ("A",), (1.0,), start_durations=(-1.0,), start_events=(None,))
+        Traceback (most recent call last):
+            ...
+        ValueError: spec 'bad' start duration -1.0 at position 0 must be a finite number >= 0
+        (or the -1.0 sentinel with a start_event)
 
         Ragged or empty specs are rejected at construction:
 
@@ -172,12 +224,22 @@ class SequenceSpec:
         Traceback (most recent call last):
             ...
         ValueError: spec 'bad' duration 0.0 at position 0 must be a finite number > 0
+        >>> SequenceSpec("bad", ("A", "B"), (1.0, 1.0), start_durations=(0.0,), start_events=(None,))
+        Traceback (most recent call last):
+            ...
+        ValueError: spec 'bad' has 2 queries but 1 start duration(s) / 1 start event(s)
+        >>> SequenceSpec("bad", ("A",), (1.0,), start_durations=(0.0,))
+        Traceback (most recent call last):
+            ...
+        ValueError: spec 'bad' has start_durations but not start_events; give both or neither
     """
 
     name: str
     queries: tuple[str, ...]
     durations: tuple[float, ...]
     bounds: tuple[str | None, ...] = ()
+    start_durations: tuple[float, ...] = ()
+    start_events: tuple[str | None, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.queries:
@@ -219,10 +281,64 @@ class SequenceSpec:
                 raise ValueError(
                     f"spec {self.name!r} duration {float(d)} at position {i} must be a finite number > 0"
                 )
+        self._validate_starts()
+
+    def _validate_starts(self) -> None:
+        """The start half of the contract: both tuples together or neither, one form per position."""
+        if bool(self.start_durations) != bool(self.start_events):
+            have, lack = (
+                ("start_durations", "start_events")
+                if self.start_durations
+                else ("start_events", "start_durations")
+            )
+            raise ValueError(f"spec {self.name!r} has {have} but not {lack}; give both or neither")
+        if not self.start_durations:
+            return
+        if len(self.start_durations) != len(self.queries) or len(self.start_events) != len(self.queries):
+            raise ValueError(
+                f"spec {self.name!r} has {len(self.queries)} queries but {len(self.start_durations)} start "
+                f"duration(s) / {len(self.start_events)} start event(s)"
+            )
+        for i, (sd, se) in enumerate(zip(self.start_durations, self.start_events, strict=True)):
+            if se is not None and (not isinstance(se, str) or not se):
+                raise ValueError(
+                    f"spec {self.name!r} start event at position {i} must be a non-empty string or null"
+                )
+            if isinstance(sd, bool) or not isinstance(sd, int | float):
+                raise TypeError(
+                    f"spec {self.name!r} start duration at position {i} must be a number, "
+                    f"got {type(sd).__name__}: {sd!r}"
+                )
+            if se is not None:
+                if float(sd) != EVENT_BOUND_DURATION_SENTINEL:
+                    raise ValueError(
+                        f"spec {self.name!r} position {i} starts at {se!r}, so its start duration must be "
+                        f"the {EVENT_BOUND_DURATION_SENTINEL} sentinel, got {float(sd)}"
+                    )
+                continue
+            if not math.isfinite(sd) or sd < 0:
+                raise ValueError(
+                    f"spec {self.name!r} start duration {float(sd)} at position {i} must be a finite "
+                    f"number >= 0 (or the {EVENT_BOUND_DURATION_SENTINEL} sentinel with a start_event)"
+                )
 
     def bound_at(self, i: int) -> str | None:
         """Boundary code at position ``i``, or ``None`` when that position is time-bounded."""
         return self.bounds[i] if self.bounds else None
+
+    def start_at(self, i: int) -> tuple[float, str | None]:
+        """``(start_duration_days, start_event)`` at position ``i``; ``(0.0, None)`` without starts."""
+        if not self.start_durations:
+            return (0.0, None)
+        return (float(self.start_durations[i]), self.start_events[i])
+
+    @property
+    def has_active_starts(self) -> bool:
+        """Whether any position opens somewhere other than the prediction time."""
+        return any(
+            se is not None or float(sd) > 0
+            for sd, se in zip(self.start_durations, self.start_events, strict=True)
+        )
 
     def __len__(self) -> int:
         return len(self.queries)
@@ -240,42 +356,113 @@ def _sanitise_names(specs: list[SequenceSpec]) -> list[SequenceSpec]:
                 f"rename one so per-spec output directories stay distinct."
             )
         seen[safe] = spec.name
-        out.append(
-            spec if safe == spec.name else SequenceSpec(safe, spec.queries, spec.durations, spec.bounds)
-        )
+        out.append(spec if safe == spec.name else dataclasses.replace(spec, name=safe))
     return out
 
 
-def _specs_from_pairs(name: str, pairs: object) -> SequenceSpec:
-    """Build one spec from a ``[[code, duration], ...]`` list."""
-    if not isinstance(pairs, Sequence) or isinstance(pairs, str):
-        raise ValueError(f"sequence {name!r} must be a list of [code, duration] pairs, got {pairs!r}")
-    queries: list[str] = []
-    durations: list[float] = []
-    bounds: list[str | None] = []
-    for i, pair in enumerate(pairs):
-        if isinstance(pair, str) or not isinstance(pair, Sequence) or len(pair) not in (2, 3):
-            raise ValueError(
-                f"sequence {name!r} entry {i} must be a [code, duration] pair or a "
-                f"[code, duration, bound_event] triple, got {pair!r}"
-            )
-        bound = pair[2] if len(pair) == 3 else None
-        if bound is not None and not isinstance(bound, str):
-            # Guards the shape `[code, duration, 9]`, which would otherwise be read as a
-            # boundary rather than rejected as a malformed [code, duration] pair.
-            raise ValueError(
-                f"sequence {name!r} entry {i} must be a [code, duration] pair or a "
-                f"[code, duration, bound_event] triple with a string bound, got {pair!r}"
-            )
-        queries.append(pair[0])
-        durations.append(pair[1])
-        bounds.append(bound)
+def _make_spec(
+    name: str,
+    queries: Sequence[str],
+    durations: Sequence[float],
+    bounds: Sequence[str | None],
+    start_durations: Sequence[float],
+    start_events: Sequence[str | None],
+) -> SequenceSpec:
+    """Assemble a spec, keeping the optional tuples empty when every position is the default.
+
+    An all-null ``bounds`` becomes ``()`` and an all-``(0.0, None)`` start pair becomes ``((), ())``,
+    so a spec written without the feature is indistinguishable from one that spells the default
+    out — which is what keeps the fingerprint and the output columns of a default grid unchanged.
+    """
+    active_start = any(
+        se is not None or float(sd) != 0.0 for sd, se in zip(start_durations, start_events, strict=True)
+    )
     return SequenceSpec(
         name=name,
         queries=tuple(queries),
         durations=tuple(durations),
         bounds=tuple(bounds) if any(b is not None for b in bounds) else (),
+        start_durations=tuple(float(sd) for sd in start_durations) if active_start else (),
+        start_events=tuple(start_events) if active_start else (),
     )
+
+
+_MAPPING_ENTRY_KEYS = frozenset(
+    {"query", "duration_days", "bound_event", "start_duration_days", "start_event"}
+)
+
+
+def _entry_from_mapping(name: str, i: int, entry: dict) -> tuple[str, float, str | None, float, str | None]:
+    """Read one ``{query, duration_days[, bound_event][, start_duration_days][, start_event]}`` entry."""
+    unknown = sorted(set(entry) - _MAPPING_ENTRY_KEYS)
+    if unknown:
+        raise ValueError(
+            f"sequence {name!r} entry {i} has unknown key(s) {unknown}; "
+            f"allowed: {sorted(_MAPPING_ENTRY_KEYS)}"
+        )
+    missing = [k for k in ("query", "duration_days") if k not in entry]
+    if missing:
+        raise ValueError(f"sequence {name!r} entry {i} is missing required key(s) {missing}: {entry!r}")
+    bound = entry.get("bound_event")
+    start_event = entry.get("start_event")
+    # Missing start keys mean a prediction-time start; a start event alone implies the sentinel,
+    # and a duration alone implies no event.  Spelling both out is fine as long as they agree.  An
+    # explicit ``null`` reads as "absent", the same rule the long-format parquet reader applies.
+    start_duration = entry.get("start_duration_days")
+    if start_duration is None:
+        start_duration = EVENT_BOUND_DURATION_SENTINEL if start_event is not None else 0.0
+    return entry["query"], entry["duration_days"], bound, start_duration, start_event
+
+
+def _specs_from_pairs(name: str, pairs: object) -> SequenceSpec:
+    """Build one spec from a list of ``[code, duration]`` pairs, ``[code, -1, bound]`` triples, or mappings.
+
+    The mapping form is the readable one for windows that do not open at the prediction time::
+
+        - query: LAB//X
+          start_event: HOSPITAL_ADMISSION      # opens at the next admission ...
+          duration_days: 30                    # ... and closes 30 days after it
+        - query: ICD//I10
+          start_duration_days: 7               # opens 7 days after the prediction time
+          duration_days: 30
+        - query: PROCEDURE//X
+          start_event: HOSPITAL_ADMISSION
+          duration_days: -1
+          bound_event: HOSPITAL_DISCHARGE      # closes at the next discharge after the admission
+
+    Missing start keys mean a prediction-time start.  The forms may be mixed within one sequence.
+    """
+    if not isinstance(pairs, Sequence) or isinstance(pairs, str):
+        raise ValueError(f"sequence {name!r} must be a list of [code, duration] pairs, got {pairs!r}")
+    queries: list[str] = []
+    durations: list[float] = []
+    bounds: list[str | None] = []
+    start_durations: list[float] = []
+    start_events: list[str | None] = []
+    for i, pair in enumerate(pairs):
+        if isinstance(pair, dict):
+            query, duration, bound, start_duration, start_event = _entry_from_mapping(name, i, pair)
+        else:
+            if isinstance(pair, str) or not isinstance(pair, Sequence) or len(pair) not in (2, 3):
+                raise ValueError(
+                    f"sequence {name!r} entry {i} must be a [code, duration] pair, a "
+                    f"[code, duration, bound_event] triple, or a mapping, got {pair!r}"
+                )
+            bound = pair[2] if len(pair) == 3 else None
+            if bound is not None and not isinstance(bound, str):
+                # Guards the shape `[code, duration, 9]`, which would otherwise be read as a
+                # boundary rather than rejected as a malformed [code, duration] pair.
+                raise ValueError(
+                    f"sequence {name!r} entry {i} must be a [code, duration] pair or a "
+                    f"[code, duration, bound_event] triple with a string bound, got {pair!r}"
+                )
+            query, duration, start_duration, start_event = pair[0], pair[1], 0.0, None
+        queries.append(query)
+        durations.append(duration)
+        bounds.append(bound)
+        start_durations.append(start_duration)
+        start_events.append(start_event)
+    return _make_spec(name, queries, durations, bounds, start_durations, start_events)
 
 
 def read_sequence_specs(path: str | Path) -> list[SequenceSpec]:
@@ -296,11 +483,23 @@ def read_sequence_specs(path: str | Path) -> list[SequenceSpec]:
 
         - [[TIMELINE//END, 1], [MEDS_DEATH, 30]]
 
-    A parquet is read as long-format ``(seq_id, position, query, duration_days[, bound_event])``,
-    one row per query; ``seq_id`` becomes the spec name and ``position`` fixes the within-sequence
-    order. ``bound_event`` is optional and nullable: a non-null value marks that row as
-    event-bounded and requires the ``-1`` duration sentinel. That form is the convenient one when
-    the specs are themselves generated by a script.
+    Entries may also be mappings, which is the readable form for windows that open later than
+    the prediction time (issue #27) — a start delay, or a start event with the end measured from
+    it — see :func:`_specs_from_pairs`::
+
+        post_admission:
+          - query: LAB//X
+            start_event: HOSPITAL_ADMISSION
+            duration_days: 30
+
+    A parquet is read as long-format ``(seq_id, position, query, duration_days[, bound_event][,
+    start_duration_days][, start_event])``, one row per query; ``seq_id`` becomes the spec name
+    and ``position`` fixes the within-sequence order. ``bound_event`` is optional and nullable: a
+    non-null value marks that row as event-bounded and requires the ``-1`` duration sentinel.
+    ``start_duration_days`` / ``start_event`` are optional the same way (a null or absent
+    ``start_event`` with a null or absent ``start_duration_days`` is a prediction-time start; a
+    non-null ``start_event`` requires the ``-1`` start sentinel, or may omit the column).  That
+    form is the convenient one when the specs are themselves generated by a script.
 
     Raises:
         ValueError: If the file is empty, has an unsupported suffix, or any sequence is malformed.
@@ -321,27 +520,47 @@ def read_sequence_specs(path: str | Path) -> list[SequenceSpec]:
             pl.col(pos_col).cast(pl.Int64),
             pl.col("query").cast(pl.Utf8),
             pl.col("duration_days").cast(pl.Float64),
+            (pl.col(BOUND_COL).cast(pl.Utf8) if has_bounds else pl.lit(None, dtype=pl.Utf8).alias(BOUND_COL)),
+            (
+                pl.col(START_EVENT_COL).cast(pl.Utf8)
+                if START_EVENT_COL in df.columns
+                else pl.lit(None, dtype=pl.Utf8).alias(START_EVENT_COL)
+            ),
+            (
+                pl.col(START_DURATION_COL).cast(pl.Float64)
+                if START_DURATION_COL in df.columns
+                else pl.lit(None, dtype=pl.Float64).alias(START_DURATION_COL)
+            ),
         ]
-        aggregations = [pl.col("query"), pl.col("duration_days")]
-        if has_bounds:
-            selections.append(pl.col(BOUND_COL).cast(pl.Utf8))
-            aggregations.append(pl.col(BOUND_COL))
         grouped = (
             df.select(selections)
+            .with_columns(
+                # A null start duration takes the form its start event implies (see the mapping
+                # reader): the sentinel next to an event, zero otherwise.
+                pl.col(START_DURATION_COL).fill_null(
+                    pl.when(pl.col(START_EVENT_COL).is_not_null())
+                    .then(pl.lit(EVENT_BOUND_DURATION_SENTINEL))
+                    .otherwise(pl.lit(0.0))
+                )
+            )
             .sort("seq_id", pos_col)
             .group_by("seq_id", maintain_order=True)
-            .agg(aggregations)
+            .agg(
+                pl.col("query"),
+                pl.col("duration_days"),
+                pl.col(BOUND_COL),
+                pl.col(START_DURATION_COL),
+                pl.col(START_EVENT_COL),
+            )
         )
         specs = [
-            SequenceSpec(
-                name=row["seq_id"],
-                queries=tuple(row["query"]),
-                durations=tuple(row["duration_days"]),
-                bounds=(
-                    tuple(row[BOUND_COL])
-                    if has_bounds and any(bound is not None for bound in row[BOUND_COL])
-                    else ()
-                ),
+            _make_spec(
+                row["seq_id"],
+                row["query"],
+                row["duration_days"],
+                row[BOUND_COL],
+                row[START_DURATION_COL],
+                row[START_EVENT_COL],
             )
             for row in grouped.iter_rows(named=True)
         ]
@@ -371,6 +590,51 @@ def read_sequence_specs(path: str | Path) -> list[SequenceSpec]:
     return _sanitise_names(specs)
 
 
+_VALID_START_DISTRIBUTIONS = ("uniform", "log-uniform")
+
+
+def _validate_start_sampling(
+    eventstart_fraction: float,
+    prediction_time_start_fraction: float,
+    start_duration_min: float,
+    start_duration_max: float,
+    start_duration_distribution: str,
+    start_event_codes: Sequence[str],
+    universe: Collection[str],
+) -> None:
+    """Mirror ``BoundaryDistribution.__post_init__``'s start checks for the eval grid's start draw."""
+    if not 0.0 <= eventstart_fraction <= 1.0:
+        raise ValueError(f"eventstart_fraction must be in [0, 1] (got {eventstart_fraction})")
+    if not 0.0 <= prediction_time_start_fraction <= 1.0:
+        raise ValueError(
+            f"prediction_time_start_fraction must be in [0, 1] (got {prediction_time_start_fraction})"
+        )
+    if eventstart_fraction + prediction_time_start_fraction > 1.0:
+        raise ValueError(
+            "eventstart_fraction + prediction_time_start_fraction must be <= 1 (got "
+            f"{eventstart_fraction} + {prediction_time_start_fraction})"
+        )
+    if eventstart_fraction > 0 and not start_event_codes:
+        raise ValueError("eventstart_fraction > 0 requires a non-empty start_event_codes pool")
+    if start_duration_min <= 0:
+        raise ValueError(f"start_duration_min must be > 0 (got {start_duration_min})")
+    if start_duration_max < start_duration_min:
+        raise ValueError(
+            f"start_duration_max ({start_duration_max}) must be >= start_duration_min ({start_duration_min})"
+        )
+    if start_duration_distribution not in _VALID_START_DISTRIBUTIONS:
+        raise ValueError(
+            f"start_duration_distribution must be one of {_VALID_START_DISTRIBUTIONS} "
+            f"(got {start_duration_distribution!r})"
+        )
+    unknown = sorted(set(start_event_codes) - set(universe))
+    if unknown:
+        raise ValueError(
+            f"{len(unknown)} start_event_codes are outside the query universe: {unknown[:10]}; "
+            "start events must be codes the model can encode."
+        )
+
+
 def sample_sequence_specs(
     n_sequences: int,
     query_codes: list[str],
@@ -383,6 +647,12 @@ def sample_sequence_specs(
     duration_mode: str = "random",
     duration_distribution: str = "log-uniform",
     eventbound_fraction: float = 0.0,
+    eventstart_fraction: float = 0.0,
+    prediction_time_start_fraction: float = 1.0,
+    start_duration_min: float = 1.0,
+    start_duration_max: float = 180.0,
+    start_duration_distribution: str = "log-uniform",
+    start_event_codes: Sequence[str] | None = None,
 ) -> list[SequenceSpec]:
     """Draw ``n_sequences`` specs from the *training* query distribution, once.
 
@@ -392,6 +662,20 @@ def sample_sequence_specs(
     byte-for-byte the one training saw — an evaluation grid drawn from a subtly different
     distribution than training is the kind of drift that shows up as unexplained metric shifts.
     No contexts are involved: these specs are then applied to *every* real context.
+
+    **Window starts (issue #27) and the parity decision.**  The query / duration / end-bound draw
+    above stays parity-anchored to ``sample_query_sequences.py``.  Only the *start* component
+    mirrors the multitask sampler (``BoundaryDistribution.sample``): per query one uniform ``u``
+    picks the form — ``u < eventstart_fraction`` an event-defined start (code iid uniform over
+    ``start_event_codes``, ``None`` = the whole query universe), ``u < eventstart_fraction +
+    prediction_time_start_fraction`` the prediction time itself, otherwise a positive
+    ``start_duration_min..max`` delay from ``start_duration_distribution`` — and every start stream
+    is drawn in full before masking.  The three start axes (``derive_seed(seed, "start_forms")``,
+    ``"start_durations"``, ``"start_codes"``) are independent of the three legacy axes, so changing
+    any start setting perturbs neither the lengths, the codes, the horizons nor the end bounds, and
+    the defaults (``eventstart_fraction=0``, ``prediction_time_start_fraction=1``) reproduce the
+    pre-#27 specs exactly.  This does **not** claim the complete sampled sequence equals a
+    ``sample_multitask_sequences.py`` draw; controlled multitask evaluations use ``sequences_path``.
 
     Examples:
         >>> specs = sample_sequence_specs(3, ["A", "B", "TIMELINE//END"], 2, 2, 1, 365, seed=0)
@@ -421,9 +705,30 @@ def sample_sequence_specs(
         >>> (spec,) = sample_sequence_specs(1, ["A", "B"], 4, 4, 1, 365, 0, eventbound_fraction=1.0)
         >>> set(spec.bounds) <= {"A", "B"}, set(spec.durations)
         (True, {-1.0})
+
+        Starts are a separate component on their own seed axes: turning them on leaves the draw
+        above untouched and only adds the start tuples.
+
+        >>> (started,) = sample_sequence_specs(1, ["A", "B"], 4, 4, 1, 365, 0, eventbound_fraction=1.0,
+        ...     eventstart_fraction=0.5, prediction_time_start_fraction=0.0, start_event_codes=["B"])
+        >>> (started.queries, started.durations, started.bounds) == (
+        ...     spec.queries, spec.durations, spec.bounds)
+        True
+        >>> started.has_active_starts, set(started.start_events) <= {"B", None}
+        (True, True)
     """
     if n_sequences < 1:
         raise ValueError(f"n_sequences must be >= 1 (got {n_sequences})")
+    start_pool = list(query_codes) if start_event_codes is None else list(start_event_codes)
+    _validate_start_sampling(
+        eventstart_fraction,
+        prediction_time_start_fraction,
+        float(start_duration_min),
+        float(start_duration_max),
+        start_duration_distribution,
+        start_pool,
+        query_codes,
+    )
 
     dist = QuerySequenceDistribution(
         query_codes=list(query_codes),
@@ -442,15 +747,81 @@ def sample_sequence_specs(
         np.random.default_rng(derive_seed(seed, "sequences")),
         np.random.default_rng(derive_seed(seed, "bounds")),
     )
-    return [
-        SequenceSpec(
-            name=f"seq_{i:04d}",
-            queries=tuple(q.code for q in seq),
-            durations=tuple(float(q.duration_days) for q in seq),
-            bounds=tuple(q.bound_event for q in seq) if any(q.bound_event for q in seq) else (),
+    start_durations, start_events = _sample_starts(
+        total=sum(len(s) for s in sequences),
+        pool=start_pool,
+        eventstart_fraction=eventstart_fraction,
+        prediction_time_start_fraction=prediction_time_start_fraction,
+        start_duration_min=float(start_duration_min),
+        start_duration_max=float(start_duration_max),
+        start_duration_distribution=start_duration_distribution,
+        form_rng=np.random.default_rng(derive_seed(seed, "start_forms")),
+        duration_rng=np.random.default_rng(derive_seed(seed, "start_durations")),
+        code_rng=np.random.default_rng(derive_seed(seed, "start_codes")),
+    )
+    specs = []
+    offset = 0
+    for i, seq in enumerate(sequences):
+        n = len(seq)
+        specs.append(
+            _make_spec(
+                f"seq_{i:04d}",
+                [q.code for q in seq],
+                [float(q.duration_days) for q in seq],
+                [q.bound_event for q in seq],
+                start_durations[offset : offset + n].tolist(),
+                start_events[offset : offset + n].tolist(),
+            )
         )
-        for i, seq in enumerate(sequences)
-    ]
+        offset += n
+    return specs
+
+
+def _sample_starts(
+    total: int,
+    pool: Sequence[str],
+    eventstart_fraction: float,
+    prediction_time_start_fraction: float,
+    start_duration_min: float,
+    start_duration_max: float,
+    start_duration_distribution: str,
+    form_rng: np.random.Generator,
+    duration_rng: np.random.Generator,
+    code_rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray]:
+    """The multitask sampler's start draw for ``total`` flat query slots (see ``BoundaryDistribution``).
+
+    Returns ``(start_durations float32, start_events object)``; every stream is drawn in full over
+    all ``total`` slots and masked afterwards, so the realised form of one slot never shifts the
+    duration or code drawn for another.
+
+    Examples:
+        >>> rngs = lambda: [np.random.default_rng(i) for i in range(3)]
+        >>> d, e = _sample_starts(6, ["A", "B"], 0.5, 0.0, 1.0, 10.0, "uniform", *rngs())
+        >>> d.shape, d.dtype, e.shape
+        ((6,), dtype('float32'), (6,))
+        >>> bool(((d == -1.0) == (e != None)).all()), bool((d[e == None] >= 1.0).all())  # noqa: E711
+        (True, True)
+        >>> d0, e0 = _sample_starts(6, ["A", "B"], 0.0, 1.0, 1.0, 10.0, "uniform", *rngs())
+        >>> bool((d0 == 0.0).all()) and all(x is None for x in e0)
+        True
+    """
+    u = form_rng.random(total)
+    is_event = u < eventstart_fraction
+    is_pt = ~is_event & (u < eventstart_fraction + prediction_time_start_fraction)
+    if start_duration_distribution == "log-uniform":
+        durations = np.exp(
+            duration_rng.uniform(np.log(start_duration_min), np.log(start_duration_max), total)
+        ).astype(np.float32)
+    else:
+        durations = duration_rng.uniform(start_duration_min, start_duration_max, total).astype(np.float32)
+    events = np.full(total, None, dtype=object)
+    if pool:
+        picks = code_rng.integers(0, len(pool), size=total)
+        events[is_event] = np.array(pool, dtype=object)[picks[is_event]]
+    durations[is_pt] = 0.0
+    durations[is_event] = EVENT_BOUND_DURATION_SENTINEL
+    return durations, events
 
 
 def build_dense_sequence_index_df(
@@ -507,8 +878,10 @@ def build_dense_sequence_index_df(
     d = TaskQuerySchema.duration_days_name
 
     # The bound column appears only when some spec is event-bounded, so a bound-free grid stays
-    # byte-identical to one built before the feature existed.
+    # byte-identical to one built before the feature existed; the two start columns likewise appear
+    # only when some spec opens a window away from the prediction time (issue #27).
     any_bounds = any(s.bounds for s in specs)
+    any_starts = any(s.has_active_starts for s in specs)
 
     out_schema = {
         CTX_ID_COL: pl.UInt32,
@@ -520,6 +893,9 @@ def build_dense_sequence_index_df(
     }
     if any_bounds:
         out_schema[BOUND_COL] = pl.Utf8
+    if any_starts:
+        out_schema[START_DURATION_COL] = pl.Float32
+        out_schema[START_EVENT_COL] = pl.Utf8
     if contexts.height == 0:
         return pl.DataFrame(schema=out_schema)
 
@@ -544,6 +920,11 @@ def build_dense_sequence_index_df(
     if any_bounds:
         spec_cols[BOUND_COL] = [s.bound_at(p) for s in specs for p in range(len(s))]
         spec_schema[BOUND_COL] = pl.Utf8
+    if any_starts:
+        spec_cols[START_DURATION_COL] = [s.start_at(p)[0] for s in specs for p in range(len(s))]
+        spec_cols[START_EVENT_COL] = [s.start_at(p)[1] for s in specs for p in range(len(s))]
+        spec_schema[START_DURATION_COL] = pl.Float32
+        spec_schema[START_EVENT_COL] = pl.Utf8
 
     spec_frame = pl.DataFrame(spec_cols, schema=spec_schema)
 
@@ -573,6 +954,12 @@ def resolve_specs(
     duration_mode: str = "random",
     duration_distribution: str = "log-uniform",
     eventbound_fraction: float = 0.5,
+    eventstart_fraction: float = 0.0,
+    prediction_time_start_fraction: float = 1.0,
+    start_duration_min: float = 1.0,
+    start_duration_max: float = 180.0,
+    start_duration_distribution: str = "log-uniform",
+    start_event_codes: Sequence[str] | None = None,
 ) -> list[SequenceSpec]:
     """Read designed specs from ``sequences_path``, or sample them when it is ``None``."""
     if sequences_path is not None:
@@ -591,8 +978,20 @@ def resolve_specs(
         duration_mode=duration_mode,
         duration_distribution=duration_distribution,
         eventbound_fraction=eventbound_fraction,
+        eventstart_fraction=eventstart_fraction,
+        prediction_time_start_fraction=prediction_time_start_fraction,
+        start_duration_min=start_duration_min,
+        start_duration_max=start_duration_max,
+        start_duration_distribution=start_duration_distribution,
+        start_event_codes=start_event_codes,
     )
-    logger.info("Sampled %d query sequence(s) from the training query distribution", len(specs))
+    n_started = sum(s.has_active_starts for s in specs)
+    logger.info(
+        "Sampled %d query sequence(s) from the training query distribution (%d with a window start "
+        "away from the prediction time)",
+        len(specs),
+        n_started,
+    )
     return specs
 
 
@@ -620,18 +1019,20 @@ def validate_spec_codes(specs: list[SequenceSpec], vocab: Collection[str]) -> No
     labeling and model loading this check precedes.  Hand-written designed specs are exactly where
     a typo'd or wrong-vocabulary MEDS code enters.
     """
-    # Boundary events are checked too — a boundary the encoder never saw cannot define a window,
-    # and an unchecked one would surface as a KeyError deep inside collate, after the labeling
-    # and model load.
+    # Boundary and start events are checked too — an event the encoder never saw cannot define a
+    # window, and an unchecked one would surface as a KeyError deep inside collate, after the
+    # labeling and model load.
     mentioned = [q for s in specs for q in s.queries]
     mentioned += [b for s in specs for b in s.bounds if b is not None]
+    mentioned += [e for s in specs for e in s.start_events if e is not None]
     unknown = sorted(set(mentioned) - set(vocab))
     if unknown:
         shown = ", ".join(repr(c) for c in unknown[:10])
         more = f" (and {len(unknown) - 10} more)" if len(unknown) > 10 else ""
         raise ValueError(
-            f"{len(unknown)} spec query code(s) are absent from the query vocabulary: {shown}{more}. "
-            f"Check that `query_codes` points at the same codes.parquet the model was trained on."
+            f"{len(unknown)} spec query/start/bound code(s) are absent from the query vocabulary: "
+            f"{shown}{more}. Check that `query_codes` points at the same codes.parquet the model was "
+            "trained on."
         )
 
 
@@ -744,7 +1145,9 @@ def _specs_fingerprint(specs: list[SequenceSpec]) -> str:
     """Digest of the specs' *content* — ``(queries, durations, bounds)`` in order — never their names.
 
     Names do not reach the output (``QuerySeqSchema`` has no spec-name column), so two runs whose
-    specs differ only by name write identical grids and must fingerprint identically.
+    specs differ only by name write identical grids and must fingerprint identically.  Window starts
+    (issue #27) join the payload only when some spec has an active one, so a start-free run keeps
+    the fingerprint it had before starts existed and its previously written shards stay current.
 
     Examples:
         >>> a = [SequenceSpec("x", ("A", "B"), (1.0, 30.0))]
@@ -752,8 +1155,22 @@ def _specs_fingerprint(specs: list[SequenceSpec]) -> str:
         True
         >>> _specs_fingerprint(a) == _specs_fingerprint([SequenceSpec("x", ("A", "B"), (1.0, 31.0))])
         False
+
+        Spelling the default start out changes nothing; an active start does:
+
+        >>> default = [SequenceSpec("x", ("A", "B"), (1.0, 30.0), start_durations=(0.0, 0.0),
+        ...                         start_events=(None, None))]
+        >>> _specs_fingerprint(a) == _specs_fingerprint(default)
+        True
+        >>> delayed = [SequenceSpec("x", ("A", "B"), (1.0, 30.0), start_durations=(0.0, 7.0),
+        ...                         start_events=(None, None))]
+        >>> _specs_fingerprint(a) == _specs_fingerprint(delayed)
+        False
     """
     payload = [[list(s.queries), list(s.durations), list(s.bounds)] for s in specs]
+    if any(s.has_active_starts for s in specs):
+        for entry, s in zip(payload, specs, strict=True):
+            entry.append([[s.start_at(i)[0], s.start_at(i)[1]] for i in range(len(s))])
     return f"{len(specs)}:{hashlib.sha256(json.dumps(payload).encode()).hexdigest()[:16]}"
 
 
@@ -1023,6 +1440,13 @@ def main(cfg: DictConfig) -> None:
     # the cohort so the same ``(seed, split)`` yields the same ``N`` sequences for any cohort.
     sequences_path = cfg.get("sequences_path")
     eventbound_fraction = cfg.get("eventbound_fraction")
+    # Window starts (issue #27): keys absent from an older config fall back to prediction-time
+    # starts, exactly as the multitask sampler reads them.  ``start_event_codes`` is an explicit
+    # list / file (``read_query_codes``) or null for the whole effective universe.
+    pts = cfg.get("prediction_time_start_fraction")
+    start_event_codes = cfg.get("start_event_codes")
+    if start_event_codes is not None:
+        start_event_codes = read_query_codes(start_event_codes)
     specs = resolve_specs(
         sequences_path=sequences_path,
         query_codes=query_codes,
@@ -1036,16 +1460,24 @@ def main(cfg: DictConfig) -> None:
         duration_mode=str(cfg.get("duration_mode", "random")),
         duration_distribution=str(cfg.get("duration_distribution", "log-uniform")),
         eventbound_fraction=eventbound_fraction,
+        eventstart_fraction=float(cfg.get("eventstart_fraction", 0.0) or 0.0),
+        prediction_time_start_fraction=1.0 if pts is None else float(pts),
+        start_duration_min=float(cfg.get("start_duration_min", 1.0)),
+        start_duration_max=float(cfg.get("start_duration_max", 180.0)),
+        start_duration_distribution=str(cfg.get("start_duration_distribution", "log-uniform")),
+        start_event_codes=start_event_codes,
     )
     validate_spec_codes(specs, model_query_vocab(query_codes, ontology_dir))
     # Only *designed* specs get the whole-day check: sampled ones draw continuous float durations
     # by design.  A designed spec's fractional duration labels correctly but is usually a slip.
     if sequences_path is not None:
-        non_integer = sorted({float(d) for s in specs for d in s.durations if not float(d).is_integer()})
+        non_integer = sorted(
+            {float(d) for s in specs for d in (*s.durations, *s.start_durations) if not float(d).is_integer()}
+        )
         if non_integer:
             logger.warning(
-                "%d designed spec duration(s) are not whole days (e.g. %s); labeling honours the "
-                "fraction — check this is intended.",
+                "%d designed spec duration(s) / start duration(s) are not whole days (e.g. %s); labeling "
+                "honours the fraction — check this is intended.",
                 len(non_integer),
                 non_integer[:5],
             )

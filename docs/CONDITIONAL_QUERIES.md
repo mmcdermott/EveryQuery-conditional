@@ -125,7 +125,11 @@ Key source modules:
 
 - `src/every_query/data/seq_dataset.py` — `ConditionalQueryPytorchDataset`, `ConditionalQueryBatch`,
     `EOS_CODE = "TIMELINE//END"`. Binary answers, no sentinel.
-- `src/every_query/data/schema.py` — `QuerySeqSchema` (`queries`, `durations`, `answers` list cols).
+- `src/every_query/data/schema.py` — `QuerySeqSchema` (`queries`, `durations`, `answers` list cols,
+    plus the optional `bound_events` and — for evaluation grids only — `start_durations` /
+    `start_events` list columns; a window is `(start, end)` with the end resolved relative to the
+    resolved start, both endpoints open).  The ordinary sequence models accept only the default
+    prediction-time start; active starts are consumed by `EQ_predict_multitask`.
 - `src/every_query/generate_tasks/sample_query_sequences.py` — the 5-stage sequence sampler,
     mirroring `sample_tasks`: Stage 0 `build_prediction_times` (reused), Stage 1'
     `QuerySequenceDistribution` (a `QueryDistribution` subclass adding `min/max_queries` plus the

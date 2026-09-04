@@ -71,11 +71,15 @@ families of (scattered-for-training, dense-for-evaluation) pairs — one per mod
     flat grid and the sequence grid score the identical `(subject, time)` set; `contexts_path`
     overrides the sampled cohort with a supplied one. The `N` sequences are designed
     (`sequences_path=tasks.yaml`, a mapping of `name -> [[code, duration], ...]`, with
-    `[code, -1, bound_event]` for an event-bounded position) or drawn once from the training query
-    distribution (`num_evaluation_sequences=64`, 50% event-bounded by default) and shared by every shard. Reuses
-    `sample_evaluation_tasks`'s cohort sampler and `sample_query_sequences`'s
-    `label_query_sequences` labeler; only the grid build is its own. Registered as
-    `EQ_generate_evaluation_query_sequences`.
+    `[code, -1, bound_event]` for an event-bounded position and a mapping entry
+    `{query, duration_days, start_event | start_duration_days, bound_event}` for a window that
+    opens later than the prediction time) or drawn once from the training query distribution
+    (`num_evaluation_sequences=64`, 50% event-bounded by default, every window opening at the
+    prediction time unless the `eventstart_fraction` / `prediction_time_start_fraction` start knobs
+    say otherwise) and shared by every shard. Reuses `sample_evaluation_tasks`'s cohort sampler and
+    `sample_query_sequences`'s `label_query_sequences` labeler (which routes a grid with explicit
+    starts through `interval_table.py`, the multitask sampler's window resolver); only the grid
+    build is its own. Registered as `EQ_generate_evaluation_query_sequences`.
 
 - **`configs/sample_query_sequences_config.yaml`** / **`configs/sample_evaluation_query_sequences_config.yaml`**
     — the conditional endpoints' configs. Same required-path-arg contract as the single-query
@@ -209,7 +213,7 @@ EQ_generate_evaluation_query_sequences \
 # Or designed sequences on a supplied cohort (`contexts_path` bypasses the cohort knobs; every
 # subject must be in the split). Event-bounded positions use `[query, -1, bound_event]`; long-format
 # parquet specs use the optional nullable `bound_event` column. Spec identity in the output is the
-# (queries, durations, bound_events) columns.
+# (queries, durations, bound_events[, start_durations, start_events]) columns.
 EQ_generate_evaluation_query_sequences \
 	data_dir=$TOKENIZED_EVENTS_DIR out_dir=$EVAL_SEQ_TASKS_DIR query_codes=$TENSORIZED_COHORT_DIR \
 	split=held_out contexts_path=cohort.parquet sequences_path=tasks.yaml
@@ -217,6 +221,54 @@ EQ_generate_evaluation_query_sequences \
 
 `EQ_generate_query_sequences` takes the same three path args and only ever samples its contexts;
 to label a supplied cohort use `EQ_generate_evaluation_query_sequences contexts_path=...`.
+
+#### Window starts (issue #27)
+
+A query's window may open later than the prediction time — after a delay, or at the next
+occurrence of a start event — with the end then measured from the **resolved start**:
+
+```
+start  = prediction_time + start_duration_days   OR  first start_event strictly after prediction_time
+end    = start + duration_days                   OR  first bound_event strictly after the resolved start
+answer = start < some occurrence of query < end  (both endpoints open)
+```
+
+A start event that never occurs after the prediction time leaves the window empty (answer `False`,
+even if the end is also unresolved); an end event that never occurs after a resolved start lets the
+window run to the end of the record.  These are the multitask sampler's window semantics, and
+`label_query_sequences` labels a grid carrying starts through the same `interval_table.py`
+resolver — so `EQ_predict_multitask` can score the grid.  Designed specs spell starts out with the
+mapping entry form (missing start keys mean a prediction-time start):
+
+```yaml
+post_admission:                        # opens at the next admission, closes 30d after it
+  - query: LAB//X
+    start_event: HOSPITAL_ADMISSION
+    duration_days: 30
+delayed:                               # opens 7d after the prediction time, closes 30d later
+  - query: ICD//I10
+    start_duration_days: 7
+    duration_days: 30
+between_events:                        # opens at the admission, closes at the next discharge
+  - query: PROCEDURE//X
+    start_event: HOSPITAL_ADMISSION
+    duration_days: -1
+    bound_event: HOSPITAL_DISCHARGE
+```
+
+or, in a long-format parquet, the optional `start_duration_days` / `start_event` columns next to
+`seq_id, position, query, duration_days[, bound_event]`.  Sampled specs draw starts from the
+`eventstart_fraction` / `prediction_time_start_fraction` / `start_duration_min|max|distribution` /
+`start_event_codes` knobs (the multitask sampler's cumulative form split) on three seed axes of their
+own, so a start knob perturbs none of the query / duration / end draws; the defaults open every window
+at the prediction time and reproduce the pre-#27 grid — same specs, no start columns in the output.
+Output rows carry `start_durations` (`0.0` = prediction time, `> 0` = delay in days, `-1.0` = event
+start) and `start_events` (the start code, or null) only when some spec has an active start.
+
+**The ordinary sequence models accept only prediction-time starts**: `ConditionalQueryPytorchDataset`
+loads a grid with absent or all-default start columns, and refuses one with any positive-delay or
+event start unless built with `allow_active_starts=True` — which only the multitask prediction
+adapter does.  `EQ_generate_query_sequences` never samples a start.
 
 ### Multitask boundary labels — every code at every window
 

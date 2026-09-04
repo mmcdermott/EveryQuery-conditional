@@ -5,8 +5,8 @@ emitting, per sampled patient context, an ordered *sequence* of queries rather t
 ``(code, duration)``::
 
     Stage 0   build + cache the canonical prediction-time map and subject counts (reused as-is)
-    Stage 1'  sample ``num_training_sequence_examples`` variable-length query sequences (QuerySequenceDistribution),
-              each query either horizon-bounded or event-bounded
+    Stage 1'  sample ``num_training_sequence_examples`` variable-length query sequences
+              (QuerySequenceDistribution), each query either horizon-bounded or event-bounded
     Stage 2   sample ``num_training_sequence_examples`` patient contexts (reused as-is)
     Stage 3'  resolve ``prediction_time_index -> prediction_time``, zip, write per-shard index
     Stage 4'  binary-label each index shard independently and write the final dataset parquet
@@ -102,6 +102,24 @@ INDEX_COLUMNS = [
 
 # Per-query boundary code in the flat index frame; becomes the ``bound_events`` list column.
 BOUND_COL = "bound_event"
+
+# Per-query explicit window start in the flat index frame (issue #27): days after the prediction
+# time (``0.0`` = the prediction time itself, ``EVENT_BOUND_DURATION_SENTINEL`` = event-defined) and
+# the start-event code (null for a duration start).  They become the ``start_durations`` /
+# ``start_events`` list columns and are present together or absent together.  Only the dense
+# evaluation grid writes them; the training sampler never samples a start.
+START_DURATION_COL = "start_duration_days"
+START_EVENT_COL = "start_event"
+START_INDEX_COLS = (START_DURATION_COL, START_EVENT_COL)
+
+# The window semantics the explicit-start labeler implements, spelled with the multitask sampler's
+# vocabulary (``sample_multitask_sequences.WINDOW_SEMANTICS`` and friends; ``tests`` assert the two
+# agree).  Stated here so the contract is visible where the scalar labeler lives.
+WINDOW_SEMANTICS = "open_open"
+START_REFERENCE = "prediction_time"
+DURATION_END_REFERENCE = "resolved_start"
+MISSING_EVENT_START = "empty_window"
+MISSING_EVENT_BOUNDARY = "infinity"
 
 
 # ---------------------------------------------------------------------------
@@ -856,6 +874,216 @@ def log_degenerate_bounds(index_df: pl.DataFrame, events_df: pl.DataFrame) -> di
     return {r[BOUND_COL]: float(r["degenerate_rate"]) for r in rates.sort(BOUND_COL).iter_rows(named=True)}
 
 
+def label_with_explicit_starts(index_df: pl.DataFrame, events_df: pl.DataFrame) -> pl.DataFrame:
+    """Label a frame whose queries carry explicit window starts (issue #27).
+
+    Each flat query row is one window resolved by the multitask sampler's rules, reusing
+    :mod:`~every_query.generate_tasks.interval_table` rather than re-deriving them::
+
+        start = prediction_time + start_duration_days           (start_event null)
+              | first occurrence of start_event STRICTLY AFTER prediction_time   (else INF)
+        end   = start + duration_days                            (bound_event null)
+              | first occurrence of bound_event STRICTLY AFTER the RESOLVED START (else INF)
+        answer = some occurrence of query satisfies  start < occurrence < end
+
+    That is ``WINDOW_SEMANTICS = "open_open"``, ``START_REFERENCE = "prediction_time"``,
+    ``DURATION_END_REFERENCE = "resolved_start"``, ``MISSING_EVENT_START = "empty_window"`` and
+    ``MISSING_EVENT_BOUNDARY = "infinity"``.  Concretely:
+
+    - Both endpoints are open: an occurrence at the start instant or at the end instant is outside.
+    - The end is resolved **relative to the resolved start**, never to ``prediction_time``: a
+      duration end is ``start + duration``, and an event end is the boundary's first occurrence
+      after the start — an occurrence of the boundary code between the prediction time and the
+      start does not close the window.
+    - A start event with no occurrence after the prediction time leaves the window empty: the
+      answer is ``False`` even when the end is also unresolved (``INF < INF`` is false), so an
+      unresolved start never becomes an infinite positive window.
+    - An end event with no occurrence after a resolved start lets the window run to the end of the
+      record, as :func:`label_with_event_bounds` does.
+    - A prediction-time start (``0.0`` / null) reproduces :func:`label_binary_occurrence` /
+      :func:`label_with_event_bounds` exactly for whole-day horizons.  One caveat for fractional
+      horizons: the legacy Polars path computes ``prediction_time + pl.duration(days=d)``, which
+      *truncates* the microsecond offset, while ``interval_table`` rounds it with ``np.rint``, so the
+      two can disagree on an occurrence landing within a microsecond of a non-integer-day horizon
+      (e.g. ``2.7`` days: 233280004119 vs 233280004120 µs).  Neither rounding is changed here; the
+      multitask training labels use the ``interval_table`` rule, which is what an explicit-start
+      grid is scored against.
+
+    Only the scalar query named by each row is labeled — no ``N x K x V`` target is built.  Codes
+    are indexed locally over the union of the event stream and every query/start/bound code, so a
+    code absent from the events simply never occurs (``INF``).
+
+    Returns:
+        One row per ``_ctx_id`` with ``queries`` / ``durations`` / ``answers`` list columns, plus
+        ``bound_events`` when the index carried ``bound_event`` and the ``start_durations`` /
+        ``start_events`` list columns (the index must carry both start columns).
+
+    Examples:
+        >>> from datetime import datetime
+        >>> events = pl.DataFrame({
+        ...     "subject_id": [1, 1, 1, 1],
+        ...     "time": [datetime(2024, 1, 3), datetime(2024, 1, 6), datetime(2024, 1, 9),
+        ...              datetime(2024, 1, 20)],
+        ...     "code": ["A", "ADMIT", "A", "DISCHARGE"],
+        ... }).with_columns(pl.col("time").cast(pl.Datetime("us")))
+        >>> idx = pl.DataFrame({
+        ...     "_ctx_id": [0, 0, 0],
+        ...     "_position": [0, 1, 2],
+        ...     "subject_id": [1, 1, 1],
+        ...     "prediction_time": [datetime(2024, 1, 1)] * 3,
+        ...     "query": ["A", "A", "A"],
+        ...     "duration_days": [30.0, -1.0, 30.0],
+        ...     "bound_event": [None, "DISCHARGE", None],
+        ...     "start_duration_days": [0.0, -1.0, -1.0],
+        ...     "start_event": [None, "ADMIT", "NEVER"],
+        ... }).with_columns(
+        ...     pl.col("prediction_time").cast(pl.Datetime("us")),
+        ...     pl.col("duration_days").cast(pl.Float32),
+        ...     pl.col("start_duration_days").cast(pl.Float32),
+        ...     pl.col("_ctx_id").cast(pl.UInt32))
+        >>> row = label_with_explicit_starts(idx, events).row(0, named=True)
+
+        Position 0 opens at the prediction time (A on the 3rd is inside 30 days); position 1 opens
+        at the admission on the 6th and closes at the discharge (A on the 9th is inside; A on the
+        3rd is before the start and does not count); position 2's start event never occurs, so the
+        window is empty:
+
+        >>> row["answers"]
+        [True, True, False]
+        >>> row["start_events"], row["bound_events"]
+        ([None, 'ADMIT', 'NEVER'], [None, 'DISCHARGE', None])
+    """
+    from every_query.generate_tasks.interval_table import (
+        INF,
+        build_interval_table,
+        next_occurrence_after,
+        resolve_end_times,
+        resolve_start_times,
+    )
+
+    sid = TaskQuerySchema.subject_id_name
+    pt = TaskQuerySchema.prediction_time_name
+    q = TaskQuerySchema.query_name
+    d = TaskQuerySchema.duration_days_name
+    missing = [c for c in START_INDEX_COLS if c not in index_df.columns]
+    if missing:
+        raise ValueError(
+            f"index frame carries {[c for c in START_INDEX_COLS if c in index_df.columns]} but not {missing}"
+        )
+    has_bounds = BOUND_COL in index_df.columns
+
+    ordered = index_df.sort(CTX_ID_COL, POSITION_COL)
+    n = ordered.height
+
+    # A local code index over everything that can occur or be named; codes named by a query but
+    # absent from the stream get an index too, and simply never resolve.
+    events = events_df.filter(pl.col(DataSchema.time_name).is_not_null())
+    named = [ordered[q], ordered[START_EVENT_COL]]
+    if has_bounds:
+        named.append(ordered[BOUND_COL])
+    universe = (
+        pl.concat([events[DataSchema.code_name].cast(pl.Utf8), *[s.cast(pl.Utf8) for s in named]])
+        .drop_nulls()
+        .unique()
+        .sort()
+    )
+    code_to_index = {c: i for i, c in enumerate(universe.to_list())}
+    vocab_size = max(len(code_to_index), 1)
+
+    def encode(series: pl.Series) -> np.ndarray:
+        """Vocabulary index per row, ``-1`` where the code is null (a duration-defined slot)."""
+        if n == 0:
+            return np.empty((0, 1), dtype=np.int64)
+        mapped = series.cast(pl.Utf8).replace_strict(code_to_index, default=-1, return_dtype=pl.Int64)
+        return mapped.fill_null(-1).to_numpy().astype(np.int64).reshape(n, 1)
+
+    # ``interval_table`` works in int64 microseconds (``US_PER_DAY``), so both time columns are
+    # normalised to ``Datetime("us")`` before the cast — a ``ms``/``ns`` frame would otherwise be
+    # silently mislabeled, exactly as the multitask sampler guards against.
+    table = build_interval_table(
+        events[sid].to_numpy().astype(np.int64),
+        events[DataSchema.time_name].cast(pl.Datetime("us")).cast(pl.Int64).to_numpy(),
+        events[DataSchema.code_name]
+        .cast(pl.Utf8)
+        .replace_strict(code_to_index, return_dtype=pl.Int64)
+        .to_numpy(),
+        vocab_size=vocab_size,
+    )
+
+    subject_ids = ordered[sid].to_numpy().astype(np.int64)
+    prediction_times = ordered[pt].cast(pl.Datetime("us")).cast(pl.Int64).to_numpy()
+    start_durations = ordered[START_DURATION_COL].cast(pl.Float64).fill_null(np.nan).to_numpy().reshape(n, 1)
+    start_codes = encode(ordered[START_EVENT_COL])
+    durations = ordered[d].cast(pl.Float64).to_numpy().reshape(n, 1)
+    bound_codes = encode(ordered[BOUND_COL]) if has_bounds else np.full((n, 1), -1, dtype=np.int64)
+    query_codes = encode(ordered[q])[:, 0]
+
+    # The representation contract is enforced at the seam that produces the answers, not only in
+    # the generator and the dataset: a negative or non-finite non-sentinel start would otherwise
+    # resolve to an arbitrary instant *before* the prediction time and label silently.
+    by_event = start_codes >= 0
+    bad_duration = ~by_event & ~(np.isfinite(start_durations) & (start_durations >= 0))
+    bad_event = by_event & (start_durations != EVENT_BOUND_DURATION_SENTINEL)
+    if bad_duration.any() or bad_event.any():
+        first = int(np.flatnonzero((bad_duration | bad_event)[:, 0])[0])
+        raise ValueError(
+            "start_duration_days/start_event disagree on which queries are event-defined: each row must "
+            "be either start_duration_days >= 0 (finite) with a null start_event, or start_duration_days "
+            f"== {EVENT_BOUND_DURATION_SENTINEL} with a non-null start_event; first bad row {first} has "
+            f"start_duration_days={start_durations[first, 0]!r}, "
+            f"start_event={ordered[START_EVENT_COL][first]!r}."
+        )
+
+    starts = resolve_start_times(table, subject_ids, prediction_times, start_durations, start_codes)
+    ends = resolve_end_times(table, subject_ids, starts, durations, bound_codes)
+    # First occurrence of the query strictly after the resolved start; an unresolved start (INF)
+    # has nothing after it, so the window stays empty even when the end is INF too.
+    next_query = next_occurrence_after(table, subject_ids, starts[:, 0], query_codes)
+    answers = next_query < ends[:, 0]
+
+    if n:
+        n_event_start = int((start_codes >= 0).sum())
+        n_empty = int((starts == INF).sum())
+        if n_event_start:
+            logger.info(
+                "Explicit starts: %d event-defined start(s), %d (%.1f%%) never resolve (empty window).",
+                n_event_start,
+                n_empty,
+                100.0 * n_empty / n_event_start,
+            )
+        # The explicit-start counterpart of ``log_degenerate_bounds``: an event end that never
+        # recurs after the *resolved* start runs to the end of the record (the query degenerates to
+        # "does this code ever occur again").  Anchored at the resolved start, not the prediction
+        # time, so only windows that actually opened are counted.
+        opened_event_end = (bound_codes >= 0) & (starts != INF)
+        n_opened = int(opened_event_end.sum())
+        if n_opened:
+            n_degenerate = int((opened_event_end & (ends == INF)).sum())
+            logger.info(
+                "Event bounds after a resolved start: %d window(s), %d (%.1f%%) have no boundary "
+                "occurrence after the start (window runs to end of record).",
+                n_opened,
+                n_degenerate,
+                100.0 * n_degenerate / n_opened,
+            )
+
+    flat = ordered.with_columns(pl.Series("answer", answers, dtype=pl.Boolean))
+    aggregations = [
+        pl.col(sid).first(),
+        pl.col(pt).first(),
+        pl.col(q).alias("queries"),
+        pl.col(d).alias("durations"),
+        pl.col("answer").alias("answers"),
+    ]
+    if has_bounds:
+        aggregations.append(pl.col(BOUND_COL).alias("bound_events"))
+    aggregations += [
+        pl.col(START_DURATION_COL).alias("start_durations"),
+        pl.col(START_EVENT_COL).alias("start_events"),
+    ]
+    return flat.group_by(CTX_ID_COL, maintain_order=True).agg(aggregations).drop(CTX_ID_COL)
+
+
 def maybe_expand_to_matching_query_nodes(events_df: pl.DataFrame, ontology_dir: str | Path | None):
     """Repeat each event under its ancestor node names, so ancestor queries label normally.
 
@@ -882,11 +1110,14 @@ def label_query_sequences(index_df: pl.DataFrame, events_df: pl.DataFrame) -> pl
     way in training and another in evaluation produces a grid that looks fine and silently
     measures the wrong thing.
 
-    Dispatch is on the *frame*, not on a config flag: an index carrying a ``bound_event``
-    column is labelled with :func:`label_with_event_bounds`, anything else with
+    Dispatch is on the *frame*, not on a config flag: an index carrying the explicit-start
+    columns (``start_duration_days`` / ``start_event``, issue #27) is labelled with
+    :func:`label_with_explicit_starts` on the interval table; one carrying only a ``bound_event``
+    column with :func:`label_with_event_bounds`; anything else with
     :func:`label_binary_occurrence`, which stays the regression anchor for plain occurrence
-    semantics.  Keying on the data means an eval grid built with bounds is always scored with
-    bound-aware labels, even if some caller forgets to pass the flag.
+    semantics.  Keying on the data means an eval grid built with bounds or starts is always scored
+    with the matching labels, even if some caller forgets to pass a flag — and an index with only
+    one of the two start columns is an error, not a legacy frame.
 
     This must remain a **module-level function**: Stage 4' fans shards out through a
     ``ProcessPoolExecutor`` with ``mp_context="spawn"``, so a closure or a locally-defined
@@ -899,8 +1130,17 @@ def label_query_sequences(index_df: pl.DataFrame, events_df: pl.DataFrame) -> pl
 
     Returns:
         One row per sequence, with the ``queries``/``durations``/``answers`` list columns
-        (plus ``bound_events`` when the index carried bounds).
+        (plus ``bound_events`` when the index carried bounds, and ``start_durations`` /
+        ``start_events`` when it carried explicit starts).
     """
+    present_starts = [c for c in START_INDEX_COLS if c in index_df.columns]
+    if present_starts:
+        if len(present_starts) != len(START_INDEX_COLS):
+            raise ValueError(
+                f"index frame carries {present_starts} but not all of {list(START_INDEX_COLS)}; the two "
+                "explicit-start columns must be present together."
+            )
+        return label_with_explicit_starts(index_df, events_df)
     if BOUND_COL in index_df.columns:
         log_degenerate_bounds(index_df, events_df)
         return label_with_event_bounds(index_df, events_df)

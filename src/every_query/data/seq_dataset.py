@@ -20,6 +20,13 @@ query list:
   holds ``ANSWER_NO``; it is ignored under ``q_mask``);
 - ``q_mask``      (B, L) bool — True at real (non-padding) query positions.
 
+Two optional label columns refine a query's window and ride along when present: ``bound_events``
+(the window ends at the next occurrence of that code; ``q_bound_codes`` in the batch) and the
+issue-#27 pair ``start_durations`` / ``start_events`` (the window *opens* later than the prediction
+time).  The ordinary sequence models do not encode starts, so the dataset rejects any *active*
+start unless built with ``allow_active_starts=True``, in which case the batch also carries
+``q_start_durations`` / ``q_start_codes`` ``(B, L)`` for the multitask prediction adapter.
+
 Unlike :class:`~every_query.data.dataset.EveryQueryPytorchDataset`, **no query token is prepended
 to the patient event sequence** — the patient sequence feeds the bidirectional encoder unchanged,
 and queries live exclusively in the decoder stream.
@@ -58,7 +65,14 @@ SEQ_LABEL_COLS = (QUERIES_COL, DURATIONS_COL, ANSWERS_COL)
 # NOT in SEQ_LABEL_COLS — that tuple is the *required* set, and a dataset generated before this
 # feature existed must keep loading.
 BOUND_EVENTS_COL = "bound_events"
-OPTIONAL_SEQ_LABEL_COLS = (BOUND_EVENTS_COL,)
+# Explicit window starts (issue #27): ``start_durations[j]`` days after the prediction time (0.0 =
+# the prediction time itself, the legacy form), or ``EVENT_BOUND_DURATION_SENTINEL`` with a
+# non-null ``start_events[j]`` for a window that opens at that event's next occurrence.  Present
+# together or absent together; absent reads as ``[0.0] * K`` / ``[None] * K``.
+START_DURATIONS_COL = "start_durations"
+START_EVENTS_COL = "start_events"
+START_COLS = (START_DURATIONS_COL, START_EVENTS_COL)
+OPTIONAL_SEQ_LABEL_COLS = (BOUND_EVENTS_COL, *START_COLS)
 ALL_SEQ_LABEL_COLS = (*SEQ_LABEL_COLS, *OPTIONAL_SEQ_LABEL_COLS)
 
 # Duration written for an event-bounded query.  The window is defined by the boundary event, so
@@ -115,6 +129,13 @@ class ConditionalQueryBatch(MEDSTorchBatch):
     # Per-query boundary-event vocab indices; ``NO_BOUND_INDEX`` (0) means "time-bounded".
     # ``None`` for a dataset whose labels carry no ``bound_events`` column at all.
     q_bound_codes: torch.LongTensor | None = None
+    # Per-query window starts (issue #27): days after the prediction time (``0.0`` = the
+    # prediction time, ``EVENT_BOUND_DURATION_SENTINEL`` = event-defined) and the start event's
+    # vocab index (``NO_BOUND_INDEX`` for a duration start).  Filled only by a dataset built with
+    # ``allow_active_starts=True`` (the multitask prediction adapter); the ordinary sequence models
+    # do not encode starts, so their batches carry ``None`` here.  Given together or not at all.
+    q_start_durations: torch.FloatTensor | None = None
+    q_start_codes: torch.LongTensor | None = None
     # Per-patient-token elapsed time in integer hours, for rotary position encoding.  Present
     # only when the dataset was built with ``strip_delta_tokens=True``; ``None`` leaves the
     # encoder on ordinary token-index positions.  Shape matches ``code``, not the query tensors.
@@ -126,6 +147,8 @@ class ConditionalQueryBatch(MEDSTorchBatch):
         "q_durations",
         "q_answers",
         "q_bound_codes",
+        "q_start_durations",
+        "q_start_codes",
     )
 
     @property
@@ -134,12 +157,19 @@ class ConditionalQueryBatch(MEDSTorchBatch):
 
     def __post_init__(self):
         super().__post_init__()
+        if (self.q_start_durations is None) != (self.q_start_codes is None):
+            missing = "q_start_durations" if self.q_start_durations is None else "q_start_codes"
+            raise ValueError(
+                f"q_start_durations and q_start_codes must be given together (got {missing}=None)"
+            )
         if self.q_codes is None:
             return
         expected = (self.batch_size, self.q_codes.shape[1])
         names = ["q_codes", "q_durations", "q_answers", "q_mask"]
         if self.q_bound_codes is not None:
             names.append("q_bound_codes")
+        if self.q_start_durations is not None:
+            names += ["q_start_durations", "q_start_codes"]
         for name in names:
             tensor = getattr(self, name)
             if tensor is None or tuple(tensor.shape) != expected:
@@ -244,6 +274,7 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
         *,
         strip_delta_tokens: bool = False,
         ontology_dir: str | None = None,
+        allow_active_starts: bool = False,
     ):
         """Build the dataset.
 
@@ -259,6 +290,15 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
                 are added to the query vocabulary, so a query may name a whole class rather
                 than one leaf code.  Must be the same directory the model was built with —
                 the indices have to agree, or a query would address the wrong embedding row.
+            allow_active_starts: Opt in to tensorizing the optional ``start_durations`` /
+                ``start_events`` label columns (issue #27) into
+                :attr:`ConditionalQueryBatch.q_start_durations` / ``q_start_codes``.  The
+                ordinary sequence models (``ConditionalQueryEncoderDecoderModel``,
+                ``ConditionalQueryARModel``) do not encode window starts, so with the default
+                ``False`` a labels directory carrying any *active* start (a positive duration or
+                an event start) is rejected at init rather than silently scored as if every window
+                opened at the prediction time.  Absent or all-default (``0.0`` / null) starts are
+                always accepted.  Only the multitask prediction adapter passes ``True``.
         """
         super().__init__(cfg, split)
 
@@ -279,6 +319,19 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
         # existed simply has no such column, and the batch then carries q_bound_codes=None.
         self.has_bound_events = BOUND_EVENTS_COL in schema_cols
         self.bound_events = self.schema_df[BOUND_EVENTS_COL] if self.has_bound_events else None
+
+        # Window starts (issue #27) are likewise keyed on the data, but the two columns must travel
+        # together: one without the other is a half-written grid, not a legacy one.
+        present_starts = [c for c in START_COLS if c in schema_cols]
+        if present_starts and len(present_starts) != len(START_COLS):
+            raise ValueError(
+                f"the labels carry {present_starts} but not all of {list(START_COLS)}; the two start "
+                "columns must be present together or absent together."
+            )
+        self.has_starts = bool(present_starts)
+        self.allow_active_starts = allow_active_starts
+        self.start_durations = self.schema_df[START_DURATIONS_COL] if self.has_starts else None
+        self.start_events = self.schema_df[START_EVENTS_COL] if self.has_starts else None
 
         code_meta = pl.read_parquet(
             self.config.code_metadata_fp, columns=["code", "code/vocab_index"], use_pyarrow=True
@@ -316,10 +369,12 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
         mentioned = set(self.queries.explode().drop_nulls().to_list())
         if self.has_bound_events:
             mentioned |= set(self.bound_events.explode().drop_nulls().to_list())
+        if self.has_starts:
+            mentioned |= set(self.start_events.explode().drop_nulls().to_list())
         unknown = sorted(mentioned - self.code_to_index.keys())
         if unknown:
             raise ValueError(
-                f"{len(unknown)} query/bound code(s) in the labels are not in this run's vocabulary "
+                f"{len(unknown)} query/bound/start code(s) in the labels are not in this run's vocabulary "
                 f"(codes.parquet + ontology): {unknown[:10]}. Regenerate the labels with the same "
                 f"query_codes/ontology_dir as this run, or pass the matching ones here."
             )
@@ -349,6 +404,8 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
                 dtype=np.int64,
                 count=len(b),
             )
+        if self.has_starts:
+            self._q_start_durations, self._q_start_codes = self._encode_starts()
 
         self.strip_delta_tokens = strip_delta_tokens
         self.delta_ids = rope_time.delta_vocab_ids(self.code_to_index)
@@ -364,6 +421,56 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
                     "RoPE time: stripping %d delta-token vocab ids from the encoder input.",
                     self.delta_ids.numel(),
                 )
+
+    def _encode_starts(self) -> tuple[np.ndarray, np.ndarray]:
+        """Validate the start columns against the module contract and pre-encode them.
+
+        Returns ``(start_durations float32, start_codes int64)`` flat arrays aligned with
+        ``_q_offsets``.  Every representation error is raised here, at init: ragged lists, a
+        non-finite or negative non-sentinel duration, an event start without the ``-1.0`` sentinel,
+        a sentinel without an event, and — unless ``allow_active_starts`` — any start that is not
+        the prediction time itself.  The last rule is what keeps an ordinary sequence model from
+        silently scoring a window it cannot represent.
+        """
+        s_offsets, s_durations = _ragged(self.start_durations)
+        e_offsets, s_events = _ragged(self.start_events)
+        if not (np.array_equal(self._q_offsets, s_offsets) and np.array_equal(self._q_offsets, e_offsets)):
+            raise ValueError("queries/start_durations/start_events list lengths disagree in the labels.")
+
+        durations = np.asarray(s_durations, dtype=np.float64)
+        if durations.size and np.isnan(durations).any():
+            raise ValueError("start_durations must not contain nulls or NaN.")
+        by_event = np.array([c is not None for c in s_events], dtype=bool)
+        if durations.size:
+            bad_event = by_event & (durations != EVENT_BOUND_DURATION_SENTINEL)
+            bad_duration = ~by_event & ~(np.isfinite(durations) & (durations >= 0))
+            if bad_event.any() or bad_duration.any():
+                first = int(np.flatnonzero(bad_event | bad_duration)[0])
+                raise ValueError(
+                    "start_durations/start_events disagree on which queries are event-defined: each "
+                    f"position must be either start_duration >= 0 (finite) with a null start_event, or "
+                    f"start_duration == {EVENT_BOUND_DURATION_SENTINEL} with a non-null start_event; "
+                    f"first bad flat position {first} has start_duration={durations[first]!r}, "
+                    f"start_event={s_events[first]!r}."
+                )
+
+        n_active = int(by_event.sum() + ((~by_event) & (durations > 0)).sum()) if durations.size else 0
+        if n_active and not self.allow_active_starts:
+            raise ValueError(
+                f"{n_active} query window(s) in the labels have an active start (a positive "
+                "start_duration or a start_event).  The ordinary sequence models "
+                "(ConditionalQueryEncoderDecoderModel / ConditionalQueryARModel) do not encode window "
+                "starts, so scoring these labels with EQ_predict_sequences would silently treat every "
+                "window as opening at the prediction time.  Score them with EQ_predict_multitask (its "
+                "adapter passes allow_active_starts=True), or regenerate the grid with prediction-time "
+                "starts."
+            )
+        start_codes = np.fromiter(
+            (NO_BOUND_INDEX if c is None else self.code_to_index[c] for c in s_events),
+            dtype=np.int64,
+            count=len(s_events),
+        )
+        return durations.astype(np.float32), start_codes
 
     @property
     def labels_df(self) -> pl.DataFrame:
@@ -403,6 +510,14 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
         out["answers"] = self._q_answers[s:e]
         if self.has_bound_events:
             out["bound_events"] = self._q_bound_codes[s:e]
+        if self.allow_active_starts:
+            # The adapter always gets start tensors: absent columns are the legacy all-default form.
+            if self.has_starts:
+                out["start_durations"] = self._q_start_durations[s:e]
+                out["start_codes"] = self._q_start_codes[s:e]
+            else:
+                out["start_durations"] = np.zeros(e - s, dtype=np.float32)
+                out["start_codes"] = np.full(e - s, NO_BOUND_INDEX, dtype=np.int64)
         return out
 
     def _apply_rope_time(self, out: dict) -> torch.LongTensor | None:
@@ -471,6 +586,11 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
         q_bound_codes = (
             torch.full((B, max_q), NO_BOUND_INDEX, dtype=torch.long) if self.has_bound_events else None
         )
+        # Start tensors exist only under the explicit opt-in; an ordinary batch is unchanged.
+        q_start_durations = torch.zeros(B, max_q, dtype=torch.float) if self.allow_active_starts else None
+        q_start_codes = (
+            torch.full((B, max_q), NO_BOUND_INDEX, dtype=torch.long) if self.allow_active_starts else None
+        )
 
         for i, item in enumerate(batch):
             n = len(item["queries"])
@@ -485,6 +605,9 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
                 # Pre-encoded at init: NO_BOUND_INDEX for a time-bounded query, else the strict
                 # vocab index (an unknown boundary code fails there, never silently PAD-encodes).
                 q_bound_codes[i, :n] = torch.as_tensor(item["bound_events"], dtype=torch.long)
+            if q_start_durations is not None:
+                q_start_durations[i, :n] = torch.as_tensor(item["start_durations"], dtype=torch.float)
+                q_start_codes[i, :n] = torch.as_tensor(item["start_codes"], dtype=torch.long)
 
         return ConditionalQueryBatch(
             **out,
@@ -493,5 +616,7 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
             q_answers=q_answers,
             q_mask=q_mask,
             q_bound_codes=q_bound_codes,
+            q_start_durations=q_start_durations,
+            q_start_codes=q_start_codes,
             time_pos_ids=time_pos_ids,
         )

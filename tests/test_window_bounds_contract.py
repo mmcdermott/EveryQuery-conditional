@@ -52,6 +52,11 @@ a query window:
    note that the adapter *refuses* a censored answer rather than papering over it.
 5. ``sample_query_sequences.label_query_sequences`` -- the public seam that both the training
    shards and the dense evaluation grid actually call.
+6. ``sample_query_sequences.label_with_explicit_starts`` -- the issue-#27 interval-table path, in
+   three configurations: a spelled-out prediction-time start (time-bounded and event-bounded, so it
+   is measured on the identical interval as 1-3), and a *resolved* start placed on the prediction
+   instant itself via a start event, so the open lower bound is checked at a resolved start too.
+   Its ``end`` is resolved relative to the resolved start, which here *is* ``PREDICTION_TIME``.
 
 **A labeller missing from that list is exactly how this drifted the first time.**  Anything new
 that decides window membership belongs in it.
@@ -97,9 +102,12 @@ from every_query.generate_tasks.sample_query_sequences import (
     BOUND_COL,
     CTX_ID_COL,
     POSITION_COL,
+    START_DURATION_COL,
+    START_EVENT_COL,
     label_binary_occurrence,
     label_query_sequences,
     label_with_event_bounds,
+    label_with_explicit_starts,
 )
 from every_query.generate_tasks.sample_tasks import evaluate_index_df
 
@@ -128,6 +136,11 @@ BOUND_CODE = "BOUND//EVENT"
 #: it never matches the query code and lands far outside the window.
 TAIL_CODE = "OBSERVED//TAIL"
 TAIL_TIME = PREDICTION_TIME + timedelta(days=365)
+#: Start event for the explicit-start decider, planted one tick BEFORE the prediction instant so the
+#: window resolved from it -- "first occurrence strictly after the *anchor*" -- opens exactly at
+#: ``PREDICTION_TIME`` when the anchor is that earlier instant.  See ``_run_label_with_explicit_starts``.
+START_CODE = "START//EVENT"
+START_ANCHOR = PREDICTION_TIME - timedelta(microseconds=1)
 
 _SID = DataSchema.subject_id_name
 _TIME = DataSchema.time_name
@@ -226,14 +239,15 @@ BOUNDARY_CASES: tuple[BoundaryCase, ...] = (
 def _events_for(case: BoundaryCase) -> pl.DataFrame:
     """The one event frame every decider is handed for ``case`` -- built once, shared verbatim.
 
-    Carries three codes: the query code at the case's instant (absent for ``no_event_at_all``), the
-    boundary code planted on ``WINDOW_CLOSE``, and a far-future tail event.  The latter two are
-    inert for the time-bounded deciders (different code, far outside the window) but let the
-    event-bounded and censoring-aware deciders be driven from this same frame instead of from a
-    look-alike of their own.
+    Carries four codes: the query code at the case's instant (absent for ``no_event_at_all``), the
+    boundary code planted on ``WINDOW_CLOSE``, a start code planted on ``PREDICTION_TIME``, and a
+    far-future tail event.  The latter three are inert for the time-bounded deciders (different
+    codes; the start code sits *on* the open lower bound and the others far outside the window) but
+    let the event-bounded, explicit-start and censoring-aware deciders be driven from this same
+    frame instead of from a look-alike of their own.
     """
-    times: list[datetime] = [TAIL_TIME, WINDOW_CLOSE]
-    codes: list[str] = [TAIL_CODE, BOUND_CODE]
+    times: list[datetime] = [TAIL_TIME, WINDOW_CLOSE, PREDICTION_TIME]
+    codes: list[str] = [TAIL_CODE, BOUND_CODE, START_CODE]
     if case.query_event_time is not None:
         times.append(case.query_event_time)
         codes.append(QUERY_CODE)
@@ -328,6 +342,55 @@ def _run_label_query_sequences(case: BoundaryCase) -> bool:
     return bool(row["answers"][0])
 
 
+def _explicit_start_index_df(
+    bound_event: str | None, start_event: str | None, prediction_time: datetime
+) -> pl.DataFrame:
+    """A one-query index frame for ``label_with_explicit_starts``: bound column always present."""
+    index_df = _sequence_index_df(bound_event=bound_event, with_bound_col=True).with_columns(
+        pl.lit(prediction_time).cast(pl.Datetime("us")).alias(TaskQuerySchema.prediction_time_name),
+        pl.lit(EVENT_BOUND_DURATION_SENTINEL if start_event is not None else 0.0)
+        .cast(pl.Float32)
+        .alias(START_DURATION_COL),
+        pl.lit(start_event, dtype=pl.Utf8).alias(START_EVENT_COL),
+    )
+    return index_df
+
+
+def _run_label_with_explicit_starts_time_bounded(case: BoundaryCase) -> bool:
+    """A spelled-out prediction-time start (``0.0`` / null) on the time-bounded window."""
+    row = label_with_explicit_starts(
+        _explicit_start_index_df(None, None, PREDICTION_TIME), _events_for(case)
+    ).row(0, named=True)
+    assert row["start_events"][0] is None and row["start_durations"][0] == 0.0, "adapter bug"
+    return bool(row["answers"][0])
+
+
+def _run_label_with_explicit_starts_event_bounded(case: BoundaryCase) -> bool:
+    """A spelled-out prediction-time start with ``BOUND_CODE`` on the horizon -- the same interval."""
+    row = label_with_explicit_starts(
+        _explicit_start_index_df(BOUND_CODE, None, PREDICTION_TIME), _events_for(case)
+    ).row(0, named=True)
+    assert row["bound_events"][0] == BOUND_CODE, "adapter bug: this row was meant to be event-bounded"
+    return bool(row["answers"][0])
+
+
+def _run_label_with_explicit_starts_resolved_start(case: BoundaryCase) -> bool:
+    """A *resolved* start that lands exactly on ``PREDICTION_TIME``.
+
+    The row's own prediction time is one tick earlier (``START_ANCHOR``) and its start event is
+    ``START_CODE``, which ``_events_for`` plants on ``PREDICTION_TIME``: "first occurrence strictly
+    after the anchor" therefore resolves the window's start to ``PREDICTION_TIME`` itself, and the
+    ``DURATION_DAYS`` end is measured from that resolved start, so the interval is once more the
+    shared ``(PREDICTION_TIME, WINDOW_CLOSE)``.  This is the configuration that checks the open
+    lower bound at a resolved (event-defined) start rather than at the prediction time.
+    """
+    row = label_with_explicit_starts(
+        _explicit_start_index_df(None, START_CODE, START_ANCHOR), _events_for(case)
+    ).row(0, named=True)
+    assert row["start_events"][0] == START_CODE, "adapter bug: this row was meant to have a start event"
+    return bool(row["answers"][0])
+
+
 def _run_evaluate_index_df(case: BoundaryCase) -> bool:
     """Stage 4's labeller, which alone has a censoring notion.
 
@@ -403,6 +466,24 @@ WINDOW_DECIDERS: tuple[WindowDecider, ...] = (
         qualname="every_query.generate_tasks.sample_query_sequences.label_query_sequences",
         configuration="public Stage 4' seam, time-bounded dispatch",
         run=_run_label_query_sequences,
+    ),
+    WindowDecider(
+        id="label_with_explicit_starts_time_bounded",
+        qualname="every_query.generate_tasks.sample_query_sequences.label_with_explicit_starts",
+        configuration="explicit prediction-time start (0.0 / null), window ends at the horizon",
+        run=_run_label_with_explicit_starts_time_bounded,
+    ),
+    WindowDecider(
+        id="label_with_explicit_starts_event_bounded",
+        qualname="every_query.generate_tasks.sample_query_sequences.label_with_explicit_starts",
+        configuration=f"explicit prediction-time start, bound_event={BOUND_CODE!r} on the horizon instant",
+        run=_run_label_with_explicit_starts_event_bounded,
+    ),
+    WindowDecider(
+        id="label_with_explicit_starts_resolved_start",
+        qualname="every_query.generate_tasks.sample_query_sequences.label_with_explicit_starts",
+        configuration=f"start_event={START_CODE!r} resolving to the prediction instant; horizon from it",
+        run=_run_label_with_explicit_starts_resolved_start,
     ),
 )
 
