@@ -10,6 +10,50 @@ set — is what these tests pin, along with the per-shard layout and the supplie
 
 Fixture cohort: the shared ``synthetic_events`` frame (3 subjects x 30 distinct times, 10d apart)
 split across two shards — ``"0"`` holds subjects 1 and 2, ``"1"`` holds subject 3.
+
+Coverage migrated from the deleted ``tests/multitask/test_eval_multitask_grid.py`` (issue #29)
+---------------------------------------------------------------------------------------------
+The legacy multitask evaluation generator is gone; ``EQ_generate_evaluation_query_sequences`` is the
+one evaluation grid and ``EQ_predict_multitask`` consumes it.  Each concern the deleted module pinned
+lives on the consolidated path as follows:
+
+- start/end resolution relative to the *resolved* start, open/open endpoints, missing start and
+  missing end: ``tests/test_queryseq_starts.py``
+  (``test_each_start_form_against_the_hand_computed_oracle``,
+  ``test_end_boundary_is_searched_after_the_resolved_start_not_the_prediction_time``,
+  ``test_both_endpoints_are_open_for_every_start_form``,
+  ``test_unresolved_start_never_becomes_an_infinite_window``) and
+  ``tests/test_window_bounds_contract.py`` (the explicit-start deciders in the shared matrix);
+- deterministic spec sampling (``test_task_table_is_deterministic_in_the_seed``):
+  :func:`test_deterministic_in_seed` here plus
+  ``tests/sampler/test_eval_grid_starts.py::test_sampled_start_draw_is_deterministic`` and
+  ``::test_legacy_draw_matches_the_pre_start_golden``;
+- independently seeded draw components (``test_groups_are_seeded_independently``):
+  ``tests/sampler/test_eval_grid_starts.py::test_each_start_axis_is_independent``,
+  ``::test_start_knobs_do_not_perturb_the_legacy_draw``,
+  ``::test_legacy_knobs_do_not_perturb_the_start_component``;
+- stale-output / provenance protection
+  (``test_rerun_with_a_new_seed_relabels_instead_of_serving_stale``,
+  ``test_cohort_knob_change_relabels``, ``test_missing_provenance_relabels_only_that_shard``,
+  ``test_grid_is_reused_unless_overwritten``): :func:`test_changed_cohort_relabels_instead_of_skipping`
+  (seed and cohort-knob changes), :func:`test_changed_specs_relabel_instead_of_skipping`,
+  :func:`test_missing_provenance_relabels_only_that_shard`,
+  :func:`test_existing_outputs_are_skipped_unless_overwrite`,
+  :func:`test_a_pre_fingerprint_sidecar_is_stale`, and
+  ``tests/sampler/test_eval_grid_starts.py::test_start_knob_change_relabels_instead_of_serving_stale_shards``;
+- every context answers every task / row alignment: :func:`test_rows_are_context_major_within_a_shard`,
+  :func:`test_specs_are_shared_across_shards`, and on the prediction side
+  ``tests/multitask/test_predict_multitask_logic.py::test_predictions_are_row_aligned_one_per_grid_row``
+  / ``::test_predictions_to_df_rejects_misaligned_labels``;
+- vocabulary validation:
+  ``tests/sampler/test_eval_grid_starts.py::test_unknown_start_codes_are_rejected_against_the_vocabulary``
+  and ``tests/multitask/test_predict_multitask_logic.py::test_unknown_codes_fail_at_init``.
+
+Not migrated, by design: the legacy sidecar contract (``eval_meta`` row alignment,
+``eval_tasks.parquet``, the per-window resolved/unresolved diagnostics, the ``_eval_summary.json``
+row count, the prevalence-weighted ``task_groups`` and ``exclude_boundary_prefixes`` pools) belonged
+to the deleted generator and has no counterpart; the QuerySeq grid's lists identify the task, and
+the ``.labels.npy`` "PAD is never a target" bit is replaced by the adapter's PAD-mapped-code rejection.
 """
 
 from pathlib import Path
@@ -431,6 +475,25 @@ def test_changed_cohort_relabels_instead_of_skipping(
     first_times.head(2).write_parquet(cohort)
     _run_seq(data_dir, out_dir, codes_yaml, contexts_path=cohort)
     assert sum(_unique(out_dir, s).height for s in SHARDS) == 2, "an edited cohort file must relabel"
+
+
+def test_missing_provenance_relabels_only_that_shard(tmp_path: Path, data_dir: Path, codes_yaml: Path):
+    """No sidecar means nothing vouches for that shard's parquet (a crash between the two writes):
+    that shard alone is relabeled, the others are reused, and the sidecar comes back."""
+    out_dir = tmp_path / "grid"
+    _run_seq(data_dir, out_dir, codes_yaml)
+    sidecars = {
+        s: eval_seq._provenance_path(out_dir, out_dir / "eval" / SPLIT / f"{s}.parquet") for s in SHARDS
+    }
+    assert all(fp.is_file() for fp in sidecars.values())
+    sidecars["0"].unlink()
+    before = dict(zip(SHARDS, _inodes(out_dir), strict=True))
+
+    _run_seq(data_dir, out_dir, codes_yaml)
+    after = dict(zip(SHARDS, _inodes(out_dir), strict=True))
+    assert after["0"] != before["0"], "the shard without provenance must be relabeled"
+    assert after["1"] == before["1"], "a shard whose provenance is intact must be reused"
+    assert sidecars["0"].is_file()
 
 
 def test_a_pre_fingerprint_sidecar_is_stale(tmp_path: Path, data_dir: Path, codes_yaml: Path):

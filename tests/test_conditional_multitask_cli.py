@@ -268,3 +268,4 @@ def test_predict_multitask_scores_a_queryseq_grid_with_active_starts(
     # Nothing legacy was written by inference either.
     for name in ("_multitask_manifest.json", "eval_meta", "eval_tasks.parquet"):
         assert not list(tmp_path.rglob(name)), name
+    assert not list(tmp_path.rglob("*.labels.npy"))

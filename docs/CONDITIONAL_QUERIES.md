@@ -122,6 +122,23 @@ The conditional pipeline mirrors the single-query one. New console scripts (in `
 | `EQ_evaluate_sequences`                        | Per-position and per-(query, horizon) metric tables.                                                                       |
 | `EQ_predict_multitask`                         | Score the *same* `EQ_generate_evaluation_query_sequences` grid with the multitask model: one final-query probability per row (issue #28). |
 
+There is one evaluation-grid generator for both model families:
+
+```
+EQ_generate_evaluation_query_sequences  ->  QuerySeqSchema eval grid  ->  EQ_predict_sequences
+                                                                       OR  EQ_predict_multitask
+```
+
+`EQ_generate_evaluation_query_sequences` labels the same `N` query sequences at every cohort context,
+optionally with explicit per-query window starts (issue #27: a start delay or a start event, the end
+resolved relative to the resolved start, both endpoints open). The ordinary sequence models accept
+only prediction-time starts — their dataset rejects an active start rather than scoring it as if the
+window opened at the prediction time — while the multitask model consumes active starts. The
+multitask *training* sampler (`EQ_generate_multitask_sequences`) remains a separate, all-vocabulary
+pipeline with packed targets; multitask *evaluation* writes one scalar final-query prediction per
+QuerySeq row and reads no packed labels, manifest or sidecar (the former multitask evaluation
+generator and its sidecar contract were removed in #29).
+
 Key source modules:
 
 - `src/every_query/data/seq_dataset.py` — `ConditionalQueryPytorchDataset`, `ConditionalQueryBatch`,

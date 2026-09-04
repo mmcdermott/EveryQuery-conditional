@@ -176,7 +176,11 @@ any_sodium_lab_7d:
 EQ_generate_evaluation_query_sequences ... sequences_path=designed.yaml
 ```
 
-A long-format parquet `(seq_id, position, query, duration_days[, bound_event])` works too.
+A long-format parquet `(seq_id, position, query, duration_days[, bound_event])` works too. A
+mapping entry (`{query, duration_days, start_duration_days | start_event, bound_event}`) opens a
+window *after* the prediction time — a start delay or a start event, the end resolved relative to
+that start; see `generate_tasks/README.md`. Only `EQ_predict_multitask` can score such starts:
+`EQ_predict_sequences` accepts prediction-time starts alone, and its dataset rejects the rest.
 
 Cohort knobs: `prediction_times_per_subject`, `min_context_per_subject` (prior events, default 50),
 `subject_subsample_fraction`, or `contexts_path=` — a parquet of `(subject_id, prediction_time)`
@@ -184,7 +188,9 @@ labeled verbatim (e.g. 24h-post-admission anchors).
 
 Output: `{out_dir}/eval/{split}/{shard}.parquet` (pass `{out_dir}/eval` to predict) plus the
 deduplicated contexts under `{out_dir}/eval_unique/`. Use a different `out_dir` from the
-single-query `EQ_generate_evaluation_tasks`; they share the layout but not the schema.
+single-query `EQ_generate_evaluation_tasks`; they share the layout but not the schema. This is the
+one evaluation grid for both conditional model families: `EQ_predict_sequences` scores every
+position; `EQ_predict_multitask` scores each row's final query with the multitask model.
 
 ### 5. Train — `EQ_train --config-name=conditional_config`
 

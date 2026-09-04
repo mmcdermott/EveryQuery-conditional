@@ -19,7 +19,16 @@ families of (scattered-for-training, dense-for-evaluation) pairs — one per mod
     independent sequence of `Uniform{min_queries..max_queries}` queries, for pretraining.
 - **`EQ_generate_evaluation_query_sequences`** — dense-grid shape: the *same* `N` query
     sequences labeled at `K` sampled prediction times per subject (or at a supplied cohort),
-    for feeding `EQ_predict_sequences` → `EQ_evaluate_sequences`.
+    for feeding `EQ_predict_sequences` → `EQ_evaluate_sequences`. Also the **only** evaluation
+    grid for the multitask model (`EQ_predict_multitask`), optionally with explicit per-query
+    window starts (issue #27).
+
+**All-vocabulary multitask model**, producing `MultitaskBoundarySchema` rows plus packed
+`.labels.npy` targets — training only; its evaluation uses the `QuerySeqSchema` grid above:
+
+- **`EQ_generate_multitask_sequences`** — scattered shape: `K` windows (start + end each) per
+    context with every base-vocabulary code labeled at every window (see the multitask section
+    below).
 
 ## What lives here
 
@@ -80,6 +89,11 @@ families of (scattered-for-training, dense-for-evaluation) pairs — one per mod
     `sample_query_sequences`'s `label_query_sequences` labeler (which routes a grid with explicit
     starts through `interval_table.py`, the multitask sampler's window resolver); only the grid
     build is its own. Registered as `EQ_generate_evaluation_query_sequences`.
+
+- **`sample_multitask_sequences.py`** / **`configs/sample_multitask_sequences_config.yaml`** — the
+    all-vocabulary multitask *training* sampler (`EQ_generate_multitask_sequences`; see
+    [Multitask boundary labels](#multitask-boundary-labels--every-code-at-every-window)). It has
+    no evaluation counterpart of its own.
 
 - **`configs/sample_query_sequences_config.yaml`** / **`configs/sample_evaluation_query_sequences_config.yaml`**
     — the conditional endpoints' configs. Same required-path-arg contract as the single-query
@@ -373,6 +387,26 @@ mix format 2 and 3 shards. No start is ever sampled in the dataset.
 **MVP scope:** observable leaf codes only. A non-null `ontology_dir` raises before Stage 0; events are
 never closure-expanded. Ancestor targets and boundaries plug in later through the seams
 `build_target_vocabulary`, `prepare_events_for_labeling` and `resolve_event_boundaries`.
+
+### Evaluating the multitask model — the same QuerySeq grid
+
+There is **one** evaluation-grid generator, `EQ_generate_evaluation_query_sequences`; the multitask
+model has no evaluation sampler of its own (the former multitask evaluation generator, with its
+all-vocabulary `.labels.npy` evaluation targets, `eval_meta` sidecars and `eval_tasks.parquet`, was
+removed in #29). The training sampler above stays separate and all-vocabulary; evaluation is:
+
+```
+EQ_generate_evaluation_query_sequences   ->   QuerySeqSchema eval grid   ->   EQ_predict_sequences
+                                                                          OR   EQ_predict_multitask
+```
+
+`EQ_predict_multitask` reads the grid's `eval/` root directly — including the explicit window starts
+(`start_durations` / `start_events`) that only the multitask model can encode — maps each row's
+`queries[:-1]` / `answers[:-1]` onto the teacher-forced conditioning pairs and scores the row's final
+query at its last window, and writes one scalar prediction per grid row (`target_code = queries[-1]`,
+`label = answers[-1]`, `prob`). No packed labels, manifest or sidecar is read or written on this path.
+The ordinary sequence models (`EQ_predict_sequences`) score the same grid but accept only
+prediction-time starts.
 
 ## Determinism & restartability
 
