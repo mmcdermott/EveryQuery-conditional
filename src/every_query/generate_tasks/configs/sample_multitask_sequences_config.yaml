@@ -59,6 +59,31 @@ duration_distribution: log-uniform # uniform | log-uniform
 eventbound_fraction: 0.5
 boundary_codes: null
 
+# --- How a boundary / start-event code is drawn from its pool ---------------------------------
+# `code_weighting: null` is the historical behaviour: iid uniform over the pool.  Drawn uniformly
+# over a whole cohort vocabulary, most boundary codes are rare, so most event-bounded windows never
+# close (the end resolves to +infinity) and most event-defined starts never open (the window is
+# empty and every target is false) - see the `frac_event_bounds_inf` / `frac_event_starts_unresolved`
+# / `frac_empty_windows` numbers each Stage 4M shard logs.
+#
+# `code_weighting: prevalence` instead draws p ∝ (`code_weight_column`) ** `code_weight_power` from
+# the same codes.parquet as `query_codes`, so common codes - the ones that actually recur in a
+# patient's timeline - bound most windows.  power 1.0 is proportional to prevalence, 0.5 is
+# square-root damped, 0.0 is uniform again.  Codes whose statistic is null or zero are floored at
+# the pool's smallest positive value rather than dropped.  The policy applies to BOTH the end-
+# boundary pool and the start-event pool; conditioning codes and the all-vocabulary target set are
+# untouched, so only which windows exist changes, never what a label bit means.
+code_weighting: null # null | prevalence
+code_weight_column: code/n_occurrences # code/n_occurrences | code/n_subjects
+code_weight_power: 1.0
+
+# Codes whose name starts with any of these prefixes are removed from the boundary AND start-event
+# pools (never from the targets or the conditioning codes).  `TIMELINE//DELTA` - the quantized
+# time-delta tokens - is the usual entry: they carry ~10% of all occurrences in a MIMIC-style
+# cohort, so prevalence weighting would spend a tenth of its event windows on boundaries that a
+# `use_rope_time` model never even sees in its input stream.
+exclude_boundary_prefixes: []
+
 # Start specification (issue #24).  Per slot, independently, one uniform draw picks the form:
 #   u < eventstart_fraction                                     => event-defined start
 #   eventstart_fraction <= u < eventstart_fraction + prediction_time_start_fraction

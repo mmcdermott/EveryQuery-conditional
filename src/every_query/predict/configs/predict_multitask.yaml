@@ -1,0 +1,43 @@
+# EQ_predict_multitask — inference over a multitask evaluation grid.
+#
+# Reads a grid written by EQ_generate_evaluation_multitask_sequences, runs the trained
+# ConditionalMultitaskAR model over it, and writes one flat row per (context, task, window)
+# with the scored code's probability and ground-truth label.  See
+# src/every_query/predict/predict_multitask.py for which code each window scores.
+
+defaults:
+  - _self_
+
+# Required: a ConditionalMultitaskAR training run directory (best_model.ckpt +
+# resolved_config.yaml).
+model_run_dir: ???
+
+# Required: the grid's labels root — `{eval grid out_dir}/eval`.
+tasks_dir: ???
+
+# Required: output parquet path.
+output_parquet: ???
+
+# The grid's row-aligned sidecars (task_id / target_code / window diagnostics).  null resolves to
+# the sibling `eval_meta` of `tasks_dir`, which is where the generator writes them.
+eval_meta_dir: null
+
+# Optional: explicit checkpoint stem under model_run_dir/checkpoints/.
+ckpt_name: null
+
+# "held_out" (default) or "tuning".  "train" is disallowed (shuffling).
+split: held_out
+
+overwrite: false
+
+# Optional inference batch-size override.  The forward pass materializes (B, K, V) logits, so this
+# is the knob that trades inference speed against peak device memory.
+batch_size: null
+
+# Optional torch device string; null picks cuda when available.
+device: null
+
+hydra:
+  output_subdir: null
+  job:
+    chdir: false

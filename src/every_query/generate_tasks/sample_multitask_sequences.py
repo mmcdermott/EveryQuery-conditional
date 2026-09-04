@@ -260,23 +260,48 @@ def build_target_vocabulary(source: object, ontology_dir: object = None) -> Targ
     return TargetVocabulary.from_pairs(df["code"].to_list(), df["code/vocab_index"].to_list())
 
 
-def read_boundary_codes(spec: object, vocab: TargetVocabulary) -> list[str]:
+def read_boundary_codes(
+    spec: object, vocab: TargetVocabulary, exclude_prefixes: Sequence[str] = ()
+) -> list[str]:
     """Resolve the boundary-code pool: ``None`` => all base codes (index >= 1); else a list / YAML path.
 
     Every listed code must be in the vocabulary and must not be PAD; unknown codes are hard errors.
-    Order-preserving dedup.
+    Order-preserving dedup.  ``exclude_prefixes`` drops codes by name prefix *after* resolution, so an
+    explicit pool and the all-vocabulary default are filtered the same way.
     """
-    return _read_code_pool(spec, vocab, "boundary")
+    return _read_code_pool(spec, vocab, "boundary", exclude_prefixes)
 
 
-def read_start_event_codes(spec: object, vocab: TargetVocabulary) -> list[str]:
+def read_start_event_codes(
+    spec: object, vocab: TargetVocabulary, exclude_prefixes: Sequence[str] = ()
+) -> list[str]:
     """Resolve the start-event pool (issue #24) with exactly the :func:`read_boundary_codes` rules."""
-    return _read_code_pool(spec, vocab, "start_event")
+    return _read_code_pool(spec, vocab, "start_event", exclude_prefixes)
 
 
-def _read_code_pool(spec: object, vocab: TargetVocabulary, what: str) -> list[str]:
+def read_exclude_prefixes(spec: object) -> tuple[str, ...]:
+    """Normalize the ``exclude_boundary_prefixes`` config value to a tuple of strings.
+
+    Examples:
+        >>> read_exclude_prefixes(None)
+        ()
+        >>> read_exclude_prefixes("TIMELINE//DELTA")
+        ('TIMELINE//DELTA',)
+        >>> read_exclude_prefixes(["A//", "B//"])
+        ('A//', 'B//')
+    """
     if spec is None:
-        return vocab.boundary_candidates()
+        return ()
+    if isinstance(spec, str):
+        return (spec,)
+    return tuple(str(p) for p in spec)
+
+
+def _read_code_pool(
+    spec: object, vocab: TargetVocabulary, what: str, exclude_prefixes: Sequence[str] = ()
+) -> list[str]:
+    if spec is None:
+        return _apply_prefix_exclusions(vocab.boundary_candidates(), exclude_prefixes, what)
     if isinstance(spec, list | tuple | ListConfig):
         raw = list(spec)
     else:
@@ -294,12 +319,120 @@ def _read_code_pool(spec: object, vocab: TargetVocabulary, what: str) -> list[st
     pad = [c for c in codes if c2i[c] == 0]
     if pad:
         raise ValueError(f"{what} code(s) at vocab index 0 (PAD) are not allowed: {pad}")
-    return codes
+    return _apply_prefix_exclusions(codes, exclude_prefixes, what)
+
+
+def _apply_prefix_exclusions(codes: list[str], exclude_prefixes: Sequence[str], what: str) -> list[str]:
+    """Drop every code whose name starts with one of ``exclude_prefixes``.
+
+    Examples:
+        >>> _apply_prefix_exclusions(["A", "T//1", "T//2"], ("T//",), "boundary")
+        ['A']
+        >>> _apply_prefix_exclusions(["A", "B"], (), "boundary")
+        ['A', 'B']
+        >>> _apply_prefix_exclusions(["T//1"], ("T//",), "boundary")
+        Traceback (most recent call last):
+            ...
+        ValueError: excluding prefixes ('T//',) empties the boundary pool
+    """
+    if not exclude_prefixes:
+        return codes
+    prefixes = tuple(exclude_prefixes)
+    kept = [c for c in codes if not c.startswith(prefixes)]
+    if not kept:
+        raise ValueError(f"excluding prefixes {prefixes} empties the {what} pool")
+    return kept
+
+
+def build_code_weights(
+    source: object, codes: Sequence[str], column: str, power: float
+) -> tuple[float, ...]:
+    """Sampling weights for ``codes``, proportional to ``codes.parquet[column] ** power``.
+
+    The column is a per-code prevalence statistic of the *cohort* (``code/n_occurrences`` or
+    ``code/n_subjects``); ``power`` tempers it - ``1.0`` is proportional to prevalence, ``0.5``
+    square-root damped, ``0.0`` uniform.  Codes with a null or zero statistic get the smallest
+    positive weight in the pool rather than zero, so no pool member becomes undrawable.  Returns
+    weights normalized to sum to 1, aligned to ``codes`` positionally.
+    """
+    if power < 0:
+        raise ValueError(f"code_weight_power must be >= 0 (got {power})")
+    fp = _codes_parquet_path(source)
+    df = pl.read_parquet(fp, columns=["code", column])
+    stat = dict(zip(df["code"].to_list(), df[column].to_list(), strict=True))
+    missing = [c for c in codes if c not in stat]
+    if missing:
+        raise ValueError(f"{len(missing)} weighted code(s) are absent from {fp}: {missing[:10]}")
+    raw = np.array([0.0 if stat[c] is None else float(stat[c]) for c in codes], dtype=np.float64)
+    positive = raw[raw > 0]
+    if positive.size == 0:
+        raise ValueError(f"{fp} column {column!r} is zero or null for every code in the pool")
+    raw[raw <= 0] = positive.min()
+    w = np.power(raw, float(power))
+    return tuple((w / w.sum()).tolist())
+
+
+def resolve_boundary_pools(
+    cfg: DictConfig, vocab: TargetVocabulary
+) -> tuple[list[str], tuple[float, ...], list[str], tuple[float, ...]]:
+    """The event-boundary and event-start pools and their sampling weights, from a Hydra config.
+
+    Reads ``boundary_codes`` / ``start_event_codes`` (pools), ``exclude_boundary_prefixes`` (applied
+    to both pools) and ``code_weighting`` / ``code_weight_column`` / ``code_weight_power`` (the
+    shared weighting policy).  ``code_weighting: null`` keeps the historical iid-uniform draw.
+
+    Returns ``(boundary_codes, boundary_weights, start_event_codes, start_event_weights)``; the
+    weight tuples are empty when weighting is off.
+    """
+    exclude = read_exclude_prefixes(cfg.get("exclude_boundary_prefixes"))
+    boundary_codes = read_boundary_codes(cfg.get("boundary_codes"), vocab, exclude)
+    start_event_codes = read_start_event_codes(cfg.get("start_event_codes"), vocab, exclude)
+
+    weighting = cfg.get("code_weighting")
+    if weighting is None or str(weighting).lower() in ("", "null", "none", "uniform"):
+        return boundary_codes, (), start_event_codes, ()
+    if str(weighting).lower() != "prevalence":
+        raise ValueError(f"code_weighting must be null or 'prevalence' (got {weighting!r})")
+    column = str(cfg.get("code_weight_column", "code/n_occurrences"))
+    power = float(cfg.get("code_weight_power", 1.0))
+    source = cfg.get("query_codes")
+    return (
+        boundary_codes,
+        build_code_weights(source, boundary_codes, column, power),
+        start_event_codes,
+        build_code_weights(source, start_event_codes, column, power),
+    )
 
 
 # ---------------------------------------------------------------------------
 # Stage 1M - the boundary-sequence distribution
 # ---------------------------------------------------------------------------
+
+
+def _validate_weights(weights: tuple[float, ...], pool: tuple[str, ...], what: str) -> None:
+    """Weights are optional, but when given must be one non-negative number per pool member.
+
+    Examples:
+        >>> _validate_weights((), ("A", "B"), "boundary")
+        >>> _validate_weights((0.5, 0.5), ("A", "B"), "boundary")
+        >>> _validate_weights((0.5,), ("A", "B"), "boundary")
+        Traceback (most recent call last):
+            ...
+        ValueError: boundary_weights has 1 entries but the boundary pool has 2
+        >>> _validate_weights((1.0, -1.0), ("A", "B"), "boundary")
+        Traceback (most recent call last):
+            ...
+        ValueError: boundary_weights must be non-negative and sum to a positive value
+    """
+    if not weights:
+        return
+    if len(weights) != len(pool):
+        raise ValueError(f"{what}_weights has {len(weights)} entries but the {what} pool has {len(pool)}")
+    arr = np.asarray(weights, dtype=np.float64)
+    if (arr < 0).any() or not arr.sum() > 0:
+        raise ValueError(f"{what}_weights must be non-negative and sum to a positive value")
+    if abs(float(arr.sum()) - 1.0) > 1e-6:
+        raise ValueError(f"{what}_weights must be normalized to sum to 1 (got {float(arr.sum())})")
 
 
 @dataclass(frozen=True)
@@ -389,6 +522,10 @@ class BoundaryDistribution:
     start_max_duration: float = 180.0
     start_duration_distribution: str = "log-uniform"
     start_event_codes: tuple[str, ...] = ()
+    # Per-pool sampling weights, positionally aligned to the pool.  Empty => iid uniform (the
+    # issue #20 behaviour); non-empty => iid weighted, both with replacement.
+    boundary_weights: tuple[float, ...] = ()
+    start_event_weights: tuple[float, ...] = ()
 
     _VALID_DISTRIBUTIONS = ("uniform", "log-uniform")
 
@@ -437,6 +574,8 @@ class BoundaryDistribution:
                 f"start_duration_distribution must be one of {self._VALID_DISTRIBUTIONS} "
                 f"(got {self.start_duration_distribution!r})"
             )
+        _validate_weights(self.boundary_weights, self.boundary_codes, "boundary")
+        _validate_weights(self.start_event_weights, self.start_event_codes, "start_event")
 
     @classmethod
     def from_config(
@@ -445,6 +584,8 @@ class BoundaryDistribution:
         boundary_codes: Sequence[str],
         condition_codes: Sequence[str],
         start_event_codes: Sequence[str] = (),
+        boundary_weights: Sequence[float] = (),
+        start_event_weights: Sequence[float] = (),
     ) -> BoundaryDistribution:
         """Build from a Hydra config.
 
@@ -467,7 +608,21 @@ class BoundaryDistribution:
             start_max_duration=float(cfg.get("start_duration_max", 180.0)),
             start_duration_distribution=str(cfg.get("start_duration_distribution", "log-uniform")),
             start_event_codes=tuple(start_event_codes),
+            boundary_weights=tuple(boundary_weights),
+            start_event_weights=tuple(start_event_weights),
         )
+
+    @staticmethod
+    def _draw_codes(
+        rng: np.random.Generator,
+        pool: tuple[str, ...],
+        weights: tuple[float, ...],
+        shape: tuple[int, int],
+    ) -> np.ndarray:
+        """``shape`` iid picks (with replacement) into ``pool``: uniform when ``weights`` is empty."""
+        if not weights:
+            return rng.integers(0, len(pool), size=shape)
+        return rng.choice(len(pool), size=shape, p=np.asarray(weights, dtype=np.float64))
 
     @staticmethod
     def _draw_durations(
@@ -504,7 +659,7 @@ class BoundaryDistribution:
         )
         bound_events = np.full(shape, None, dtype=object)
         if self.boundary_codes:
-            picks = code_rng.integers(0, len(self.boundary_codes), size=shape)
+            picks = self._draw_codes(code_rng, self.boundary_codes, self.boundary_weights, shape)
             pool = np.array(self.boundary_codes, dtype=object)
             bound_events[is_event] = pool[picks[is_event]]
         durations[is_event] = EVENT_BOUND_DURATION_SENTINEL
@@ -523,7 +678,9 @@ class BoundaryDistribution:
         )
         start_events = np.full(shape, None, dtype=object)
         if self.start_event_codes:
-            picks = start_code_rng.integers(0, len(self.start_event_codes), size=shape)
+            picks = self._draw_codes(
+                start_code_rng, self.start_event_codes, self.start_event_weights, shape
+            )
             pool = np.array(self.start_event_codes, dtype=object)
             start_events[start_is_event] = pool[picks[start_is_event]]
         start_durations[start_is_pt] = 0.0
@@ -643,6 +800,24 @@ def build_multitask_index(
 # ---------------------------------------------------------------------------
 
 
+def effective_support(weights: Sequence[float], pool_size: int) -> float:
+    """``exp(H)`` of a weight vector - how many codes the pool behaves like.  Uniform => ``pool_size``.
+
+    Examples:
+        >>> effective_support((), 100)
+        100.0
+        >>> round(effective_support((0.5, 0.5), 2), 6)
+        2.0
+        >>> round(effective_support((0.99, 0.01), 2), 3)
+        1.058
+    """
+    if not weights:
+        return float(pool_size)
+    p = np.asarray(weights, dtype=np.float64)
+    p = p[p > 0]
+    return float(np.exp(-(p * np.log(p)).sum()))
+
+
 def _sha256_json(obj: object) -> str:
     return hashlib.sha256(json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
@@ -663,12 +838,14 @@ def config_fingerprint(dist: BoundaryDistribution, vocab: TargetVocabulary) -> s
             "duration_distribution": dist.duration_distribution,
             "eventbound_fraction": dist.eventbound_fraction,
             "boundary_codes": _sha256_json(list(dist.boundary_codes)),
+            "boundary_weights": _sha256_json([round(w, 12) for w in dist.boundary_weights]),
             "eventstart_fraction": dist.eventstart_fraction,
             "prediction_time_start_fraction": dist.prediction_time_start_fraction,
             "start_duration_min": dist.start_min_duration,
             "start_duration_max": dist.start_max_duration,
             "start_duration_distribution": dist.start_duration_distribution,
             "start_event_codes": _sha256_json(list(dist.start_event_codes)),
+            "start_event_weights": _sha256_json([round(w, 12) for w in dist.start_event_weights]),
             "condition_codes": _sha256_json(list(dist.condition_codes)),
             "condition_policy": CONDITION_POLICY,
             "vocab_fingerprint": vocab.fingerprint,
@@ -706,6 +883,10 @@ def build_manifest(dist: BoundaryDistribution, vocab: TargetVocabulary) -> dict:
         "ontology_mode": ONTOLOGY_MODE_NONE,
         "condition_policy": CONDITION_POLICY,
         "num_condition_codes": dist.num_bounds - 1,
+        "n_boundary_codes": len(dist.boundary_codes),
+        "n_start_event_codes": len(dist.start_event_codes),
+        "boundary_code_policy": "weighted" if dist.boundary_weights else "uniform",
+        "start_event_code_policy": "weighted" if dist.start_event_weights else "uniform",
         "config_fingerprint": config_fingerprint(dist, vocab),
         "labels_suffix": LABELS_SUFFIX,
     }
@@ -963,6 +1144,7 @@ def label_multitask_index(
     chunk_rows: int = 2000,
     out: np.ndarray | None = None,
     ontology_dir: object = None,
+    window_times_out: dict[str, np.ndarray] | None = None,
 ) -> tuple[pl.DataFrame, np.ndarray, LabelStats]:
     """Stage 4M kernel: label a (possibly supplied) index against an event stream.
 
@@ -980,6 +1162,12 @@ def label_multitask_index(
     ``out[context_row, k]``.  An index without start columns labels with prediction-time starts.
 
     Sampling policy never enters here: everything about a window is fixed by the index rows.
+
+    Diagnostics seam: pass a dict as ``window_times_out`` to receive the resolved ``(N, K)``
+    ``start_times`` / ``end_times`` matrices (int64 microseconds, ``INF`` where a boundary event never
+    occurred), row-aligned with the returned metadata frame.  They are what separates "the window was
+    a real bounded interval" from "the boundary never occurred, so the window ran to the end of the
+    timeline (or stayed empty)", which no stored label bit records.  Default ``None`` costs nothing.
 
     Examples:
         >>> from datetime import datetime
@@ -1057,6 +1245,9 @@ def label_multitask_index(
     is_event = (bound_code_index >= 0) & resolved  # only windows whose start resolved
     stats.n_event_bounds = int((bound_code_index >= 0).sum())
     stats.frac_event_bounds_inf = float((end_times[is_event] == INF).mean()) if is_event.any() else 0.0
+    if window_times_out is not None:
+        window_times_out["start_times"] = start_times.copy()
+        window_times_out["end_times"] = end_times.copy()
     del start_durations, start_code_index, durations, bound_code_index, resolved, is_event, is_event_start
 
     shape = (n, num_bounds, vocab.packed_width)
@@ -1442,20 +1633,32 @@ def run(cfg: DictConfig) -> None:
     artifacts_dir = default_artifacts_dir(out_root)
 
     vocab = build_target_vocabulary(cfg.get("query_codes"))
-    boundary_codes = read_boundary_codes(cfg.get("boundary_codes"), vocab)
-    start_event_codes = read_start_event_codes(cfg.get("start_event_codes"), vocab)
+    boundary_codes, boundary_weights, start_event_codes, start_event_weights = resolve_boundary_pools(
+        cfg, vocab
+    )
     dist = BoundaryDistribution.from_config(
-        cfg, boundary_codes, vocab.boundary_candidates(), start_event_codes
+        cfg,
+        boundary_codes,
+        vocab.boundary_candidates(),
+        start_event_codes,
+        boundary_weights,
+        start_event_weights,
     )
     logger.info(
         "Vocabulary: %s codes, V=%s (packed width %s bytes), fingerprint %s; %s boundary candidate(s), "
-        "%s start-event candidate(s).",
+        "%s start-event candidate(s); code_weighting=%s (%s^%s), excluded prefixes %s, "
+        "effective boundary support %s.",
         f"{len(vocab.codes):,}",
         f"{vocab.size:,}",
         vocab.packed_width,
         vocab.fingerprint[:12],
         f"{len(boundary_codes):,}",
         f"{len(start_event_codes):,}",
+        cfg.get("code_weighting"),
+        cfg.get("code_weight_column", "code/n_occurrences"),
+        cfg.get("code_weight_power", 1.0),
+        list(read_exclude_prefixes(cfg.get("exclude_boundary_prefixes"))),
+        f"{effective_support(boundary_weights, len(boundary_codes)):,.0f}",
     )
 
     n_subjects = build_prediction_times(
