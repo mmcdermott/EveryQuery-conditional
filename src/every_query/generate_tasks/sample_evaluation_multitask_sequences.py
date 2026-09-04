@@ -30,6 +30,9 @@ Output layout (``{out_dir}/eval`` is directly usable as a ``task_labels_dir``)::
     {out_dir}/eval/{split}/_multitask_manifest.json vocabulary + semantics the bits were built under
     {out_dir}/eval_meta/{split}/{shard}.parquet     row-aligned sidecar: task_id, target_code, and
                                                     per-window resolution diagnostics
+    {out_dir}/eval_meta/{split}/_labeled/{shard}.json
+                                                    provenance written *last*: the fingerprints the
+                                                    three files above were built under + row count
     {out_dir}/eval_tasks.parquet                    the N task specifications themselves
 
 The sidecar lives *outside* the labels root on purpose: a dataset points at ``{out_dir}/eval`` and
@@ -103,6 +106,7 @@ from every_query.generate_tasks.sample_multitask_sequences import (
     write_manifest,
 )
 from every_query.generate_tasks.sample_tasks import (
+    _atomic_write_json,
     _atomic_write_parquet,
     _read_event_shard,
     _require_path_arg,
@@ -120,6 +124,7 @@ TARGET_CODE_COL = "target_code"
 EVAL_TASKS_NAME = "eval_tasks.parquet"
 EVAL_DIRNAME = "eval"
 EVAL_META_DIRNAME = "eval_meta"
+PROVENANCE_DIRNAME = "_labeled"
 
 # Sidecar diagnostic columns, one list of K entries per row.
 START_RESOLVED_COL = "start_resolved"
@@ -404,6 +409,73 @@ def build_sidecar(
     )
 
 
+def cohort_fingerprint(cfg: DictConfig) -> str:
+    """Digest of the knobs that decide *which contexts* a shard labels (the task table has its own).
+
+    ``data_dir`` is part of the digest: the same knobs over a different cohort must relabel, even when the
+    two cohorts happen to yield identical row counts.
+
+    Examples:
+        >>> from omegaconf import OmegaConf
+        >>> a = OmegaConf.create({"seed": 1, "split": "held_out", "prediction_times_per_subject": 2,
+        ...     "min_context_per_subject": 5, "subject_subsample_fraction": None, "data_dir": "/c/a"})
+        >>> cohort_fingerprint(a) == cohort_fingerprint(OmegaConf.create(dict(a)))
+        True
+        >>> cohort_fingerprint(a) == cohort_fingerprint(OmegaConf.create({**dict(a), "seed": 2}))
+        False
+        >>> cohort_fingerprint(a) == cohort_fingerprint(OmegaConf.create({**dict(a), "data_dir": "/c/b"}))
+        False
+    """
+    knobs = {
+        "seed": int(cfg.seed),
+        "split": str(cfg.split),
+        "prediction_times_per_subject": int(cfg.prediction_times_per_subject),
+        "min_context_per_subject": int(cfg.min_context_per_subject),
+        "subject_subsample_fraction": cfg.get("subject_subsample_fraction"),
+        "data_dir": str(cfg.get("data_dir")),
+    }
+    return hashlib.sha256(json.dumps(knobs, sort_keys=True).encode()).hexdigest()
+
+
+def provenance_path(meta_dir: Path, shard: str) -> Path:
+    return meta_dir / PROVENANCE_DIRNAME / f"{shard}.json"
+
+
+def eval_output_is_reusable(
+    final_parquet: Path,
+    final_labels: Path,
+    final_meta: Path,
+    provenance_fp: Path,
+    expected: dict,
+    manifest: dict,
+) -> bool:
+    """The reuse gate for one grid shard: all files present, provenance matches, row counts agree.
+
+    Modeled on the training sampler's ``output_is_reusable``: the provenance file is written last,
+    so its presence means the label parquet, the packed labels and the sidecar are complete, and
+    its fingerprints say what they were built under.  Without it (or on any mismatch) the shard is
+    relabeled -- a rerun with a new seed or task table must never serve stale labels under a new
+    ``eval_tasks.parquet``.
+    """
+    if not (final_parquet.exists() and final_labels.exists() and final_meta.exists()):
+        return False
+    try:
+        recorded = json.loads(provenance_fp.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    if any(recorded.get(key) != value for key, value in expected.items()):
+        return False
+    try:
+        n_rows = pl.scan_parquet(final_parquet).select(pl.len()).collect().item()
+        n_meta = pl.scan_parquet(final_meta).select(pl.len()).collect().item()
+        shape = tuple(np.load(final_labels, mmap_mode="r").shape)
+    except Exception:
+        return False
+    if recorded.get("n_rows") != n_rows or n_meta != n_rows:
+        return False
+    return shape == (n_rows, int(manifest["num_bounds"]), int(manifest["packed_width_bytes"]))
+
+
 def label_one_eval_shard(
     shard: str,
     data_dir: Path,
@@ -419,16 +491,25 @@ def label_one_eval_shard(
     seed: int,
     overwrite: bool,
     chunk_rows: int,
+    cohort_fp: str,
 ) -> tuple[str, str, dict]:
     """Worker: sample one shard's cohort, label every task at every context, write the three files.
 
     Module-level so it pickles under ``spawn``.  Returns ``(shard, status, stats)`` with status
-    ``"skipped"`` or ``"labeled"``.
+    ``"skipped"`` or ``"labeled"``.  ``cohort_fp`` is :func:`cohort_fingerprint` of the run.
     """
     final_parquet = out_dir / f"{shard}.parquet"
     final_labels = out_dir / f"{shard}{LABELS_SUFFIX}"
     final_meta = meta_dir / f"{shard}.parquet"
-    if not overwrite and final_parquet.exists() and final_labels.exists() and final_meta.exists():
+    provenance_fp = provenance_path(meta_dir, shard)
+    expected = {
+        "tasks_fingerprint": manifest["config_fingerprint"],
+        "vocab_fingerprint": manifest["vocab_fingerprint"],
+        "cohort_fingerprint": cohort_fp,
+    }
+    if not overwrite and eval_output_is_reusable(
+        final_parquet, final_labels, final_meta, provenance_fp, expected, manifest
+    ):
         return shard, "skipped", {}
 
     vocab = build_target_vocabulary(codes_source)
@@ -492,7 +573,16 @@ def label_one_eval_shard(
     _atomic_write_parquet(
         build_sidecar(index_df, window_times["start_times"], window_times["end_times"]), final_meta
     )
+    # Written last: a present provenance file always describes a complete, consistent triple.
+    _atomic_write_json({**expected, "n_rows": index_df.height, "stats": stats.as_dict()}, provenance_fp)
     return shard, "labeled", stats.as_dict()
+
+
+def _shard_rows(eval_dir: Path, shard: str, status: str, stats: dict) -> int:
+    """Rows a shard contributes to the summary: a skipped shard reports its on-disk parquet height."""
+    if status == "skipped":
+        return int(pl.scan_parquet(eval_dir / f"{shard}.parquet").select(pl.len()).collect().item())
+    return int(stats.get("n_contexts", 0))
 
 
 def _log_shard(shard: str, stats: dict) -> None:
@@ -589,13 +679,14 @@ def run(cfg: DictConfig) -> None:
         "seed": seed,
         "overwrite": bool(cfg.get("overwrite", False)),
         "chunk_rows": chunk_rows,
+        "cohort_fp": cohort_fingerprint(cfg),
     }
     n_rows = 0
     if n_workers <= 1:
         for shard in shards:
-            name, _status, stats = label_one_eval_shard(shard, **args)
+            name, status, stats = label_one_eval_shard(shard, **args)
             _log_shard(name, stats)
-            n_rows += int(stats.get("n_contexts", 0))
+            n_rows += _shard_rows(eval_dir, name, status, stats)
     else:
         # Spawn, not the platform default: a forked child inherits polars' thread state and
         # deadlocks before it runs a line of this module, exactly as the training driver's pool does.
@@ -603,9 +694,9 @@ def run(cfg: DictConfig) -> None:
         with ProcessPoolExecutor(max_workers=n_workers, mp_context=mp_context) as pool:
             futures = {pool.submit(label_one_eval_shard, shard, **args): shard for shard in shards}
             for fut in as_completed(futures):
-                name, _status, stats = fut.result()
+                name, status, stats = fut.result()
                 _log_shard(name, stats)
-                n_rows += int(stats.get("n_contexts", 0))
+                n_rows += _shard_rows(eval_dir, name, status, stats)
 
     logger.info(
         "Evaluation grid complete: %s labeled row(s) = contexts x %d task(s) x %d window(s) in %s.",

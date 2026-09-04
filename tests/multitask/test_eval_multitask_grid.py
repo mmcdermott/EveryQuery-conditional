@@ -273,6 +273,69 @@ def test_grid_end_to_end(eval_cohort: Path, tmp_path: Path):
     assert summary["num_bounds"] == K
 
 
+def _label_files(out_dir: Path) -> dict[Path, int]:
+    eval_dir = out_dir / "eval" / "held_out"
+    files = sorted(eval_dir.glob("*.parquet")) + sorted(eval_dir.glob("*.npy"))
+    return {fp: fp.stat().st_mtime_ns for fp in files}
+
+
+def _assert_labels_match_task_table(out_dir: Path) -> None:
+    """Every stored window spec is the one the sidecar's task_id names in the *current* task table."""
+    tasks = pl.read_parquet(out_dir / "eval_tasks.parquet")
+    for label_fp in sorted((out_dir / "eval" / "held_out").glob("*.parquet")):
+        labels = pl.read_parquet(label_fp)
+        sidecar = pl.read_parquet(out_dir / "eval_meta" / "held_out" / label_fp.name)
+        expected = sidecar.select(TASK_ID_COL).join(
+            tasks.select(TASK_ID_COL, *SPEC_COLS), on=TASK_ID_COL, how="left"
+        )
+        for col in SPEC_COLS:
+            assert labels[col].equals(expected[col]), (label_fp.name, col)
+
+
+def test_rerun_with_a_new_seed_relabels_instead_of_serving_stale(eval_cohort: Path, tmp_path: Path):
+    """``eval_tasks.parquet`` is rewritten unconditionally, so a skipped shard would pair old labels
+    with a new task table; the provenance file gates reuse on the task fingerprint."""
+    out_dir = tmp_path / "grid"
+    sems.run(eval_cfg(eval_cohort, out_dir))
+    stamps = _label_files(out_dir)
+    sems.run(eval_cfg(eval_cohort, out_dir, overwrite=False, seed=12))
+    assert all(fp.stat().st_mtime_ns != t for fp, t in stamps.items()), "every shard must be relabeled"
+    _assert_labels_match_task_table(out_dir)
+
+
+def test_cohort_knob_change_relabels(eval_cohort: Path, tmp_path: Path):
+    out_dir = tmp_path / "grid"
+    sems.run(eval_cfg(eval_cohort, out_dir))
+    stamps = _label_files(out_dir)
+    sems.run(eval_cfg(eval_cohort, out_dir, overwrite=False, prediction_times_per_subject=2))
+    assert all(fp.stat().st_mtime_ns != t for fp, t in stamps.items())
+    _assert_labels_match_task_table(out_dir)
+
+
+def test_missing_provenance_relabels_only_that_shard(eval_cohort: Path, tmp_path: Path):
+    """No provenance file means the triple may be incomplete (a crash between writes): relabel."""
+    out_dir = tmp_path / "grid"
+    sems.run(eval_cfg(eval_cohort, out_dir))
+    meta_dir = out_dir / "eval_meta" / "held_out"
+    assert (meta_dir / "_labeled" / "0.json").is_file() and (meta_dir / "_labeled" / "1.json").is_file()
+    (meta_dir / "_labeled" / "0.json").unlink()
+    stamps = _label_files(out_dir)
+    sems.run(eval_cfg(eval_cohort, out_dir, overwrite=False))
+    for fp, t in stamps.items():
+        assert (fp.stat().st_mtime_ns != t) == fp.name.startswith("0."), fp.name
+    assert (meta_dir / "_labeled" / "0.json").is_file()
+
+
+def test_summary_counts_the_rows_of_skipped_shards(eval_cohort: Path, tmp_path: Path):
+    out_dir = tmp_path / "grid"
+    sems.run(eval_cfg(eval_cohort, out_dir))
+    first = json.loads((out_dir / "_eval_summary.json").read_text())["n_labeled_rows"]
+    assert first > 0
+    sems.run(eval_cfg(eval_cohort, out_dir, overwrite=False))
+    second = json.loads((out_dir / "_eval_summary.json").read_text())["n_labeled_rows"]
+    assert second == first
+
+
 def test_grid_is_reused_unless_overwritten(eval_cohort: Path, tmp_path: Path):
     out_dir = tmp_path / "grid"
     sems.run(eval_cfg(eval_cohort, out_dir))
