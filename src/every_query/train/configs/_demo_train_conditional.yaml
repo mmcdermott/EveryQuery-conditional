@@ -27,11 +27,14 @@ datamodule:
     seq_sampling_strategy: to_end
     max_seq_len: 64
     batch_mode: SM
-  # Mirror production's feature-toggle surface so integration tests can switch features on with
-  # a plain Hydra override rather than a `+` append (and so the demo drifts less from real runs).
+  # Mirror production's feature-toggle surface: both dataset-side toggles interpolate from the
+  # model-side knobs exactly as `conditional_config.yaml` does, so an integration test that sets
+  # `lightning_module.model.use_rope_time` / `.ontology_dir` switches the dataset with it (a
+  # literal `false` / `null` here left the dataset on the un-featured path while the model
+  # expected RoPE positions and ancestor vocabulary).
   dataset_kwargs:
-    strip_delta_tokens: false
-    ontology_dir: null
+    strip_delta_tokens: ${lightning_module.model.use_rope_time}
+    ontology_dir: ${lightning_module.model.ontology_dir}
   batch_size: 2
   num_workers: 0
   pin_memory: false
