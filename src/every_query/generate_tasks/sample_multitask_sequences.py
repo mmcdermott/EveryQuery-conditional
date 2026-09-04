@@ -1044,6 +1044,16 @@ def _encode_events(
     )
     n_unknown = int(ev["_code_index"].null_count())
     ev = ev.filter(pl.col("_code_index") > 0)  # drops unknown (null) and PAD (0)
+    if ev.height == 0 and n_unknown > 0:
+        # A shard where *nothing* matched is not a sparse shard, it is the wrong input: string codes
+        # that are not in codes.parquet, most likely the string-coded ``tokenized_events`` instead
+        # of the vocab-indexed intermediate ``data_dir``.  Every label would silently be false.
+        raise ValueError(
+            f"all {n_unknown} timed event(s) of this shard carry codes outside the target vocabulary; "
+            "no label could ever be true. Check that data_dir is the preprocessing *intermediate* "
+            "dir (vocab-indexed codes, matching query_codes/codes.parquet) rather than the "
+            "string-coded tokenized_events."
+        )
     sid = ev[SID].to_numpy().astype(np.int64)
     t = ev[DataSchema.time_name].cast(pl.Datetime("us")).cast(pl.Int64).to_numpy().astype(np.int64)
     ci = ev["_code_index"].to_numpy().astype(np.int64)

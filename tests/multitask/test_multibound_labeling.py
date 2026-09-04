@@ -150,6 +150,15 @@ def test_pad_bit_stays_false_and_unknown_event_codes_are_ignored() -> None:
     assert vocab.boundary_candidates() == ["A"]
 
 
+def test_all_unknown_event_codes_is_a_hard_error() -> None:
+    """A shard where *every* event is out-of-vocabulary is the wrong input (string-coded events),
+    not a sparse shard: it must raise instead of labeling everything false."""
+    vocab = TargetVocabulary.from_pairs(["PAD", "A"], [0, 1])
+    ev = _events([(1, T0 + timedelta(days=1), "ZZZ"), (1, T0 + timedelta(days=2), "YYY")])
+    with pytest.raises(ValueError, match="outside the target vocabulary"):
+        label_multitask_index(make_index([(1, T0)], [[(5.0, None)]]), ev, vocab, 1)
+
+
 def test_unknown_boundary_code_is_a_hard_error() -> None:
     ev = _events([(1, T0 + timedelta(days=1), "A")])
     with pytest.raises(ValueError, match="not in the base vocabulary"):
