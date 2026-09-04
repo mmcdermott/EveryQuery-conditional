@@ -9,7 +9,8 @@ from typing import Any
 import hydra
 import torch
 from hydra.utils import instantiate
-from lightning.pytorch import seed_everything
+from lightning.pytorch import Trainer, seed_everything
+from lightning.pytorch.callbacks import LearningRateMonitor
 from MEDS_transforms.configs.utils import OmegaConfResolver
 from omegaconf import DictConfig, OmegaConf, open_dict
 
@@ -211,6 +212,204 @@ def find_checkpoint_path(output_dir: Path) -> Path | None:
     return sorted_checkpoints[-1] if sorted_checkpoints else None
 
 
+def resolve_seed(do_demo: bool, seed: int | None) -> int | None:
+    """The seed to pass to ``seed_everything``, or ``None`` when the run should not be seeded.
+
+    ``seed=0`` is a legitimate seed; the old ``if do_demo or cfg.get("seed")`` truthiness gate
+    silently skipped seeding for it.
+
+    Examples:
+        >>> resolve_seed(False, 0)
+        0
+        >>> resolve_seed(False, 7)
+        7
+        >>> resolve_seed(False, None) is None
+        True
+        >>> resolve_seed(True, None)
+        1
+    """
+    if seed is not None:
+        return int(seed)
+    return 1 if do_demo else None
+
+
+def drop_lr_monitor_without_logger(trainer: Trainer) -> int:
+    """Remove every ``LearningRateMonitor`` from a trainer that has no logger; returns the count.
+
+    ``LearningRateMonitor.on_train_start`` raises ``MisconfigurationException`` without a logger,
+    *after* the dataset has been loaded and the baseline validation has run.  Every production
+    config ships the monitor, so ``trainer.logger=false`` has to be able to shed it on its own.
+
+    Examples:
+        >>> t = Trainer(logger=False, callbacks=[LearningRateMonitor()], enable_progress_bar=False)
+        >>> drop_lr_monitor_without_logger(t)
+        1
+        >>> any(isinstance(cb, LearningRateMonitor) for cb in t.callbacks)
+        False
+
+        With a logger the callbacks are left alone:
+
+        >>> import tempfile
+        >>> from lightning.pytorch.loggers import CSVLogger
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     t = Trainer(logger=CSVLogger(d), callbacks=[LearningRateMonitor()], enable_progress_bar=False)
+        ...     drop_lr_monitor_without_logger(t)
+        0
+    """
+    if trainer.loggers:
+        return 0
+    kept = [cb for cb in trainer.callbacks if not isinstance(cb, LearningRateMonitor)]
+    dropped = len(trainer.callbacks) - len(kept)
+    if dropped:
+        logger.warning(
+            "trainer.logger is disabled; dropping %d LearningRateMonitor callback(s) that would "
+            "otherwise raise at train start.",
+            dropped,
+        )
+        trainer.callbacks = kept
+    return dropped
+
+
+def completed_epochs(ckpt: dict) -> int | None:
+    """Number of training epochs a Lightning checkpoint has fully completed, or ``None`` if unknown.
+
+    ``ckpt["epoch"]`` is the epoch *index* and ``fit_loop.epoch_progress.current.processed`` is
+    only bumped in ``on_train_epoch_end`` -- a ``last.ckpt`` written by the end-of-epoch
+    validation (the shipped configs' cadence) therefore still reads ``processed=0`` after a full
+    epoch.  Lightning infers the finished epoch from the batch loop on restore; this mirrors
+    that inference so the decision can be made *before* ``trainer.fit`` touches the checkpoint.
+
+    Examples:
+        >>> def ckpt(processed, completed, started, ready_b, processed_b, last):
+        ...     return {"loops": {"fit_loop": {
+        ...         "epoch_progress": {"current": {"ready": started, "started": started,
+        ...                                        "processed": processed, "completed": completed}},
+        ...         "epoch_loop.batch_progress": {"is_last_batch": last,
+        ...             "current": {"ready": ready_b, "started": ready_b,
+        ...                         "processed": processed_b, "completed": processed_b}},
+        ...     }}}
+
+        Saved by ``on_train_epoch_end``: the epoch is already counted.
+
+        >>> completed_epochs(ckpt(1, 0, 1, 4, 4, True))
+        1
+
+        Saved by the validation after the last batch of the first epoch: not yet counted.
+
+        >>> completed_epochs(ckpt(0, 0, 1, 4, 4, True))
+        1
+
+        Saved mid-epoch:
+
+        >>> completed_epochs(ckpt(0, 0, 1, 2, 2, False))
+        0
+        >>> completed_epochs(ckpt(1, 1, 2, 2, 2, False))
+        1
+
+        A checkpoint without loop state:
+
+        >>> completed_epochs({"epoch": 0}) is None
+        True
+    """
+    try:
+        fit_loop = ckpt["loops"]["fit_loop"]
+        epoch = fit_loop["epoch_progress"]["current"]
+        batch = fit_loop["epoch_loop.batch_progress"]
+        processed = int(epoch["processed"])
+        at_last_batch = bool(batch["is_last_batch"]) and int(batch["current"]["ready"]) == int(
+            batch["current"]["processed"]
+        )
+        uncounted = int(epoch["started"]) > processed and int(epoch["completed"]) == processed
+    except (KeyError, TypeError, ValueError):
+        return None
+    return processed + 1 if (at_last_batch and uncounted) else processed
+
+
+def resume_budget_spent(ckpt: dict, max_steps: int | None, max_epochs: int | None) -> str | None:
+    """Why resuming *ckpt* under this trainer budget would train zero steps, or ``None`` if it would train.
+
+    A no-op ``trainer.fit`` is not harmless: Lightning restores the loop state, bumps the epoch
+    counters, and ``ModelCheckpoint.on_train_end`` rewrites ``last.ckpt`` with them, after which
+    a later ``trainer.max_epochs=2`` extension resumes at the end of its batch loop and also
+    trains zero steps.
+
+    Examples:
+        >>> ck = {"global_step": 4, "loops": {"fit_loop": {
+        ...     "epoch_progress": {"current": {"ready": 1, "started": 1, "processed": 0, "completed": 0}},
+        ...     "epoch_loop.batch_progress": {"is_last_batch": True,
+        ...         "current": {"ready": 4, "started": 4, "processed": 4, "completed": 4}}}}}
+        >>> resume_budget_spent(ck, 4, 5)
+        'global_step=4 >= max_steps=4'
+        >>> resume_budget_spent(ck, -1, 1)
+        'completed_epochs=1 >= max_epochs=1'
+        >>> resume_budget_spent(ck, 6, 2) is None
+        True
+        >>> resume_budget_spent({"global_step": 4}, None, 1) is None
+        True
+    """
+    global_step = int(ckpt.get("global_step", 0))
+    if max_steps is not None and max_steps > 0 and global_step >= max_steps:
+        return f"global_step={global_step} >= max_steps={max_steps}"
+    epochs = completed_epochs(ckpt)
+    if max_epochs is not None and max_epochs > 0 and epochs is not None and epochs >= max_epochs:
+        return f"completed_epochs={epochs} >= max_epochs={max_epochs}"
+    return None
+
+
+def resolve_best_checkpoint(reported: str | Path | None, run_dir: Path) -> Path:
+    """The checkpoint to publish as ``best_model.ckpt``: the reported best, else the latest one.
+
+    ``ModelCheckpoint`` only records a best path in ``on_validation_end``, so a run whose
+    ``max_steps`` ends before the first validation (or a resume that trained zero steps) reports
+    none even though training succeeded.  Falling back to ``last.ckpt`` (via
+    :func:`find_checkpoint_path`) keeps such runs usable; only a run with no checkpoint at all
+    is an error.  A reported path that no longer exists (the run dir was moved) is retried by
+    basename under ``run_dir/checkpoints``.
+
+    Examples:
+        >>> import tempfile
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     ckpts = Path(d) / "checkpoints"; ckpts.mkdir()
+        ...     (ckpts / "epoch=0-step=3.ckpt").touch(); (ckpts / "last.ckpt").touch()
+        ...     resolve_best_checkpoint(ckpts / "epoch=0-step=3.ckpt", Path(d)).name
+        ...     resolve_best_checkpoint("/moved/checkpoints/epoch=0-step=3.ckpt", Path(d)).name
+        ...     resolve_best_checkpoint("", Path(d)).name
+        'epoch=0-step=3.ckpt'
+        'epoch=0-step=3.ckpt'
+        'last.ckpt'
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     resolve_best_checkpoint("", Path(d))
+        Traceback (most recent call last):
+            ...
+        ValueError: No best checkpoint reported and no checkpoint found under ...
+    """
+    if reported:
+        reported = Path(reported)
+        for candidate in (reported, run_dir / "checkpoints" / reported.name):
+            if candidate.is_file():
+                return candidate
+    fallback = find_checkpoint_path(run_dir)
+    if fallback is None:
+        raise ValueError(
+            f"No best checkpoint reported and no checkpoint found under {run_dir / 'checkpoints'}."
+        )
+    logger.warning(
+        "No best checkpoint reported (reported=%r); publishing %s as best_model.ckpt instead. "
+        "This happens when max_steps ends before the first validation.",
+        str(reported) if reported else "",
+        fallback,
+    )
+    return fallback
+
+
+def _best_model_path_from_checkpoint(ckpt: dict) -> str:
+    """``ModelCheckpoint``'s recorded ``best_model_path`` in a checkpoint's callback states, or ``""``."""
+    for state in (ckpt.get("callbacks") or {}).values():
+        if isinstance(state, dict) and state.get("best_model_path"):
+            return str(state["best_model_path"])
+    return ""
+
+
 def _is_wandb_logger(logger_cfg: Any) -> bool:
     """Return ``True`` if *logger_cfg* is a wandb-shaped logger node.
 
@@ -399,8 +598,9 @@ def main(cfg: DictConfig) -> float | None:
     # trajectories.  Reading `do_demo` off the config (rather than the instantiated
     # `M.model.do_demo`) lets us keep the gate without needing `M` yet.
     do_demo = cfg.lightning_module.model.get("do_demo", False)
-    if do_demo or cfg.get("seed", None):
-        seed_everything(cfg.get("seed", 1), workers=True)
+    seed = resolve_seed(do_demo, cfg.get("seed", None))
+    if seed is not None:
+        seed_everything(seed, workers=True)
 
     D = instantiate(cfg.datamodule)
     logger.info(f"Train dataset contains {len(D.train_dataloader().dataset)} datapoints")
@@ -408,6 +608,7 @@ def main(cfg: DictConfig) -> float | None:
     M = hydra.utils.instantiate(cfg.lightning_module)
 
     trainer = instantiate(cfg.trainer)
+    drop_lr_monitor_without_logger(trainer)
 
     # Log the run dir up front so every run (even crashed/in-flight) is matchable from the wandb UI
     # back to its folder on disk — best_ckpt_path below is only logged after fit() completes.
@@ -432,20 +633,35 @@ def main(cfg: DictConfig) -> float | None:
         logger.info("Running baseline validation")
         trainer.validate(M, datamodule=D)
 
-    logger.info("Fitting model")
-    trainer.fit(**trainer_kwargs)
+    # A resume whose budget is already spent must not enter ``trainer.fit``: Lightning would
+    # restore the loop state, count the finished epoch, and let ``ModelCheckpoint.on_train_end``
+    # rewrite ``last.ckpt`` with the bumped counters -- after which a later ``max_epochs``
+    # extension resumes at the end of its batch loop and trains zero steps too.
+    skip_reason = None
+    if ckpt_path:
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        skip_reason = resume_budget_spent(ckpt, cfg.trainer.get("max_steps"), cfg.trainer.get("max_epochs"))
 
-    best_ckpt_path = Path(trainer.checkpoint_callback.best_model_path)
-    if not best_ckpt_path.is_file():
-        raise ValueError("No best checkpoint reported.")
+    if skip_reason:
+        logger.warning(
+            f"Resume checkpoint {ckpt_path} already meets the training budget ({skip_reason}); "
+            "skipping trainer.fit so last.ckpt is left untouched. Raise max_steps/max_epochs to train."
+        )
+        reported_best = _best_model_path_from_checkpoint(ckpt)
+        best_score = None
     else:
-        for log in trainer.loggers:
-            log.log_hyperparams({"best_ckpt_path": best_ckpt_path})
+        logger.info("Fitting model")
+        trainer.fit(**trainer_kwargs)
+        reported_best = trainer.checkpoint_callback.best_model_path
+        best_score = trainer.checkpoint_callback.best_model_score
+
+    best_ckpt_path = resolve_best_checkpoint(reported_best, run_dir)
+    for log in trainer.loggers:
+        # ``str``: a PosixPath in hparams.yaml is not ``yaml.safe_load``-able.
+        log.log_hyperparams({"best_ckpt_path": str(best_ckpt_path)})
 
     output_fp = run_dir / "best_model.ckpt"
     shutil.copyfile(best_ckpt_path, output_fp)
-
-    best_score = trainer.checkpoint_callback.best_model_score
 
     # ``best_model_score`` is scoped to the current ``fit`` call's validation events: on a
     # no-op resume (``max_steps`` already reached) no validation runs, so it stays None

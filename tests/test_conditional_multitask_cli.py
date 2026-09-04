@@ -1,5 +1,6 @@
 """CLI integration for multitask sampling, training, and checkpoint restoration."""
 
+import filecmp
 from pathlib import Path
 
 import pytest
@@ -86,3 +87,80 @@ def test_conditional_multitask_train_checkpoint_and_reload(
     assert isinstance(module.model, ConditionalMultitaskARModel)
     assert loaded_cfg.lightning_module.model.max_windows == 5
     assert trainer is not None
+
+
+def _train_cmd(cohort_dir: Path, labels_dir: Path, output_dir: Path, *overrides: str) -> list[str]:
+    return [
+        "EQ_train",
+        "--config-name=_demo_train_conditional_multitask_ar",
+        f"output_dir={output_dir!s}",
+        f"datamodule.config.tensorized_cohort_dir={cohort_dir!s}",
+        f"datamodule.config.task_labels_dir={labels_dir!s}",
+        *overrides,
+    ]
+
+
+def test_logger_false_drops_the_lr_monitor(
+    eq_preprocessed_dataset: Path, conditional_multitask_labels_dir: Path, tmp_path: Path
+):
+    """Every production config ships a ``LearningRateMonitor``; ``trainer.logger=false`` must not
+    crash on it at train start (Lightning refuses the monitor without a logger)."""
+    output_dir = tmp_path / "nologger"
+    run_and_check(
+        _train_cmd(
+            eq_preprocessed_dataset,
+            conditional_multitask_labels_dir,
+            output_dir,
+            "trainer.logger=false",
+            "+trainer.callbacks.learning_rate_monitor="
+            "{_target_: lightning.pytorch.callbacks.LearningRateMonitor}",
+        ),
+        timeout=300.0,
+    )
+    assert (output_dir / "best_model.ckpt").is_file()
+
+
+@pytest.fixture(scope="module")
+def max_steps_before_first_validation_dir(
+    eq_preprocessed_dataset: Path, conditional_multitask_labels_dir: Path, tmp_path_factory
+) -> Path:
+    """One optimizer step under a fractional val cadence, i.e. training ends before the first
+    validation ever records a best checkpoint; logged to CSV so hparams.yaml can be inspected."""
+    output_dir = tmp_path_factory.mktemp("multitask_max_steps")
+    run_and_check(
+        _train_cmd(
+            eq_preprocessed_dataset,
+            conditional_multitask_labels_dir,
+            output_dir,
+            "~trainer.logger",
+            "+trainer.logger={_target_: lightning.pytorch.loggers.CSVLogger, "
+            "save_dir: ${trainer.default_root_dir}/loggers}",
+            "trainer.check_val_every_n_epoch=1",
+            "trainer.val_check_interval=0.5",
+            "+trainer.max_steps=1",
+        ),
+        timeout=300.0,
+    )
+    return output_dir
+
+
+def test_max_steps_before_first_validation_still_publishes_best_model(
+    max_steps_before_first_validation_dir: Path,
+):
+    out = max_steps_before_first_validation_dir
+    assert (out / "best_model.ckpt").is_file()
+    # No validation ran, so there is no "best"; last.ckpt is what gets published.
+    assert filecmp.cmp(out / "best_model.ckpt", out / "checkpoints" / "last.ckpt", shallow=False)
+
+
+def test_csv_logger_logs_best_ckpt_path_as_a_plain_string(max_steps_before_first_validation_dir: Path):
+    """``best_ckpt_path`` is logged as ``str``: a ``!!python/object`` PosixPath tag is not
+    ``yaml.safe_load``-able.  (The datamodule's own ``MEDSTorchDataConfig`` paths still land as
+    tags in the same file; only the entry train.py writes is checked here.)"""
+    hparams = sorted(max_steps_before_first_validation_dir.rglob("hparams.yaml"))
+    assert hparams, "CSVLogger wrote no hparams.yaml"
+    lines = [ln for ln in hparams[-1].read_text().splitlines() if ln.startswith("best_ckpt_path:")]
+    assert len(lines) == 1, lines
+    loaded = yaml.safe_load(lines[0])
+    assert isinstance(loaded["best_ckpt_path"], str)
+    assert Path(loaded["best_ckpt_path"]).is_file()
