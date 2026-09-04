@@ -239,7 +239,9 @@ def test_dense_grid_designed_sequences(eq_preprocessed_dataset: Path, cq_cohort_
     )
 
     # Spec identity is the (queries, durations) columns: group on them to score one task at a time.
-    df = pl.read_parquet(out_dir / "eval" / train_split / "0.parquet")
+    # The fixture split has more than one shard and the cohort fixture's subjects land in whichever
+    # shard ``rglob`` listed first, so read every shard rather than assuming ``0.parquet``.
+    df = pl.concat([pl.read_parquet(fp) for fp in sorted((out_dir / "eval" / train_split).glob("*.parquet"))])
     assert df.height == 2 * n_contexts
     two = df.filter(pl.col("queries").list.len() == 2)
     one = df.filter(pl.col("queries").list.len() == 1)

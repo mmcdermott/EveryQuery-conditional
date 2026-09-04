@@ -415,7 +415,7 @@ def main():
         "run_dir": str(args.run_dir),
         "split": args.split,
         "force_prior": args.force_prior,
-        "n_sequences": out.height,
+        "num_evaluation_sequences": out.height,
         "mean_prob": float(out["prob"].mean()),
         "target_prevalence": float(np.mean(out["true_answer"].to_list())),
     }

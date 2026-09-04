@@ -574,15 +574,19 @@ def test_default_grid_specs_are_the_previous_draw(
 
     out_dir = tmp_path / "grid"
     _run(data_dir, out_dir, codes_yaml)
+    # The duration bounds come from the shipped config so this test tracks its defaults.
+    shipped = yaml.safe_load(
+        (Path(eval_seq.CONFIGS) / "sample_evaluation_query_sequences_config.yaml").read_text()
+    )
     expected = sample_sequence_specs(
         4,
         synthetic_query_codes,
         2,
         2,
-        1,
-        731,
+        float(shipped["duration_min"]),
+        float(shipped["duration_max"]),
         derive_seed(1, "eval_seq_specs", SPLIT),
-        eventbound_fraction=0.5,
+        eventbound_fraction=float(shipped["eventbound_fraction"]),
     )
     df = _labels(out_dir, "0").head(4)
     assert [tuple(q) for q in df["queries"].to_list()] == [s.queries for s in expected]
