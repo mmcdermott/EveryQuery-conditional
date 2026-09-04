@@ -525,8 +525,8 @@ def test_every_window_decider_agrees_on_every_boundary_case(
 ) -> None:
     """Each window decider, on each shared boundary case, answers what the rule requires.
 
-    The node id names both the labeller and the case, so a re-flipped operator is identified by the
-    test name alone, before the message is even read.
+    The node id names both the labeller and the case, so a re-flipped operator is identified by the test name
+    alone, before the message is even read.
     """
     got = decider.run(case)
     assert got == case.expected, _fail(decider, case, got)
@@ -679,11 +679,11 @@ def test_a_query_at_the_exact_instant_of_the_boundary_event_does_not_count() -> 
 def test_the_boundary_search_itself_is_strict_at_the_prediction_instant() -> None:
     """A boundary-code occurrence *at* ``prediction_time`` does not close the window.
 
-    The lower bound is strict for the boundary search too, not only for the query search -- so a
-    boundary code charted at the prediction instant is skipped and the *next* occurrence closes the
-    window.  Without this, closing the upper bound would make every event-bounded query whose
-    boundary code sits on the prediction instant collapse to an empty window and answer False
-    forever, which is the mirror-image silent-wrong-label defect.
+    The lower bound is strict for the boundary search too, not only for the query search -- so a boundary code
+    charted at the prediction instant is skipped and the *next* occurrence closes the window.  Without this,
+    closing the upper bound would make every event-bounded query whose boundary code sits on the prediction
+    instant collapse to an empty window and answer False forever, which is the mirror-image silent-wrong-label
+    defect.
     """
     events = (
         pl.DataFrame(

@@ -226,9 +226,9 @@ def test_left_or_interior_padding_is_rejected():
 def test_duration_embedding_is_on_the_code_embedding_scale():
     """A duration-bounded window token must not be dominated by the duration MLP.
 
-    Only the final Linear of each MLP is rescaled (weight std = initializer_range, bias 0); the
-    hidden ReLU layer keeps its default init, so the output norm measures ~3-5x an embedding row
-    (7d / 365d, over seeds) instead of the ~12-19x of the default final-layer init.
+    Only the final Linear of each MLP is rescaled (weight std = initializer_range, bias 0); the hidden ReLU
+    layer keeps its default init, so the output norm measures ~3-5x an embedding row (7d / 365d, over seeds)
+    instead of the ~12-19x of the default final-layer init.
     """
     torch.manual_seed(0)
     H = 384
@@ -424,8 +424,8 @@ def _gather_final(logits: torch.Tensor, q_mask: torch.Tensor, codes: torch.Tenso
 
 @pytest.mark.parametrize("autocast", [False, True], ids=["fp32", "bf16-autocast"])
 def test_score_final_query_matches_gathered_full_vocab_logits(autocast):
-    """``score_final_query`` == ``forward``'s logits at ``[b, last_b, code_b]`` for several scored
-    codes and several real lengths in one padded batch (the numerical regression of #28)."""
+    """``score_final_query`` == ``forward``'s logits at ``[b, last_b, code_b]`` for several scored codes and
+    several real lengths in one padded batch (the numerical regression of #28)."""
     model = tiny_model()
     q_mask = [[True, True, True], [True, False, False], [True, True, False], [True, True, True]]
     code = [[2, 3, 4, 5], [7, 8, 0, 0], [9, 10, 11, 0], [12, 13, 14, 15]]

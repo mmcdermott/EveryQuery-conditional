@@ -36,21 +36,21 @@ Key files:
 
 - `predict.py` — `EQ_predict` (inference-only Hydra main).
 - `predict_sequences.py` — `EQ_predict_sequences`: the conditional counterpart. Consumes
-  `QuerySeqSchema` parquets plus a `ConditionalQueryLightningModule` checkpoint and runs
-  teacher-forced inference, emitting one flat row per query *position*
-  (`subject_id`, `prediction_time`, `position`, `query`, `duration_days`, `answer`, `answer_prob`).
+    `QuerySeqSchema` parquets plus a `ConditionalQueryLightningModule` checkpoint and runs
+    teacher-forced inference, emitting one flat row per query *position*
+    (`subject_id`, `prediction_time`, `position`, `query`, `duration_days`, `answer`, `answer_prob`).
 - `predict_multitask.py` — `EQ_predict_multitask`: scores the *same*
-  `EQ_generate_evaluation_query_sequences` grid with a `ConditionalMultitaskLightningModule`
-  checkpoint. Per grid row, `queries[:-1]` / `answers[:-1]` are the teacher-forced conditioning
-  pairs and the final query is scored target-only at its last window (no all-vocabulary logits,
-  packed labels, manifest or sidecar), emitting one row per grid row (`subject_id`,
-  `prediction_time`, the window lists incl. `start_durations` / `start_events`, `target_code`,
-  `label`, `prob`). This is the only inference path that consumes active window starts.
+    `EQ_generate_evaluation_query_sequences` grid with a `ConditionalMultitaskLightningModule`
+    checkpoint. Per grid row, `queries[:-1]` / `answers[:-1]` are the teacher-forced conditioning
+    pairs and the final query is scored target-only at its last window (no all-vocabulary logits,
+    packed labels, manifest or sidecar), emitting one row per grid row (`subject_id`,
+    `prediction_time`, the window lists incl. `start_durations` / `start_events`, `target_code`,
+    `label`, `prob`). This is the only inference path that consumes active window starts.
 - `schema.py` — `PredictionSchema` (`TaskQuerySchema` + `censor_prob` + `occurs_prob`).
 - `configs/predict_sequences.yaml` — same required trio as `predict.yaml`
-  (`model_run_dir`, `tasks_dir`, `output_parquet`), pointed at a conditional training run.
+    (`model_run_dir`, `tasks_dir`, `output_parquet`), pointed at a conditional training run.
 - `configs/predict_multitask.yaml` — the same trio for a multitask run; `tasks_dir` is the
-  QuerySeq grid's `eval/` root.
+    QuerySeq grid's `eval/` root.
 - `configs/predict.yaml` — required: `model_run_dir`, `tasks_dir`, `output_parquet`; optional: `ckpt_name`, `split` (`held_out` | `tuning`), `overwrite` (default `false` — refuses to clobber an existing `output_parquet`; pass `overwrite=true` to replace).
 - `external_tasks/` — convert + aggregate tasks outside EQ's native vocabulary (`aces_to_eq.py`, `process_composite.py`, `get_per_code_from_composite.py`).
 

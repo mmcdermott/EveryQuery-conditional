@@ -254,9 +254,9 @@ answer = start < some occurrence of query < end  (both endpoints open)
 
 A start event that never occurs after the prediction time leaves the window empty (answer `False`,
 even if the end is also unresolved); an end event that never occurs after a resolved start lets the
-window run to the end of the record.  These are the multitask sampler's window semantics, and
+window run to the end of the record. These are the multitask sampler's window semantics, and
 `label_query_sequences` labels a grid carrying starts through the same `interval_table.py`
-resolver — so `EQ_predict_multitask` can score the grid.  Designed specs spell starts out with the
+resolver — so `EQ_predict_multitask` can score the grid. Designed specs spell starts out with the
 mapping entry form (missing start keys mean a prediction-time start):
 
 ```yaml
@@ -276,7 +276,7 @@ between_events:                        # opens at the admission, closes at the n
 ```
 
 or, in a long-format parquet, the optional `start_duration_days` / `start_event` columns next to
-`seq_id, position, query, duration_days[, bound_event]`.  Sampled specs draw starts from the
+`seq_id, position, query, duration_days[, bound_event]`. Sampled specs draw starts from the
 `eventstart_fraction` / `prediction_time_start_fraction` / `start_duration_min|max|distribution` /
 `start_event_codes` knobs (the multitask sampler's cumulative form split) on three seed axes of their
 own, so a start knob perturbs none of the query / duration / end draws; the defaults open every window
@@ -287,7 +287,7 @@ start) and `start_events` (the start code, or null) only when some spec has an a
 **The ordinary sequence models accept only prediction-time starts**: `ConditionalQueryPytorchDataset`
 loads a grid with absent or all-default start columns, and refuses one with any positive-delay or
 event start unless built with `allow_active_starts=True` — which only the multitask prediction
-adapter does.  `EQ_generate_query_sequences` never samples a start.
+adapter does. `EQ_generate_query_sequences` never samples a start.
 
 ### Multitask boundary labels — every code at every window
 

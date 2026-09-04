@@ -335,8 +335,8 @@ def _start_view(specs: list[SequenceSpec]) -> list[tuple]:
 
 
 def test_default_start_knobs_reproduce_the_previous_draw_exactly():
-    """Every window opens at the prediction time, the specs carry no start tuples, and the legacy
-    (queries, durations, bounds) draw is the one the pre-#27 signature produced."""
+    """Every window opens at the prediction time, the specs carry no start tuples, and the legacy (queries,
+    durations, bounds) draw is the one the pre-#27 signature produced."""
     plain = _draw()
     spelled = _draw(eventstart_fraction=0.0, prediction_time_start_fraction=1.0)
     assert plain == spelled
@@ -369,8 +369,8 @@ _GOLDEN_LEGACY_DRAW = [
     ids=["default-starts", "mixed-starts", "all-duration-starts"],
 )
 def test_legacy_draw_matches_the_pre_start_golden(start_kwargs):
-    """The (queries, durations, bounds) draw is byte-identical to the pre-#27 sampler's, with the
-    start knobs at their defaults and with every start form switched on."""
+    """The (queries, durations, bounds) draw is byte-identical to the pre-#27 sampler's, with the start knobs
+    at their defaults and with every start form switched on."""
     specs = sample_sequence_specs(
         3, ["A", "B", "C", "TIMELINE//END"], 1, 4, 1, 365, 7, eventbound_fraction=0.5, **start_kwargs
     )
@@ -392,9 +392,9 @@ def test_start_knobs_do_not_perturb_the_legacy_draw():
 
 
 def test_legacy_knobs_do_not_perturb_the_start_component():
-    """Changing an end-side knob changes the end draw only; the per-slot start forms/values stay put
-    slot for slot (the start streams are drawn over the same total query count, so lengths must
-    agree — which they do because lengths come from the untouched structure axis)."""
+    """Changing an end-side knob changes the end draw only; the per-slot start forms/values stay put slot for
+    slot (the start streams are drawn over the same total query count, so lengths must agree — which they do
+    because lengths come from the untouched structure axis)."""
     a = _draw(eventstart_fraction=0.3, prediction_time_start_fraction=0.3, eventbound_fraction=0.0)
     b = _draw(eventstart_fraction=0.3, prediction_time_start_fraction=0.3, eventbound_fraction=1.0)
     assert _start_view(a) == _start_view(b)
@@ -467,8 +467,8 @@ def test_start_sampling_validation_mirrors_the_multitask_sampler(kw, match):
 
 
 def test_sample_starts_cumulative_split_matches_the_multitask_form_rule():
-    """Same ``u`` thresholds as ``BoundaryDistribution.sample``: event below ``e``, prediction time
-    below ``e + p``, delay above."""
+    """Same ``u`` thresholds as ``BoundaryDistribution.sample``: event below ``e``, prediction time below ``e
+    + p``, delay above."""
     rng_u = np.random.default_rng(3)
     u = rng_u.random(500)
     d, e = _sample_starts(
@@ -621,8 +621,8 @@ def test_sampled_starts_reach_the_output_and_label_through_the_start_path(
 def test_designed_starts_are_labeled_per_the_rule(
     tmp_path: Path, data_dir: Path, codes_yaml: Path, synthetic_events: pl.DataFrame
 ):
-    """End to end through ``main`` on the synthetic cohort, checked row by row against the
-    plain-Python oracle in ``tests/test_queryseq_starts.py`` (which shares no code with the labeler).
+    """End to end through ``main`` on the synthetic cohort, checked row by row against the plain-Python oracle
+    in ``tests/test_queryseq_starts.py`` (which shares no code with the labeler).
 
     The specs exercise every start/end form at once: an event start with an event end, an event
     start with a duration end, a duration start with an event end, and a start event that never

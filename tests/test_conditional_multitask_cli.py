@@ -103,8 +103,8 @@ def _train_cmd(cohort_dir: Path, labels_dir: Path, output_dir: Path, *overrides:
 def test_logger_false_drops_the_lr_monitor(
     eq_preprocessed_dataset: Path, conditional_multitask_labels_dir: Path, tmp_path: Path
 ):
-    """Every production config ships a ``LearningRateMonitor``; ``trainer.logger=false`` must not
-    crash on it at train start (Lightning refuses the monitor without a logger)."""
+    """Every production config ships a ``LearningRateMonitor``; ``trainer.logger=false`` must not crash on it
+    at train start (Lightning refuses the monitor without a logger)."""
     output_dir = tmp_path / "nologger"
     run_and_check(
         _train_cmd(
@@ -124,8 +124,8 @@ def test_logger_false_drops_the_lr_monitor(
 def max_steps_before_first_validation_dir(
     eq_preprocessed_dataset: Path, conditional_multitask_labels_dir: Path, tmp_path_factory
 ) -> Path:
-    """One optimizer step under a fractional val cadence, i.e. training ends before the first
-    validation ever records a best checkpoint; logged to CSV so hparams.yaml can be inspected."""
+    """One optimizer step under a fractional val cadence, i.e. training ends before the first validation ever
+    records a best checkpoint; logged to CSV so hparams.yaml can be inspected."""
     output_dir = tmp_path_factory.mktemp("multitask_max_steps")
     run_and_check(
         _train_cmd(
@@ -155,8 +155,11 @@ def test_max_steps_before_first_validation_still_publishes_best_model(
 
 def test_csv_logger_logs_best_ckpt_path_as_a_plain_string(max_steps_before_first_validation_dir: Path):
     """``best_ckpt_path`` is logged as ``str``: a ``!!python/object`` PosixPath tag is not
-    ``yaml.safe_load``-able.  (The datamodule's own ``MEDSTorchDataConfig`` paths still land as
-    tags in the same file; only the entry train.py writes is checked here.)"""
+    ``yaml.safe_load``-able.
+
+    (The datamodule's own ``MEDSTorchDataConfig`` paths still land as
+    tags in the same file; only the entry train.py writes is checked here.)
+    """
     hparams = sorted(max_steps_before_first_validation_dir.rglob("hparams.yaml"))
     assert hparams, "CSVLogger wrote no hparams.yaml"
     lines = [ln for ln in hparams[-1].read_text().splitlines() if ln.startswith("best_ckpt_path:")]

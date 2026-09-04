@@ -113,13 +113,13 @@ ______________________________________________________________________
 
 The conditional pipeline mirrors the single-query one. New console scripts (in `pyproject.toml`):
 
-| CLI                                            | Purpose                                                                                                                    |
-| ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `EQ_generate_query_sequences`                  | Sample fully-random query sequences per patient context; binary-label every query (`QuerySeqSchema` parquets).             |
-| `EQ_train --config-name=conditional_config`    | Train the encoder–decoder `ConditionalQueryEncoderDecoderModel` (`conditional_lightning.ConditionalQueryLightningModule`). |
-| `EQ_train --config-name=conditional_ar_config` | Train the decoder-only `ConditionalQueryARModel` (same Lightning module; see §1b).                                         |
-| `EQ_predict_sequences`                         | Teacher-forced per-position inference → flat per-query-position parquet.                                                   |
-| `EQ_evaluate_sequences`                        | Per-position and per-(query, horizon) metric tables.                                                                       |
+| CLI                                            | Purpose                                                                                                                                   |
+| ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `EQ_generate_query_sequences`                  | Sample fully-random query sequences per patient context; binary-label every query (`QuerySeqSchema` parquets).                            |
+| `EQ_train --config-name=conditional_config`    | Train the encoder–decoder `ConditionalQueryEncoderDecoderModel` (`conditional_lightning.ConditionalQueryLightningModule`).                |
+| `EQ_train --config-name=conditional_ar_config` | Train the decoder-only `ConditionalQueryARModel` (same Lightning module; see §1b).                                                        |
+| `EQ_predict_sequences`                         | Teacher-forced per-position inference → flat per-query-position parquet.                                                                  |
+| `EQ_evaluate_sequences`                        | Per-position and per-(query, horizon) metric tables.                                                                                      |
 | `EQ_predict_multitask`                         | Score the *same* `EQ_generate_evaluation_query_sequences` grid with the multitask model: one final-query probability per row (issue #28). |
 
 There is one evaluation-grid generator for both model families:
@@ -146,7 +146,7 @@ Key source modules:
 - `src/every_query/data/schema.py` — `QuerySeqSchema` (`queries`, `durations`, `answers` list cols,
     plus the optional `bound_events` and — for evaluation grids only — `start_durations` /
     `start_events` list columns; a window is `(start, end)` with the end resolved relative to the
-    resolved start, both endpoints open).  The ordinary sequence models accept only the default
+    resolved start, both endpoints open). The ordinary sequence models accept only the default
     prediction-time start; active starts are consumed by `EQ_predict_multitask`.
 - `src/every_query/generate_tasks/sample_query_sequences.py` — the 5-stage sequence sampler,
     mirroring `sample_tasks`: Stage 0 `build_prediction_times` (reused), Stage 1'

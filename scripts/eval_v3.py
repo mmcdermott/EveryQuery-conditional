@@ -264,7 +264,7 @@ def score_last(model, ds, batch_size: int, force_prior: int | None, keep_all_pos
 def with_conditional(out: pl.DataFrame, force_prior: int | None) -> pl.DataFrame:
     """Attach ``conditional``: the teacher-forced context the model actually saw, as a stable string.
 
-    Rendered ``code@Nd=YES | code@Nd=NO`` in sequence order, or ``<marginal>`` for a single-query
+    Rendered ``code@<days>d=YES | code@<days>d=NO`` in sequence order, or ``<marginal>`` for a single-query
     sequence.  Under ``--force-prior`` the label reports the *overridden* answers, since those — not
     the recorded ones — are what conditioned the prediction.
     """

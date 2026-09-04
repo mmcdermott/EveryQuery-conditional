@@ -229,8 +229,8 @@ def test_codes_past_the_checkpoint_vocabulary_width_are_rejected(tensorized_coho
 
 
 def test_rows_longer_than_the_checkpoints_window_budget_are_rejected_at_init(tensorized_cohort_dir, tmp_path):
-    """A 3-query row fits ``max_windows=3`` and is rejected by ``max_windows=2`` before any model runs
-    (the model itself would only fail when that row's batch reached the backbone)."""
+    """A 3-query row fits ``max_windows=3`` and is rejected by ``max_windows=2`` before any model runs (the
+    model itself would only fail when that row's batch reached the backbone)."""
     grid = _write_grid(tmp_path / "grid", _mixed_rows())
     ds = _dataset(tensorized_cohort_dir, grid, max_windows=3)
     assert ds.max_windows == 3

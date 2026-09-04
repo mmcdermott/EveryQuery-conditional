@@ -479,7 +479,9 @@ def test_changed_cohort_relabels_instead_of_skipping(
 
 def test_missing_provenance_relabels_only_that_shard(tmp_path: Path, data_dir: Path, codes_yaml: Path):
     """No sidecar means nothing vouches for that shard's parquet (a crash between the two writes):
-    that shard alone is relabeled, the others are reused, and the sidecar comes back."""
+
+    that shard alone is relabeled, the others are reused, and the sidecar comes back.
+    """
     out_dir = tmp_path / "grid"
     _run_seq(data_dir, out_dir, codes_yaml)
     sidecars = {

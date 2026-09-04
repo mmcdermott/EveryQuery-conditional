@@ -214,9 +214,9 @@ def test_each_start_form_against_the_hand_computed_oracle(spec, expected, why):
 def test_end_boundary_is_searched_after_the_resolved_start_not_the_prediction_time():
     """The discharge on day 1 lies between the prediction time and the admission on day 5.
 
-    A labeler that resolved the end against the prediction time would close the window at day 1
-    and answer False; the rule resolves it against the resolved start (day 5), finds the day-11
-    discharge, and sees A on day 8.
+    A labeler that resolved the end against the prediction time would close the window at day 1 and answer
+    False; the rule resolves it against the resolved start (day 5), finds the day-11 discharge, and sees A on
+    day 8.
     """
     spec = ("A", SENTINEL, "DISCHARGE", SENTINEL, "ADMIT")
     assert _answers(_index([spec]), _events(RECORD)) == [True]
@@ -363,8 +363,10 @@ def test_dispatch_keys_on_the_frame_and_requires_both_start_columns():
 
 def test_labeler_rejects_contradictory_start_rows_at_the_seam():
     """The representation contract is enforced where the answers are produced, not only upstream:
-    a negative / non-finite non-sentinel start or an event start without the sentinel would
-    otherwise resolve to an arbitrary instant and label silently."""
+
+    a negative / non-finite non-sentinel start or an event start without the sentinel would otherwise resolve
+    to an arbitrary instant and label silently.
+    """
     events = _events([(1, _day(5), "A"), (1, _day(30), "B")])
     for bad_duration, bad_event in [(-1.0, None), (-3.0, None), (float("nan"), None), (float("inf"), None)]:
         idx = _index([("A", 30.0, None, bad_duration, bad_event)])
@@ -383,8 +385,8 @@ def test_labeler_rejects_contradictory_start_rows_at_the_seam():
 
 @pytest.mark.parametrize("unit", ["ms", "ns"])
 def test_labeler_normalises_datetime_units_before_the_interval_table(unit):
-    """``interval_table`` works in int64 microseconds; a ``ms``/``ns`` frame must label exactly as
-    the ``us`` frame does rather than being read as the wrong instants."""
+    """``interval_table`` works in int64 microseconds; a ``ms``/``ns`` frame must label exactly as the ``us``
+    frame does rather than being read as the wrong instants."""
     events = _events([(1, _day(3), "A"), (1, _day(6), "ADMIT"), (1, _day(9), "A"), (1, _day(20), "DIS")])
     idx = _index(
         [("A", 30.0, None, 0.0, None), ("A", -1.0, "DIS", SENTINEL, "ADMIT"), ("A", 2.0, None, 7.0, None)]
