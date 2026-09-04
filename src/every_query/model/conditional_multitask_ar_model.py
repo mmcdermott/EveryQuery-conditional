@@ -99,6 +99,14 @@ class ConditionalMultitaskARModel(torch.nn.Module):
         H = self.HF_model_config.hidden_size
         self.start_duration_embed = MLP(layers=[1, 64, H], dropout_prob=0)
         self.end_duration_embed = MLP(layers=[1, 64, H], dropout_prob=0)
+        # Put a duration-bounded window token on the same scale as the code / type / marker / block
+        # embeddings: at the default Linear init the MLP output norm is ~10x an embedding row, so a
+        # window token was dominated by its duration.  Only the output layer is rescaled; the
+        # hidden ReLU layer keeps its default init.
+        for mlp in (self.start_duration_embed, self.end_duration_embed):
+            final = mlp.model[-1]
+            torch.nn.init.normal_(final.weight, mean=0.0, std=self.HF_model_config.initializer_range)
+            torch.nn.init.zeros_(final.bias)
         self.start_marker = torch.nn.Parameter(torch.randn(H) * self.HF_model_config.initializer_range)
         self.bound_marker = torch.nn.Parameter(torch.randn(H) * self.HF_model_config.initializer_range)
         self.answer_embed = torch.nn.Embedding(N_ANSWER_CLASSES, H)
@@ -248,6 +256,14 @@ class ConditionalMultitaskARModel(torch.nn.Module):
         pad = batch.PAD_INDEX
         patient_mask = batch.code != pad
         n_patient = patient_mask.sum(dim=1)
+        # The query tokens are scattered to positions n_patient.. and the patient prefix is
+        # attended as ``code != PAD``, which is only right when every real token precedes every
+        # PAD.  Left padding or an interior PAD would silently overwrite real tokens.
+        if (patient_mask[:, 1:] & ~patient_mask[:, :-1]).any():
+            raise ValueError(
+                "patient_mask is not a prefix mask: batch.code has a real token after a PAD (left "
+                "padding or an interior PAD). ConditionalMultitaskARModel requires right padding."
+            )
 
         patient_emb = self.HF_model.get_input_embeddings()(batch.code)
         patient_emb = patient_emb + self.token_type_embed.weight[TYPE_PATIENT].to(patient_emb.dtype)

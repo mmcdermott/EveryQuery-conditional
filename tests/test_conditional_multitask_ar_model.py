@@ -209,6 +209,43 @@ def test_patient_padding_is_invisible_and_query_mask_covers_whole_block():
         assert captured["mask"][row, n : n + 7].tolist() == [1, 1, 1, 0, 0, 0, 1]
 
 
+def test_left_or_interior_padding_is_rejected():
+    """The stream layout assumes right padding; anything else must raise, not corrupt silently."""
+    model = tiny_model()
+    right = make_batch(code=[[2, 3, 4, 5], [7, 8, 0, 0]])
+    loss, _ = model(right)
+    assert loss.isfinite()
+    left = make_batch(code=[[2, 3, 4, 5], [0, 0, 7, 8]])
+    with pytest.raises(ValueError, match="prefix mask"):
+        model(left)
+    interior = make_batch(code=[[2, 3, 4, 5], [7, 0, 8, 0]])
+    with pytest.raises(ValueError, match="prefix mask"):
+        model(interior)
+
+
+def test_duration_embedding_is_on_the_code_embedding_scale():
+    """A duration-bounded window token must not be dominated by the duration MLP.
+
+    Only the final Linear of each MLP is rescaled (weight std = initializer_range, bias 0); the
+    hidden ReLU layer keeps its default init, so the output norm measures ~3-5x an embedding row
+    (7d / 365d, over seeds) instead of the ~12-19x of the default final-layer init.
+    """
+    torch.manual_seed(0)
+    H = 384
+    model = ConditionalMultitaskARModel(
+        config_overrides=dict(MODEL_CFG, hidden_size=H, intermediate_size=4 * H), max_windows=5
+    )
+    code_row_norm = model.HF_model.get_input_embeddings().weight.norm(dim=1).mean().item()
+    for mlp in (model.start_duration_embed, model.end_duration_embed):
+        final = mlp.model[-1]
+        assert isinstance(final, torch.nn.Linear)
+        assert torch.equal(final.bias, torch.zeros(H))
+        for days in (7.0, 365.0):
+            emb = mlp(torch.tensor([[days / 365.0]]))
+            ratio = emb.norm().item() / code_row_norm
+            assert ratio < 6.0, f"duration embedding for {days}d is {ratio:.1f}x a code row"
+
+
 def test_tied_readout_identity_and_gradient():
     model = tiny_model()
     assert "lm_head" not in dict(model.named_modules())
