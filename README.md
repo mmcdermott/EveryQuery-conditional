@@ -120,19 +120,19 @@ an i.i.d. query sequence for each, and labels every query by observed occurrence
 columns `queries`, `durations` (float days), `answers` (bool) and, when `eventbound_fraction > 0`,
 `bound_events`. Run it for `split=train` and `split=tuning` (training validates on `tuning`).
 
-| Knob                                                      | Default                 | Meaning                                                                                                                       |
-| --------------------------------------------------------- | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `query_codes`                                             | required                | query universe: a tensorized-cohort root (reads `metadata/codes.parquet`), an inline list `[HR,TEMP]`, or a YAML/parquet path |
-| `num_training_sequence_examples`                          | 4096                    | total sequences over the split (global budget, not per shard)                                                                 |
-| `min_queries` / `max_queries`                             | 1 / 5                   | sequence length ~ Uniform{min..max}                                                                                           |
-| `duration_min` / `duration_max` / `duration_distribution` | 1 / 731 / `log-uniform` | per-query horizon draw, continuous days                                                                                       |
-| `eventbound_fraction`                                     | 0.5                     | fraction of queries bounded by the next occurrence of a random boundary event instead of a horizon                            |
-| `eos_first_fraction`                                      | 0.0                     | probability a sequence starts with `TIMELINE//END`                                                                            |
-| `duration_mode`                                           | `random`                | `random` \| `same` \| `nondecreasing` horizons within a sequence                                                              |
-| `min_prediction_times_per_subject`                        | 50                      | eligibility threshold for a prediction time                                                                                   |
-| `ontology_dir`                                            | null                    | adds every ancestor node to the query/boundary universe and labels ancestor queries via descendants                           |
-| `max_workers`                                             | cores                   | shard-labeling parallelism (raise → more RAM)                                                                                 |
-| `seed`                                                    | 1                       | per-shard seeds also mix in the shard id, so no two shards draw the same queries                                              |
+| Knob                                                      | Default                  | Meaning                                                                                                                       |
+| --------------------------------------------------------- | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
+| `query_codes`                                             | required                 | query universe: a tensorized-cohort root (reads `metadata/codes.parquet`), an inline list `[HR,TEMP]`, or a YAML/parquet path |
+| `num_training_sequence_examples`                          | 4096                     | total sequences over the split (global budget, not per shard)                                                                 |
+| `min_queries` / `max_queries`                             | 1 / 5                    | sequence length ~ Uniform{min..max}                                                                                           |
+| `duration_min` / `duration_max` / `duration_distribution` | 1 / 1826 / `log-uniform` | per-query horizon draw, continuous days                                                                                       |
+| `eventbound_fraction`                                     | 0.5                      | fraction of queries bounded by the next occurrence of a random boundary event instead of a horizon                            |
+| `eos_first_fraction`                                      | 0.0                      | probability a sequence starts with `TIMELINE//END`                                                                            |
+| `duration_mode`                                           | `random`                 | `random` \| `same` \| `nondecreasing` horizons within a sequence                                                              |
+| `min_prediction_times_per_subject`                        | 50                       | eligibility threshold for a prediction time                                                                                   |
+| `ontology_dir`                                            | null                     | adds every ancestor node to the query/boundary universe and labels ancestor queries via descendants                           |
+| `max_workers`                                             | cores                    | shard-labeling parallelism (raise → more RAM)                                                                                 |
+| `seed`                                                    | 1                        | per-shard seeds also mix in the shard id, so no two shards draw the same queries                                              |
 
 Intermediates (prediction-time counts, sequence index) land in the sibling
 `{out_dir}_artifacts/`; `out_dir` holds final parquets only.

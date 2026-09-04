@@ -32,8 +32,10 @@ datamodule:
   # Mirror production's feature-toggle surface so integration tests can switch features on with
   # a plain Hydra override rather than a `+` append (and so the demo drifts less from real runs).
   dataset_kwargs:
-    strip_delta_tokens: false
-    ontology_dir: null
+    # Interpolated from the model-side knobs exactly as `conditional_ar_config.yaml` does, so a
+    # feature switched on at the model is switched on in the dataset.
+    strip_delta_tokens: ${lightning_module.model.use_rope_time}
+    ontology_dir: ${lightning_module.model.ontology_dir}
   batch_size: 2
   num_workers: 0
   pin_memory: false

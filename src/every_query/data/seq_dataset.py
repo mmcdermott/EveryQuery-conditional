@@ -6,8 +6,10 @@ The on-disk label rows follow :class:`~every_query.data.schema.QuerySeqSchema`: 
 - ``queries``: list of MEDS code strings (any vocabulary code, in random order — including the
   end-of-timeline code :data:`EOS_CODE`, which is an ordinary code, not a special sentinel);
 - ``durations``: list of float horizon lengths (days);
-- ``answers``: list of booleans.  ``answers[j]`` is simply *"was ``queries[j]`` observed in
-  ``(prediction_time, prediction_time + durations[j])``?"* — binary, never null.  An event we
+- ``answers``: list of booleans.  ``answers[j]`` is simply *"was ``queries[j]`` observed strictly
+  inside its window?"* — with the default prediction-time start and no bound event that window is
+  ``(prediction_time, prediction_time + durations[j])``; a bound event closes it at that code's next
+  occurrence after the (resolved) start instead — binary, never null.  An event we
   could not observe (because the record ends first) is ``False``; censoring is expressed by a
   separate ``TIMELINE//END`` query rather than a null answer.
 

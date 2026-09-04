@@ -433,7 +433,10 @@ def _specs_from_pairs(name: str, pairs: object) -> SequenceSpec:
     Missing start keys mean a prediction-time start.  The forms may be mixed within one sequence.
     """
     if not isinstance(pairs, Sequence) or isinstance(pairs, str):
-        raise ValueError(f"sequence {name!r} must be a list of [code, duration] pairs, got {pairs!r}")
+        raise ValueError(
+            f"sequence {name!r} must be a list of [code, duration] pairs, [code, -1, bound_event] triples "
+            f"or {{query, duration_days, ...}} mappings, got {pairs!r}"
+        )
     queries: list[str] = []
     durations: list[float] = []
     bounds: list[str | None] = []

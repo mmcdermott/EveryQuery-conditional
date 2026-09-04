@@ -115,8 +115,10 @@ class QuerySeqSchema(LabelSchema):
     ``prediction_time``.  Both endpoints are open.  A start event that never occurs after the
     prediction time leaves the window empty (answer ``False``, even if the end is also
     unresolved); an end event that never occurs after a resolved start lets the window run to
-    the end of the record.  With the default prediction-time start this is exactly the legacy
-    ``(prediction_time, prediction_time + duration)`` / ``(prediction_time, boundary)`` window.
+    the end of the record.  With the default prediction-time start this is the legacy
+    ``(prediction_time, prediction_time + duration)`` / ``(prediction_time, boundary)`` window —
+    bit-for-bit for whole-day horizons; a fractional horizon can differ by one microsecond at the
+    window end between the two labelers (see ``label_with_explicit_starts``).
 
     Attributes:
         queries: Ordered list of MEDS code strings (any vocabulary code, random order — including
