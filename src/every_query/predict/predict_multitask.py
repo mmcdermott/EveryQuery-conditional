@@ -130,6 +130,31 @@ def align_sidecar(schema_df: pl.DataFrame, sidecar: pl.DataFrame) -> pl.DataFram
     return joined
 
 
+def check_grid_coverage(schema_df: pl.DataFrame, sidecar: pl.DataFrame) -> None:
+    """Require the dataset to have loaded every grid row the sidecar describes.
+
+    The dataset inner-joins the grid against the tensorized cohort, so a grid row whose subject is
+    absent from the cohort disappears without a trace on the dataset side (``align_sidecar`` only
+    checks the dataset's rows); only the sidecar still counts it.  Scoring a silently shrunken
+    grid would misreport every per-task metric.
+
+    Examples:
+        >>> two = pl.DataFrame({"a": [1, 2]})
+        >>> check_grid_coverage(two, two)
+        >>> check_grid_coverage(two.head(1), two)
+        Traceback (most recent call last):
+            ...
+        RuntimeError: the evaluation sidecar has 2 row(s) but the dataset loaded 1; 1 grid row(s) ...
+    """
+    if sidecar.height != schema_df.height:
+        raise RuntimeError(
+            f"the evaluation sidecar has {sidecar.height} row(s) but the dataset loaded "
+            f"{schema_df.height}; {sidecar.height - schema_df.height} grid row(s) were dropped, most "
+            "likely because their subject is absent from the tensorized cohort. Regenerate the grid "
+            "against this cohort."
+        )
+
+
 def scored_code_matrix(
     dataset, sidecar: pl.DataFrame, num_bounds: int
 ) -> tuple[np.ndarray, list[list[str]]]:
@@ -137,7 +162,9 @@ def scored_code_matrix(
 
     Windows ``0..K-2`` score their conditioning code; window ``K-1`` scores the task's target code.
     """
-    cond = np.stack(dataset._condition_codes).astype(np.int64)
+    cond = np.asarray(dataset._condition_codes, dtype=np.int64)
+    if cond.ndim != 2 or cond.shape[0] == 0:
+        raise ValueError("the evaluation grid has no rows; nothing to score")
     if cond.shape[1] != num_bounds - 1:
         raise ValueError(f"expected {num_bounds - 1} conditioning codes per row, got {cond.shape[1]}")
     target_codes = sidecar[TARGET_CODE_COL].to_list()
@@ -277,7 +304,9 @@ def main(cfg: DictConfig) -> None:
         raise RuntimeError(f"{dataloader_attr} must use SequentialSampler; got {sampler_cls!r}.")
     logger.info(f"Loaded {len(dataset)} grid rows from {tasks_dir} (split={split})")
 
-    sidecar = align_sidecar(dataset.schema_df, read_sidecars(meta_dir, split))
+    sidecar = read_sidecars(meta_dir, split)
+    check_grid_coverage(dataset.schema_df, sidecar)
+    sidecar = align_sidecar(dataset.schema_df, sidecar)
     scored_idx, scored_codes = scored_code_matrix(dataset, sidecar, dataset.num_bounds)
 
     device = torch.device(cfg.get("device") or ("cuda" if torch.cuda.is_available() else "cpu"))

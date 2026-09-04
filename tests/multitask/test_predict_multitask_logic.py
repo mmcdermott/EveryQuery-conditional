@@ -21,6 +21,7 @@ from every_query.generate_tasks.sample_evaluation_multitask_sequences import (
 )
 from every_query.predict.predict_multitask import (
     align_sidecar,
+    check_grid_coverage,
     predictions_to_df,
     read_sidecars,
     scored_code_matrix,
@@ -98,6 +99,18 @@ def test_align_sidecar_rejects_an_unmatched_row(tmp_path: Path):
         align_sidecar(_schema_df([("held_out/0", 0), ("held_out/9", 0)]), side)
 
 
+def test_grid_coverage_rejects_a_dropped_grid_row(tmp_path: Path):
+    """A grid row whose subject is absent from the cohort vanishes from the dataset silently; the
+    sidecar still counts it, and that disagreement must be an error, not a shrunken grid."""
+    _write_sidecar(tmp_path, "held_out", "0", 3, first_task=0)
+    side = read_sidecars(tmp_path, "held_out")
+    schema_df = _schema_df([("held_out/0", 0), ("held_out/0", 1)])
+    align_sidecar(schema_df, side)  # every dataset row is matched, so alignment alone is silent
+    with pytest.raises(RuntimeError, match="1 grid row\\(s\\) were dropped"):
+        check_grid_coverage(schema_df, side)
+    check_grid_coverage(_schema_df([("held_out/0", i) for i in range(3)]), side)
+
+
 def test_align_sidecar_rejects_a_non_multitask_frame(tmp_path: Path):
     _write_sidecar(tmp_path, "held_out", "0", 1, first_task=0)
     side = read_sidecars(tmp_path, "held_out")
@@ -121,6 +134,13 @@ def test_scored_codes_reject_an_out_of_vocabulary_target():
     dataset = _FakeDataset(np.array([[1, 2]], dtype=np.int64), {"A": 1, "B": 2})
     with pytest.raises(ValueError, match="outside the cohort vocabulary"):
         scored_code_matrix(dataset, pl.DataFrame({TARGET_CODE_COL: ["NOPE"]}), K)
+
+
+def test_scored_codes_reject_an_empty_grid():
+    dataset = _FakeDataset(np.zeros((0, K - 1), dtype=np.int64), {"T": 1})
+    empty = pl.DataFrame({TARGET_CODE_COL: []}, schema={TARGET_CODE_COL: pl.Utf8})
+    with pytest.raises(ValueError, match="grid has no rows"):
+        scored_code_matrix(dataset, empty, K)
 
 
 def test_scored_codes_check_the_conditioning_width():
