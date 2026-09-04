@@ -311,6 +311,46 @@ def test_strip_emits_times_even_when_the_cohort_has_no_delta_tokens(
         _tiny_model(use_rope_time=False)._encoder_position_kwargs(after)
 
 
+def test_dataset_strip_never_touches_the_static_table(tensorized_cohort_dir, seq_task_labels_dir):
+    """``static_code`` & friends are a separate table, not per-token fields of the dynamic stream.
+
+    The old width heuristic compacted *any* ``(B, n_old)`` tensor with the dynamic keep mask, so
+    with ``static_inclusion_mode=include`` the static table was corrupted whenever it happened to
+    be exactly as wide as the padded dynamic stream.  Pick ``max_seq_len`` so that it is.
+    """
+
+    def cfg(max_seq_len: int) -> MEDSTorchDataConfig:
+        return MEDSTorchDataConfig(
+            tensorized_cohort_dir=str(tensorized_cohort_dir),
+            task_labels_dir=str(seq_task_labels_dir),
+            max_seq_len=max_seq_len,
+            seq_sampling_strategy="to_end",
+            static_inclusion_mode="include",
+            batch_mode="SM",
+        )
+
+    plain = before = None
+    for max_seq_len in range(1, 9):
+        plain = ConditionalQueryPytorchDataset(cfg(max_seq_len), split=train_split)
+        before = plain.collate([plain[i] for i in range(len(plain))])
+        if before.code.shape[1] == before.static_code.shape[1]:
+            break
+    assert before.code.shape[1] == before.static_code.shape[1], "fixture never lines the widths up"
+
+    real = before.code[before.code != ConditionalQueryBatch.PAD_INDEX]
+    victim = int(real.mode().values.item())
+    ds = ConditionalQueryPytorchDataset(
+        cfg(plain.config.max_seq_len), split=train_split, strip_delta_tokens=True
+    )
+    ds.delta_ids = torch.tensor([victim])
+    after = ds.collate([ds[i] for i in range(len(ds))])
+
+    assert after.code.shape[1] < before.code.shape[1], "the dynamic stream must actually get shorter"
+    assert torch.equal(after.static_code, before.static_code)
+    assert torch.equal(after.static_numeric_value, before.static_numeric_value)
+    assert torch.equal(after.static_numeric_value_mask, before.static_numeric_value_mask)
+
+
 def test_dataset_strip_leaves_query_tensors_untouched(tensorized_cohort_dir, seq_task_labels_dir):
     """Stripping touches the encoder stream only; the decoder's query blocks are unaffected."""
     cfg = _seq_cfg(tensorized_cohort_dir, seq_task_labels_dir)

@@ -1011,3 +1011,63 @@ def test_seq_dataset_rejects_labels_outside_vocab(tmp_path, tensorized_cohort_di
     )
     with pytest.raises(ValueError, match="NOT//A//CODE"):
         ConditionalQueryPytorchDataset(cfg, split=train_split)
+
+
+def _adversarial_seq_label_frames() -> tuple[pl.DataFrame, pl.DataFrame, list[int]]:
+    """A shuffled query-sequence ``label_df`` with foreign subjects, plus the ``schema_df`` it joins."""
+    from datetime import timedelta
+
+    known = [3, 1, 2]
+    base = datetime(2020, 1, 1)  # naive timestamps are fine for synthetic frames
+    rows = []
+    for i, sid in enumerate([2, 99, 3, 1, 3, 98, 2, 1, 97]):
+        rows.append(
+            {
+                "subject_id": sid,
+                "prediction_time": base + timedelta(days=(7 * i) % 30),
+                "queries": [f"Q{i}"],
+                "durations": [float(i)],
+                "answers": [i % 2 == 0],
+            }
+        )
+    label_df = pl.DataFrame(rows).cast(
+        {
+            "subject_id": pl.Int64,
+            "prediction_time": pl.Datetime("us"),
+            "queries": pl.List(pl.Utf8),
+            "durations": pl.List(pl.Float32),
+            "answers": pl.List(pl.Boolean),
+        }
+    )
+    schema_df = pl.DataFrame(
+        {"subject_id": known, "time": [[base + timedelta(days=d) for d in range(0, 40, 5)]] * len(known)}
+    ).cast({"subject_id": pl.Int64})
+    surviving = [i for i, r in enumerate(rows) if r["subject_id"] in known]
+    return label_df, schema_df, surviving
+
+
+def test_seq_label_extras_stay_aligned_with_the_upstream_rows() -> None:
+    """Foreign subjects and a shuffled input order must not shift the hstacked query columns."""
+    from every_query.data.seq_dataset import ConditionalQueryPytorchDataset
+
+    label_df, schema_df, surviving = _adversarial_seq_label_frames()
+    out = ConditionalQueryPytorchDataset.get_task_seq_bounds_and_labels(label_df, schema_df)
+    assert out["queries"].to_list() == label_df["queries"][surviving].to_list()
+    assert out["subject_id"].to_list() == label_df["subject_id"][surviving].to_list()
+    assert out["prediction_time"].to_list() == label_df["prediction_time"][surviving].to_list()
+
+
+def test_seq_upstream_reordering_is_an_error_not_a_silent_misalignment(monkeypatch) -> None:
+    from meds_torchdata import MEDSPytorchDataset
+
+    from every_query.data.seq_dataset import ConditionalQueryPytorchDataset
+
+    label_df, schema_df, _ = _adversarial_seq_label_frames()
+    real = MEDSPytorchDataset.get_task_seq_bounds_and_labels.__func__
+
+    def reversed_upstream(cls, l_df, s_df):
+        return real(cls, l_df, s_df).reverse()
+
+    monkeypatch.setattr(MEDSPytorchDataset, "get_task_seq_bounds_and_labels", classmethod(reversed_upstream))
+    with pytest.raises(RuntimeError, match=r"misaligned .* row\(s\) differ"):
+        ConditionalQueryPytorchDataset.get_task_seq_bounds_and_labels(label_df, schema_df)

@@ -638,3 +638,61 @@ def test_end_to_end_run_with_starts_to_batch_matches_raw_events(
     assert not batch.targets.numpy()[st == INF].any()  # ... and those windows are all-false
     got = batch.targets[:, : k - 1].gather(2, batch.condition_codes.unsqueeze(-1)).squeeze(-1)
     assert torch.equal(got, batch.condition_answers)
+
+
+def _adversarial_label_frames() -> tuple[pl.DataFrame, pl.DataFrame, list[int]]:
+    """A shuffled ``label_df`` with foreign subjects interleaved, and the ``schema_df`` it joins against.
+
+    Returns the frames plus the label rows (by input position) that survive the join.
+    """
+    known = [3, 1, 2]
+    base = datetime(2020, 1, 1)  # naive timestamps are fine for synthetic frames
+    rows = []
+    rng = np.random.default_rng(5)
+    for i, sid in enumerate([2, 99, 3, 1, 3, 98, 2, 1, 97]):
+        rows.append(
+            {
+                "subject_id": sid,
+                "prediction_time": base + timedelta(days=int(rng.integers(0, 30))),
+                "durations": [float(i), 2.0 * i],
+                "_source_row": i,
+            }
+        )
+    label_df = pl.DataFrame(rows).cast(
+        {
+            "subject_id": pl.Int64,
+            "prediction_time": pl.Datetime("us"),
+            "durations": pl.List(pl.Float32),
+            "_source_row": pl.Int64,
+        }
+    )
+    schema_df = pl.DataFrame(
+        {"subject_id": known, "time": [[base + timedelta(days=d) for d in range(0, 40, 5)]] * len(known)}
+    ).cast({"subject_id": pl.Int64})
+    surviving = [i for i, r in enumerate(rows) if r["subject_id"] in known]
+    return label_df, schema_df, surviving
+
+
+def test_label_extras_stay_aligned_with_the_upstream_rows() -> None:
+    """Foreign subjects and a shuffled input order must not shift the hstacked extras."""
+    label_df, schema_df, surviving = _adversarial_label_frames()
+    out = MultitaskBoundaryPytorchDataset.get_task_seq_bounds_and_labels(label_df, schema_df)
+    assert out["_source_row"].to_list() == surviving
+    assert out["subject_id"].to_list() == label_df["subject_id"][surviving].to_list()
+    assert out["prediction_time"].to_list() == label_df["prediction_time"][surviving].to_list()
+    assert out["durations"].to_list() == label_df["durations"][surviving].to_list()
+
+
+def test_upstream_reordering_is_an_error_not_a_silent_misalignment(monkeypatch) -> None:
+    """If a polars/MTD bump ever stops preserving label order, the hstack must fail loudly."""
+    from meds_torchdata import MEDSPytorchDataset
+
+    label_df, schema_df, _ = _adversarial_label_frames()
+    real = MEDSPytorchDataset.get_task_seq_bounds_and_labels.__func__
+
+    def reversed_upstream(cls, l_df, s_df):
+        return real(cls, l_df, s_df).reverse()
+
+    monkeypatch.setattr(MEDSPytorchDataset, "get_task_seq_bounds_and_labels", classmethod(reversed_upstream))
+    with pytest.raises(RuntimeError, match=r"misaligned .* row\(s\) differ"):
+        MultitaskBoundaryPytorchDataset.get_task_seq_bounds_and_labels(label_df, schema_df)

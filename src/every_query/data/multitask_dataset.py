@@ -254,6 +254,39 @@ def _vocab_fingerprint_from_codes_parquet(fp: Path) -> tuple[int, str]:
     return vocab.size, vocab.fingerprint
 
 
+def _check_rows_aligned(base: pl.DataFrame, surviving: pl.DataFrame) -> None:
+    """Require ``base`` and ``surviving`` to agree row-for-row on subject_id and prediction_time.
+
+    Examples:
+        >>> from datetime import datetime
+        >>> t = [datetime(2020, 1, 1), datetime(2020, 1, 2)]
+        >>> a = pl.DataFrame({"subject_id": [1, 2], "prediction_time": t})
+        >>> _check_rows_aligned(a, a.with_columns(pl.lit(0).alias("x")))
+        >>> _check_rows_aligned(a, a.reverse())
+        Traceback (most recent call last):
+            ...
+        RuntimeError: label rows are misaligned with the sequence bounds: 2 of 2 row(s) differ ...
+        >>> _check_rows_aligned(a, a.head(1))
+        Traceback (most recent call last):
+            ...
+        RuntimeError: label rows are misaligned with the sequence bounds: 2 vs 1 row(s)...
+    """
+    sid, pt = DataSchema.subject_id_name, LabelSchema.prediction_time_name
+    if base.height != surviving.height:
+        raise RuntimeError(
+            f"label rows are misaligned with the sequence bounds: {base.height} vs {surviving.height} "
+            "row(s); the upstream join dropped or duplicated rows."
+        )
+    mismatch = (base[sid] != surviving[sid]) | (base[pt] != surviving[pt])
+    n_bad = int(mismatch.sum())
+    if n_bad:
+        raise RuntimeError(
+            f"label rows are misaligned with the sequence bounds: {n_bad} of {base.height} row(s) differ "
+            f"in subject_id/prediction_time (first at row {int(mismatch.arg_max())}); the upstream join "
+            "no longer preserves label order."
+        )
+
+
 class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
     """MEDS dataset over multitask-boundary metadata parquets + packed ``.labels.npy`` sidecars."""
 
@@ -272,7 +305,13 @@ class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
         if not extras:
             return base
         sid = DataSchema.subject_id_name
-        surviving = label_df.join(schema_df.lazy().select(sid).unique().collect(), on=sid, how="semi")
+        # ``maintain_order="left"`` pins the semi join to ``label_df`` order (polars' default is
+        # unspecified); the check below turns a future ordering drift into an error rather than
+        # silently pairing one context's targets with another's patient window.
+        surviving = label_df.join(
+            schema_df.lazy().select(sid).unique().collect(), on=sid, how="semi", maintain_order="left"
+        )
+        _check_rows_aligned(base, surviving)
         return base.hstack(surviving.select(extras))
 
     def __init__(

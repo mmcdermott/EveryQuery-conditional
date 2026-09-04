@@ -165,6 +165,53 @@ def _ragged(series: pl.Series) -> tuple[np.ndarray, np.ndarray]:
     return offsets, values
 
 
+def _check_rows_aligned(base: pl.DataFrame, surviving: pl.DataFrame) -> None:
+    """Require ``base`` and ``surviving`` to agree row-for-row on subject_id and prediction_time.
+
+    Examples:
+        >>> from datetime import datetime
+        >>> t = [datetime(2020, 1, 1), datetime(2020, 1, 2)]
+        >>> a = pl.DataFrame({"subject_id": [1, 2], "prediction_time": t})
+        >>> _check_rows_aligned(a, a.with_columns(pl.lit(0).alias("x")))
+        >>> _check_rows_aligned(a, a.reverse())
+        Traceback (most recent call last):
+            ...
+        RuntimeError: label rows are misaligned with the sequence bounds: 2 of 2 row(s) differ ...
+        >>> _check_rows_aligned(a, a.head(1))
+        Traceback (most recent call last):
+            ...
+        RuntimeError: label rows are misaligned with the sequence bounds: 2 vs 1 row(s)...
+    """
+    sid, pt = DataSchema.subject_id_name, LabelSchema.prediction_time_name
+    if base.height != surviving.height:
+        raise RuntimeError(
+            f"label rows are misaligned with the sequence bounds: {base.height} vs {surviving.height} "
+            "row(s); the upstream join dropped or duplicated rows."
+        )
+    mismatch = (base[sid] != surviving[sid]) | (base[pt] != surviving[pt])
+    n_bad = int(mismatch.sum())
+    if n_bad:
+        raise RuntimeError(
+            f"label rows are misaligned with the sequence bounds: {n_bad} of {base.height} row(s) differ "
+            f"in subject_id/prediction_time (first at row {int(mismatch.arg_max())}); the upstream join "
+            "no longer preserves label order."
+        )
+
+
+# Per-token fields of the dynamic stream that a delta-token strip must compact together with
+# ``code``.  ``static_mask`` is the prepend-mode marker over that same stream; ``static_code`` /
+# ``static_numeric_value`` / ``static_numeric_value_mask`` are the *separate* static table and
+# must never be touched, however wide they happen to be.
+_PER_TOKEN_FIELDS = (
+    "code",
+    "numeric_value",
+    "numeric_value_mask",
+    "time_delta_days",
+    "event_mask",
+    "static_mask",
+)
+
+
 class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
     """MEDS dataset over query-sequence label parquets (see module docstring for tensor shapes)."""
 
@@ -181,7 +228,13 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
         if not extras:
             return base
         sid = DataSchema.subject_id_name
-        surviving = label_df.join(schema_df.lazy().select(sid).unique().collect(), on=sid, how="semi")
+        # ``maintain_order="left"`` pins the semi join to ``label_df`` order (polars' default is
+        # unspecified); the check below turns a future ordering drift into an error rather than
+        # silently pairing one context's queries with another's patient window.
+        surviving = label_df.join(
+            schema_df.lazy().select(sid).unique().collect(), on=sid, how="semi", maintain_order="left"
+        )
+        _check_rows_aligned(base, surviving)
         return base.hstack(surviving.select(extras))
 
     def __init__(
@@ -355,9 +408,11 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
     def _apply_rope_time(self, out: dict) -> torch.LongTensor | None:
         """Strip delta tokens from ``out`` in place and return the matching ``time_pos_ids``.
 
-        Every per-token field of the collated batch is compacted with the same keep mask, so
-        fields the upstream batch adds (e.g. ``static_mask``) stay aligned to ``code``.
-        Returns ``None`` when stripping is disabled.
+        Every per-token field of the dynamic stream (:data:`_PER_TOKEN_FIELDS`) is compacted with
+        the same keep mask so it stays aligned to ``code``.  The whitelist is explicit: a
+        width-based rule used to compact ``static_code`` and friends too whenever the static table
+        happened to be as wide as the padded dynamic stream.  Returns ``None`` when stripping is
+        disabled.
         """
         if not self.strip_delta_tokens:
             return None
@@ -387,12 +442,13 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
             "numeric_value_mask": new_nvm,
             "time_delta_days": new_tdd,
         }
-        for name, value in list(out.items()):
+        for name in _PER_TOKEN_FIELDS:
+            value = out.get(name)
+            if value is None:
+                continue
             if name in replacements:
-                if value is not None:
-                    out[name] = replacements[name]
+                out[name] = replacements[name]
             elif isinstance(value, torch.Tensor) and value.dim() == 2 and value.shape[1] == n_old:
-                # Any other per-token field (e.g. static_mask) must follow the same selection.
                 out[name] = rope_time.compact_by_keep(value, keep, new_n, 0)
 
         return time_pos
