@@ -410,3 +410,106 @@ def test_lazy_package_exports_do_not_cycle():
     from every_query.model import ConditionalMultitaskARModel as Exported
 
     assert Exported is ConditionalMultitaskARModel
+
+
+# ---------------------------------------------------------------------------
+# Issue #28: target-only scoring must equal the gathered full-vocabulary logits
+# ---------------------------------------------------------------------------
+
+
+def _gather_final(logits: torch.Tensor, q_mask: torch.Tensor, codes: torch.Tensor) -> torch.Tensor:
+    last = q_mask.sum(dim=1) - 1
+    return logits[torch.arange(logits.shape[0]), last, codes]
+
+
+@pytest.mark.parametrize("autocast", [False, True], ids=["fp32", "bf16-autocast"])
+def test_score_final_query_matches_gathered_full_vocab_logits(autocast):
+    """``score_final_query`` == ``forward``'s logits at ``[b, last_b, code_b]`` for several scored
+    codes and several real lengths in one padded batch (the numerical regression of #28)."""
+    model = tiny_model()
+    q_mask = [[True, True, True], [True, False, False], [True, True, False], [True, True, True]]
+    code = [[2, 3, 4, 5], [7, 8, 0, 0], [9, 10, 11, 0], [12, 13, 14, 15]]
+    batch = make_batch(code=code, q_mask=q_mask)
+    scored = torch.tensor([2, 17, 5, 30], dtype=torch.long)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16, enabled=autocast):
+        _, out = model(batch)
+        target_only = model.score_final_query(batch, scored)
+    expected = _gather_final(out.logits, batch.q_mask, scored)
+    assert target_only.shape == (4,) and target_only.dtype == torch.float32
+    torch.testing.assert_close(target_only, expected, atol=1e-5, rtol=1e-5)
+    # Different codes and different last windows really are being compared, not one repeated value.
+    assert len({round(v, 4) for v in target_only.tolist()}) > 1
+
+
+def test_score_final_query_reads_the_last_real_window_not_the_padded_width():
+    """Padding a 1-window row out to K=3 must not move which window is scored."""
+    model = tiny_model()
+    padded = make_batch(n_windows=3, q_mask=[[True, False, False]] * 2)
+    alone = make_batch(n_windows=1)
+    scored = torch.tensor([4, 6], dtype=torch.long)
+    torch.testing.assert_close(
+        model.score_final_query(padded, scored), model.score_final_query(alone, scored), atol=1e-5, rtol=1e-5
+    )
+
+
+def test_score_final_query_never_reads_targets_or_builds_dense_logits(monkeypatch):
+    model = tiny_model()
+    batch = make_batch()
+    batch.targets = None  # an evaluation batch has no dense targets
+    calls = []
+    real_matmul = torch.Tensor.__matmul__
+
+    def spy(a, b):
+        calls.append((tuple(a.shape), tuple(b.shape)))
+        return real_matmul(a, b)
+
+    monkeypatch.setattr(torch.Tensor, "__matmul__", spy)
+    out = model.score_final_query(batch, torch.tensor([2, 3]))
+    assert out.shape == (2,)
+    assert not any(shape[-1] == VOCAB for _, shape in calls), "no (.., V) projection may be built"
+
+
+def test_score_final_query_validates_codes_and_mask():
+    model = tiny_model()
+    batch = make_batch()
+    with pytest.raises(ValueError, match="never be PAD"):
+        model.score_final_query(batch, torch.tensor([0, 2]))
+    with pytest.raises(ValueError, match=r"lie in \[0, 31\)"):
+        model.score_final_query(batch, torch.tensor([2, VOCAB]))
+    with pytest.raises(ValueError, match="shape"):
+        model.score_final_query(batch, torch.tensor([[2, 3]]))
+    with pytest.raises(ValueError, match="int64"):
+        model.score_final_query(batch, torch.tensor([2, 3], dtype=torch.int32))
+    with pytest.raises(ValueError, match="prefix mask"):
+        model.score_final_query(make_batch(q_mask=[[True, False, True]] * 2), torch.tensor([2, 3]))
+    with pytest.raises(ValueError, match="at least one real window"):
+        model.score_final_query(make_batch(q_mask=[[False, False, False]] * 2), torch.tensor([2, 3]))
+
+
+def test_training_forward_is_the_window_hidden_states_projection():
+    """The all-vocabulary training forward is unchanged by the refactor: it is exactly
+    ``window_hidden_states`` followed by the tied projection, bias, PAD/q_mask masking and BCE."""
+    model = tiny_model()
+    batch = make_batch(q_mask=[[True, True, False]] * 2)
+    calls = []
+    real = model.window_hidden_states
+
+    def spy(b):
+        calls.append(b)
+        return real(b)
+
+    model.window_hidden_states = spy
+    loss, out = model(batch)
+    assert calls == [batch], "forward must read its hidden states through window_hidden_states"
+
+    hidden = real(batch)
+    emb = model.HF_model.get_input_embeddings().weight
+    logits = hidden.float() @ emb.float().T + model.code_bias.float()
+    valid = batch.q_mask.unsqueeze(-1) & (torch.arange(VOCAB) != 0).view(1, 1, -1)
+    per_element = torch.nn.functional.binary_cross_entropy_with_logits(
+        logits, batch.targets.float(), reduction="none"
+    )
+    expected_loss = (per_element * valid).sum() / valid.sum().clamp_min(1)
+    torch.testing.assert_close(out.logits, logits)
+    assert torch.equal(out.valid_mask, valid.expand(2, 3, -1))
+    torch.testing.assert_close(loss, expected_loss)

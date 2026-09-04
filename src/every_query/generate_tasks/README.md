@@ -105,6 +105,11 @@ EQ_process_data       EQ_generate_training_tasks           EQ_train       EQ_pre
                       EQ_generate_query_sequences          EQ_train       EQ_predict_sequences
                       EQ_generate_evaluation_query_sequences ───────────►  (inference input)
                                                                           EQ_evaluate_sequences
+
+                      EQ_generate_multitask_sequences      EQ_train       EQ_predict_multitask
+                      EQ_generate_evaluation_query_sequences ───────────►  (inference input:
+                                                                           the same QuerySeq grid,
+                                                                           active starts allowed)
 ```
 
 All endpoints consume:

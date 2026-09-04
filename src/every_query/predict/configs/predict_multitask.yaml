@@ -1,26 +1,31 @@
-# EQ_predict_multitask — inference over a multitask evaluation grid.
+# EQ_predict_multitask — inference over a QuerySeqSchema evaluation grid with the multitask model.
 #
-# Reads a grid written by EQ_generate_evaluation_multitask_sequences, runs the trained
-# ConditionalMultitaskAR model over it, and writes one flat row per (context, task, window)
-# with the scored code's probability and ground-truth label.  See
-# src/every_query/predict/predict_multitask.py for which code each window scores.
+# Reads the `eval/` root written by EQ_generate_evaluation_query_sequences (the same grid
+# EQ_predict_sequences scores), runs the trained ConditionalMultitaskAR model over it, and writes
+# ONE scalar prediction per grid row: the probability that the row's final query occurs in its
+# window, conditioned on the patient and on the earlier queries with their true answers
+# (queries[:-1] / answers[:-1] are teacher-forced conditioning pairs; queries[-1] is scored).
+# Unlike EQ_predict_sequences this path consumes the grid's explicit window starts
+# (start_durations / start_events), which only the multitask model encodes.  See
+# src/every_query/predict/predict_multitask.py for the row mapping and the output columns.
+#
+# No evaluation manifest, packed `.labels.npy`, `eval_meta` or `eval_tasks.parquet` is needed.
 
 defaults:
   - _self_
 
 # Required: a ConditionalMultitaskAR training run directory (best_model.ckpt +
-# resolved_config.yaml).
+# resolved_config.yaml).  Its cohort / sequence settings are reused for the grid.
 model_run_dir: ???
 
-# Required: the grid's labels root — `{eval grid out_dir}/eval`.
+# Required: EQ_generate_evaluation_query_sequences' labels root — `{eval grid out_dir}/eval`
+# (point at `eval/`, never at `out_dir` itself: `eval_unique/` is not a grid).
 tasks_dir: ???
 
-# Required: output parquet path.
+# Required: output parquet path.  One row per grid row, in grid order, with the columns
+# subject_id, prediction_time, queries, start_durations, start_events, durations, bound_events,
+# answers, target_code (= queries[-1]), label (= answers[-1]), prob.
 output_parquet: ???
-
-# The grid's row-aligned sidecars (task_id / target_code / window diagnostics).  null resolves to
-# the sibling `eval_meta` of `tasks_dir`, which is where the generator writes them.
-eval_meta_dir: null
 
 # Optional: explicit checkpoint stem under model_run_dir/checkpoints/.
 ckpt_name: null
@@ -30,12 +35,16 @@ split: held_out
 
 overwrite: false
 
-# Optional inference batch-size override.  The forward pass materializes (B, K, V) logits, so this
-# is the knob that trades inference speed against peak device memory.
+# Optional inference batch-size override (defaults to the checkpoint's datamodule batch size).
+# No (B, K, V) logits are materialized — only one backbone pass plus B dot products per batch —
+# so device memory is the backbone's alone.
 batch_size: null
 
 # Optional torch device string; null picks cuda when available.
 device: null
+
+# Optional DataLoader worker-count override (defaults to the checkpoint's datamodule num_workers).
+num_workers: null
 
 hydra:
   output_subdir: null

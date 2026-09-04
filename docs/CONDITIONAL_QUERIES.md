@@ -120,6 +120,7 @@ The conditional pipeline mirrors the single-query one. New console scripts (in `
 | `EQ_train --config-name=conditional_ar_config` | Train the decoder-only `ConditionalQueryARModel` (same Lightning module; see §1b).                                         |
 | `EQ_predict_sequences`                         | Teacher-forced per-position inference → flat per-query-position parquet.                                                   |
 | `EQ_evaluate_sequences`                        | Per-position and per-(query, horizon) metric tables.                                                                       |
+| `EQ_predict_multitask`                         | Score the *same* `EQ_generate_evaluation_query_sequences` grid with the multitask model: one final-query probability per row (issue #28). |
 
 Key source modules:
 

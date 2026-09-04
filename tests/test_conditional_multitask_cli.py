@@ -164,3 +164,107 @@ def test_csv_logger_logs_best_ckpt_path_as_a_plain_string(max_steps_before_first
     loaded = yaml.safe_load(lines[0])
     assert isinstance(loaded["best_ckpt_path"], str)
     assert Path(loaded["best_ckpt_path"]).is_file()
+
+
+# ---------------------------------------------------------------------------
+# Issue #28: EQ_predict_multitask over a QuerySeqSchema grid with active starts
+# ---------------------------------------------------------------------------
+
+
+def test_predict_multitask_scores_a_queryseq_grid_with_active_starts(
+    conditional_multitask_trained_dir: Path, eq_preprocessed_dataset: Path, tmp_path: Path
+):
+    """End to end: EQ_generate_evaluation_query_sequences (designed sequences with duration and
+    event starts, on a supplied cohort) -> EQ_predict_multitask, one scalar prediction per row,
+    with no legacy sidecar anywhere."""
+    import polars as pl
+
+    intermediate = eq_preprocessed_dataset.parent / "intermediate"
+    shard = pl.read_parquet(next((intermediate / "data" / tuning_split).rglob("*.parquet")))
+    # Prediction time = each subject's first timed event, so windows opening later have data to see.
+    cohort = shard.group_by("subject_id").agg(pl.col("time").drop_nulls().min().alias("prediction_time"))
+    cohort_fp = tmp_path / "cohort.parquet"
+    cohort.write_parquet(cohort_fp)
+
+    specs = {
+        "post_admission": [
+            {"query": "DISCHARGE", "start_event": "ADMISSION//PULMONARY", "duration_days": 30}
+        ],
+        "delayed_then_bounded": [
+            {"query": "HR//value_[119.8,inf)", "start_duration_days": 1, "duration_days": 30},
+            {
+                "query": "DISCHARGE",
+                "start_event": "ADMISSION//PULMONARY",
+                "duration_days": -1,
+                "bound_event": "TIMELINE//END",
+            },
+        ],
+        "single": [["TIMELINE//END", 1]],
+    }
+    specs_fp = tmp_path / "specs.yaml"
+    specs_fp.write_text(yaml.safe_dump(specs))
+    grid_dir = tmp_path / "grid"
+    run_and_check(
+        [
+            "EQ_generate_evaluation_query_sequences",
+            f"data_dir={intermediate!s}",
+            f"out_dir={grid_dir!s}",
+            f"query_codes={eq_preprocessed_dataset!s}",
+            f"split={tuning_split}",
+            f"contexts_path={cohort_fp!s}",
+            f"sequences_path={specs_fp!s}",
+        ],
+        timeout=180.0,
+    )
+    grid = pl.concat(
+        [pl.read_parquet(fp) for fp in sorted((grid_dir / "eval" / tuning_split).glob("*.parquet"))]
+    )
+    assert grid.height == cohort.height * len(specs)
+    assert {"start_durations", "start_events"} <= set(grid.columns)
+    for name in ("_multitask_manifest.json", "eval_meta", "eval_tasks.parquet"):
+        assert not list(grid_dir.parent.rglob(name)), name
+    assert not list(grid_dir.parent.rglob("*.labels.npy"))
+
+    predictions_fp = tmp_path / "predictions.parquet"
+    run_and_check(
+        [
+            "EQ_predict_multitask",
+            f"model_run_dir={conditional_multitask_trained_dir!s}",
+            f"tasks_dir={grid_dir / 'eval'!s}",
+            f"output_parquet={predictions_fp!s}",
+            f"split={tuning_split}",
+        ],
+        timeout=300.0,
+    )
+    preds = pl.read_parquet(predictions_fp)
+    assert preds.height == grid.height
+    assert preds.columns == [
+        "subject_id",
+        "prediction_time",
+        "queries",
+        "start_durations",
+        "start_events",
+        "durations",
+        "bound_events",
+        "answers",
+        "target_code",
+        "label",
+        "prob",
+    ]
+    assert preds["prob"].is_between(0.0, 1.0).all()
+    assert preds["target_code"].to_list() == [q[-1] for q in preds["queries"].to_list()]
+    assert preds["label"].to_list() == [a[-1] for a in preds["answers"].to_list()]
+    # The grid rows come back verbatim, active starts included.
+    key = ["subject_id", "prediction_time", "queries"]
+    joined = preds.join(grid, on=key, how="inner", suffix="_grid")
+    assert joined.height == grid.height
+    for col in ("answers", "durations", "bound_events", "start_durations", "start_events"):
+        assert joined[col].to_list() == joined[f"{col}_grid"].to_list(), col
+    starts = preds.explode("start_durations", "start_events")
+    assert (starts["start_events"] == "ADMISSION//PULMONARY").sum() == 2 * cohort.height
+    assert (starts["start_durations"] == 1.0).sum() == cohort.height
+    # Both label values are represented, so the contract is exercised on a real positive and negative.
+    assert preds["label"].any() and not preds["label"].all()
+    # Nothing legacy was written by inference either.
+    for name in ("_multitask_manifest.json", "eval_meta", "eval_tasks.parquet"):
+        assert not list(tmp_path.rglob(name)), name

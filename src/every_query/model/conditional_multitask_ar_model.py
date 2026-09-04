@@ -9,6 +9,11 @@ that window and ``A_i`` supplies its teacher-forced answer, so the answer can
 condition later windows without leaking into the prediction for its own window.
 Each ``W_i`` hidden state is projected onto the backbone's input-embedding table,
 giving one logit for every vocabulary code without a separate output matrix.
+
+:meth:`ConditionalMultitaskARModel.forward` is the all-vocabulary training pass (dense targets,
+masked BCE).  :meth:`ConditionalMultitaskARModel.score_final_query` is the evaluation pass over a
+``QuerySeqSchema`` grid: the same hidden states, but only the last real window of each row is
+projected, onto only that row's scored code, so no ``(B, K, V)`` tensor is ever built.
 """
 
 from dataclasses import dataclass
@@ -232,8 +237,17 @@ class ConditionalMultitaskARModel(torch.nn.Module):
         position_ids.scatter_(1, query_positions, query_hours)
         return position_ids
 
-    def forward(self, batch) -> tuple[torch.FloatTensor, ConditionalMultitaskOutput]:
-        """Run one causal pass and return masked BCE loss plus all-vocabulary logits."""
+    def window_hidden_states(self, batch) -> torch.Tensor:
+        """Run the causal backbone and return the ``(B, K, H)`` hidden state at every window token.
+
+        This is the whole of :meth:`forward` up to (and excluding) the tied-vocabulary projection,
+        so the training forward and :meth:`score_final_query` read the *same* hidden states.  All
+        the batch validation lives here: at least one window, ``K <= max_windows``, the paired
+        start-field rule, the position budget, and the right-padding prefix rule.  The batch needs
+        ``code``, ``q_durations``, ``q_bound_codes``, ``q_mask``, ``condition_codes`` /
+        ``condition_answers`` (when ``K > 1``) and optionally the start fields and
+        ``time_pos_ids``; ``targets`` is never read.
+        """
         B, n_windows = batch.q_durations.shape
         if n_windows < 1:
             raise ValueError("ConditionalMultitaskARModel requires at least one window")
@@ -292,7 +306,14 @@ class ConditionalMultitaskARModel(torch.nn.Module):
         window_positions = n_patient.unsqueeze(1) + TOKENS_PER_WINDOW * torch.arange(
             n_windows, device=device
         ).unsqueeze(0)
-        window_hidden = hidden.gather(1, window_positions.unsqueeze(-1).expand(-1, -1, H))
+        return hidden.gather(1, window_positions.unsqueeze(-1).expand(-1, -1, H))
+
+    def forward(self, batch) -> tuple[torch.FloatTensor, ConditionalMultitaskOutput]:
+        """Run one causal pass and return masked BCE loss plus all-vocabulary logits."""
+        window_hidden = self.window_hidden_states(batch)
+        B, n_windows = batch.q_durations.shape
+        device = batch.code.device
+        pad = batch.PAD_INDEX
 
         embedding_weight = self.HF_model.get_input_embeddings().weight
         if embedding_weight.shape[0] != batch.targets.shape[-1]:
@@ -318,3 +339,79 @@ class ConditionalMultitaskARModel(torch.nn.Module):
             logits=logits,
             valid_mask=valid_mask,
         )
+
+    @staticmethod
+    def last_real_window(q_mask: torch.Tensor) -> torch.Tensor:
+        """Index of each row's last real window, requiring a non-empty right-padded prefix mask.
+
+        Examples:
+            >>> ConditionalMultitaskARModel.last_real_window(
+            ...     torch.tensor([[True, True, False], [True, False, False]])).tolist()
+            [1, 0]
+            >>> ConditionalMultitaskARModel.last_real_window(torch.tensor([[True, False, True]]))
+            Traceback (most recent call last):
+                ...
+            ValueError: q_mask must be a right-padded prefix mask (True at every real window, then False)
+            >>> ConditionalMultitaskARModel.last_real_window(torch.tensor([[False, False]]))
+            Traceback (most recent call last):
+                ...
+            ValueError: every row needs at least one real window; q_mask row 0 is all False
+        """
+        if q_mask.dim() != 2 or q_mask.dtype != torch.bool:
+            raise ValueError(f"q_mask must be a 2-D boolean tensor, got {tuple(q_mask.shape)} {q_mask.dtype}")
+        if (q_mask[:, 1:] & ~q_mask[:, :-1]).any():
+            raise ValueError(
+                "q_mask must be a right-padded prefix mask (True at every real window, then False)"
+            )
+        n_real = q_mask.sum(dim=1)
+        if (n_real == 0).any():
+            row = int((n_real == 0).nonzero()[0].item())
+            raise ValueError(f"every row needs at least one real window; q_mask row {row} is all False")
+        return n_real - 1
+
+    def score_final_query(self, batch, scored_codes: torch.Tensor) -> torch.Tensor:
+        """Float32 logit ``(B,)`` of ``scored_codes[b]`` at row ``b``'s **last real** window.
+
+        This is exactly ``forward(batch)[1].logits[b, last_b, scored_codes[b]]`` where
+        ``last_b = q_mask[b].sum() - 1``: the same :meth:`window_hidden_states` (one backbone
+        pass, identical inputs, positions and masks), the same tied input-embedding row and the
+        same ``code_bias`` entry — just selected per row instead of projected onto the whole
+        vocabulary.  Nothing of shape ``(B, K, V)`` is built and ``batch.targets`` is never
+        read, so a batch without targets (the QuerySeq evaluation adapter's) is fine.
+
+        The dot product is taken per row (``(h * e).sum(-1)``) rather than as a slice of the
+        ``h @ E.T`` matmul, so the float32 accumulation order can differ from :meth:`forward`'s
+        at the rounding level (~1e-6 relative); the two agree to ``allclose`` tolerance, not
+        bit-for-bit.  Like the projection in :meth:`forward`, it runs outside autocast.
+
+        Args:
+            batch: Any batch :meth:`window_hidden_states` accepts; ``q_mask`` must be a
+                right-padded prefix mask with at least one real window per row.
+            scored_codes: ``(B,)`` int64 vocabulary indices, never PAD, each ``< vocab_size``.
+        """
+        # Validate the codes before paying for the backbone pass.
+        B = batch.q_durations.shape[0]
+        if scored_codes.shape != (B,) or scored_codes.dtype != torch.long:
+            raise ValueError(
+                f"scored_codes must be an int64 tensor of shape ({B},), got "
+                f"{tuple(scored_codes.shape)} {scored_codes.dtype}"
+            )
+        if scored_codes.numel() and (scored_codes.min() < 0 or scored_codes.max() >= self.vocab_size):
+            raise ValueError(
+                f"scored_codes must lie in [0, {self.vocab_size}); got min {int(scored_codes.min())}, "
+                f"max {int(scored_codes.max())}"
+            )
+        if (scored_codes == batch.PAD_INDEX).any():
+            raise ValueError(f"scored_codes must never be PAD (index {batch.PAD_INDEX})")
+
+        window_hidden = self.window_hidden_states(batch)
+        H = window_hidden.shape[-1]
+        last = self.last_real_window(batch.q_mask).to(window_hidden.device)
+        selected = window_hidden.gather(1, last.view(B, 1, 1).expand(-1, 1, H)).squeeze(1)
+        embedding_weight = self.HF_model.get_input_embeddings().weight
+        # Explicitly leave autocast, as the full projection in ``forward`` does: `.float()`
+        # alone is still downcast by bf16 autocast.
+        with torch.autocast(device_type=selected.device.type, enabled=False):
+            rows = embedding_weight[scored_codes].float()
+            logits = (selected.float() * rows).sum(dim=-1) + self.code_bias[scored_codes].float()
+        return logits

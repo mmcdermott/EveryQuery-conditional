@@ -1,33 +1,48 @@
-"""Inference over a multitask evaluation grid — ``EQ_predict_multitask``.
+"""Inference over a ``QuerySeqSchema`` evaluation grid with the multitask model — ``EQ_predict_multitask``.
+
+The evaluation flow is::
+
+    EQ_generate_evaluation_query_sequences -> QuerySeqSchema eval grid -> EQ_predict_multitask
 
 Takes a trained :class:`~every_query.model.conditional_multitask_ar_model.ConditionalMultitaskARModel`
-run directory and a grid written by ``EQ_generate_evaluation_multitask_sequences``, and writes one
-flat row per ``(context, task, window)`` with the model's probability and the ground-truth label for
-that window's **scored code**.
+run directory and the ``eval/`` root written by ``EQ_generate_evaluation_query_sequences`` (the same
+grid ``EQ_predict_sequences`` consumes, plus the explicit window starts only this model can read),
+and writes **one scalar prediction per grid row**: the probability that the row's *final* query
+occurs in its window, conditioned on the patient and on the earlier queries with their true answers.
 
-Which code is scored, and why
------------------------------
-During training every window's hidden state is projected onto the whole vocabulary, so one forward
-pass yields ``(B, K, V)`` probabilities.  A *task*, though, asks about one code.  For window ``k``
-the scored code is the one the query stream already names:
+Per real grid row the :class:`~every_query.data.multitask_eval_dataset.QuerySeqMultitaskEvalDataset`
+adapter maps::
 
-- ``k < K-1``: the conditioning code ``C_k``.  Its answer ``A_k`` is teacher-forced into the stream,
-  but only at the position *after* ``W_k``, so the causal mask keeps it out of window ``k``'s own
-  prediction — ``probs[:, k, C_k]`` is an honest prediction, not a read-back of its own label.
-- ``k == K-1``: the task's ``target_code``.  This is the query the grid exists to answer, and the
-  one the primary metric is computed on; rows carry ``is_final`` so a consumer can select it.
+    q_durations        <- durations
+    q_bound_codes      <- bound_events        (no-bound index where null / absent)
+    q_start_durations  <- start_durations     (0.0 where absent)
+    q_start_codes      <- start_events        (no-bound index where null / absent)
+    condition_codes    <- queries[:-1]
+    condition_answers  <- answers[:-1]
+    scored_code        <- queries[-1]
+    label              <- answers[-1]
 
-Writing every window rather than only the last costs nothing (the probabilities are already
-computed) and multiplies the rows available for stratified analysis by ``K``.
+``[:-1]`` / ``[-1]`` are the row's own real queries, never the padded batch width, and the final
+query is not teacher-forced into its own prediction.  The model scores only that code at only that
+window (``ConditionalMultitaskARModel.score_final_query``): the same hidden state, tied embedding row
+and bias the training forward uses, without ever materializing ``(B, K, V)`` logits or dense targets.
 
-Output columns
---------------
-``subject_id``, ``prediction_time``, ``task_id``, ``task_group``, ``position`` (0-based window
-index), ``is_final``, ``scored_code``, ``prob``, ``label``, plus the window-resolution diagnostics
-carried through from the grid's sidecar: ``start_resolved``, ``end_resolved``, ``window_days``.
+Nothing here needs, reads or writes a ``.labels.npy`` sidecar, a multitask manifest, ``eval_meta``
+or ``eval_tasks.parquet``.  The checkpoint's cohort / sequence settings (``tensorized_cohort_dir``,
+``max_seq_len``, ``seq_sampling_strategy``, ...) are reused from its ``resolved_config.yaml``; its
+datamodule is *not* instantiated, since that one expects the training sampler's packed layout.
 
-Row order is dataloader order exploded by window, so consumers can regroup on
-``(subject_id, prediction_time, task_id)``.
+Output columns, one row per input sequence, in dataset (= dataloader = input) order::
+
+    subject_id, prediction_time,
+    queries, start_durations, start_events, durations, bound_events, answers,
+    target_code, label, prob
+
+The complete lists identify the conditional task (``target_code == queries[-1]``,
+``label == answers[-1]``).  ``start_durations`` / ``start_events`` / ``bound_events`` are always
+written, normalized to their defaults (``0.0`` / null / null) when the grid lacked the column.  The
+old evaluation-only ``task_id``, ``task_group``, ``start_resolved``, ``end_resolved`` and
+``window_days`` sidecar fields are intentionally not recreated.
 """
 
 from __future__ import annotations
@@ -44,15 +59,16 @@ import torch
 from hydra.utils import instantiate
 from meds import held_out_split, tuning_split
 from omegaconf import DictConfig  # noqa: TC002 - Hydra resolves this at runtime
+from torch.utils.data import DataLoader, SequentialSampler
 
-from every_query.data.multitask_dataset import SOURCE_ROW_COL, SOURCE_SHARD_COL
-from every_query.generate_tasks.sample_evaluation_multitask_sequences import (
-    END_RESOLVED_COL,
-    GROUP_COL,
-    START_RESOLVED_COL,
-    TARGET_CODE_COL,
-    TASK_ID_COL,
-    WINDOW_DAYS_COL,
+from every_query.data.multitask_eval_dataset import QuerySeqMultitaskEvalDataset
+from every_query.data.seq_dataset import (
+    ANSWERS_COL,
+    BOUND_EVENTS_COL,
+    DURATIONS_COL,
+    QUERIES_COL,
+    START_DURATIONS_COL,
+    START_EVENTS_COL,
 )
 from every_query.model.conditional_multitask_lightning import ConditionalMultitaskLightningModule
 from every_query.utils.model_loader import setup_model
@@ -62,124 +78,83 @@ logging.basicConfig(level=logging.INFO)
 
 CONFIGS = str(files("every_query") / "predict" / "configs")
 
-_SPLIT_TO_DATAMODULE_ATTRS: dict[str, tuple[str, str]] = {
-    tuning_split: ("val_dataset", "val_dataloader"),
-    held_out_split: ("test_dataset", "test_dataloader"),
-}
+# "train" is disallowed: the grid is an evaluation artifact and scoring must stay sequential.
+_ALLOWED_SPLITS = (tuning_split, held_out_split)
 
-SIDECAR_COLUMNS = [
-    TASK_ID_COL,
-    GROUP_COL,
-    TARGET_CODE_COL,
-    START_RESOLVED_COL,
-    END_RESOLVED_COL,
-    WINDOW_DAYS_COL,
+OUTPUT_COLUMNS = [
+    "subject_id",
+    "prediction_time",
+    QUERIES_COL,
+    START_DURATIONS_COL,
+    START_EVENTS_COL,
+    DURATIONS_COL,
+    BOUND_EVENTS_COL,
+    ANSWERS_COL,
+    "target_code",
+    "label",
+    "prob",
 ]
 
 
-def read_sidecars(meta_dir: Path, split: str) -> pl.DataFrame:
-    """Load the grid's evaluation sidecars, keyed the way the dataset names its source rows.
+def build_eval_dataset(
+    train_cfg: DictConfig,
+    tasks_dir: Path,
+    split: str,
+    *,
+    expected_vocab_size: int,
+    use_rope_time: bool,
+    max_windows: int | None = None,
+) -> QuerySeqMultitaskEvalDataset:
+    """Build the QuerySeq adapter on the checkpoint's cohort settings, pointed at the grid.
 
-    ``MultitaskBoundaryPytorchDataset`` tags every metadata row with ``_source_shard`` (the label
-    parquet's path relative to ``task_labels_dir``, without the suffix) and ``_source_row`` (its
-    physical row in that file).  The sidecar is written row-for-row alongside that parquet, so
-    re-deriving the same two keys here is what re-attaches a task to a model output — no ordering
-    assumption, no join on floats.
+    ``train_cfg.datamodule.config`` (a ``MEDSTorchDataConfig``) is instantiated with its
+    ``task_labels_dir`` swapped for ``tasks_dir``; everything else - ``tensorized_cohort_dir``,
+    ``max_seq_len``, ``seq_sampling_strategy``, ``static_inclusion_mode``, ``batch_mode`` - is
+    the checkpoint's.  ``strip_delta_tokens`` is read from the datamodule's ``dataset_kwargs`` and
+    must agree with the model's ``use_rope_time``: a mismatch would feed a RoPE-time model
+    token-index positions (or vice versa) and score garbage without an error.  The cohort's
+    vocabulary width must equal the model's tied-embedding width (``train.py`` sizes the latter from
+    the former, and the multitask model has no ontology extension), so a checkpoint pointed at a
+    different cohort fails here rather than scoring codes through the wrong embedding rows.
     """
-    split_dir = meta_dir / split
-    fps = sorted(split_dir.glob("*.parquet"))
-    if not fps:
-        raise FileNotFoundError(f"no evaluation sidecars under {split_dir}")
-    frames = []
-    for fp in fps:
-        frames.append(
-            pl.read_parquet(fp)
-            .with_row_index(SOURCE_ROW_COL)
-            .with_columns(
-                pl.col(SOURCE_ROW_COL).cast(pl.Int64),
-                pl.lit(f"{split}/{fp.stem}").alias(SOURCE_SHARD_COL),
-            )
+    strip_delta_tokens = bool(train_cfg.datamodule.get("dataset_kwargs", {}).get("strip_delta_tokens", False))
+    if strip_delta_tokens != bool(use_rope_time):
+        raise ValueError(
+            f"the checkpoint's datamodule strips delta tokens={strip_delta_tokens} but its model has "
+            f"use_rope_time={use_rope_time}; resolved_config.yaml is inconsistent."
         )
-    return pl.concat(frames, how="vertical")
-
-
-def align_sidecar(schema_df: pl.DataFrame, sidecar: pl.DataFrame) -> pl.DataFrame:
-    """Reorder ``sidecar`` into dataset row order, failing loudly if a row is unmatched."""
-    keys = [SOURCE_SHARD_COL, SOURCE_ROW_COL]
-    missing = [c for c in keys if c not in schema_df.columns]
-    if missing:
-        raise ValueError(f"the dataset's schema frame lacks {missing}; it is not a multitask dataset")
-    joined = (
-        schema_df.select(*keys)
-        .with_row_index("_pos")
-        .join(sidecar.select(*keys, *SIDECAR_COLUMNS), on=keys, how="left")
-        .sort("_pos")
-        .drop("_pos")
+    data_cfg = instantiate(train_cfg.datamodule.config, task_labels_dir=str(tasks_dir))
+    if int(data_cfg.vocab_size) != int(expected_vocab_size):
+        raise ValueError(
+            f"the cohort at {data_cfg.tensorized_cohort_dir} has vocab_size={data_cfg.vocab_size} but the "
+            f"checkpoint's tied embedding table is {expected_vocab_size} wide; the model was trained on a "
+            "different codes.parquet."
+        )
+    return QuerySeqMultitaskEvalDataset(
+        data_cfg,
+        split=split,
+        strip_delta_tokens=strip_delta_tokens,
+        expected_vocab_size=int(expected_vocab_size),
+        max_windows=max_windows,
     )
-    if joined.height != schema_df.height:
+
+
+def build_dataloader(
+    dataset: QuerySeqMultitaskEvalDataset, batch_size: int, num_workers: int = 0
+) -> DataLoader:
+    """A sequential loader: row ``i`` of the output must be grid row ``i``."""
+    loader = DataLoader(
+        dataset,
+        batch_size=int(batch_size),
+        shuffle=False,
+        collate_fn=dataset.collate,
+        num_workers=int(num_workers),
+    )
+    if not isinstance(loader.sampler, SequentialSampler):
         raise RuntimeError(
-            f"sidecar join changed the row count ({schema_df.height} -> {joined.height}); the "
-            "sidecars and label parquets are inconsistent."
+            f"the evaluation loader must use SequentialSampler; got {type(loader.sampler).__name__}"
         )
-    n_null = joined[TASK_ID_COL].null_count()
-    if n_null:
-        raise RuntimeError(
-            f"{n_null} labeled row(s) have no evaluation sidecar entry; regenerate the grid so the "
-            "sidecar and the label parquets are written together."
-        )
-    return joined
-
-
-def check_grid_coverage(schema_df: pl.DataFrame, sidecar: pl.DataFrame) -> None:
-    """Require the dataset to have loaded every grid row the sidecar describes.
-
-    The dataset inner-joins the grid against the tensorized cohort, so a grid row whose subject is
-    absent from the cohort disappears without a trace on the dataset side (``align_sidecar`` only
-    checks the dataset's rows); only the sidecar still counts it.  Scoring a silently shrunken
-    grid would misreport every per-task metric.
-
-    Examples:
-        >>> two = pl.DataFrame({"a": [1, 2]})
-        >>> check_grid_coverage(two, two)
-        >>> check_grid_coverage(two.head(1), two)
-        Traceback (most recent call last):
-            ...
-        RuntimeError: the evaluation sidecar has 2 row(s) but the dataset loaded 1; 1 grid row(s) ...
-    """
-    if sidecar.height != schema_df.height:
-        raise RuntimeError(
-            f"the evaluation sidecar has {sidecar.height} row(s) but the dataset loaded "
-            f"{schema_df.height}; {sidecar.height - schema_df.height} grid row(s) were dropped, most "
-            "likely because their subject is absent from the tensorized cohort. Regenerate the grid "
-            "against this cohort."
-        )
-
-
-def scored_code_matrix(
-    dataset, sidecar: pl.DataFrame, num_bounds: int
-) -> tuple[np.ndarray, list[list[str]]]:
-    """``(N, K)`` vocabulary indices of the scored code per window, plus the code strings.
-
-    Windows ``0..K-2`` score their conditioning code; window ``K-1`` scores the task's target code.
-    """
-    cond = np.asarray(dataset._condition_codes, dtype=np.int64)
-    if cond.ndim != 2 or cond.shape[0] == 0:
-        raise ValueError("the evaluation grid has no rows; nothing to score")
-    if cond.shape[1] != num_bounds - 1:
-        raise ValueError(f"expected {num_bounds - 1} conditioning codes per row, got {cond.shape[1]}")
-    target_codes = sidecar[TARGET_CODE_COL].to_list()
-    unknown = sorted({c for c in target_codes if c not in dataset.code_to_index})
-    if unknown:
-        raise ValueError(f"{len(unknown)} target code(s) are outside the cohort vocabulary: {unknown[:5]}")
-    target_idx = np.array([dataset.code_to_index[c] for c in target_codes], dtype=np.int64)
-
-    idx = np.empty((cond.shape[0], num_bounds), dtype=np.int64)
-    idx[:, : num_bounds - 1] = cond
-    idx[:, num_bounds - 1] = target_idx
-
-    index_to_code = {i: c for c, i in dataset.code_to_index.items()}
-    codes = [[index_to_code.get(int(v), "") for v in row] for row in idx]
-    return idx, codes
+    return loader
 
 
 def _to_device(batch, device: torch.device):
@@ -194,129 +169,133 @@ def _to_device(batch, device: torch.device):
 @torch.no_grad()
 def run_inference(
     model: ConditionalMultitaskLightningModule,
-    dataloader,
-    scored_idx: np.ndarray,
+    dataloader: DataLoader,
     device: torch.device,
+    n_rows: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Stream the grid, keeping only the scored code's probability and label per window.
+    """Stream the grid; return ``(probs, labels)``, one float32 / bool per grid row.
 
-    The model emits ``(B, K, V)`` logits; at V ~ 14k that is ~70 MB per batch of 256, so gathering
-    down to ``(B, K)`` inside the loop — rather than accumulating batches the way
-    ``Trainer.predict`` does — is what keeps the whole grid in memory.
+    Each batch costs one backbone pass plus ``B`` dot products - nothing of shape ``(B, K, V)``
+    exists at any point.  The loader must yield exactly ``n_rows`` rows, or the output could not be
+    row-aligned with the grid.
     """
     model = model.to(device).eval()
     probs_out: list[np.ndarray] = []
     labels_out: list[np.ndarray] = []
-    row = 0
+    seen = 0
     for batch in dataloader:
         batch = _to_device(batch, device)
-        _, outputs = model.model(batch)
-        b = outputs.logits.shape[0]
-        sel = torch.from_numpy(scored_idx[row : row + b]).to(device).unsqueeze(-1)
-        probs_out.append(outputs.probs.gather(2, sel).squeeze(-1).float().cpu().numpy())
-        labels_out.append(batch.targets.gather(2, sel).squeeze(-1).cpu().numpy())
-        row += b
-    if row != scored_idx.shape[0]:
-        raise RuntimeError(f"dataloader yielded {row} rows but the grid has {scored_idx.shape[0]}")
-    return np.concatenate(probs_out), np.concatenate(labels_out)
+        logits = model.model.score_final_query(batch, batch.scored_codes)
+        probs_out.append(torch.sigmoid(logits).float().cpu().numpy())
+        labels_out.append(batch.labels.cpu().numpy().astype(bool))
+        seen += int(logits.shape[0])
+    if seen != n_rows:
+        raise RuntimeError(f"dataloader yielded {seen} prediction(s) but the grid has {n_rows} row(s)")
+    if not probs_out:
+        return np.empty(0, dtype=np.float32), np.empty(0, dtype=bool)
+    return np.concatenate(probs_out).astype(np.float32), np.concatenate(labels_out)
 
 
 def predictions_to_df(
-    schema_df: pl.DataFrame,
-    sidecar: pl.DataFrame,
-    scored_codes: list[list[str]],
-    probs: np.ndarray,
-    labels: np.ndarray,
+    dataset: QuerySeqMultitaskEvalDataset, probs: np.ndarray, labels: np.ndarray
 ) -> pl.DataFrame:
-    """Explode the ``(N, K)`` arrays into one row per ``(context, task, window)``."""
-    k = probs.shape[1]
-    out = pl.DataFrame(
+    """One output row per grid row, in dataset order, with the normalized window lists.
+
+    ``labels`` (collated by the loader) must equal ``answers[-1]`` read back from the dataset's own
+    rows: the two are produced by different code paths, so disagreement means the loader's row
+    order drifted from the dataset's, and the probabilities would be attached to the wrong rows.
+    """
+    schema_df = dataset.schema_df
+    n = schema_df.height
+    if probs.shape != (n,) or labels.shape != (n,):
+        raise RuntimeError(
+            f"got {probs.shape[0]} prediction(s) / {labels.shape[0]} label(s) for {n} grid row(s)"
+        )
+    queries = schema_df[QUERIES_COL]
+    answers = schema_df[ANSWERS_COL]
+    durations = schema_df[DURATIONS_COL]
+    lengths = queries.list.len()
+    if n and (lengths == 0).any():
+        raise ValueError("every grid row needs at least one query")
+
+    target_code = queries.list.last()
+    label = answers.list.last()
+    if n and not np.array_equal(label.to_numpy().astype(bool), labels):
+        bad = int(np.flatnonzero(label.to_numpy().astype(bool) != labels)[0])
+        raise RuntimeError(
+            f"the collated final-query label disagrees with answers[-1] at grid row {bad}; the loader's "
+            "row order does not match the dataset's."
+        )
+
+    def default_list(fill, dtype: pl.DataType) -> pl.Series:
+        return pl.Series([[fill] * int(k) for k in lengths.to_list()], dtype=pl.List(dtype))
+
+    start_durations = schema_df[START_DURATIONS_COL] if dataset.has_starts else default_list(0.0, pl.Float32)
+    start_events = schema_df[START_EVENTS_COL] if dataset.has_starts else default_list(None, pl.Utf8)
+    bound_events = schema_df[BOUND_EVENTS_COL] if dataset.has_bound_events else default_list(None, pl.Utf8)
+
+    return pl.DataFrame(
         {
             "subject_id": schema_df["subject_id"],
             "prediction_time": schema_df["prediction_time"],
-            TASK_ID_COL: sidecar[TASK_ID_COL],
-            GROUP_COL: sidecar[GROUP_COL],
-            "scored_code": scored_codes,
-            "prob": [row.tolist() for row in probs],
-            "label": [row.tolist() for row in labels],
-            START_RESOLVED_COL: sidecar[START_RESOLVED_COL],
-            END_RESOLVED_COL: sidecar[END_RESOLVED_COL],
-            WINDOW_DAYS_COL: sidecar[WINDOW_DAYS_COL],
+            QUERIES_COL: queries,
+            START_DURATIONS_COL: start_durations.cast(pl.List(pl.Float32)).alias(START_DURATIONS_COL),
+            START_EVENTS_COL: start_events.cast(pl.List(pl.Utf8)).alias(START_EVENTS_COL),
+            DURATIONS_COL: durations.cast(pl.List(pl.Float32)),
+            BOUND_EVENTS_COL: bound_events.cast(pl.List(pl.Utf8)).alias(BOUND_EVENTS_COL),
+            ANSWERS_COL: answers,
+            "target_code": target_code,
+            "label": label.cast(pl.Boolean),
+            "prob": pl.Series(probs, dtype=pl.Float32),
         }
-    ).with_columns(pl.int_ranges(0, k).alias("position"))
-    exploded = [
-        "position",
-        "scored_code",
-        "prob",
-        "label",
-        START_RESOLVED_COL,
-        END_RESOLVED_COL,
-        WINDOW_DAYS_COL,
-    ]
-    return (
-        out.explode(*exploded)
-        .with_columns((pl.col("position") == k - 1).alias("is_final"))
-        .select(
-            "subject_id",
-            "prediction_time",
-            TASK_ID_COL,
-            GROUP_COL,
-            "position",
-            "is_final",
-            "scored_code",
-            pl.col("prob").cast(pl.Float32),
-            pl.col("label").cast(pl.Boolean),
-            START_RESOLVED_COL,
-            END_RESOLVED_COL,
-            WINDOW_DAYS_COL,
-        )
-    )
+    ).select(OUTPUT_COLUMNS)
 
 
 @hydra.main(version_base="1.3", config_path=CONFIGS, config_name="predict_multitask")
 def main(cfg: DictConfig) -> None:
     model_run_dir = Path(cfg.model_run_dir)
     tasks_dir = Path(cfg.tasks_dir)
-    meta_dir = Path(cfg.eval_meta_dir) if cfg.get("eval_meta_dir") else tasks_dir.parent / "eval_meta"
     output_parquet = Path(cfg.output_parquet)
     split = cfg.get("split", held_out_split)
     overwrite = bool(cfg.get("overwrite", False))
 
-    if split not in _SPLIT_TO_DATAMODULE_ATTRS:
-        raise ValueError(f"split must be one of {sorted(_SPLIT_TO_DATAMODULE_ATTRS)}, got {split!r}.")
+    if split not in _ALLOWED_SPLITS:
+        raise ValueError(f"split must be one of {sorted(_ALLOWED_SPLITS)}, got {split!r}.")
     if output_parquet.exists() and not overwrite:
         raise FileExistsError(f"output_parquet {output_parquet} already exists; pass overwrite=true.")
+    if not tasks_dir.is_dir():
+        raise NotADirectoryError(f"tasks_dir must be the grid's eval/ root, got {tasks_dir}")
 
     train_cfg, model, _ = setup_model(
         model_run_dir, ckpt_name=cfg.get("ckpt_name"), module_cls=ConditionalMultitaskLightningModule
     )
 
-    if cfg.get("batch_size") is not None:
-        train_cfg.datamodule.batch_size = int(cfg.batch_size)
-    train_cfg.datamodule.config.task_labels_dir = str(tasks_dir)
-    D = instantiate(train_cfg.datamodule)
-
-    dataset_attr, dataloader_attr = _SPLIT_TO_DATAMODULE_ATTRS[split]
-    dataset = getattr(D, dataset_attr)
-    dataloader = getattr(D, dataloader_attr)()
-    sampler_cls = type(getattr(dataloader, "sampler", None)).__name__
-    if sampler_cls != "SequentialSampler":
-        raise RuntimeError(f"{dataloader_attr} must use SequentialSampler; got {sampler_cls!r}.")
+    dataset = build_eval_dataset(
+        train_cfg,
+        tasks_dir,
+        split,
+        expected_vocab_size=model.model.vocab_size,
+        use_rope_time=model.model.use_rope_time,
+        max_windows=model.model.max_windows,
+    )
     logger.info(f"Loaded {len(dataset)} grid rows from {tasks_dir} (split={split})")
 
-    sidecar = read_sidecars(meta_dir, split)
-    check_grid_coverage(dataset.schema_df, sidecar)
-    sidecar = align_sidecar(dataset.schema_df, sidecar)
-    scored_idx, scored_codes = scored_code_matrix(dataset, sidecar, dataset.num_bounds)
+    batch_size = cfg.get("batch_size")
+    if batch_size is None:
+        batch_size = int(train_cfg.datamodule.batch_size)
+    num_workers = cfg.get("num_workers")
+    if num_workers is None:
+        num_workers = train_cfg.datamodule.get("num_workers", 0) or 0
+    dataloader = build_dataloader(dataset, int(batch_size), num_workers=int(num_workers))
 
     device = torch.device(cfg.get("device") or ("cuda" if torch.cuda.is_available() else "cpu"))
-    logger.info(f"Running inference on {device} over {len(dataset)} rows x K={dataset.num_bounds}")
-    probs, labels = run_inference(model, dataloader, scored_idx, device)
+    logger.info(f"Scoring the final query of {len(dataset)} rows on {device}")
+    probs, labels = run_inference(model, dataloader, device, len(dataset))
 
-    out = predictions_to_df(dataset.schema_df, sidecar, scored_codes, probs, labels)
+    out = predictions_to_df(dataset, probs, labels)
     output_parquet.parent.mkdir(parents=True, exist_ok=True)
     out.write_parquet(output_parquet)
-    logger.info(f"Wrote {out.height} per-window predictions to {output_parquet}")
+    logger.info(f"Wrote {out.height} final-query predictions to {output_parquet}")
 
 
 if __name__ == "__main__":
