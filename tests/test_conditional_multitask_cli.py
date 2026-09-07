@@ -1,11 +1,14 @@
-"""CLI integration for multitask sampling, training, and checkpoint restoration."""
+"""CLI integration for multitask sampling, training, checkpoint restoration and grid prediction."""
 
 import filecmp
+import shutil
 from pathlib import Path
 
+import polars as pl
 import pytest
 import yaml
 from meds import train_split, tuning_split
+from polars.testing import assert_frame_equal
 
 from conftest import run_and_check
 
@@ -173,40 +176,36 @@ def test_csv_logger_logs_best_ckpt_path_as_a_plain_string(max_steps_before_first
 # Issue #28: EQ_predict_multitask over a QuerySeqSchema grid with active starts
 # ---------------------------------------------------------------------------
 
+# Designed sequences with duration and event starts (issue #27), labeled at a supplied cohort.
+_GRID_SPECS = {
+    "post_admission": [{"query": "DISCHARGE", "start_event": "ADMISSION//PULMONARY", "duration_days": 30}],
+    "delayed_then_bounded": [
+        {"query": "HR//value_[119.8,inf)", "start_duration_days": 1, "duration_days": 30},
+        {
+            "query": "DISCHARGE",
+            "start_event": "ADMISSION//PULMONARY",
+            "duration_days": -1,
+            "bound_event": "TIMELINE//END",
+        },
+    ],
+    "single": [["TIMELINE//END", 1]],
+}
 
-def test_predict_multitask_scores_a_queryseq_grid_with_active_starts(
-    conditional_multitask_trained_dir: Path, eq_preprocessed_dataset: Path, tmp_path: Path
-):
-    """End to end: EQ_generate_evaluation_query_sequences (designed sequences with duration and
-    event starts, on a supplied cohort) -> EQ_predict_multitask, one scalar prediction per row,
-    with no legacy sidecar anywhere."""
-    import polars as pl
 
+@pytest.fixture(scope="module")
+def queryseq_grid(eq_preprocessed_dataset: Path, tmp_path_factory) -> tuple[Path, pl.DataFrame]:
+    """``EQ_generate_evaluation_query_sequences`` over ``_GRID_SPECS`` on the tuning split: the grid's
+    ``out_dir`` (score ``out_dir / "eval"``) and the cohort it was labeled at."""
+    root = tmp_path_factory.mktemp("queryseq_grid")
     intermediate = eq_preprocessed_dataset.parent / "intermediate"
     shard = pl.read_parquet(next((intermediate / "data" / tuning_split).rglob("*.parquet")))
     # Prediction time = each subject's first timed event, so windows opening later have data to see.
     cohort = shard.group_by("subject_id").agg(pl.col("time").drop_nulls().min().alias("prediction_time"))
-    cohort_fp = tmp_path / "cohort.parquet"
+    cohort_fp = root / "cohort.parquet"
     cohort.write_parquet(cohort_fp)
-
-    specs = {
-        "post_admission": [
-            {"query": "DISCHARGE", "start_event": "ADMISSION//PULMONARY", "duration_days": 30}
-        ],
-        "delayed_then_bounded": [
-            {"query": "HR//value_[119.8,inf)", "start_duration_days": 1, "duration_days": 30},
-            {
-                "query": "DISCHARGE",
-                "start_event": "ADMISSION//PULMONARY",
-                "duration_days": -1,
-                "bound_event": "TIMELINE//END",
-            },
-        ],
-        "single": [["TIMELINE//END", 1]],
-    }
-    specs_fp = tmp_path / "specs.yaml"
-    specs_fp.write_text(yaml.safe_dump(specs))
-    grid_dir = tmp_path / "grid"
+    specs_fp = root / "specs.yaml"
+    specs_fp.write_text(yaml.safe_dump(_GRID_SPECS))
+    grid_dir = root / "grid"
     run_and_check(
         [
             "EQ_generate_evaluation_query_sequences",
@@ -219,6 +218,38 @@ def test_predict_multitask_scores_a_queryseq_grid_with_active_starts(
         ],
         timeout=180.0,
     )
+    return grid_dir, cohort
+
+
+def _read_grid(grid_dir: Path) -> pl.DataFrame:
+    return pl.concat(
+        [pl.read_parquet(fp) for fp in sorted((grid_dir / "eval" / tuning_split).glob("*.parquet"))]
+    )
+
+
+def _predict_multitask(run_dir: Path, grid_dir: Path, output_parquet: Path, *overrides: str) -> pl.DataFrame:
+    run_and_check(
+        [
+            "EQ_predict_multitask",
+            f"model_run_dir={run_dir!s}",
+            f"tasks_dir={grid_dir / 'eval'!s}",
+            f"output_parquet={output_parquet!s}",
+            f"split={tuning_split}",
+            *overrides,
+        ],
+        timeout=300.0,
+    )
+    return pl.read_parquet(output_parquet)
+
+
+def test_predict_multitask_scores_a_queryseq_grid_with_active_starts(
+    conditional_multitask_trained_dir: Path, queryseq_grid: tuple[Path, pl.DataFrame], tmp_path: Path
+):
+    """End to end: EQ_generate_evaluation_query_sequences (designed sequences with duration and
+    event starts, on a supplied cohort) -> EQ_predict_multitask, one scalar prediction per row,
+    with no legacy sidecar anywhere."""
+    grid_dir, cohort = queryseq_grid
+    specs = _GRID_SPECS
     grid = pl.concat(
         [pl.read_parquet(fp) for fp in sorted((grid_dir / "eval" / tuning_split).glob("*.parquet"))]
     )
@@ -272,3 +303,71 @@ def test_predict_multitask_scores_a_queryseq_grid_with_active_starts(
     for name in ("_multitask_manifest.json", "eval_meta", "eval_tasks.parquet"):
         assert not list(tmp_path.rglob(name)), name
     assert not list(tmp_path.rglob("*.labels.npy"))
+
+
+# ---------------------------------------------------------------------------
+# Issue #30: prediction through Trainer.predict on ConditionalMultitaskDataModule
+# ---------------------------------------------------------------------------
+
+
+def test_trained_run_dir_carries_the_split_datamodule_shape(conditional_multitask_trained_dir: Path):
+    """The run dir the end-to-end test above predicts from has the post-#30 ``datamodule`` node:
+
+    ``ConditionalMultitaskDataModule`` with the grid root unset at training time.  That test is
+    therefore the CLI-level check that such a run dir predicts fine.
+    """
+    cfg = yaml.safe_load((conditional_multitask_trained_dir / "resolved_config.yaml").read_text())
+    node = cfg["datamodule"]
+    assert node["_target_"].endswith(".conditional_multitask_datamodule.ConditionalMultitaskDataModule")
+    assert node["eval_tasks_dir"] is None
+    assert node["max_windows"] == cfg["lightning_module"]["model"]["max_windows"]
+    assert "data_class" not in node
+    assert (
+        node["dataset_kwargs"]["expected_vocab_size"]
+        == (cfg["lightning_module"]["model"]["config_overrides"]["vocab_size"])
+    )
+
+
+def _pre_issue_30_run_dir(run_dir: Path, dst: Path) -> Path:
+    """Copy ``run_dir`` and rewrite its resolved ``datamodule`` node to the pre-#30 shape.
+
+    Older runs recorded ``ResumableDatamodule`` with an explicit ``data_class`` and no grid keys; the
+    checkpoint, its cohort settings and its loader settings are otherwise identical.
+    """
+    shutil.copytree(run_dir, dst)
+    resolved = dst / "resolved_config.yaml"
+    cfg = yaml.safe_load(resolved.read_text())
+    node = cfg["datamodule"]
+    cfg["datamodule"] = {
+        "_target_": "every_query.data.datamodule.ResumableDatamodule",
+        "data_class": "every_query.data.multitask_dataset.MultitaskBoundaryPytorchDataset",
+        "config": node["config"],
+        "dataset_kwargs": node["dataset_kwargs"],
+        "batch_size": node["batch_size"],
+        "num_workers": node["num_workers"],
+        "pin_memory": node["pin_memory"],
+    }
+    resolved.write_text(yaml.safe_dump(cfg))
+    return dst
+
+
+def test_predict_multitask_accepts_a_pre_issue_30_run_dir(
+    conditional_multitask_trained_dir: Path, queryseq_grid: tuple[Path, pl.DataFrame], tmp_path: Path
+):
+    """A checkpoint whose ``resolved_config.yaml`` predates the split datamodule predicts identically to the
+    same checkpoint under the current shape: the predictor reads the node's cohort / loader settings,
+    never its ``_target_``.  Both runs pin ``device=cpu`` so the comparison is like for like."""
+    grid_dir, _ = queryseq_grid
+    old_dir = _pre_issue_30_run_dir(conditional_multitask_trained_dir, tmp_path / "pre_issue_30_run")
+    old_node = yaml.safe_load((old_dir / "resolved_config.yaml").read_text())["datamodule"]
+    assert old_node["_target_"] == "every_query.data.datamodule.ResumableDatamodule"
+    assert "eval_tasks_dir" not in old_node and "max_windows" not in old_node
+
+    quiet = ("device=cpu", "enable_progress_bar=false")
+    new = _predict_multitask(conditional_multitask_trained_dir, grid_dir, tmp_path / "new.parquet", *quiet)
+    old = _predict_multitask(old_dir, grid_dir, tmp_path / "old.parquet", *quiet)
+
+    grid = _read_grid(grid_dir)
+    assert new.height == old.height == grid.height
+    assert new["prob"].is_between(0.0, 1.0).all()
+    assert_frame_equal(new, old)

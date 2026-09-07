@@ -40,11 +40,23 @@ overwrite: false
 # so device memory is the backbone's alone.
 batch_size: null
 
-# Optional torch device string; null picks cuda when available.
+# Optional torch device string, mapped onto the Lightning accelerator of the inference Trainer:
+# null -> accelerator=auto (the first GPU when there is one, else the CPU); cpu -> cpu;
+# cuda -> gpu (the default GPU); cuda:N -> gpu, device N; mps -> mps.  Prediction is always
+# SINGLE-device: outputs are concatenated in loader order and must stay row-aligned with the grid,
+# so a multi-device or distributed trainer is refused rather than sharding rows across ranks.
 device: null
 
 # Optional DataLoader worker-count override (defaults to the checkpoint's datamodule num_workers).
 num_workers: null
+
+# Lightning precision string for the inference Trainer.  bf16-mixed is the production training
+# precision, so scoring runs under the same autocast the checkpoint was trained with; pass 32-true
+# for full-precision probabilities (they differ from bf16-mixed at the ~1e-2 level).
+precision: bf16-mixed
+
+# Show the Lightning predict progress bar (stderr).  Set false for batch / log-file runs.
+enable_progress_bar: true
 
 hydra:
   output_subdir: null
