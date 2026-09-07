@@ -9,6 +9,7 @@ import yaml
 from omegaconf import OmegaConf
 
 from every_query.data.multitask_dataset import MultitaskBoundaryBatch
+from every_query.data.multitask_eval_dataset import MultitaskEvalBatch
 from every_query.model.conditional_multitask_ar_model import (
     TYPE_CONDITION_ANSWER,
     TYPE_CONDITION_CODE,
@@ -81,6 +82,58 @@ def make_batch(
         condition_answers=answers,
         time_pos_ids=time_pos_ids,
         **kwargs,
+    )
+
+
+def make_eval_batch(
+    *,
+    code: list[list[int]] | None = None,
+    n_queries: list[int] | None = None,
+    scored_codes: list[int] | None = None,
+    labels: list[bool] | None = None,
+) -> MultitaskEvalBatch:
+    """A right-padded ``MultitaskEvalBatch`` whose real windows / conditions are ``make_batch``'s.
+
+    Row ``i`` has ``n_queries[i]`` real windows (default: every row has three), so the equivalent
+    training batch for row ``i`` is ``make_batch(n_windows=n_queries[i], code=[code[i]])``.
+    """
+    code = code or [[2, 3, 4, 5], [7, 8, 0, 0]]
+    B, S = len(code), len(code[0])
+    n_queries = n_queries or [3] * B
+    k = max(n_queries)
+    scored_codes = scored_codes or [2 + i for i in range(B)]
+    labels = labels or [i % 2 == 0 for i in range(B)]
+
+    start_durations = torch.zeros(B, k)
+    start_codes = torch.zeros(B, k, dtype=torch.long)
+    durations = torch.zeros(B, k)
+    bounds = torch.zeros(B, k, dtype=torch.long)
+    mask = torch.zeros(B, k, dtype=torch.bool)
+    conditions = torch.zeros(B, k - 1, dtype=torch.long)  # PAD beyond the real conditions
+    answers = torch.zeros(B, k - 1, dtype=torch.bool)
+    for i, n in enumerate(n_queries):
+        start_durations[i, :n] = torch.tensor([0.0, 2.0, -1.0, 4.0, 0.0][:n])
+        start_codes[i, :n] = torch.tensor([0, 0, 9, 0, 0][:n])
+        durations[i, :n] = torch.tensor([7.0, -1.0, 30.0, 4.0, 2.0][:n])
+        bounds[i, :n] = torch.tensor([0, 10, 0, 0, 0][:n])
+        mask[i, :n] = True
+        conditions[i, : n - 1] = torch.tensor([11, 12, 13, 14][: n - 1], dtype=torch.long)
+        answers[i, : n - 1] = torch.tensor([True, False, True, False][: n - 1])
+    return MultitaskEvalBatch(
+        code=torch.tensor(code),
+        numeric_value=torch.zeros(B, S),
+        numeric_value_mask=torch.zeros(B, S, dtype=torch.bool),
+        time_delta_days=torch.zeros(B, S),
+        q_start_durations=start_durations,
+        q_start_codes=start_codes,
+        q_durations=durations,
+        q_bound_codes=bounds,
+        q_mask=mask,
+        condition_codes=conditions,
+        condition_answers=answers,
+        scored_codes=torch.tensor(scored_codes, dtype=torch.long),
+        labels=torch.tensor(labels, dtype=torch.bool),
+        n_queries=torch.tensor(n_queries, dtype=torch.long),
     )
 
 
@@ -356,18 +409,11 @@ def test_lightning_predict_and_checkpoint_round_trip(tmp_path):
     model = tiny_model()
     module = ConditionalMultitaskLightningModule(model=model, optimizer=partial(torch.optim.AdamW, lr=1e-4))
     assert all(not metrics for metrics in module.metrics.values())
-    prediction = module.predict_step(make_batch())
-    assert set(prediction) == {
-        "probs",
-        "q_mask",
-        "q_start_durations",
-        "q_start_codes",
-        "q_durations",
-        "q_bound_codes",
-        "targets",
-        "condition_codes",
-        "condition_answers",
-    }
+    # Prediction scores QuerySeq rows (``MultitaskEvalBatch``); the loop contracts themselves are
+    # covered in ``tests/multitask/test_conditional_multitask_lightning.py``.
+    prediction = module.predict_step(make_eval_batch())
+    assert set(prediction) == {"probs", "labels", "scored_codes"}
+    assert all(t.shape == (2,) for t in prediction.values())
     ckpt = tmp_path / "model.ckpt"
     _save_checkpoint(module, ckpt)
     loaded = ConditionalMultitaskLightningModule.load_from_checkpoint(str(ckpt))
