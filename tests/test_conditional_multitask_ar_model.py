@@ -391,11 +391,16 @@ def test_configs_and_position_budget():
         "_demo_train_conditional_multitask_ar.yaml",
     ):
         cfg = yaml.safe_load((Path(CONFIGS) / name).read_text())
-        assert cfg["datamodule"]["data_class"].endswith("MultitaskBoundaryPytorchDataset")
-        assert "ontology_dir" not in cfg["datamodule"]["dataset_kwargs"]
-        assert cfg["datamodule"]["dataset_kwargs"]["expected_vocab_size"].endswith(
-            "config_overrides.vocab_size}"
-        )
+        dm_cfg = cfg["datamodule"]
+        # Issue #30: the split datamodule pins the training dataset class itself, keeps the training
+        # labels under config.task_labels_dir, and takes the (optional) QuerySeq grid root separately.
+        assert dm_cfg["_target_"].endswith("ConditionalMultitaskDataModule")
+        assert "data_class" not in dm_cfg
+        assert dm_cfg["config"]["task_labels_dir"] == "???"
+        assert dm_cfg["eval_tasks_dir"] is None
+        assert dm_cfg["max_windows"] == "${lightning_module.model.max_windows}"
+        assert "ontology_dir" not in dm_cfg["dataset_kwargs"]
+        assert dm_cfg["dataset_kwargs"]["expected_vocab_size"].endswith("config_overrides.vocab_size}")
         assert cfg["lightning_module"]["model"]["max_windows"] == 5
     model_cfg = OmegaConf.create(
         {
