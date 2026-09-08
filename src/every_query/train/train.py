@@ -521,7 +521,7 @@ def main(cfg: DictConfig) -> float | None:
     # V_ext in the config in sync with a rebuilt DAG.
     ontology_dir = cfg.lightning_module.model.get("ontology_dir")
     if ontology_dir:
-        from every_query.data.ontology import extended_vocab_size
+        from every_query.data.ontology import check_ontology_cohort, cohort_code_map, extended_vocab_size
 
         v_ext = extended_vocab_size(ontology_dir)
         if v_ext < vocab_size:
@@ -530,10 +530,27 @@ def main(cfg: DictConfig) -> float | None:
                 f"vocab_size={vocab_size}.  It was almost certainly built from a different "
                 f"codes.parquet than this cohort."
             )
+        # Widths agree; now require the ontology's observed nodes to be this cohort's codes.parquet
+        # rows, code for code and index for index.  Same-width ontologies of another cohort, or of
+        # this one with renumbered codes, would otherwise pair every leaf embedding and target
+        # column with the wrong ancestor rows without any error.
+        check_ontology_cohort(ontology_dir, code_to_index=cohort_code_map(ds_cfg.code_metadata_fp))
         logger.info("Ontology: sizing the encoder to V_ext=%d (cohort vocab %d).", v_ext, vocab_size)
         vocab_size = v_ext
 
     cfg.lightning_module.model.config_overrides.vocab_size = vocab_size
+    # Models that persist the cohort's vocabulary identity (the multitask model's
+    # ``cohort_vocab_fingerprint``; the shipped configs carry the key as ``null``) get it from the
+    # same codes.parquet the widths came from, so every later load of the checkpoint can re-verify
+    # its ontology - and EQ_predict_multitask the inference cohort - against the cohort it was
+    # trained on rather than against a width.
+    if "cohort_vocab_fingerprint" in cfg.lightning_module.model:
+        from every_query.data.ontology import cohort_code_map
+        from every_query.utils.digest import vocab_fingerprint
+
+        cfg.lightning_module.model.cohort_vocab_fingerprint = vocab_fingerprint(
+            cohort_code_map(ds_cfg.code_metadata_fp)
+        )
     # The multitask datamodule's ``expected_vocab_size`` is the width its training sidecars are
     # checked against, and those are leaf-only: it must stay the *cohort's* V even when the model
     # above was just widened to V_ext.  The shipped configs interpolate it from

@@ -9,8 +9,11 @@ per batch from the leaf block and the ``event_to_query_nodes.parquet`` closure. 
 2. deriving from the **multitask labeler's** leaf bits reproduces the independent
    ``tests/ontology_suite`` oracle for every ancestor node on the hand-checked golden cohort - the
    proof that derivation equals the scalar path's event-explosion semantics;
-3. :func:`load_closure_index` rejects an ontology built from a different cohort;
-4. :func:`closure_fingerprint` is the closure half of the evaluation grid's provenance digest;
+3. :func:`load_closure_index` rejects an ontology built from a different cohort - by width, and, given
+   the cohort's ``code -> index`` rows or their fingerprint, a *same-width* foreign or permuted one
+   that the width checks alone would accept (:func:`check_ontology_cohort`);
+4. :func:`closure_fingerprint` is the closure half of the evaluation grid's provenance digest, and
+   :func:`ontology_vocab_fingerprint` is the multitask manifest's ``vocab_fingerprint``;
 5. (PR B) a QuerySeq evaluation grid labeled *with* an ontology and multitask training labels
    generated *without* one agree on the same ancestor query at the same contexts once derived.
 """
@@ -33,12 +36,14 @@ from every_query.data.ontology import (
     ClosureIndex,
     build_event_to_query_nodes,
     build_ontology,
+    check_ontology_cohort,
     closure_fingerprint,
     derive_ancestor_targets,
     extended_vocab_size,
     load_closure_index,
     load_event_to_query_nodes,
     load_nodes,
+    ontology_vocab_fingerprint,
 )
 from every_query.generate_tasks import sample_evaluation_query_sequences as eval_seq
 from every_query.generate_tasks import sample_multitask_sequences as sms
@@ -48,6 +53,7 @@ from every_query.generate_tasks.sample_multitask_sequences import (
     build_target_vocabulary,
     label_multitask_index,
 )
+from every_query.utils.digest import vocab_fingerprint
 from tests.multitask.conftest import CODES, base_cfg, make_events, make_index, write_cohort
 from tests.ontology_suite.golden import DECLARED_PARENTS, EVENTS, LEAVES, ONTOLOGY, T0, TRUTH_TABLE
 from tests.ontology_suite.oracle import label_duration, label_event_bounded
@@ -226,6 +232,101 @@ def test_closure_index_rejects_a_foreign_ontology(tmp_path: Path):
     ).write_parquet(torn / EVENT_TO_QUERY_NODES_FILE)
     with pytest.raises(ValueError, match="absent from"):
         load_closure_index(torn, v)
+
+
+def test_closure_index_rejects_a_same_width_foreign_or_permuted_ontology(tmp_path: Path):
+    """Regression for the PR #32 review: the width checks only compare the highest observed index with ``V``.
+
+    Two unrelated ``codes.parquet`` files of the same size, or this cohort's codes at permuted indices, pass
+    them with the same ``V`` (and, for the permutation, the same ``V_ext``) and would silently pair leaf
+    target columns with the wrong closure rows.  Given the cohort's ``code -> index`` rows or their
+    fingerprint the loader refuses both, naming what differs; the genuine ontology passes every form and
+    reads identically.
+    """
+    onto = _write_ontology(tmp_path / "onto", _BF_LEAVES, _BF_PARENTS)
+    cohort = {c: i + 1 for i, c in enumerate(_BF_LEAVES)}
+    v = len(_BF_LEAVES) + 1
+    fingerprint = vocab_fingerprint(cohort)
+    assert ontology_vocab_fingerprint(onto) == fingerprint
+
+    bare = load_closure_index(onto, v)
+    for identity in (
+        {"code_to_index": cohort},
+        {"vocab_fingerprint": fingerprint},
+        {"code_to_index": cohort, "vocab_fingerprint": fingerprint},
+    ):
+        got = load_closure_index(onto, v, **identity)
+        assert torch.equal(got.leaf_ids, bare.leaf_ids) and torch.equal(got.ancestor_ids, bare.ancestor_ids)
+        assert (got.base_vocab_size, got.v_ext) == (bare.base_vocab_size, bare.v_ext)
+
+    # Same codes, two leaf indices swapped: same V, same V_ext, internally consistent artifacts.
+    swapped = list(_BF_LEAVES)
+    i, j = swapped.index("X//1"), swapped.index("M//L")
+    swapped[i], swapped[j] = swapped[j], swapped[i]
+    permuted = _write_ontology(tmp_path / "permuted", swapped, _BF_PARENTS)
+    width_only = load_closure_index(permuted, v)
+    assert (width_only.base_vocab_size, width_only.v_ext) == (v, bare.v_ext), (
+        "widths cannot see a permutation"
+    )
+    renumbered = (
+        r"different codes\.parquet.*2 code\(s\) sit at a different index "
+        r"\('M//L': ontology \d+ vs cohort \d+, 'X//1': ontology \d+ vs cohort \d+\)"
+    )
+    with pytest.raises(ValueError, match=renumbered):
+        load_closure_index(permuted, v, code_to_index=cohort)
+    with pytest.raises(ValueError, match=r"different codes\.parquet.*observed nodes digest to"):
+        load_closure_index(permuted, v, vocab_fingerprint=fingerprint)
+    with pytest.raises(ValueError, match=renumbered):
+        check_ontology_cohort(permuted, code_to_index=cohort, vocab_fingerprint=fingerprint)
+    # The permutation is not harmless: the cohort's ``M//L`` column is the permuted closure's ``X//1``, so
+    # ``M//L``'s ancestors go dark and ``X``'s subtree node lights up instead.
+    ids = _ids(onto)
+    ancestor_ids = {n: i for n, i in ids.items() if i >= v}
+    assert ancestor_ids == {n: i for n, i in _ids(permuted).items() if i >= v}, "ancestors are minted by name"
+    leaf = torch.zeros(1, 1, v, dtype=torch.bool)
+    leaf[..., cohort["M//L"]] = True
+    right = derive_ancestor_targets(leaf, bare)[0, 0]
+    wrong = derive_ancestor_targets(leaf, width_only)[0, 0]
+    assert right[ids["M"]] and right[ids["G//P"]] and not right[ids["X//ANY"]]
+    assert not wrong[ids["M"]] and not wrong[ids["G//P"]] and wrong[ids["X//ANY"]]
+
+    # Unrelated codes, the same number of them: same V again; both directions of the row diff are reported.
+    n = len(_BF_LEAVES)
+    foreign = _write_ontology(tmp_path / "foreign", [f"F//{k}" for k in range(n)])
+    assert load_closure_index(foreign, v).base_vocab_size == v
+    both_ways = (
+        rf"{n} cohort code\(s\) are not ontology leaves \(e\.g\. \['LONE'.*"
+        rf"{n} ontology leaf name\(s\) are not cohort codes \(e\.g\. \['F//0'"
+    )
+    with pytest.raises(ValueError, match=both_ways):
+        load_closure_index(foreign, v, code_to_index=cohort)
+    with pytest.raises(ValueError, match=r"different codes\.parquet"):
+        check_ontology_cohort(foreign, vocab_fingerprint=fingerprint)
+    # One code renamed at the same index: one missing, one extra, nothing renumbered.
+    renamed = _write_ontology(tmp_path / "renamed", [*_BF_LEAVES[:-1], "U//C//E"], _BF_PARENTS)
+    one_each = (
+        r"\(1 cohort code\(s\) are not ontology leaves \(e\.g\. \['U//C//D'\]\); "
+        r"1 ontology leaf name\(s\) are not cohort codes \(e\.g\. \['U//C//E'\]\)\)\."
+    )
+    with pytest.raises(ValueError, match=one_each):
+        check_ontology_cohort(renamed, code_to_index=cohort)
+    # The check needs to be told which cohort it is comparing against.
+    with pytest.raises(ValueError, match="needs the cohort's code_to_index or its vocab_fingerprint"):
+        check_ontology_cohort(onto)
+
+
+def test_ontology_vocab_fingerprint_is_the_multitask_manifest_fingerprint(tmp_path: Path):
+    """The ontology's observed nodes digest exactly as the multitask sampler digests the cohort's
+    ``codes.parquet`` (``TargetVocabulary.fingerprint``, the manifest's ``vocab_fingerprint``), so a
+    checkpoint's ``cohort_vocab_fingerprint``, a manifest and an ontology all compare like with like."""
+    onto = _write_ontology(tmp_path / "onto", _BF_LEAVES, _BF_PARENTS)
+    vocab = TargetVocabulary.from_pairs(list(reversed(_BF_LEAVES)), list(range(len(_BF_LEAVES), 0, -1)))
+    assert ontology_vocab_fingerprint(onto) == vocab.fingerprint == vocab_fingerprint(vocab.code_to_index())
+    # Ancestor nodes are not part of it (they are derived), and a same-width permutation moves it.
+    assert vocab_fingerprint(_ids(onto)) != vocab.fingerprint
+    swapped = dict(vocab.code_to_index())
+    swapped["X//1"], swapped["M//L"] = swapped["M//L"], swapped["X//1"]
+    assert vocab_fingerprint(swapped) != vocab.fingerprint
 
 
 def test_closure_fingerprint_is_the_closure_half_of_the_grid_provenance(tmp_path: Path):

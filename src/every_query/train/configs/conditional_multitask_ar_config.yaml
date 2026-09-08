@@ -67,6 +67,11 @@ lightning_module:
     # The training sampler needs no ontology; `datamodule.dataset_kwargs.ontology_dir` interpolates
     # from here for the evaluation adapter.
     ontology_dir: null
+    # Leave null: train.py fills in the cohort's vocabulary fingerprint (the multitask manifest's
+    # `vocab_fingerprint`, recomputed from metadata/codes.parquet).  Persisted in the checkpoint so an
+    # `ontology_dir` is re-verified against *this* cohort on every load and EQ_predict_multitask can
+    # refuse a same-width but different cohort.
+    cohort_vocab_fingerprint: null
     config_overrides:
       hidden_size: 384
       num_hidden_layers: 12

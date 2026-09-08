@@ -48,7 +48,10 @@ Key files:
     `label`, `prob`). This is the only inference path that consumes active window starts. A
     checkpoint trained with `ontology_dir` scores ancestor queries too: the grid's ancestor names
     resolve to the ontology's `[V, V_ext)` indices, and a grid whose provenance sidecar records a
-    *different* closure than the checkpoint's ontology is refused before scoring. Inference
+    *different* closure than the checkpoint's ontology is refused before scoring. The cohort on the
+    inference machine must match the checkpoint's by width *and*, when the checkpoint recorded it,
+    by vocabulary fingerprint (`cohort_vocab_fingerprint`), and the evaluation adapter requires the
+    ontology's leaves to be that cohort's `codes.parquet` rows code for code. Inference
     is `Trainer.predict` over a `ConditionalMultitaskDataModule` built from the checkpoint's cohort
     settings with only the label root swapped for the grid (#30), on exactly one device in exactly
     one process (`device=` picks the accelerator; a multi-device trainer or a `torchrun` / `srun

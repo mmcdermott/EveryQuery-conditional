@@ -475,19 +475,26 @@ def test_ontology_training_records_both_widths_and_needs_no_new_labels(
     eq_preprocessed_dataset: Path,
 ):
     """Training with an ontology reads the leaf-only sidecars unchanged: ``resolved_config.yaml`` records the
-    ontology's ``V_ext`` on the model and the cohort's ``V`` on the datamodule, and the reloaded model
-    reports both."""
-    from every_query.data.ontology import extended_vocab_size
+    ontology's ``V_ext`` on the model, the cohort's ``V`` on the datamodule and the cohort's vocabulary
+    fingerprint (the manifest's) on the model, and the reloaded model reports all three."""
+    from every_query.data.ontology import cohort_code_map, extended_vocab_size, ontology_vocab_fingerprint
     from every_query.generate_tasks.sample_multitask_sequences import read_manifest
+    from every_query.utils.digest import vocab_fingerprint
 
     cfg = yaml.safe_load((conditional_multitask_ontology_trained_dir / "resolved_config.yaml").read_text())
     v_ext = extended_vocab_size(multitask_ontology_dir)
-    v = int(read_manifest(conditional_multitask_labels_dir / train_split)["vocab_size"])
-    codes = pl.read_parquet(eq_preprocessed_dataset / "metadata" / "codes.parquet")
+    manifest = read_manifest(conditional_multitask_labels_dir / train_split)
+    v = int(manifest["vocab_size"])
+    codes_fp = eq_preprocessed_dataset / "metadata" / "codes.parquet"
+    codes = pl.read_parquet(codes_fp)
     assert v == int(codes["code/vocab_index"].max()) + 1 < v_ext
     model_cfg = cfg["lightning_module"]["model"]
     assert model_cfg["ontology_dir"] == str(multitask_ontology_dir)
     assert model_cfg["config_overrides"]["vocab_size"] == v_ext
+    # One digest, three artifacts: the cohort's codes.parquet, the leaf manifest and the ontology's leaves.
+    fingerprint = vocab_fingerprint(cohort_code_map(codes_fp))
+    assert model_cfg["cohort_vocab_fingerprint"] == fingerprint
+    assert manifest["vocab_fingerprint"] == fingerprint == ontology_vocab_fingerprint(multitask_ontology_dir)
     dm_kwargs = cfg["datamodule"]["dataset_kwargs"]
     assert dm_kwargs["expected_vocab_size"] == v, (
         "the training datasets are checked against the leaf manifest"
@@ -499,6 +506,36 @@ def test_ontology_training_records_both_widths_and_needs_no_new_labels(
     )
     assert module.model.vocab_size == v_ext and module.model.base_vocab_size == v
     assert module.model.code_bias.shape == (v_ext,)
+    assert module.model.cohort_vocab_fingerprint == fingerprint
+
+
+def test_train_refuses_a_same_width_permuted_ontology(
+    eq_preprocessed_dataset: Path, conditional_multitask_labels_dir: Path, tmp_path: Path
+):
+    """Regression for the PR #32 review: an ontology built from this cohort's codes with two indices swapped
+    has the cohort's ``V`` and the genuine ontology's ``V_ext``, so every width check passes.
+
+    ``EQ_train``
+    must still refuse it before a single step, naming the renumbered codes.
+    """
+    from every_query.data.ontology import cohort_code_map
+    from tests.multitask.conftest import write_cohort_ontology
+
+    first, second = sorted(cohort_code_map(eq_preprocessed_dataset / "metadata" / "codes.parquet"))[:2]
+    permuted = write_cohort_ontology(eq_preprocessed_dataset, tmp_path / "permuted", swap=(first, second))
+    output_dir = tmp_path / "train_permuted"
+    with pytest.raises(RuntimeError, match=r"different codes\.parquet than this cohort") as info:
+        run_and_check(
+            _train_cmd(
+                eq_preprocessed_dataset,
+                conditional_multitask_labels_dir,
+                output_dir,
+                f"lightning_module.model.ontology_dir={permuted!s}",
+            ),
+            timeout=300.0,
+        )
+    assert "2 code(s) sit at a different index" in str(info.value)
+    assert not (output_dir / "resolved_config.yaml").exists(), "refused before the run directory was written"
 
 
 @pytest.fixture(scope="module")

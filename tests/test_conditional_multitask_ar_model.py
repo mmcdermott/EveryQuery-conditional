@@ -590,13 +590,18 @@ _LEAF_NAMES = ["A//B//C", "A//B//D", "A//B", "E", "F//G"] + [f"Z//{i}" for i in 
 _DECLARED_PARENTS = {"F//G": ["P//Q"]}
 
 
-def write_tiny_ontology(root: Path) -> tuple[Path, int]:
-    """Write the three ``EQ_build_ontology`` artifacts for ``_LEAF_NAMES`` (leaf ids 1..VOCAB-1)."""
+def write_tiny_ontology(root: Path, names: list[str] = _LEAF_NAMES) -> tuple[Path, int]:
+    """Write the three ``EQ_build_ontology`` artifacts for ``names`` (leaf ids 1..VOCAB-1).
+
+    ``names`` defaults to ``_LEAF_NAMES``; passing it with two entries swapped writes a *same-width*
+    ontology of the same codes at a permuted numbering.  Overwrites in place, as re-running
+    ``EQ_build_ontology`` into the same directory does.
+    """
     frame = pl.DataFrame(
         {
-            "code": _LEAF_NAMES,
+            "code": names,
             "code/vocab_index": list(range(1, VOCAB)),
-            "parent_codes": [_DECLARED_PARENTS.get(c) for c in _LEAF_NAMES],
+            "parent_codes": [_DECLARED_PARENTS.get(c) for c in names],
         }
     )
     nodes, mix = build_ontology(frame)
@@ -765,3 +770,61 @@ def test_checkpoint_round_trip_with_an_ontology(tmp_path):
     torch.testing.assert_close(
         model.score_final_query(batch, scored), loaded.model.score_final_query(batch, scored)
     )
+
+
+def test_cohort_vocab_fingerprint_guards_the_ontology_and_round_trips(tmp_path):
+    """``cohort_vocab_fingerprint`` (``train.py`` fills it from the cohort's ``codes.parquet``) turns the
+    model's own closure load into an identity check: the tiny ontology passes against its cohort's fingerprint
+    and is refused against a same-width cohort with two codes swapped, which every width check accepts.
+
+    It is a hyperparameter, so a reloaded checkpoint re-runs the check against whatever now sits
+    at ``ontology_dir``.
+    """
+    from every_query.model.conditional_multitask_lightning import ConditionalMultitaskLightningModule
+    from every_query.utils.digest import vocab_fingerprint
+
+    cohort = dict(zip(_LEAF_NAMES, range(1, VOCAB), strict=True))
+    fingerprint = vocab_fingerprint(cohort)
+    model, onto, v_ext = ontology_model(tmp_path, cohort_vocab_fingerprint=fingerprint)
+    assert model.cohort_vocab_fingerprint == model.hparams["cohort_vocab_fingerprint"] == fingerprint
+    assert model.vocab_size == v_ext and model.base_vocab_size == VOCAB
+    plain = tiny_model()
+    assert plain.cohort_vocab_fingerprint is None and plain.hparams["cohort_vocab_fingerprint"] is None
+    # Without an ontology the fingerprint is only recorded (EQ_predict_multitask checks the cohort against
+    # it).
+    recorded = tiny_model(cohort_vocab_fingerprint="not-checked-here")
+    assert (
+        recorded.cohort_vocab_fingerprint
+        == recorded.hparams["cohort_vocab_fingerprint"]
+        == "not-checked-here"
+    )
+
+    # The cohort with two codes swapped has the same V; only the fingerprint tells the model it is not
+    # this one.
+    swapped_names = list(_LEAF_NAMES)
+    a, b = swapped_names.index("A//B//C"), swapped_names.index("E")
+    swapped_names[a], swapped_names[b] = swapped_names[b], swapped_names[a]
+    swapped = dict(zip(swapped_names, range(1, VOCAB), strict=True))
+    assert vocab_fingerprint(swapped) != fingerprint
+    with pytest.raises(ValueError, match=r"different codes\.parquet than this cohort.*observed nodes digest"):
+        tiny_model(
+            ontology_dir=str(onto),
+            config_overrides={"vocab_size": v_ext},
+            cohort_vocab_fingerprint=vocab_fingerprint(swapped),
+        )
+
+    module = ConditionalMultitaskLightningModule(model=model, optimizer=partial(torch.optim.AdamW, lr=1e-4))
+    ckpt = tmp_path / "fingerprinted.ckpt"
+    _save_checkpoint(module, ckpt)
+    loaded = ConditionalMultitaskLightningModule.load_from_checkpoint(str(ckpt))
+    assert loaded.model.cohort_vocab_fingerprint == fingerprint
+    batch = make_batch()
+    torch.testing.assert_close(model(batch)[1].logits, loaded.model.eval()(batch)[1].logits)
+
+    # Rebuild the ontology in place from the swapped numbering (same V_ext, so the table still fits): the
+    # checkpoint now refuses to load, where a width-only check would have paired every leaf with the wrong
+    # rows.
+    _, v_ext_swapped = write_tiny_ontology(onto, swapped_names)
+    assert v_ext_swapped == v_ext
+    with pytest.raises(ValueError, match=r"different codes\.parquet than this cohort"):
+        ConditionalMultitaskLightningModule.load_from_checkpoint(str(ckpt))

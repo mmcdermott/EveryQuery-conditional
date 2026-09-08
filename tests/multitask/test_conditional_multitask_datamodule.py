@@ -372,6 +372,38 @@ def test_training_dataset_width_is_the_leaf_manifest_under_an_ontology(
     assert plain.expected_vocab_size == v and not (set(ancestors) & set(plain.code_to_index))
 
 
+def test_evaluation_adapter_refuses_a_same_width_permuted_ontology(
+    data_config, grid_dir, tensorized_cohort_dir, cohort_ontology_dir, tmp_path
+):
+    """Regression for the PR #32 review.  The adapter grafts the ontology's ancestor indices onto the cohort's
+    code map, so the ontology's leaves must *be* this cohort's ``codes.parquet`` rows.  One built.
+
+    from the same codes with two indices swapped has the cohort's ``V`` and the genuine ontology's ``V_ext``
+    - every width check passes, and the datamodule's width view is unchanged - and is refused when the
+    dataset is built, naming the renumbered codes.
+    """
+    from every_query.data.ontology import extended_vocab_size
+
+    permuted = write_cohort_ontology(tensorized_cohort_dir, tmp_path / "permuted", swap=("HR", "TEMP"))
+    v, v_ext = data_config.vocab_size, extended_vocab_size(cohort_ontology_dir)
+    assert extended_vocab_size(permuted) == v_ext
+    dm = _datamodule(
+        data_config,
+        eval_tasks_dir=grid_dir,
+        max_windows=5,
+        dataset_kwargs={"expected_vocab_size": v, "ontology_dir": str(permuted)},
+    )
+    assert dm.eval_vocab_size == v_ext, "widths alone cannot see the permutation"
+    by_name = (
+        r"different codes\.parquet.*2 code\(s\) sit at a different index "
+        r"\('HR': ontology \d+ vs cohort \d+, 'TEMP'"
+    )
+    with pytest.raises(ValueError, match=by_name):
+        _ = dm.test_dataset
+    # The training side never touches the ontology and is unaffected either way.
+    assert dm.train_dataset.vocab_size == v
+
+
 # --- 7: Hydra ------------------------------------------------------------------------------------
 
 

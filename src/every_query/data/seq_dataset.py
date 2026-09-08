@@ -354,8 +354,12 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
             )
         self.ontology_dir = ontology_dir
         if ontology_dir is not None:
-            from every_query.data.ontology import extend_code_map
+            from every_query.data.ontology import check_ontology_cohort, extend_code_map
 
+            # The ontology's ancestor indices and the model's mix rows are only meaningful relative
+            # to the leaf indices the ontology was built with, so its observed nodes must be exactly
+            # this cohort's ``codes.parquet`` rows - not merely the same number of them.
+            check_ontology_cohort(ontology_dir, code_to_index=self.code_to_index)
             n_before = len(self.code_to_index)
             self.code_to_index = extend_code_map(self.code_to_index, ontology_dir)
             logger.info(

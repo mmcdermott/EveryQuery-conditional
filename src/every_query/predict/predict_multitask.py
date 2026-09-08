@@ -133,6 +133,7 @@ def build_predict_datamodule(
     num_workers: int | None = None,
     base_vocab_size: int | None = None,
     ontology_dir: str | Path | None = None,
+    cohort_vocab_fingerprint: str | None = None,
 ) -> ConditionalMultitaskDataModule:
     """The prediction datamodule: the checkpoint's cohort settings, pointed at the grid.
 
@@ -149,15 +150,19 @@ def build_predict_datamodule(
     nothing here reads it.  Everything else - ``tensorized_cohort_dir``, ``max_seq_len``,
     ``seq_sampling_strategy``, ``static_inclusion_mode``, ``batch_mode`` - is the checkpoint's.
 
-    Three consistency checks guard the checkpoint against the cohort and the ontology.
+    Four consistency checks guard the checkpoint against the cohort and the ontology.
     ``strip_delta_tokens`` (from ``dataset_kwargs``) must agree with the model's ``use_rope_time``:
     a mismatch would feed a RoPE-time model token-index positions (or vice versa) and score garbage
     without an error.  The cohort's vocabulary width must equal the model's **cohort** width
     (``base_vocab_size``; ``train.py`` sizes the model from the cohort), so a checkpoint pointed at
-    a different cohort fails here rather than scoring codes through the wrong embedding rows.  And
-    with an ontology, the ontology's extended width must equal the model's tied-embedding width
+    a different cohort fails here rather than scoring codes through the wrong embedding rows.  With
+    an ontology, the ontology's extended width must equal the model's tied-embedding width
     (``expected_vocab_size``), so the two widths are checked separately and fail with distinct
-    messages: the first names the cohort, the second the ontology.
+    messages: the first names the cohort, the second the ontology.  And when the checkpoint recorded
+    the training cohort's vocabulary fingerprint (``cohort_vocab_fingerprint``), the cohort on this
+    machine must digest to it: a width cannot tell two cohorts apart, a fingerprint can.  (The
+    ontology itself is checked against that fingerprint by the model at load, and against this
+    cohort's ``codes.parquet`` row for row by the evaluation adapter.)
 
     Args:
         train_cfg: The OmegaConf of the run's ``resolved_config.yaml`` (``setup_model`` returns it).
@@ -174,6 +179,9 @@ def build_predict_datamodule(
             this machine must match.  Defaults to ``expected_vocab_size`` (no ontology).
         ontology_dir: The model's ``ontology_dir``; forwarded to the evaluation adapter so ancestor
             query / start / bound names resolve, and checked against ``expected_vocab_size``.
+        cohort_vocab_fingerprint: The model's ``cohort_vocab_fingerprint`` (the training cohort's
+            :func:`~every_query.utils.digest.vocab_fingerprint`), which this machine's cohort must
+            digest to.  ``None`` (a checkpoint from before it was recorded) skips the check.
     """
     dm_cfg = train_cfg.datamodule
     dataset_kwargs = dm_cfg.get("dataset_kwargs") or {}
@@ -218,6 +226,18 @@ def build_predict_datamodule(
             f"the cohort at {data_cfg.tensorized_cohort_dir} has vocab_size={data_cfg.vocab_size} but "
             f"{detail}; the model was trained on a different codes.parquet."
         )
+    if cohort_vocab_fingerprint is not None:
+        from every_query.data.ontology import cohort_code_map
+        from every_query.utils.digest import vocab_fingerprint
+
+        actual = vocab_fingerprint(cohort_code_map(data_cfg.code_metadata_fp))
+        if actual != cohort_vocab_fingerprint:
+            raise ValueError(
+                f"the cohort at {data_cfg.tensorized_cohort_dir} has the checkpoint's vocab_size="
+                f"{base_vocab_size} but its vocabulary digests to {actual[:12]}... where the checkpoint "
+                f"recorded {cohort_vocab_fingerprint[:12]}...; the model was trained on a different "
+                "codes.parquet (same width, other codes or a different numbering)."
+            )
     if batch_size is None:
         batch_size = dm_cfg.batch_size
     if num_workers is None:
@@ -632,6 +652,7 @@ def main(cfg: DictConfig) -> None:
         num_workers=cfg.get("num_workers"),
         base_vocab_size=model.model.base_vocab_size,
         ontology_dir=model.model.ontology_dir,
+        cohort_vocab_fingerprint=model.model.cohort_vocab_fingerprint,
     )
     dataset = datamodule.predict_dataset
     logger.info(f"Loaded {len(dataset)} grid rows from {tasks_dir} (split={split})")

@@ -86,6 +86,13 @@ class ConditionalMultitaskARModel(torch.nn.Module):
             becomes the ancestor-mixed table, the readout projects onto it, and leaf-only
             ``(B, K, V)`` targets are widened to ``V_ext`` in :meth:`forward` (see the module
             docstring).
+        cohort_vocab_fingerprint: :func:`~every_query.utils.digest.vocab_fingerprint` of the cohort's
+            ``codes.parquet`` - the identity of the vocabulary the leaf rows ``[0, V)`` mean.
+            ``train.py`` fills it in from the training cohort; it is persisted in the hyperparameters,
+            so with an ``ontology_dir`` every construction (training and every checkpoint load)
+            re-verifies that the ontology at that path was built from *this* cohort, not merely one
+            of the same width, and ``EQ_predict_multitask`` checks the inference cohort against it.
+            ``None`` (pre-existing checkpoints) keeps the width-only checks.
     """
 
     PRECISION_TO_MODEL_WEIGHTS_DTYPE: ClassVar[dict[str, torch.dtype]] = {
@@ -104,6 +111,7 @@ class ConditionalMultitaskARModel(torch.nn.Module):
         max_windows: int = 5,
         use_rope_time: bool = False,
         ontology_dir: str | None = None,
+        cohort_vocab_fingerprint: str | None = None,
     ):
         super().__init__()
         if max_windows < 1:
@@ -145,6 +153,7 @@ class ConditionalMultitaskARModel(torch.nn.Module):
         self.max_windows = max_windows
         self.use_rope_time = use_rope_time
         self.ontology_dir = ontology_dir
+        self.cohort_vocab_fingerprint = cohort_vocab_fingerprint
         # ``V``: the cohort's own width.  Equal to ``vocab_size`` (the table width) without an
         # ontology; with one, the leaf block of the ``V_ext``-wide table.
         self._base_vocab_size = self.HF_model_config.vocab_size
@@ -158,7 +167,10 @@ class ConditionalMultitaskARModel(torch.nn.Module):
             # bound and condition codes all inherit the ontology mix; ``wrap_tok_embeddings`` also
             # checks the table is exactly ``V_ext`` rows.
             wrap_tok_embeddings(self, load_mix_matrix(ontology_dir))
-            closure = load_closure_index(ontology_dir)
+            # With the cohort's fingerprint the loader also checks the ontology's observed nodes
+            # *are* that cohort's ``codes.parquet`` rows; the width checks alone would accept any
+            # same-width ontology and silently pair the leaf columns with the wrong closure rows.
+            closure = load_closure_index(ontology_dir, vocab_fingerprint=cohort_vocab_fingerprint)
             if closure.v_ext != self.vocab_size:
                 raise ValueError(
                     f"The ontology at {ontology_dir} extends the vocabulary to V_ext={closure.v_ext} but "
@@ -177,6 +189,7 @@ class ConditionalMultitaskARModel(torch.nn.Module):
             "max_windows": max_windows,
             "use_rope_time": use_rope_time,
             "ontology_dir": ontology_dir,
+            "cohort_vocab_fingerprint": cohort_vocab_fingerprint,
         }
 
     @property

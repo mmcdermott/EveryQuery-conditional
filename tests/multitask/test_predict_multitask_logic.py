@@ -508,6 +508,90 @@ def test_build_predict_datamodule_separates_cohort_width_from_table_width(
         build_predict_datamodule(cfg, grid, tuning_split, expected_vocab_size=v_ext, **kw)
 
 
+def test_build_predict_datamodule_checks_the_cohort_identity_not_just_its_width(
+    tensorized_cohort_dir, tmp_path, cohort_ontology_dir
+):
+    """Regression for the PR #32 review.
+
+    A checkpoint that recorded its training cohort's vocabulary
+    fingerprint refuses a same-width cohort whose ``codes.parquet`` digests differently, with or without an
+    ontology; and an ontology of this cohort's codes at two swapped indices (same ``V``, same ``V_ext``)
+    passes every width check here and is refused by the evaluation adapter, code by code.
+    """
+    from every_query.data.ontology import cohort_code_map, extended_vocab_size
+    from every_query.utils.digest import vocab_fingerprint
+
+    grid = _write_grid(tmp_path / "grid", _eval_rows(), split=tuning_split)
+    cfg = _train_cfg(tensorized_cohort_dir)
+    v = _vocab_size(tensorized_cohort_dir, grid)
+    v_ext = extended_vocab_size(cohort_ontology_dir)
+    cohort = cohort_code_map(_data_config(tensorized_cohort_dir, grid).code_metadata_fp)
+    fingerprint = vocab_fingerprint(cohort)
+    kw = {"use_rope_time": False, "max_windows": 5}
+
+    # The cohort on this machine is the checkpoint's: accepted with and without an ontology.
+    with_onto = build_predict_datamodule(
+        cfg,
+        grid,
+        tuning_split,
+        expected_vocab_size=v_ext,
+        base_vocab_size=v,
+        ontology_dir=cohort_ontology_dir,
+        cohort_vocab_fingerprint=fingerprint,
+        **kw,
+    )
+    assert len(with_onto.predict_dataset) == 4
+    plain = build_predict_datamodule(
+        cfg, grid, tuning_split, expected_vocab_size=v, cohort_vocab_fingerprint=fingerprint, **kw
+    )
+    assert len(plain.predict_dataset) == 4
+    # Same width, different codes.parquet (one code moved to the free PAD slot): the width check passes,
+    # the fingerprint check does not.
+    other = vocab_fingerprint({**cohort, Q1: 0})
+    for onto_kw in ({}, {"ontology_dir": cohort_ontology_dir, "base_vocab_size": v}):
+        table = v_ext if onto_kw else v
+        with pytest.raises(ValueError, match=r"same width, other codes or a different numbering"):
+            build_predict_datamodule(
+                cfg,
+                grid,
+                tuning_split,
+                expected_vocab_size=table,
+                cohort_vocab_fingerprint=other,
+                **onto_kw,
+                **kw,
+            )
+    # A pre-fingerprint checkpoint (``None``) keeps the width-only behaviour.
+    legacy = build_predict_datamodule(cfg, grid, tuning_split, expected_vocab_size=v, **kw)
+    assert len(legacy.predict_dataset) == 4
+
+    # A permuted ontology of this very cohort: widths agree everywhere, the adapter refuses it by name.
+    permuted = write_cohort_ontology(tensorized_cohort_dir, tmp_path / "permuted", swap=(Q1, Q2))
+    assert extended_vocab_size(permuted) == v_ext
+    dm = build_predict_datamodule(
+        cfg, grid, tuning_split, expected_vocab_size=v_ext, base_vocab_size=v, ontology_dir=permuted, **kw
+    )
+    by_name = rf"different codes\.parquet.*'{Q1}': ontology {cohort[Q2]} vs cohort {cohort[Q1]}.*'{Q2}'"
+    with pytest.raises(ValueError, match=by_name):
+        _ = dm.predict_dataset
+    # ...and the model itself refuses to be built on it once it knows the cohort.
+    with pytest.raises(ValueError, match=r"different codes\.parquet than this cohort"):
+        ConditionalMultitaskARModel(
+            config_overrides={
+                "hidden_size": 16,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "intermediate_size": 32,
+                "max_position_embeddings": 64 + 15,
+                "vocab_size": v_ext,
+                "pad_token_id": 0,
+            },
+            max_windows=5,
+            ontology_dir=str(permuted),
+            cohort_vocab_fingerprint=fingerprint,
+        )
+
+
 def test_ancestor_query_scores_through_the_predict_datamodule(
     tensorized_cohort_dir, tmp_path, cohort_ontology_dir
 ):

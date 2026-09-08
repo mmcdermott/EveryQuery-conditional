@@ -36,7 +36,11 @@ shape, no Hydra entry points, no configs.
     window for QuerySeq grids without building `(B, K, V)`. With `ontology_dir` the table is the
     ancestor-mixed `V_ext` one on both the input and readout sides, and leaf-only `(B, K, V)`
     targets are widened to `V_ext` inside `forward` (`derive_ancestor_targets`: an ancestor's bit
-    is the OR of its descendant leaves'), so the sampler's sidecars stay leaf-only.
+    is the OR of its descendant leaves'), so the sampler's sidecars stay leaf-only. The closure is
+    checked against the cohort by *identity*, not width: `train.py` records the cohort's vocabulary
+    fingerprint (`cohort_vocab_fingerprint`, the multitask manifest's `vocab_fingerprint`) as a
+    model hparam, and every construction, checkpoint loads included, requires the ontology's
+    observed nodes to digest to it, so a same-width foreign or renumbered ontology is refused.
 - **`conditional_multitask_lightning.py`** — `ConditionalMultitaskLightningModule`: fit /
     validation on `MultitaskBoundaryBatch` (dense loss), test / predict on `MultitaskEvalBatch`
     (target-only scoring).

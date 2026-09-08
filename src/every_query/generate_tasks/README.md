@@ -390,7 +390,10 @@ raises before Stage 0 and events are never closure-expanded. That is not a gap f
 multitask model derives them per batch from these leaf sidecars and the ontology closure when it is
 trained with `lightning_module.model.ontology_dir` set (`derive_ancestor_targets` in
 `every_query.data.ontology`) — `.labels.npy`, the manifest and `vocab_size` are byte-identical with
-or without an ontology. What is not yet supported is an ancestor acting as an *event*
+or without an ontology. The manifest's `vocab_fingerprint` is the same digest the ontology's
+observed nodes are checked against (`ontology_vocab_fingerprint`) and the one `train.py` records on
+the model (`cohort_vocab_fingerprint`), so the labels, the ontology and the checkpoint all name one
+`codes.parquet`. What is not yet supported is an ancestor acting as an *event*
 (ancestor-valued `start_event` / `bound_event`) or as a conditioning code; those plug in through the
 seams `build_target_vocabulary`, `prepare_events_for_labeling` and `resolve_event_boundaries`.
 

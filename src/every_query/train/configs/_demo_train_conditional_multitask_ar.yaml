@@ -40,6 +40,8 @@ lightning_module:
     max_windows: 5
     use_rope_time: false
     ontology_dir: null
+    # train.py fills this in from the cohort's codes.parquet (see conditional_multitask_ar_config).
+    cohort_vocab_fingerprint: null
     config_overrides:
       hidden_size: 64
       num_hidden_layers: 2

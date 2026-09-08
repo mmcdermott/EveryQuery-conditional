@@ -31,13 +31,14 @@ not in the mixing improving ordinary leaf queries.
 """
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
 import polars as pl
 import torch
 
-from every_query.utils.digest import frame_digest
+from every_query.utils.digest import frame_digest, vocab_fingerprint
 
 logger = logging.getLogger(__name__)
 
@@ -518,6 +519,135 @@ def closure_fingerprint(ontology_dir: str | Path) -> str:
     return frame_digest(load_event_to_query_nodes(ontology_dir))
 
 
+def cohort_code_map(code_metadata_fp: str | Path) -> dict[str, int]:
+    """The cohort's ``code -> code/vocab_index`` mapping from its ``codes.parquet``.
+
+    The same two columns every dataset reads to encode codes, and the same rows ``EQ_build_ontology``
+    turns into the ontology's observed nodes - so :func:`check_ontology_cohort` compares the two
+    sides like with like.  Rows without an index are not part of the vocabulary and are dropped.
+
+    Examples:
+        >>> import tempfile
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     fp = Path(d) / "codes.parquet"
+        ...     _ = pl.DataFrame({"code": ["A", "B", "C"], "code/vocab_index": [2, 1, None],
+        ...                       "description": ["a", "b", "c"]}).write_parquet(fp)
+        ...     cohort_code_map(fp)
+        {'A': 2, 'B': 1}
+    """
+    codes = pl.read_parquet(Path(code_metadata_fp), columns=["code", "code/vocab_index"]).filter(
+        pl.col("code").is_not_null() & pl.col("code/vocab_index").is_not_null()
+    )
+    return {
+        c: int(i) for c, i in zip(codes["code"].to_list(), codes["code/vocab_index"].to_list(), strict=True)
+    }
+
+
+def observed_code_map(ontology_dir: str | Path) -> dict[str, int]:
+    """The ontology's observed nodes as ``code -> token_id``: the ``codes.parquet`` rows it was built from.
+
+    ``build_ontology`` keeps every leaf at its own ``code/vocab_index``, so for an ontology built
+    from a cohort this equals that cohort's :func:`cohort_code_map` exactly.  Unindexed rows are
+    dropped on both sides, so the two maps stay comparable on a cohort that carries them.
+    """
+    leaves = load_nodes(ontology_dir).filter(pl.col("is_observed_code") & pl.col("token_id").is_not_null())
+    return {
+        c: int(i) for c, i in zip(leaves["node_name"].to_list(), leaves["token_id"].to_list(), strict=True)
+    }
+
+
+def ontology_vocab_fingerprint(ontology_dir: str | Path) -> str:
+    """:func:`~every_query.utils.digest.vocab_fingerprint` of the ontology's observed nodes.
+
+    The digest the multitask sampler records in every manifest as ``vocab_fingerprint`` and the
+    multitask dataset recomputes from the cohort's ``codes.parquet`` - so an ontology built from that
+    cohort digests to the same string, and a checkpoint that persists the cohort's fingerprint can
+    re-verify the ontology it is pointed at on every load.
+    """
+    return vocab_fingerprint(observed_code_map(ontology_dir))
+
+
+def check_ontology_cohort(
+    ontology_dir: str | Path,
+    *,
+    code_to_index: Mapping[str, int] | None = None,
+    vocab_fingerprint: str | None = None,
+) -> None:
+    """Require the ontology's observed nodes to *be* the cohort's ``(code, code/vocab_index)`` rows.
+
+    Widths alone cannot tell two cohorts apart: two unrelated ``codes.parquet`` files of the same
+    size, or the same codes at permuted indices, give the same ``V`` while every leaf target column
+    would be paired with the wrong closure and mix rows.  This is the check that establishes the
+    ontology was built from *this* cohort, in whichever form the caller has the cohort:
+
+    Args:
+        ontology_dir: The ``EQ_build_ontology`` output directory.
+        code_to_index: The cohort's mapping (:func:`cohort_code_map`, or a dataset's
+            ``code_to_index`` before any ontology extension).  Compared row for row; the error names
+            codes the ontology lacks, codes it has that the cohort does not, and codes at a different
+            index.
+        vocab_fingerprint: The cohort's :func:`~every_query.utils.digest.vocab_fingerprint` (a
+            multitask manifest's ``vocab_fingerprint``, or the one a checkpoint recorded).  Compared
+            against :func:`ontology_vocab_fingerprint`.
+
+    At least one of the two must be given; both are checked when both are.
+
+    Raises:
+        ValueError: On any difference, or when neither form of the cohort was given.
+
+    Examples:
+        The same three codes at permuted indices have the same width and are still refused:
+
+        >>> import tempfile
+        >>> codes = pl.DataFrame({"code": ["A//B", "A//C", "D"], "code/vocab_index": [1, 2, 3]})
+        >>> nodes, _ = build_ontology(codes)
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     _ = nodes.write_parquet(Path(d) / ONTOLOGY_VOCAB_FILE)
+        ...     check_ontology_cohort(d, code_to_index={"A//B": 1, "A//C": 2, "D": 3})
+        ...     check_ontology_cohort(d, vocab_fingerprint=vocab_fingerprint({"A//B": 1, "A//C": 2, "D": 3}))
+        ...     check_ontology_cohort(d, code_to_index={"A//B": 1, "A//C": 3, "D": 2})
+        Traceback (most recent call last):
+            ...
+        ValueError: The ontology at ... was built from a different codes.parquet than this cohort ...
+        >>> check_ontology_cohort("/nowhere")
+        Traceback (most recent call last):
+            ...
+        ValueError: check_ontology_cohort needs the cohort's code_to_index or its vocab_fingerprint
+    """
+    if code_to_index is None and vocab_fingerprint is None:
+        raise ValueError("check_ontology_cohort needs the cohort's code_to_index or its vocab_fingerprint")
+    observed = observed_code_map(ontology_dir)
+    if code_to_index is not None:
+        cohort = {str(c): int(i) for c, i in code_to_index.items()}
+        missing = sorted(set(cohort) - set(observed))
+        extra = sorted(set(observed) - set(cohort))
+        renumbered = sorted(
+            (c, observed[c], cohort[c]) for c in set(cohort) & set(observed) if observed[c] != cohort[c]
+        )
+        if missing or extra or renumbered:
+            details = []
+            if missing:
+                details.append(f"{len(missing)} cohort code(s) are not ontology leaves (e.g. {missing[:5]})")
+            if extra:
+                details.append(f"{len(extra)} ontology leaf name(s) are not cohort codes (e.g. {extra[:5]})")
+            if renumbered:
+                shown = ", ".join(f"{c!r}: ontology {o} vs cohort {k}" for c, o, k in renumbered[:5])
+                details.append(f"{len(renumbered)} code(s) sit at a different index ({shown})")
+            raise ValueError(
+                f"The ontology at {ontology_dir} was built from a different codes.parquet than this cohort "
+                f"({'; '.join(details)}).  Its leaf indices would pair the cohort's target columns with the "
+                "wrong closure and mix rows; rebuild it with EQ_build_ontology from this cohort."
+            )
+    if vocab_fingerprint is not None:
+        actual = ontology_vocab_fingerprint(ontology_dir)
+        if actual != vocab_fingerprint:
+            raise ValueError(
+                f"The ontology at {ontology_dir} was built from a different codes.parquet than this cohort: "
+                f"its observed nodes digest to {actual[:12]}... but the cohort's vocabulary fingerprint is "
+                f"{vocab_fingerprint[:12]}....  Rebuild it with EQ_build_ontology from this cohort."
+            )
+
+
 @dataclass(frozen=True)
 class ClosureIndex:
     """The strict closure as index pairs: leaf ``leaf_ids[i]`` lies under ancestor ``ancestor_ids[i]``.
@@ -548,19 +678,35 @@ class ClosureIndex:
         )
 
 
-def load_closure_index(ontology_dir: str | Path, base_vocab_size: int | None = None) -> ClosureIndex:
-    """Read the closure as :class:`ClosureIndex`, validating it was built from *this* cohort.
+def load_closure_index(
+    ontology_dir: str | Path,
+    base_vocab_size: int | None = None,
+    *,
+    code_to_index: Mapping[str, int] | None = None,
+    vocab_fingerprint: str | None = None,
+) -> ClosureIndex:
+    """Read the closure as :class:`ClosureIndex`, checking it against the cohort it is used with.
+
+    Two kinds of check.  The **width** checks (always run) require the leaves to span exactly
+    ``[.., base_vocab_size)`` and every ancestor to sit above them - the shape the derivation needs.
+    They cannot tell two same-width cohorts apart, so the **identity** check
+    (:func:`check_ontology_cohort`) runs whenever the caller can say which cohort this is: pass the
+    cohort's ``code -> index`` mapping, its vocabulary fingerprint, or both.  Every production load
+    passes one; a bare call is width-only and suits tests that built the ontology themselves.
 
     Args:
         ontology_dir: The ``EQ_build_ontology`` output directory.
         base_vocab_size: The cohort's ``vocab_size`` (``V``).  When given it must equal one past
-            the ontology's highest leaf index, i.e. the ontology was built from this cohort's
-            ``codes.parquet``; when ``None`` that number is taken as ``V``.
+            the ontology's highest leaf index; when ``None`` that number is taken as ``V``.
+        code_to_index: The cohort's ``code -> code/vocab_index`` mapping (:func:`cohort_code_map`),
+            compared row for row against the ontology's observed nodes.
+        vocab_fingerprint: The cohort's :func:`~every_query.utils.digest.vocab_fingerprint`,
+            compared against :func:`ontology_vocab_fingerprint`.
 
     Raises:
         ValueError: If the ontology's leaves do not span exactly ``[.., base_vocab_size)``, if any
-            closure leaf lies at or past ``base_vocab_size``, or if any closure ancestor lies below
-            it (a foreign ontology, or one whose nodes were renumbered).
+            closure leaf lies at or past ``base_vocab_size``, if any closure ancestor lies below it,
+            or if the observed nodes are not the cohort's rows (see :func:`check_ontology_cohort`).
 
     Examples:
         >>> import tempfile
@@ -578,6 +724,21 @@ def load_closure_index(ontology_dir: str | Path, base_vocab_size: int | None = N
         (4, 5, 1)
         >>> sorted(zip(closure.leaf_ids.tolist(), closure.ancestor_ids.tolist()))
         [(1, 4), (2, 4)]
+
+        A cohort with the same three codes at permuted indices has the same width, so it passes the
+        width checks alone and is refused only once the loader is told which cohort it is:
+
+        >>> permuted = {"A//B": 2, "A//C": 1, "D": 3}
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     _ = nodes.write_parquet(Path(d) / ONTOLOGY_VOCAB_FILE)
+        ...     _ = build_event_to_query_nodes(nodes, mix).write_parquet(Path(d) / EVENT_TO_QUERY_NODES_FILE)
+        ...     width_only = load_closure_index(d, base_vocab_size=4)  # passes: same V, same V_ext
+        ...     load_closure_index(d, base_vocab_size=4, code_to_index=permuted)
+        Traceback (most recent call last):
+            ...
+        ValueError: The ontology at ... was built from a different codes.parquet than this cohort ...
+        >>> width_only.n_ancestors
+        1
     """
     nodes = load_nodes(ontology_dir)
     leaves = nodes.filter(pl.col("is_observed_code"))
@@ -621,6 +782,8 @@ def load_closure_index(ontology_dir: str | Path, base_vocab_size: int | None = N
                 f"closure ancestor indices must lie in [{base_vocab_size}, {v_ext}); got "
                 f"[{int(ancestor_ids.min())}, {int(ancestor_ids.max())}] from the ontology at {ontology_dir}."
             )
+    if code_to_index is not None or vocab_fingerprint is not None:
+        check_ontology_cohort(ontology_dir, code_to_index=code_to_index, vocab_fingerprint=vocab_fingerprint)
     return ClosureIndex(leaf_ids, ancestor_ids, base_vocab_size, v_ext)
 
 

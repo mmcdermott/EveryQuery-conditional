@@ -114,6 +114,8 @@ from every_query.generate_tasks.sample_tasks import (
     resolve_workers,
     sample_patient_contexts,
 )
+from every_query.utils.digest import VOCAB_FINGERPRINT_VERSION as VOCAB_FINGERPRINT_VERSION  # re-export
+from every_query.utils.digest import vocab_fingerprint
 from every_query.utils.seeds import derive_seed
 
 if TYPE_CHECKING:
@@ -122,9 +124,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 FORMAT_VERSION = 3
-# The vocabulary fingerprint salt is pinned independently of FORMAT_VERSION so a format bump does not
-# change ``vocab_fingerprint`` and legacy (v2) outputs still pass the cohort check.
-VOCAB_FINGERPRINT_VERSION = 2
+# The vocabulary fingerprint salt (``VOCAB_FINGERPRINT_VERSION``, owned by ``every_query.utils.digest``
+# and re-exported above) is pinned independently of FORMAT_VERSION so a format bump does not change
+# ``vocab_fingerprint`` and legacy (v2) outputs still pass the cohort check.
 MANIFEST_NAME = "_multitask_manifest.json"
 LABELS_SUFFIX = ".labels.npy"
 ONTOLOGY_MODE_NONE = "none"
@@ -218,11 +220,10 @@ class TargetVocabulary:
         ordered_codes = tuple(str(codes[i]) for i in order)
         ordered_idx = idx[order]
         size = int(ordered_idx[-1]) + 1
-        h = hashlib.sha256()
-        h.update(f"multitask-vocab-v{VOCAB_FINGERPRINT_VERSION}:{size}\n".encode())
-        for i, c in zip(ordered_idx.tolist(), ordered_codes, strict=True):
-            h.update(f"{i}\t{c}\n".encode())
-        return cls(codes=ordered_codes, indices=ordered_idx, size=size, fingerprint=h.hexdigest())
+        # The one digest every "is this the cohort I labeled under" check compares: the multitask
+        # dataset recomputes it from ``codes.parquet`` and the ontology loader over the observed nodes.
+        fingerprint = vocab_fingerprint(dict(zip(ordered_codes, ordered_idx.tolist(), strict=True)))
+        return cls(codes=ordered_codes, indices=ordered_idx, size=size, fingerprint=fingerprint)
 
     def code_to_index(self) -> dict[str, int]:
         return dict(zip(self.codes, self.indices.tolist(), strict=True))

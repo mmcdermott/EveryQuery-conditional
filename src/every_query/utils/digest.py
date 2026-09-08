@@ -5,7 +5,55 @@ for importing :mod:`every_query.data.ontology` (which imports torch) to do so, w
 side digests the same closure table and has to get the same string.
 """
 
+import hashlib
+from collections.abc import Mapping
+
 import polars as pl
+
+#: Salt of :func:`vocab_fingerprint`.  Pinned independently of the multitask sampler's
+#: ``FORMAT_VERSION`` so a manifest format bump does not move ``vocab_fingerprint`` and legacy
+#: outputs still pass the cohort check.
+VOCAB_FINGERPRINT_VERSION = 2
+
+
+def vocab_fingerprint(code_to_index: Mapping[str, int]) -> str:
+    """Digest of a ``code -> code/vocab_index`` mapping: the multitask manifest's ``vocab_fingerprint``.
+
+    SHA-256 over ``"{index}\\t{code}\\n"`` rows in index order, prefixed by the width
+    ``V = max(index) + 1``.  It is the identity of a cohort's vocabulary: two ``codes.parquet`` files
+    with the same width but different codes, or the same codes at permuted indices, digest
+    differently.  The multitask sampler records it in every manifest, the multitask dataset
+    recomputes it from the cohort's ``codes.parquet``, and the ontology loader
+    (``every_query.data.ontology.ontology_vocab_fingerprint``) computes it over an ontology's
+    observed nodes, so all three compare like with like.
+
+    Insertion order is irrelevant; only the pairs are:
+
+    Examples:
+        >>> vocab_fingerprint({"B": 2, "A": 1}) == vocab_fingerprint({"A": 1, "B": 2})
+        True
+        >>> vocab_fingerprint({"A": 2, "B": 1}) == vocab_fingerprint({"A": 1, "B": 2})
+        False
+        >>> vocab_fingerprint({"A": 1, "C": 2}) == vocab_fingerprint({"A": 1, "B": 2})
+        False
+        >>> vocab_fingerprint({})
+        Traceback (most recent call last):
+            ...
+        ValueError: the vocabulary is empty
+    """
+    if not code_to_index:
+        raise ValueError("the vocabulary is empty")
+    ordered = sorted((int(i), str(c)) for c, i in code_to_index.items())
+    if ordered[0][0] < 0:
+        raise ValueError("code/vocab_index must be non-negative")
+    if len({i for i, _ in ordered}) != len(ordered):
+        raise ValueError("code/vocab_index values must be unique")
+    size = ordered[-1][0] + 1
+    h = hashlib.sha256()
+    h.update(f"multitask-vocab-v{VOCAB_FINGERPRINT_VERSION}:{size}\n".encode())
+    for i, c in ordered:
+        h.update(f"{i}\t{c}\n".encode())
+    return h.hexdigest()
 
 
 def frame_digest(df: pl.DataFrame) -> str:
