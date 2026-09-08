@@ -45,7 +45,10 @@ Key files:
     pairs and the final query is scored target-only at its last window (no all-vocabulary logits,
     packed labels, manifest or sidecar), emitting one row per grid row (`subject_id`,
     `prediction_time`, the window lists incl. `start_durations` / `start_events`, `target_code`,
-    `label`, `prob`). This is the only inference path that consumes active window starts. Inference
+    `label`, `prob`). This is the only inference path that consumes active window starts. A
+    checkpoint trained with `ontology_dir` scores ancestor queries too: the grid's ancestor names
+    resolve to the ontology's `[V, V_ext)` indices, and a grid whose provenance sidecar records a
+    *different* closure than the checkpoint's ontology is refused before scoring. Inference
     is `Trainer.predict` over a `ConditionalMultitaskDataModule` built from the checkpoint's cohort
     settings with only the label root swapped for the grid (#30), on exactly one device in exactly
     one process (`device=` picks the accelerator; a multi-device trainer or a `torchrun` / `srun

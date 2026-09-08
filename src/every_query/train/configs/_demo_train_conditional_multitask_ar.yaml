@@ -21,7 +21,9 @@ datamodule:
     batch_mode: SM
   dataset_kwargs:
     strip_delta_tokens: false
+    # The cohort's V (train.py pins it after sizing the model, so it stays V under an ontology).
     expected_vocab_size: ${lightning_module.model.config_overrides.vocab_size}
+    ontology_dir: ${lightning_module.model.ontology_dir}
   # Optional QuerySeq evaluation-grid `eval/` root (EQ_generate_evaluation_query_sequences); only
   # trainer.test / trainer.predict / EQ_predict_multitask need it, fit never reads it.
   eval_tasks_dir: null

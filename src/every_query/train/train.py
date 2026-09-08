@@ -512,7 +512,8 @@ def main(cfg: DictConfig) -> float | None:
     # ``validate_resume_directory`` diffs it, so the run dir records the real numbers and a
     # resumed run compares like with like.
     ds_cfg = instantiate(cfg.datamodule.config)
-    vocab_size = ds_cfg.vocab_size
+    cohort_vocab_size = ds_cfg.vocab_size
+    vocab_size = cohort_vocab_size
 
     # With an ontology, the embedding table must cover the ancestor nodes too: they are appended
     # above the highest leaf index, so the cohort's own vocab_size would leave every ancestor
@@ -533,6 +534,15 @@ def main(cfg: DictConfig) -> float | None:
         vocab_size = v_ext
 
     cfg.lightning_module.model.config_overrides.vocab_size = vocab_size
+    # The multitask datamodule's ``expected_vocab_size`` is the width its training sidecars are
+    # checked against, and those are leaf-only: it must stay the *cohort's* V even when the model
+    # above was just widened to V_ext.  The shipped configs interpolate it from
+    # ``config_overrides.vocab_size``, which would now resolve to V_ext, so pin the cohort width
+    # explicitly; ``resolved_config.yaml`` then records both numbers (``EQ_predict_multitask``
+    # reads them).  Configs whose datasets do not take the key (the scalar models') are left alone.
+    dataset_kwargs = cfg.datamodule.get("dataset_kwargs")
+    if dataset_kwargs is not None and "expected_vocab_size" in dataset_kwargs:
+        cfg.datamodule.dataset_kwargs.expected_vocab_size = cohort_vocab_size
     cfg.lightning_module.model.config_overrides.max_position_embeddings = required_position_embeddings(
         cfg.lightning_module.model, ds_cfg.max_seq_len
     )

@@ -384,9 +384,15 @@ are rejected), exactly one start and one end representation must be active per s
 parquets written before #24 (format 2, no start columns) load as prediction-time starts — a split may
 mix format 2 and 3 shards. No start is ever sampled in the dataset.
 
-**MVP scope:** observable leaf codes only. A non-null `ontology_dir` raises before Stage 0; events are
-never closure-expanded. Ancestor targets and boundaries plug in later through the seams
-`build_target_vocabulary`, `prepare_events_for_labeling` and `resolve_event_boundaries`.
+**Leaf-only by design.** The sampler labels observable leaf codes only; a non-null `ontology_dir`
+raises before Stage 0 and events are never closure-expanded. That is not a gap for ancestor
+*targets*: under the window rule an ancestor's bit is the OR of its descendant leaves' bits, so the
+multitask model derives them per batch from these leaf sidecars and the ontology closure when it is
+trained with `lightning_module.model.ontology_dir` set (`derive_ancestor_targets` in
+`every_query.data.ontology`) — `.labels.npy`, the manifest and `vocab_size` are byte-identical with
+or without an ontology. What is not yet supported is an ancestor acting as an *event*
+(ancestor-valued `start_event` / `bound_event`) or as a conditioning code; those plug in through the
+seams `build_target_vocabulary`, `prepare_events_for_labeling` and `resolve_event_boundaries`.
 
 ### Evaluating the multitask model — the same QuerySeq grid
 

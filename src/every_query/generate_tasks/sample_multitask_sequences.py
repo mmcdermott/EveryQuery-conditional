@@ -48,10 +48,17 @@ Targets are bit-packed and written incrementally through a temporary ``open_memm
 shard-wide target tensor is ever allocated, and no worker holds shard-wide ``(context, code,
 next_time)`` triples.
 
-**MVP scope**: the target vocabulary is the cohort's ``codes.parquet`` - observable codes treated as
-ontology leaves, bits aligned to the unchanged ``code/vocab_index``.  A non-null ``ontology_dir`` is
-a hard error.  The three seams :func:`build_target_vocabulary`, :func:`prepare_events_for_labeling`
-and :func:`resolve_event_boundaries` are where ancestor support will plug in later.
+**Leaf-only by design**: the target vocabulary is the cohort's ``codes.parquet`` - observable codes,
+bits aligned to the unchanged ``code/vocab_index``.  Ancestor *targets* need no sampler support:
+under the window rule an ancestor's bit is the OR of its descendant leaves' bits, so
+:class:`~every_query.model.conditional_multitask_ar_model.ConditionalMultitaskARModel` derives them
+per batch from these leaf sidecars and the ontology's closure
+(:func:`~every_query.data.ontology.derive_ancestor_targets`); storing them would only add ~50% to
+every ``.labels.npy`` for no information.  What the sampler does *not* yet do is let an ancestor act
+as an **event** - an ancestor-valued ``start_event`` / ``bound_event`` ("until the next occurrence
+of any ``LAB//X//*``") - or as a conditioning code, so a non-null ``ontology_dir`` is still a hard
+error here.  The three seams :func:`build_target_vocabulary`, :func:`prepare_events_for_labeling`
+and :func:`resolve_event_boundaries` are where that plugs in.
 """
 
 from __future__ import annotations
@@ -148,13 +155,14 @@ INDEX_COLUMNS = [CTX_ID_COL, SID, PT, *START_COLUMNS, DURATIONS_COL, BOUND_EVENT
 METADATA_COLUMNS = [SID, PT, *START_COLUMNS, DURATIONS_COL, BOUND_EVENTS_COL, CONDITION_CODES_COL]
 
 ONTOLOGY_NOT_SUPPORTED = (
-    "The multitask sampler currently supports observable leaf codes only. "
-    "Ontology-expanded targets and boundaries will be added separately."
+    "The multitask sampler labels observable leaf codes only; ancestor targets are derived from "
+    "these leaf labels inside the model (set lightning_module.model.ontology_dir at training time, "
+    "not here). Ancestor-valued start / bound events and conditioning codes are not supported yet."
 )
 
 
 def reject_ontology(ontology_dir: object) -> None:
-    """Hard-fail on any non-null ``ontology_dir`` (MVP is leaf-only)."""
+    """Hard-fail on any non-null ``ontology_dir`` (the sampler is leaf-only; see the module docstring)."""
     if ontology_dir is not None:
         raise NotImplementedError(ONTOLOGY_NOT_SUPPORTED)
 
@@ -344,9 +352,7 @@ def _apply_prefix_exclusions(codes: list[str], exclude_prefixes: Sequence[str], 
     return kept
 
 
-def build_code_weights(
-    source: object, codes: Sequence[str], column: str, power: float
-) -> tuple[float, ...]:
+def build_code_weights(source: object, codes: Sequence[str], column: str, power: float) -> tuple[float, ...]:
     """Sampling weights for ``codes``, proportional to ``codes.parquet[column] ** power``.
 
     The column is a per-code prevalence statistic of the *cohort* (``code/n_occurrences`` or
@@ -678,9 +684,7 @@ class BoundaryDistribution:
         )
         start_events = np.full(shape, None, dtype=object)
         if self.start_event_codes:
-            picks = self._draw_codes(
-                start_code_rng, self.start_event_codes, self.start_event_weights, shape
-            )
+            picks = self._draw_codes(start_code_rng, self.start_event_codes, self.start_event_weights, shape)
             pool = np.array(self.start_event_codes, dtype=object)
             start_events[start_is_event] = pool[picks[start_is_event]]
         start_durations[start_is_pt] = 0.0

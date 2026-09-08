@@ -82,6 +82,32 @@ def write_cohort(
     return root
 
 
+def write_cohort_ontology(cohort_dir: Path, out: Path, decay: float = 0.5) -> Path:
+    """The three ``EQ_build_ontology`` artifacts for ``{cohort_dir}/metadata/codes.parquet``, in ``out``.
+
+    What ``EQ_build_ontology`` writes, minus the CLI: leaf ids are the cohort's own ``code/vocab_index``,
+    ancestors are appended above them.  Returned so tests can build a ``V_ext``-wide model or datamodule
+    against the session fixture cohort.
+    """
+    from every_query.data.ontology import (
+        EMBEDDING_MIX_FILE,
+        EVENT_TO_QUERY_NODES_FILE,
+        ONTOLOGY_VOCAB_FILE,
+        build_event_to_query_nodes,
+        build_ontology,
+    )
+
+    codes = pl.read_parquet(Path(cohort_dir) / "metadata" / "codes.parquet").filter(
+        pl.col("code/vocab_index").is_not_null() & pl.col("code").is_not_null()
+    )
+    nodes, mix = build_ontology(codes.select("code", "code/vocab_index"), decay=decay)
+    out.mkdir(parents=True, exist_ok=True)
+    nodes.write_parquet(out / ONTOLOGY_VOCAB_FILE)
+    mix.write_parquet(out / EMBEDDING_MIX_FILE)
+    build_event_to_query_nodes(nodes, mix).write_parquet(out / EVENT_TO_QUERY_NODES_FILE)
+    return out
+
+
 @pytest.fixture
 def synthetic_cohort(tmp_path: Path) -> Path:
     """Two-shard synthetic cohort with seven subjects per shard."""

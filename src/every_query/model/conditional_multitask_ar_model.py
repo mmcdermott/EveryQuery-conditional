@@ -14,6 +14,18 @@ giving one logit for every vocabulary code without a separate output matrix.
 masked BCE).  :meth:`ConditionalMultitaskARModel.score_final_query` is the evaluation pass over a
 ``QuerySeqSchema`` grid: the same hidden states, but only the last real window of each row is
 projected, onto only that row's scored code, so no ``(B, K, V)`` tensor is ever built.
+
+Ontology
+--------
+With ``ontology_dir`` set the model is sized to the ontology's extended vocabulary ``V_ext``
+(``train.py`` does this): the tied table gains one row per ancestor node, the input embedding is
+the ancestor-mixed :class:`~every_query.model.ontology_embedding.OntologyEmbedding` exactly as in
+the scalar :class:`~every_query.model.conditional_ar_model.ConditionalARModel`, and the readout
+projects onto the same **mixed** table.  The training labels stay leaf-only: a ``(B, K, V)``
+batch (``V`` = :attr:`base_vocab_size`, the cohort's width) is widened inside :meth:`forward` to
+``(B, K, V_ext)`` by :func:`~every_query.data.ontology.derive_ancestor_targets`, since under the
+window rule an ancestor's bit is exactly the OR of its descendant leaves' bits.  Nothing wider than
+``(B, K, V)`` crosses host to device, and nothing about the sampler or its sidecars changes.
 """
 
 from dataclasses import dataclass
@@ -29,6 +41,7 @@ from every_query.model.conditional_model import (
     validate_rope_time_pair,
 )
 from every_query.model.model import MLP
+from every_query.model.ontology_embedding import OntologyEmbedding
 
 TOKENS_PER_WINDOW = 3
 
@@ -68,7 +81,11 @@ class ConditionalMultitaskARModel(torch.nn.Module):
         config_overrides: Keyword overrides for a fresh :class:`LlamaConfig`.
         max_windows: Maximum supported ``K``; sizes the learned block positions.
         use_rope_time: If true, consume ``batch.time_pos_ids`` as elapsed-hour RoPE positions.
-        ontology_dir: Reserved for future ontology support.  Any non-null value is rejected.
+        ontology_dir: Directory of ``EQ_build_ontology`` artifacts.  When set,
+            ``config_overrides.vocab_size`` must be the ontology's ``V_ext``; the input embedding
+            becomes the ancestor-mixed table, the readout projects onto it, and leaf-only
+            ``(B, K, V)`` targets are widened to ``V_ext`` in :meth:`forward` (see the module
+            docstring).
     """
 
     PRECISION_TO_MODEL_WEIGHTS_DTYPE: ClassVar[dict[str, torch.dtype]] = {
@@ -89,8 +106,6 @@ class ConditionalMultitaskARModel(torch.nn.Module):
         ontology_dir: str | None = None,
     ):
         super().__init__()
-        if ontology_dir is not None:
-            raise NotImplementedError("ConditionalMultitaskARModel does not yet support ontology_dir")
         if max_windows < 1:
             raise ValueError(f"max_windows must be at least 1, got {max_windows}")
 
@@ -130,6 +145,31 @@ class ConditionalMultitaskARModel(torch.nn.Module):
         self.max_windows = max_windows
         self.use_rope_time = use_rope_time
         self.ontology_dir = ontology_dir
+        # ``V``: the cohort's own width.  Equal to ``vocab_size`` (the table width) without an
+        # ontology; with one, the leaf block of the ``V_ext``-wide table.
+        self._base_vocab_size = self.HF_model_config.vocab_size
+        if ontology_dir is not None:
+            # Lazy, as in ``ConditionalARModel``: ``every_query.data`` reaches back into this
+            # package through the sequence dataset, so a module-level import would cycle.
+            from every_query.data.ontology import load_closure_index, load_mix_matrix
+            from every_query.model.ontology_embedding import wrap_tok_embeddings
+
+            # Substituting the embedding module (not the call sites) is what lets patient, start,
+            # bound and condition codes all inherit the ontology mix; ``wrap_tok_embeddings`` also
+            # checks the table is exactly ``V_ext`` rows.
+            wrap_tok_embeddings(self, load_mix_matrix(ontology_dir))
+            closure = load_closure_index(ontology_dir)
+            if closure.v_ext != self.vocab_size:
+                raise ValueError(
+                    f"The ontology at {ontology_dir} extends the vocabulary to V_ext={closure.v_ext} but "
+                    f"config_overrides.vocab_size={self.vocab_size}; size the model from the ontology "
+                    "(train.py does this automatically when lightning_module.model.ontology_dir is set)."
+                )
+            self._base_vocab_size = closure.base_vocab_size
+            # Non-persistent: the closure is re-read from ``ontology_dir`` on load, exactly like the
+            # mix matrix, so a checkpoint never carries a copy that could drift from the artifacts.
+            self.register_buffer("closure_leaf_ids", closure.leaf_ids, persistent=False)
+            self.register_buffer("closure_ancestor_ids", closure.ancestor_ids, persistent=False)
         self.hparams = {
             "architecture": "conditional_multitask_ar",
             "precision": precision,
@@ -146,7 +186,53 @@ class ConditionalMultitaskARModel(torch.nn.Module):
 
     @property
     def vocab_size(self) -> int:
+        """``V_ext``: the tied table's width, i.e. every code the model can score."""
         return self.HF_model_config.vocab_size
+
+    @property
+    def base_vocab_size(self) -> int:
+        """``V``: the cohort's own width - the width of a leaf-only training batch.
+
+        Equals :attr:`vocab_size` without an ontology.  With one, ``[base_vocab_size, vocab_size)``
+        are the ancestor rows the model derives targets for and can score, but that never occur in
+        a patient stream.
+        """
+        return self._base_vocab_size
+
+    @property
+    def has_ontology(self) -> bool:
+        return self.ontology_dir is not None
+
+    def _closure(self):
+        """The registered closure buffers as a :class:`~every_query.data.ontology.ClosureIndex`."""
+        from every_query.data.ontology import ClosureIndex
+
+        return ClosureIndex(
+            self.closure_leaf_ids, self.closure_ancestor_ids, self.base_vocab_size, self.vocab_size
+        )
+
+    def _readout_weight(self) -> torch.Tensor:
+        """The table the window hidden states are projected onto: the **effective** input table.
+
+        ``OntologyEmbedding.weight`` deliberately returns the raw learned table, but every input
+        lookup (patient, start, bound and condition codes) reads a row of the mixed table
+        ``A @ W``.  Tying the readout to the raw rows would score ancestors through rows the input
+        side never sees, so with an ontology this is ``mixed_weight()``; without one the two tables
+        are the same object.  The mixed table is computed at most once per forward and shared with
+        the input lookups (``window_hidden_states`` clears the cache first).
+        """
+        embedding = self.HF_model.get_input_embeddings()
+        if isinstance(embedding, OntologyEmbedding):
+            return embedding.mixed_weight()
+        return embedding.weight
+
+    def _widen_targets(self, targets: torch.Tensor) -> torch.Tensor:
+        """Leaf-only ``(B, K, V)`` targets -> ``(B, K, V_ext)``; a ``V_ext``-wide batch passes through."""
+        if targets.shape[-1] == self.base_vocab_size < self.vocab_size:
+            from every_query.data.ontology import derive_ancestor_targets
+
+            return derive_ancestor_targets(targets, self._closure())
+        return targets
 
     def _start_fields(self, batch) -> tuple[torch.Tensor, torch.Tensor]:
         """Return explicit start tensors, filling the paired legacy absence with zeros."""
@@ -256,6 +342,14 @@ class ConditionalMultitaskARModel(torch.nn.Module):
         # Validate the paired legacy rule even before token construction.
         self._start_fields(batch)
 
+        # ``wrap_tok_embeddings`` clears the per-forward mixed-table cache through a pre-hook on
+        # ``forward``; ``score_final_query`` reaches these hidden states without going through
+        # ``forward``, so clear here too.  Every lookup below and the readout after share one
+        # product (and, in training, one autograd node) per pass.
+        embedding = self.HF_model.get_input_embeddings()
+        if isinstance(embedding, OntologyEmbedding):
+            embedding.clear_cache()
+
         S = batch.code.shape[1]
         n_query_tokens = TOKENS_PER_WINDOW * n_windows - 2
         total_len = S + n_query_tokens
@@ -309,17 +403,28 @@ class ConditionalMultitaskARModel(torch.nn.Module):
         return hidden.gather(1, window_positions.unsqueeze(-1).expand(-1, -1, H))
 
     def forward(self, batch) -> tuple[torch.FloatTensor, ConditionalMultitaskOutput]:
-        """Run one causal pass and return masked BCE loss plus all-vocabulary logits."""
+        """Run one causal pass and return masked BCE loss plus all-vocabulary logits.
+
+        ``batch.targets`` may be ``(B, K, V)`` leaf bits (the training sidecars' width) or, under
+        an ontology, already ``(B, K, V_ext)``; the former is widened here, on the batch's device,
+        before the projection.  Logits and ``valid_mask`` are always ``(B, K, vocab_size)``.
+        """
         window_hidden = self.window_hidden_states(batch)
         B, n_windows = batch.q_durations.shape
         device = batch.code.device
         pad = batch.PAD_INDEX
 
-        embedding_weight = self.HF_model.get_input_embeddings().weight
-        if embedding_weight.shape[0] != batch.targets.shape[-1]:
+        targets = self._widen_targets(batch.targets)
+        embedding_weight = self._readout_weight()
+        if embedding_weight.shape[0] != targets.shape[-1]:
             raise ValueError(
-                f"Target vocabulary width V={batch.targets.shape[-1]} does not match the tied "
+                f"Target vocabulary width V={targets.shape[-1]} does not match the tied "
                 f"embedding table width V={embedding_weight.shape[0]}"
+                + (
+                    f" (leaf-only targets must be exactly base_vocab_size={self.base_vocab_size} wide)"
+                    if self.base_vocab_size != self.vocab_size
+                    else ""
+                )
             )
         # Explicitly leave autocast: `.float()` alone is still downcast by bf16 autocast.
         with torch.autocast(device_type=window_hidden.device.type, enabled=False):
@@ -330,7 +435,7 @@ class ConditionalMultitaskARModel(torch.nn.Module):
         valid_mask = batch.q_mask.unsqueeze(-1) & vocab_not_pad.view(1, 1, -1)
         valid_mask = valid_mask.expand(B, n_windows, -1)
         per_element = torch.nn.functional.binary_cross_entropy_with_logits(
-            logits, batch.targets.float(), reduction="none"
+            logits, targets.float(), reduction="none"
         )
         loss = (per_element * valid_mask).sum() / valid_mask.sum().clamp_min(1)
 
@@ -408,7 +513,10 @@ class ConditionalMultitaskARModel(torch.nn.Module):
         H = window_hidden.shape[-1]
         last = self.last_real_window(batch.q_mask).to(window_hidden.device)
         selected = window_hidden.gather(1, last.view(B, 1, 1).expand(-1, 1, H)).squeeze(1)
-        embedding_weight = self.HF_model.get_input_embeddings().weight
+        # The same effective table ``forward`` projects onto (the mixed one under an ontology), so an
+        # ancestor code in ``[base_vocab_size, vocab_size)`` scores through the row its logit in the
+        # dense forward reads.
+        embedding_weight = self._readout_weight()
         # Explicitly leave autocast, as the full projection in ``forward`` does: `.float()`
         # alone is still downcast by bf16 autocast.
         with torch.autocast(device_type=selected.device.type, enabled=False):
