@@ -459,6 +459,9 @@ def test_configs_and_position_budget():
         # interpolates from it, as the scalar configs' does.
         assert dm_cfg["dataset_kwargs"]["ontology_dir"] == "${lightning_module.model.ontology_dir}"
         assert cfg["lightning_module"]["model"]["ontology_dir"] is None
+        # train.py fills this in from the cohort's codes.parquet; shipping it as an explicit null is
+        # what makes the key present for that assignment and inert for a run without an ontology.
+        assert cfg["lightning_module"]["model"]["cohort_vocab_fingerprint"] is None
         assert dm_cfg["dataset_kwargs"]["expected_vocab_size"].endswith("config_overrides.vocab_size}")
         assert cfg["lightning_module"]["model"]["max_windows"] == 5
     model_cfg = OmegaConf.create(

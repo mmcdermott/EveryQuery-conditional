@@ -296,7 +296,10 @@ def check_grid_ontology_provenance(tasks_dir: Path, split: str, ontology_dir: st
         model_closure = closure_fingerprint(ontology_dir)
 
     out_dir = Path(tasks_dir).parent
-    shards = sorted((Path(tasks_dir) / split).glob("*.parquet"))
+    # ``rglob``, not ``glob``: the dataset selects every shard with the split directory anywhere in
+    # its parents, so a hand-merged grid with nested shards would otherwise be scored while this
+    # gate silently inspected nothing.
+    shards = sorted((Path(tasks_dir) / split).rglob("*.parquet"))
     without_sidecar: list[str] = []
     foreign: list[str] = []
     for fp in shards:
