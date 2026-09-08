@@ -43,16 +43,22 @@ batch_size: null
 # Optional torch device string, mapped onto the Lightning accelerator of the inference Trainer:
 # null -> accelerator=auto (the first GPU when there is one, else the CPU); cpu -> cpu;
 # cuda -> gpu (the default GPU); cuda:N -> gpu, device N; mps -> mps.  Prediction is always
-# SINGLE-device: outputs are concatenated in loader order and must stay row-aligned with the grid,
-# so a multi-device or distributed trainer is refused rather than sharding rows across ranks.
+# SINGLE-device and SINGLE-process: outputs are concatenated in loader order and must stay
+# row-aligned with the grid, so a multi-device or distributed trainer is refused rather than
+# sharding rows across ranks, and so is a multi-process launcher (torchrun / srun --ntasks>1),
+# whose every rank would score the whole grid and write the same output_parquet.  Launch one
+# process: no torchrun; srun / sbatch with --ntasks=1.
 device: null
 
 # Optional DataLoader worker-count override (defaults to the checkpoint's datamodule num_workers).
 num_workers: null
 
-# Lightning precision string for the inference Trainer.  bf16-mixed is the production training
-# precision, so scoring runs under the same autocast the checkpoint was trained with; pass 32-true
-# for full-precision probabilities (they differ from bf16-mixed at the ~1e-2 level).
+# Lightning precision string for the inference Trainer.  bf16-mixed is the precision every shipped
+# training config records, so scoring runs under the same autocast the checkpoint was trained
+# with, and it is what EQ_predict / EQ_predict_sequences inherit from the run's trainer config, so
+# both model families score a grid under the same numerics (a run trained under another precision
+# needs the matching value here).  Pass 32-true for full-precision probabilities (they differ from
+# bf16-mixed at the ~1e-2 level; the pre-#30 manual loop was fp32).
 precision: bf16-mixed
 
 # Show the Lightning predict progress bar (stderr).  Set false for batch / log-file runs.

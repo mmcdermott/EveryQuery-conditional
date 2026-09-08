@@ -44,7 +44,8 @@ lives on the consolidated path as follows:
 - every context answers every task / row alignment: :func:`test_rows_are_context_major_within_a_shard`,
   :func:`test_specs_are_shared_across_shards`, and on the prediction side
   ``tests/multitask/test_predict_multitask_logic.py::test_predictions_are_row_aligned_one_per_grid_row``
-  / ``::test_predictions_to_df_rejects_misaligned_labels``;
+  / ``::test_predictions_to_df_rejects_misaligned_labels_and_scored_codes``
+  / ``::test_a_same_label_row_swap_in_the_loader_is_caught_by_the_scored_codes``;
 - vocabulary validation:
   ``tests/sampler/test_eval_grid_starts.py::test_unknown_start_codes_are_rejected_against_the_vocabulary``
   and ``tests/multitask/test_predict_multitask_logic.py::test_unknown_codes_fail_at_init``.

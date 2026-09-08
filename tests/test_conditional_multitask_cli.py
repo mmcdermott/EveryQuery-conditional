@@ -4,13 +4,19 @@ import filecmp
 import shutil
 from pathlib import Path
 
+import numpy as np
 import polars as pl
 import pytest
+import torch
 import yaml
 from meds import train_split, tuning_split
 from polars.testing import assert_frame_equal
+from torch.utils.data import DataLoader
 
 from conftest import run_and_check
+from every_query.model.conditional_multitask_lightning import ConditionalMultitaskLightningModule
+from every_query.predict.predict_multitask import build_eval_dataset
+from every_query.utils.model_loader import setup_model
 
 
 def test_conditional_multitask_config_help():
@@ -371,3 +377,38 @@ def test_predict_multitask_accepts_a_pre_issue_30_run_dir(
     assert new.height == old.height == grid.height
     assert new["prob"].is_between(0.0, 1.0).all()
     assert_frame_equal(new, old)
+
+
+def test_predict_multitask_probabilities_match_a_direct_score_final_query(
+    conditional_multitask_trained_dir: Path, queryseq_grid: tuple[Path, pl.DataFrame], tmp_path: Path
+):
+    """The CLI's ``prob`` column is ``sigmoid(score_final_query)`` of the checkpoint over the grid, in grid
+    order: ``precision=32-true`` on the CPU reproduces a direct fp32 call (to the tolerance of batch
+    padding), and the default ``bf16-mixed`` agrees with it to bf16 rounding.  Everything but ``prob`` is
+    identical between the two runs."""
+    grid_dir, _ = queryseq_grid
+    run_dir = conditional_multitask_trained_dir
+    quiet = ("enable_progress_bar=false",)
+    default = _predict_multitask(run_dir, grid_dir, tmp_path / "bf16.parquet", *quiet)
+    fp32 = _predict_multitask(
+        run_dir, grid_dir, tmp_path / "fp32.parquet", "precision=32-true", "device=cpu", *quiet
+    )
+    assert_frame_equal(default.drop("prob"), fp32.drop("prob"))
+
+    train_cfg, module, _ = setup_model(run_dir, module_cls=ConditionalMultitaskLightningModule)
+    model = module.model.cpu().eval()
+    ds = build_eval_dataset(
+        train_cfg,
+        grid_dir / "eval",
+        tuning_split,
+        expected_vocab_size=model.vocab_size,
+        use_rope_time=model.use_rope_time,
+        max_windows=model.max_windows,
+    )
+    loader = DataLoader(ds, batch_size=4, shuffle=False, collate_fn=ds.collate)
+    with torch.no_grad():
+        reference = torch.cat([torch.sigmoid(model.score_final_query(b, b.scored_codes)) for b in loader])
+    reference = reference.float().numpy()
+    assert reference.shape == (fp32.height,) and len(np.unique(np.round(reference, 5))) > 1
+    np.testing.assert_allclose(fp32["prob"].to_numpy(), reference, atol=1e-4, rtol=0.0)
+    np.testing.assert_allclose(default["prob"].to_numpy(), reference, atol=2e-2, rtol=0.0)

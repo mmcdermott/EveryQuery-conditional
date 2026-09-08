@@ -40,11 +40,16 @@ and batching: ``Trainer.predict`` moves each batch to the accelerator and calls
 :meth:`~every_query.model.conditional_multitask_lightning.ConditionalMultitaskLightningModule.predict_step`,
 which scores through ``score_final_query`` and never touches the dense forward or ``batch.targets``.
 
-Prediction is **single-device** by construction.  Row ``i`` of the output is grid row ``i`` because
-the loader is sequential and the per-batch outputs are concatenated in loader order; a multi-device
-or distributed strategy would shard and interleave rows across ranks and break that alignment, so
-the inference trainer is pinned to one device (``device`` on the command line picks which) and
-refuses anything else (issue #30 non-goal).
+Prediction is **single-device, single-process** by construction.  Row ``i`` of the output is grid
+row ``i`` because the loader is sequential and the per-batch outputs are concatenated in loader
+order; a multi-device or distributed strategy would shard and interleave rows across ranks and break
+that alignment, so the inference trainer is pinned to one device (``device`` on the command line
+picks which) and refuses anything else (issue #30 non-goal).  The guard also looks past the trainer
+at the launcher: ``torchrun`` / ``srun --ntasks>1`` start several copies of this script, each of
+which would score the whole grid and write the same ``output_parquet``, and Lightning's
+single-device strategy cannot see them (:func:`launcher_world_size`).  Alignment is then verified
+on the way out: the collated final-query labels and scored code indices are compared, row by row,
+against ``answers[-1]`` / ``queries[-1]`` read back from the grid itself.
 
 Output columns, one row per input sequence, in dataset (= dataloader = input) order::
 
@@ -62,6 +67,7 @@ old evaluation-only ``task_id``, ``task_group``, ``start_resolved``, ``end_resol
 from __future__ import annotations
 
 import logging
+import os
 from importlib.resources import files
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -71,6 +77,7 @@ import numpy as np
 import polars as pl
 import torch
 from hydra.utils import instantiate
+from lightning.fabric.plugins.environments import TorchElasticEnvironment
 from lightning.pytorch import Trainer
 from lightning.pytorch.strategies import SingleDeviceStrategy
 from meds import held_out_split
@@ -252,13 +259,65 @@ def resolve_accelerator(device: str | None) -> tuple[str, int | list[int]]:
             raise ValueError(f"device must be null, cpu, cuda, cuda:N or mps; got {device!r}")
 
 
-def check_single_device(trainer: Trainer) -> None:
-    """Refuse a trainer that would run prediction on more than one device or process.
+def launcher_world_size() -> int:
+    """How many processes the launcher that started this one created; ``1`` when it was started alone.
+
+    ``devices=1`` always resolves to a ``SingleDeviceStrategy`` whose ``world_size`` is hard-wired to
+    1, even when this process is one of several that ``torchrun`` or ``srun --ntasks>1`` started, so
+    the trainer alone cannot tell.  Three witnesses are asked, in order: an already-initialized
+    ``torch.distributed`` process group; ``torchrun`` (Lightning's own detector, checked before SLURM
+    as Lightning does, since ``torchrun`` can run inside a SLURM job); and a SLURM job step, read
+    from the task-level variables ``slurmstepd`` sets in every task (``SLURM_PROCID`` marks a step,
+    ``SLURM_STEP_NUM_TASKS`` counts an ``srun`` step, ``SLURM_NTASKS`` a batch step).  An
+    ``salloc`` shell that has not run ``srun`` sets neither ``SLURM_PROCID`` nor a step count, so a
+    plain command there counts as one process.  Lightning's ``SLURMEnvironment`` is deliberately
+    not used: its constructor rejects ``--ntasks=N`` without ``--ntasks-per-node`` with its own
+    error, and its ``detect()`` skips allocations named ``bash`` / ``interactive`` - a hatch that
+    would let ``srun -n 2`` from such a shell through.  (Only the SLURM variables, not a cluster,
+    were available when this was written; validate on the cluster if it ever refuses a run you
+    consider single-process.)
+    """
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return int(torch.distributed.get_world_size())
+    if TorchElasticEnvironment.detect():
+        return int(os.environ.get("WORLD_SIZE", 1))
+    if "SLURM_PROCID" in os.environ:
+        return int(os.environ.get("SLURM_STEP_NUM_TASKS") or os.environ.get("SLURM_NTASKS") or 1)
+    return 1
+
+
+def check_single_process() -> None:
+    """Refuse to run as one of several launcher processes (``torchrun`` / ``srun`` / ``sbatch --ntasks>1``).
+
+    Called by ``main`` before the trainer is built and by :func:`check_single_device`: every such
+    process would otherwise score the whole grid and write the same ``output_parquet``.
 
     Raises:
-        ValueError: If the trainer's strategy is not a ``SingleDeviceStrategy``, or it spans more
-            than one device, node or process.
+        ValueError: If :func:`launcher_world_size` is not 1.
     """
+    launcher = launcher_world_size()
+    if launcher != 1:
+        raise ValueError(
+            "EQ_predict_multitask prediction must run in exactly one process, but the launcher started "
+            f"{launcher} process(es): each would score the whole grid and write the same output_parquet "
+            "(issue #30 non-goal). Start exactly one process: no torchrun, and srun / sbatch with "
+            "--ntasks=1."
+        )
+
+
+def check_single_device(trainer: Trainer) -> None:
+    """Refuse a trainer that would run prediction on more than one device or in more than one process.
+
+    Both the launcher (:func:`check_single_process`) and the trainer's shape (strategy, devices,
+    nodes, world size) are checked: under ``torchrun`` / ``srun --ntasks>1`` every rank would pass
+    the second alone.
+
+    Raises:
+        ValueError: If this process was started by a multi-process launcher, or the trainer's
+            strategy is not a ``SingleDeviceStrategy``, or it spans more than one device, node or
+            process.
+    """
+    check_single_process()
     single = (
         isinstance(trainer.strategy, SingleDeviceStrategy)
         and trainer.num_devices == 1
@@ -272,8 +331,7 @@ def check_single_device(trainer: Trainer) -> None:
             f"num_nodes={trainer.num_nodes}, world_size={trainer.world_size}. Outputs are concatenated in "
             "loader order and must stay row-aligned with dataset.schema_df; multi-device / distributed "
             "prediction would shard rows across ranks and is not supported (issue #30 non-goal). Pass "
-            "device=cpu, device=cuda:N or device=mps (one device) and do not launch through a "
-            "multi-process launcher (torchrun / srun --ntasks>1) that would set up a distributed world."
+            "device=cpu, device=cuda:N or device=mps (one device)."
         )
 
 
@@ -295,7 +353,12 @@ def build_predict_trainer(
 
     ``precision`` is a Lightning precision string and defaults to ``bf16-mixed``, the production
     training precision, so the backbone pass runs under the same autocast the checkpoint was trained
-    with.  Pass ``32-true`` for full-precision scoring (e.g. to compare against a hand-computed
+    with - and under the same numerics as ``EQ_predict`` / ``EQ_predict_sequences``, which predict
+    through the trainer of the run's ``resolved_config.yaml`` and so inherit the ``bf16-mixed`` every
+    shipped training config records; a multitask-vs-conditional comparison on one grid is therefore
+    like for like (a run trained under another precision would need the matching override here).
+    (The pre-#30 manual loop ran the model in fp32; ``bf16-mixed`` is a deliberate change.)  Pass
+    ``32-true`` for full-precision scoring (e.g. to compare against a hand-computed
     ``score_final_query``); the two agree to bf16 rounding (~1e-2 on the probabilities), not exactly.
     """
     accelerator, devices = resolve_accelerator(device)
@@ -320,49 +383,55 @@ def run_inference(
     model: ConditionalMultitaskLightningModule,
     datamodule: ConditionalMultitaskDataModule,
     trainer: Trainer,
-) -> tuple[np.ndarray, np.ndarray]:
-    """``trainer.predict`` over the datamodule's predict loader; ``(probs, labels)``, one per grid row.
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """``trainer.predict`` over the predict loader; ``(probs, labels, scored_codes)``, one per grid row.
 
     The Lightning predict loop moves each batch to the trainer's device and collects the
     ``predict_step`` dictionaries (``probs`` / ``labels`` / ``scored_codes``, CPU tensors of shape
-    ``(B,)``), which are concatenated here in loader order into a float32 and a bool array.  Each
-    batch costs one backbone pass plus ``B`` dot products - nothing of shape ``(B, K, V)`` exists at
-    any point.  The loader must yield exactly ``len(datamodule.predict_dataset)`` rows, or the output
-    could not be row-aligned with the grid.
+    ``(B,)``), which are concatenated here in loader order into a float32, a bool and an int64
+    array.  Each batch costs one backbone pass plus ``B`` dot products - nothing of shape
+    ``(B, K, V)`` exists at any point.  The loader must yield exactly
+    ``len(datamodule.predict_dataset)`` rows, or the output could not be row-aligned with the grid;
+    :func:`predictions_to_df` then checks the labels and scored codes row by row against the grid.
 
     Raises:
-        ValueError: If ``trainer`` is not single-device (:func:`check_single_device`).
+        ValueError: If ``trainer`` is not single-device / single-process (:func:`check_single_device`).
         RuntimeError: If the loader yielded a different number of rows than the grid has.
     """
     check_single_device(trainer)
     n_rows = len(datamodule.predict_dataset)
     outputs = trainer.predict(model, datamodule=datamodule, return_predictions=True) or []
-    probs_out = [out["probs"] for out in outputs]
-    labels_out = [out["labels"] for out in outputs]
-    seen = sum(int(p.shape[0]) for p in probs_out)
+    seen = sum(int(out["probs"].shape[0]) for out in outputs)
     if seen != n_rows:
         raise RuntimeError(f"dataloader yielded {seen} prediction(s) but the grid has {n_rows} row(s)")
-    if not probs_out:
-        return np.empty(0, dtype=np.float32), np.empty(0, dtype=bool)
-    probs = torch.cat(probs_out).float().cpu().numpy().astype(np.float32, copy=False)
-    labels = torch.cat(labels_out).cpu().numpy().astype(bool)
-    return probs, labels
+    if not outputs:
+        return np.empty(0, dtype=np.float32), np.empty(0, dtype=bool), np.empty(0, dtype=np.int64)
+    probs = torch.cat([out["probs"] for out in outputs]).float().cpu().numpy().astype(np.float32, copy=False)
+    labels = torch.cat([out["labels"] for out in outputs]).cpu().numpy().astype(bool)
+    scored_codes = torch.cat([out["scored_codes"] for out in outputs]).cpu().numpy().astype(np.int64)
+    return probs, labels, scored_codes
 
 
 def predictions_to_df(
-    dataset: QuerySeqMultitaskEvalDataset, probs: np.ndarray, labels: np.ndarray
+    dataset: QuerySeqMultitaskEvalDataset, probs: np.ndarray, labels: np.ndarray, scored_codes: np.ndarray
 ) -> pl.DataFrame:
     """One output row per grid row, in dataset order, with the normalized window lists.
 
-    ``labels`` (collated by the loader) must equal ``answers[-1]`` read back from the dataset's own
-    rows: the two are produced by different code paths, so disagreement means the loader's row
-    order drifted from the dataset's, and the probabilities would be attached to the wrong rows.
+    ``labels`` and ``scored_codes`` (collated by the loader, carried through the predict loop) must
+    equal ``answers[-1]`` and ``code_to_index[queries[-1]]`` read back from the dataset's own rows:
+    the two sides are produced by different code paths, so disagreement means the loader's row order
+    drifted from the dataset's, and the probabilities would be attached to the wrong rows.  The
+    label alone would miss a swap of two same-label rows; the code index catches every swap of rows
+    that score different codes.  (Two rows sharing both final label and final query remain
+    interchangeable to these checks; nothing in the sequential single-process loader this CLI
+    enforces can produce that swap.)
     """
     schema_df = dataset.schema_df
     n = schema_df.height
-    if probs.shape != (n,) or labels.shape != (n,):
+    if probs.shape != (n,) or labels.shape != (n,) or scored_codes.shape != (n,):
         raise RuntimeError(
-            f"got {probs.shape[0]} prediction(s) / {labels.shape[0]} label(s) for {n} grid row(s)"
+            f"got {probs.shape[0]} prediction(s) / {labels.shape[0]} label(s) / {scored_codes.shape[0]} "
+            f"scored code(s) for {n} grid row(s)"
         )
     queries = schema_df[QUERIES_COL]
     answers = schema_df[ANSWERS_COL]
@@ -378,6 +447,14 @@ def predictions_to_df(
         raise RuntimeError(
             f"the collated final-query label disagrees with answers[-1] at grid row {bad}; the loader's "
             "row order does not match the dataset's."
+        )
+    expected_codes = np.array([dataset.code_to_index[c] for c in target_code.to_list()], dtype=np.int64)
+    if n and not np.array_equal(expected_codes, scored_codes):
+        bad = int(np.flatnonzero(expected_codes != scored_codes)[0])
+        raise RuntimeError(
+            f"the collated scored code disagrees with queries[-1] at grid row {bad} (index "
+            f"{int(scored_codes[bad])} vs {int(expected_codes[bad])} for {target_code[bad]!r}); the "
+            "loader's row order does not match the dataset's."
         )
 
     def default_list(fill, dtype: pl.DataType) -> pl.Series:
@@ -436,15 +513,18 @@ def main(cfg: DictConfig) -> None:
     dataset = datamodule.predict_dataset
     logger.info(f"Loaded {len(dataset)} grid rows from {tasks_dir} (split={split})")
 
+    # Before the trainer: Lightning's own SLURM detection can fail a multi-task launch with a less
+    # useful message of its own while the Trainer is being built.
+    check_single_process()
     trainer = build_predict_trainer(
         cfg.get("device"),
         precision=str(cfg.get("precision") or DEFAULT_PREDICT_PRECISION),
         enable_progress_bar=bool(cfg.get("enable_progress_bar", True)),
     )
     logger.info(f"Scoring the final query of {len(dataset)} rows on {trainer.strategy.root_device}")
-    probs, labels = run_inference(model, datamodule, trainer)
+    probs, labels, scored_codes = run_inference(model, datamodule, trainer)
 
-    out = predictions_to_df(dataset, probs, labels)
+    out = predictions_to_df(dataset, probs, labels, scored_codes)
     output_parquet.parent.mkdir(parents=True, exist_ok=True)
     out.write_parquet(output_parquet)
     logger.info(f"Wrote {out.height} final-query predictions to {output_parquet}")

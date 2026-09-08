@@ -14,11 +14,15 @@ that wrong and the metrics look plausible and mean nothing:
     ``tests/test_conditional_multitask_ar_model.py``);
 9.  the all-vocabulary training forward is unchanged (``tests/test_conditional_multitask_ar_model.py``);
 10. prediction through the Lightning predict loop is row-aligned, one row per input row, and equals
-    ``sigmoid(score_final_query)`` over the sequential loader;
+    ``sigmoid(score_final_query)`` over the sequential loader; the collated labels *and* scored code
+    indices are re-checked against the grid, so a same-label swap of rows scoring different codes
+    cannot slip through;
 11. a grid subject absent from the tensorized cohort is rejected, never silently dropped;
 12. no manifest, packed labels or eval-meta sidecar is needed;
 13. the prediction datamodule is built from either shape of ``resolved_config.yaml`` (pre- and
-    post-#30) with the checkpoint-vs-cohort checks, and the inference trainer is single-device.
+    post-#30) with the checkpoint-vs-cohort checks, and the inference trainer is single-device and
+    single-process (a ``torchrun`` / ``srun --ntasks>1`` launch is refused even though Lightning's
+    single-device strategy reports ``world_size == 1``).
 
 The grid rows are written against the session fixture cohort (``tensorized_cohort_dir``), whose
 subjects and codes are the real ones the dataset joins against.  Dataset-level tests use the train
@@ -26,6 +30,7 @@ subjects; predictor-level tests go through the prediction datamodule, which scor
 evaluation splits (``train`` shuffles), so their grids sit on the tuning subject.
 """
 
+import os
 from datetime import datetime
 from functools import partial
 from pathlib import Path
@@ -59,6 +64,8 @@ from every_query.predict.predict_multitask import (
     build_predict_datamodule,
     build_predict_trainer,
     check_single_device,
+    check_single_process,
+    launcher_world_size,
     predictions_to_df,
     resolve_accelerator,
     run_inference,
@@ -524,22 +531,25 @@ def test_predict_trainer_defaults_to_bf16_mixed_and_agrees_with_fp32_to_bf16_rou
     assert _cpu_trainer().precision == "32-true"
 
     dm, module = _predict_setup(tensorized_cohort_dir, tmp_path)
-    probs_fp32, labels_fp32 = run_inference(module, dm, _cpu_trainer())
-    probs_bf16, labels_bf16 = run_inference(module, dm, _cpu_trainer("bf16-mixed"))
+    probs_fp32, labels_fp32, codes_fp32 = run_inference(module, dm, _cpu_trainer())
+    probs_bf16, labels_bf16, codes_bf16 = run_inference(module, dm, _cpu_trainer("bf16-mixed"))
     assert probs_bf16.dtype == np.float32 and probs_bf16.shape == probs_fp32.shape
     np.testing.assert_array_equal(labels_bf16, labels_fp32)
+    np.testing.assert_array_equal(codes_bf16, codes_fp32)
     np.testing.assert_allclose(probs_bf16, probs_fp32, atol=2e-2, rtol=0.0)
 
 
 def test_run_inference_matches_score_final_query_over_the_sequential_loader(tensorized_cohort_dir, tmp_path):
     """Through a real CPU ``Trainer``: ``probs`` is ``sigmoid(score_final_query)`` batch by batch over the
-    datamodule's sequential loader (four rows in batches of three and one), ``labels`` the collated final
-    answers, both in loader order."""
+    datamodule's sequential loader (four rows in batches of three and one), ``labels`` / ``scored_codes`` the
+    collated final answers / final query indices, all in loader order."""
     dm, module = _predict_setup(tensorized_cohort_dir, tmp_path)
-    probs, labels = run_inference(module, dm, _cpu_trainer())
+    ds = dm.predict_dataset
+    probs, labels, codes = run_inference(module, dm, _cpu_trainer())
 
     assert isinstance(probs, np.ndarray) and probs.dtype == np.float32 and probs.shape == (4,)
     assert isinstance(labels, np.ndarray) and labels.dtype == np.bool_ and labels.shape == (4,)
+    assert isinstance(codes, np.ndarray) and codes.dtype == np.int64 and codes.shape == (4,)
     with torch.no_grad():
         batches = list(dm.predict_dataloader())
         assert [b.batch_size for b in batches] == [3, 1]
@@ -547,8 +557,14 @@ def test_run_inference_matches_score_final_query_over_the_sequential_loader(tens
             [torch.sigmoid(module.model.score_final_query(b, b.scored_codes)) for b in batches]
         )
         expected_labels = torch.cat([b.labels for b in batches])
+        expected_codes = torch.cat([b.scored_codes for b in batches])
     torch.testing.assert_close(torch.from_numpy(probs), expected.float())
     assert labels.tolist() == expected_labels.tolist() == [r["answers"][-1] for r in _eval_rows()]
+    assert (
+        codes.tolist()
+        == expected_codes.tolist()
+        == [ds.code_to_index[r["queries"][-1]] for r in _eval_rows()]
+    )
     assert len({round(p, 5) for p in probs.tolist()}) > 1, "rows must not collapse to one value"
 
 
@@ -556,8 +572,8 @@ def test_predictions_are_row_aligned_one_per_grid_row(tensorized_cohort_dir, tmp
     rows = _eval_rows()
     dm, module = _predict_setup(tensorized_cohort_dir, tmp_path)
     ds = dm.predict_dataset
-    probs, labels = run_inference(module, dm, _cpu_trainer())
-    out = predictions_to_df(ds, probs, labels)
+    probs, labels, codes = run_inference(module, dm, _cpu_trainer())
+    out = predictions_to_df(ds, probs, labels, codes)
 
     assert out.height == len(rows) == len(ds)
     assert out.columns == [
@@ -626,20 +642,53 @@ def test_run_inference_never_calls_the_dense_forward_or_projects_onto_the_vocabu
 
     monkeypatch.setattr(torch.Tensor, "__matmul__", spy)
 
-    probs, labels = run_inference(module, dm, _cpu_trainer())
-    assert probs.shape == labels.shape == (4,)
+    probs, labels, codes = run_inference(module, dm, _cpu_trainer())
+    assert probs.shape == labels.shape == codes.shape == (4,)
     assert not any(shape[-1] == vocab for _, shape in calls), "no (.., V) projection may be built"
 
 
-def test_predictions_to_df_rejects_misaligned_labels(tensorized_cohort_dir, tmp_path):
-    ds = _dataset(tensorized_cohort_dir, _write_grid(tmp_path / "grid", _mixed_rows()))
+def test_predictions_to_df_rejects_misaligned_labels_and_scored_codes(tensorized_cohort_dir, tmp_path):
+    """Rows 0 and 1 share a final label but score different codes: swapping them keeps the labels aligned
+    and is caught by the scored-code check, which the label check alone would miss."""
+    rows = _mixed_rows()
+    ds = _dataset(tensorized_cohort_dir, _write_grid(tmp_path / "grid", rows))
     probs = np.zeros(len(ds), dtype=np.float32)
-    labels = np.array([r["answers"][-1] for r in _mixed_rows()])
-    predictions_to_df(ds, probs, labels)
+    labels = np.array([r["answers"][-1] for r in rows])
+    codes = np.array([ds.code_to_index[r["queries"][-1]] for r in rows], dtype=np.int64)
+    predictions_to_df(ds, probs, labels, codes)
     with pytest.raises(RuntimeError, match="disagrees with answers\\[-1\\]"):
-        predictions_to_df(ds, probs, ~labels)
+        predictions_to_df(ds, probs, ~labels, codes)
+
+    assert labels[0] == labels[1] and codes[0] != codes[1]
+    swapped = codes.copy()
+    swapped[[0, 1]] = codes[[1, 0]]
+    with pytest.raises(RuntimeError, match="scored code disagrees with queries\\[-1\\] at grid row 0"):
+        predictions_to_df(ds, probs, labels, swapped)
     with pytest.raises(RuntimeError, match="for 4 grid row"):
-        predictions_to_df(ds, probs[:-1], labels[:-1])
+        predictions_to_df(ds, probs[:-1], labels[:-1], codes[:-1])
+
+
+def test_a_same_label_row_swap_in_the_loader_is_caught_by_the_scored_codes(
+    tensorized_cohort_dir, tmp_path, monkeypatch
+):
+    """End to end through ``run_inference``: a loader that yields grid rows 0 and 1 in the wrong order (same
+    final label, different final query) passes the label check and is stopped by the scored codes, so a
+    probability can never be attached to the wrong query."""
+    rows = _eval_rows()
+    assert (
+        rows[0]["answers"][-1] == rows[1]["answers"][-1] and rows[0]["queries"][-1] != rows[1]["queries"][-1]
+    )
+    dm, module = _predict_setup(tensorized_cohort_dir, tmp_path)
+    ds = dm.predict_dataset
+
+    def swapped() -> DataLoader:
+        return DataLoader(Subset(ds, [1, 0, 2, 3]), batch_size=3, shuffle=False, collate_fn=ds.collate)
+
+    monkeypatch.setattr(dm, "predict_dataloader", swapped)
+    probs, labels, codes = run_inference(module, dm, _cpu_trainer())
+    assert labels.tolist() == [r["answers"][-1] for r in rows], "the label check alone cannot see the swap"
+    with pytest.raises(RuntimeError, match="scored code disagrees with queries\\[-1\\] at grid row 0"):
+        predictions_to_df(ds, probs, labels, codes)
 
 
 def test_a_grid_subject_absent_from_the_cohort_is_rejected(tensorized_cohort_dir, tmp_path):
@@ -726,3 +775,129 @@ def test_predict_trainer_is_single_device_and_multi_device_trainers_are_rejected
         with pytest.raises(ValueError, match="exactly one device") as err:
             check_single_device(multi)
         assert "row-aligned with dataset.schema_df" in str(err.value) and "issue #30" in str(err.value)
+
+
+# What ``torchrun --nproc_per_node=2`` and ``srun --ntasks=2`` put in rank 0's environment (the
+# rendezvous / rank variables ``torch.distributed`` and ``slurmstepd`` set per task).
+_TORCHRUN_RANK0 = {
+    "TORCHELASTIC_RUN_ID": "eq-predict-test",
+    "WORLD_SIZE": "2",
+    "LOCAL_WORLD_SIZE": "2",
+    "RANK": "0",
+    "LOCAL_RANK": "0",
+    "GROUP_RANK": "0",
+    "MASTER_ADDR": "127.0.0.1",
+    "MASTER_PORT": "29500",
+}
+_SRUN_RANK0 = {
+    "SLURM_JOB_ID": "12345",
+    "SLURM_JOB_NAME": "eq_predict_multitask",
+    "SLURM_NTASKS": "2",
+    "SLURM_STEP_ID": "0",
+    "SLURM_STEP_NUM_TASKS": "2",
+    "SLURM_PROCID": "0",
+    "SLURM_LOCALID": "0",
+    "SLURM_NODEID": "0",
+}
+# The batch step of ``sbatch --ntasks=2`` running the CLI directly (no ``srun``): one real process,
+# but SLURM says two tasks and nothing distinguishes it from rank 0 of two, so it is refused too
+# (the message says to use ``--ntasks=1``).
+_SBATCH_NTASKS2_BATCH_STEP = {
+    "SLURM_JOB_ID": "12345",
+    "SLURM_JOB_NAME": "eq_predict_multitask",
+    "SLURM_NTASKS": "2",
+    "SLURM_PROCID": "0",
+    "SLURM_LOCALID": "0",
+    "SLURM_NODEID": "0",
+}
+# An ``salloc -n 2`` shell before any ``srun``: the allocation's variables, no task-level ones.
+_SALLOC_SHELL = {"SLURM_JOB_ID": "12345", "SLURM_JOB_NAME": "interactive", "SLURM_NTASKS": "2"}
+_LAUNCHER_VARS = {
+    "WORLD_SIZE",
+    "LOCAL_WORLD_SIZE",
+    "RANK",
+    "LOCAL_RANK",
+    "GROUP_RANK",
+    "MASTER_ADDR",
+    "MASTER_PORT",
+}
+
+
+def _simulate_launcher(monkeypatch, env: dict[str, str]) -> None:
+    """Replace whatever launcher variables this test process inherited with ``env``."""
+    for key in list(os.environ):
+        if key in _LAUNCHER_VARS or key.startswith(("SLURM_", "TORCHELASTIC_")):
+            monkeypatch.delenv(key)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+
+
+@pytest.mark.parametrize(
+    "env, expected",
+    [
+        (_TORCHRUN_RANK0, 2),
+        (_SRUN_RANK0, 2),
+        ({**_SRUN_RANK0, "SLURM_JOB_NAME": "bash"}, 2),
+        (_SBATCH_NTASKS2_BATCH_STEP, 2),
+        ({**_TORCHRUN_RANK0, "WORLD_SIZE": "1", "LOCAL_WORLD_SIZE": "1"}, 1),
+        ({**_SRUN_RANK0, "SLURM_NTASKS": "1", "SLURM_STEP_NUM_TASKS": "1"}, 1),
+        ({**_SBATCH_NTASKS2_BATCH_STEP, "SLURM_NTASKS": "1"}, 1),
+        (_SALLOC_SHELL, 1),
+        ({}, 1),
+    ],
+    ids=[
+        "torchrun-2",
+        "srun-2",
+        "srun-2-inside-a-bash-named-allocation",
+        "sbatch-ntasks-2-batch-step",
+        "torchrun-1",
+        "srun-1",
+        "sbatch-ntasks-1",
+        "salloc-shell-no-srun",
+        "plain",
+    ],
+)
+def test_multi_process_launchers_are_refused_though_the_trainer_looks_single_device(
+    monkeypatch, env, expected, tensorized_cohort_dir, tmp_path
+):
+    """``devices=1`` resolves to a ``SingleDeviceStrategy`` whose ``world_size`` is 1 even inside a
+    ``torchrun`` / ``srun --ntasks=2`` job, where every rank would score the whole grid and write the same
+    parquet.
+
+    The guard counts the launcher's processes instead - before the trainer exists
+    (:func:`check_single_process`, as ``main`` calls it) and again inside :func:`check_single_device`
+    - and refuses before ``trainer.predict``.  One-task launches, an ``salloc`` shell that has not
+    run ``srun`` and a plain launch pass; a ``bash``-named allocation is no exemption.
+    """
+    _simulate_launcher(monkeypatch, env)
+    assert launcher_world_size() == expected
+    if expected == 1:
+        check_single_process()  # no raise
+        trainer = _cpu_trainer()  # built under the launcher's environment, as the CLI's would be
+        assert isinstance(trainer.strategy, SingleDeviceStrategy) and trainer.world_size == 1
+        check_single_device(trainer)  # no raise
+        return
+
+    with pytest.raises(ValueError, match=r"the launcher started 2 process\(es\)") as err:
+        check_single_process()
+    assert "--ntasks=1" in str(err.value)
+
+    # Lightning's own SLURM detection may refuse to build a Trainer under some of these environments
+    # (it rejects ``--ntasks=N`` without ``--ntasks-per-node``); ``main`` therefore checks first.
+    try:
+        trainer = _cpu_trainer()
+    except RuntimeError as e:
+        assert "ntasks" in str(e), e
+        return
+    assert isinstance(trainer.strategy, SingleDeviceStrategy) and trainer.world_size == 1
+    with pytest.raises(ValueError, match=r"the launcher started 2 process\(es\)"):
+        check_single_device(trainer)
+
+    dm, module = _predict_setup(tensorized_cohort_dir, tmp_path)
+
+    def never(*args, **kwargs):
+        raise AssertionError("trainer.predict ran under a multi-process launcher")
+
+    monkeypatch.setattr(trainer, "predict", never)
+    with pytest.raises(ValueError, match="exactly one process"):
+        run_inference(module, dm, trainer)

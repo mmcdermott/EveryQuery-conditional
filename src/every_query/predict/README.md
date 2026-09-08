@@ -47,14 +47,17 @@ Key files:
     `prediction_time`, the window lists incl. `start_durations` / `start_events`, `target_code`,
     `label`, `prob`). This is the only inference path that consumes active window starts. Inference
     is `Trainer.predict` over a `ConditionalMultitaskDataModule` built from the checkpoint's cohort
-    settings with only the label root swapped for the grid (#30), on exactly one device (`device=`
-    picks the accelerator; multi-device prediction is refused so rows stay aligned with the grid).
+    settings with only the label root swapped for the grid (#30), on exactly one device in exactly
+    one process (`device=` picks the accelerator; a multi-device trainer or a `torchrun` / `srun
+    --ntasks>1` launch is refused so rows stay aligned with the grid, and the collated labels and
+    scored codes are re-checked row by row against the grid before writing).
 - `schema.py` — `PredictionSchema` (`TaskQuerySchema` + `censor_prob` + `occurs_prob`).
 - `configs/predict_sequences.yaml` — same required trio as `predict.yaml`
     (`model_run_dir`, `tasks_dir`, `output_parquet`), pointed at a conditional training run.
 - `configs/predict_multitask.yaml` — the same trio for a multitask run; `tasks_dir` is the
     QuerySeq grid's `eval/` root. Optional: `ckpt_name`, `split`, `overwrite`, `batch_size`,
     `num_workers`, `device` (`null` | `cpu` | `cuda` | `cuda:N` | `mps`, always one device),
+    `precision` (`bf16-mixed`, the training / sibling-CLI precision; `32-true` for fp32),
     `enable_progress_bar`.
 - `configs/predict.yaml` — required: `model_run_dir`, `tasks_dir`, `output_parquet`; optional: `ckpt_name`, `split` (`held_out` | `tuning`), `overwrite` (default `false` — refuses to clobber an existing `output_parquet`; pass `overwrite=true` to replace).
 - `external_tasks/` — convert + aggregate tasks outside EQ's native vocabulary (`aces_to_eq.py`, `process_composite.py`, `get_per_code_from_composite.py`).
