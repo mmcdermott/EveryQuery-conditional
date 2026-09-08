@@ -174,6 +174,12 @@ def build_predict_datamodule(
             f"the checkpoint's datamodule strips delta tokens={strip_delta_tokens} but its model has "
             f"use_rope_time={use_rope_time}; resolved_config.yaml is inconsistent."
         )
+    # ``task_labels_dir`` here is a placeholder that must merely exist: the checkpoint records the
+    # TRAINING labels root, which need not be present on this machine, and ``__post_init__`` raises
+    # FileNotFoundError on a missing one.  Nothing on this path reads it - the grid is reached through
+    # the datamodule's ``eval_tasks_dir`` below - but pointing it at the grid (rather than ``None``)
+    # keeps ``__post_init__``'s ``seq_sampling_strategy == to_end`` check firing here, where the error
+    # names the checkpoint, instead of later inside ``eval_config``.
     data_cfg = instantiate(dm_cfg.config, task_labels_dir=str(tasks_dir))
     if int(data_cfg.vocab_size) != int(expected_vocab_size):
         raise ValueError(
