@@ -86,10 +86,17 @@ class ConditionalMultitaskDataModule(ResumableDatamodule):
         pin_memory: As in the upstream ``Datamodule``.
         persistent_workers: As in the upstream ``Datamodule``.
         prefetch_factor: As in the upstream ``Datamodule``.
-        dataset_kwargs: Forwarded verbatim to the two training datasets, as in
-            :class:`~every_query.data.datamodule.ResumableDatamodule`.  Of its keys only
-            ``strip_delta_tokens`` and ``expected_vocab_size`` reach the evaluation adapter (the rest -
-            manifest checks - have no meaning for a grid).
+        dataset_kwargs: Forwarded to the two training datasets, as in
+            :class:`~every_query.data.datamodule.ResumableDatamodule`, except for ``ontology_dir``
+            (below), which is taken out first.  Of its keys only ``strip_delta_tokens`` and
+            ``expected_vocab_size`` reach the evaluation adapter (the rest - manifest checks - have
+            no meaning for a grid).  ``expected_vocab_size`` is the **cohort's** width ``V``: the
+            training sidecars are leaf-only whether or not an ontology is in use.  Its
+            ``ontology_dir`` key is the checkpoint's ``model.ontology_dir`` (interpolated from it in
+            the shipped configs); the training datasets never see it - their manifest and packed
+            labels are leaf-only, and the model widens targets to ``V_ext`` itself - so it reaches
+            only the evaluation adapter, where it makes ancestor query / start / bound names
+            resolvable and raises the adapter's width check from ``V`` to the ontology's ``V_ext``.
         eval_tasks_dir: Optional QuerySeq evaluation-grid ``eval/`` root
             (``EQ_generate_evaluation_query_sequences``).  Only ``trainer.test`` / ``trainer.predict``
             / ``EQ_predict_multitask`` need it; ``None`` is fine for ``fit``.
@@ -103,6 +110,8 @@ class ConditionalMultitaskDataModule(ResumableDatamodule):
         train_dataset / val_dataset: ``MultitaskBoundaryPytorchDataset`` over ``config`` (inherited).
         test_dataset / predict_dataset: ``QuerySeqMultitaskEvalDataset`` over :attr:`eval_config`.
         eval_config: ``config`` with only ``task_labels_dir`` replaced by ``eval_tasks_dir``.
+        ontology_dir: The ontology the evaluation adapter resolves names through; ``None`` without one.
+        dataset_kwargs: The training datasets' keyword arguments (``ontology_dir`` removed).
 
     Examples:
         Everything about the grid is lazy, so a datamodule without one is fully usable for ``fit``
@@ -152,6 +161,17 @@ class ConditionalMultitaskDataModule(ResumableDatamodule):
         Traceback (most recent call last):
             ...
         ValueError: predict_split must be one of ['held_out', 'tuning'], got 'train'; ...
+
+        ``ontology_dir`` is lifted out of ``dataset_kwargs``: the training datasets keep the leaf
+        width, the ontology is remembered for the evaluation adapter and recorded in the
+        hyperparameters beside the rest:
+
+        >>> D = ConditionalMultitaskDataModule(
+        ...     cfg, dataset_kwargs={"expected_vocab_size": 7, "ontology_dir": "/onto"}, max_windows=5)
+        >>> D.dataset_kwargs, D.ontology_dir
+        ({'expected_vocab_size': 7}, PosixPath('/onto'))
+        >>> D.hparams["dataset_kwargs"], D.hparams["ontology_dir"]
+        ({'expected_vocab_size': 7}, '/onto')
         >>> tmp.cleanup(); grid.cleanup()
     """
 
@@ -173,6 +193,12 @@ class ConditionalMultitaskDataModule(ResumableDatamodule):
                 f"predict_split must be one of {sorted(EVAL_SPLITS)}, got {predict_split!r}; the QuerySeq "
                 "grid is an evaluation artifact scored in row order, so a shuffled split has no meaning."
             )
+        # ``ontology_dir`` rides in ``dataset_kwargs`` so the shipped configs can interpolate it from
+        # ``lightning_module.model.ontology_dir`` the way the scalar datamodule's does, but the
+        # training datasets are leaf-only and do not take it: lift it out before the parent forwards
+        # the rest verbatim.
+        training_kwargs = dict(dataset_kwargs or {})
+        ontology_dir = training_kwargs.pop("ontology_dir", None)
         super().__init__(
             config,
             data_class=MultitaskBoundaryPytorchDataset,
@@ -181,8 +207,9 @@ class ConditionalMultitaskDataModule(ResumableDatamodule):
             pin_memory=pin_memory,
             persistent_workers=persistent_workers,
             prefetch_factor=prefetch_factor,
-            dataset_kwargs=dataset_kwargs,
+            dataset_kwargs=training_kwargs,
         )
+        self.ontology_dir: Path | None = None if ontology_dir is None else Path(ontology_dir)
         self.eval_tasks_dir: Path | None = None if eval_tasks_dir is None else Path(eval_tasks_dir)
         self.max_windows: int | None = None if max_windows is None else int(max_windows)
         self.predict_split: str = predict_split
@@ -192,6 +219,7 @@ class ConditionalMultitaskDataModule(ResumableDatamodule):
         self.save_hyperparameters(
             {
                 "dataset_kwargs": dict(self.dataset_kwargs),
+                "ontology_dir": None if self.ontology_dir is None else str(self.ontology_dir),
                 "eval_tasks_dir": None if self.eval_tasks_dir is None else str(self.eval_tasks_dir),
                 "max_windows": self.max_windows,
                 "predict_split": self.predict_split,
@@ -211,14 +239,30 @@ class ConditionalMultitaskDataModule(ResumableDatamodule):
             raise ValueError(MISSING_EVAL_TASKS_DIR_MSG)
         return dataclasses.replace(self.config, task_labels_dir=str(self.eval_tasks_dir))
 
-    def _eval_dataset(self, split: str) -> QuerySeqMultitaskEvalDataset:
+    @cached_property
+    def eval_vocab_size(self) -> int | None:
+        """The width the evaluation adapter checks grid codes against: ``V_ext`` with an ontology, else ``V``.
+
+        ``dataset_kwargs["expected_vocab_size"]`` is the cohort's leaf width (what the training
+        sidecars are checked against).  A grid may name ancestor nodes, whose indices sit in
+        ``[V, V_ext)``, so under an ontology the adapter's ceiling is the extended width instead.
+        ``None`` when neither is known.
+        """
+        if self.ontology_dir is not None:
+            from every_query.data.ontology import extended_vocab_size
+
+            return extended_vocab_size(self.ontology_dir)
         expected_vocab_size = self.dataset_kwargs.get("expected_vocab_size")
+        return None if expected_vocab_size is None else int(expected_vocab_size)
+
+    def _eval_dataset(self, split: str) -> QuerySeqMultitaskEvalDataset:
         return QuerySeqMultitaskEvalDataset(
             self.eval_config,
             split=split,
             strip_delta_tokens=bool(self.dataset_kwargs.get("strip_delta_tokens", False)),
-            expected_vocab_size=None if expected_vocab_size is None else int(expected_vocab_size),
+            expected_vocab_size=self.eval_vocab_size,
             max_windows=self.max_windows,
+            ontology_dir=self.ontology_dir,
         )
 
     @cached_property

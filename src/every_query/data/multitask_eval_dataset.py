@@ -204,8 +204,13 @@ class QuerySeqMultitaskEvalDataset(ConditionalQueryPytorchDataset):
     - every grid row of this split to survive the cohort join - a grid subject absent from the
       tensorized cohort is an error, never a silently shrunken grid;
     - every query / start / bound code to map to a non-PAD index and, when ``expected_vocab_size``
-      is given, below it (the checkpoint's tied embedding width);
+      is given, below it (the checkpoint's tied embedding width: ``V_ext`` under an ontology);
     - when ``max_windows`` is given, no row longer than the checkpoint's window budget.
+
+    ``ontology_dir`` goes through to the parent, whose ``extend_code_map`` adds the ontology's
+    ancestor node names to ``code_to_index`` (at their ``[V, V_ext)`` indices), so a grid that asks
+    about, starts at or is bounded by an ancestor node resolves; without it those names are unknown
+    codes and fail at init like any other.
 
     Only ``{task_labels_dir}/{split}/*.parquet`` is read, so a grid root holding several splits'
     ``eval/{split}/`` trees is fine.  No manifest, packed labels, ``eval_meta`` or
@@ -220,13 +225,18 @@ class QuerySeqMultitaskEvalDataset(ConditionalQueryPytorchDataset):
         strip_delta_tokens: bool = False,
         expected_vocab_size: int | None = None,
         max_windows: int | None = None,
+        ontology_dir: str | Path | None = None,
     ):
         if cfg.task_labels_dir is None:
             raise ValueError("QuerySeqMultitaskEvalDataset requires task_labels_dir (the grid's eval/ root)")
         self._split_dir = Path(cfg.task_labels_dir) / split
         self.n_grid_rows: int | None = None
         super().__init__(
-            cfg, split, strip_delta_tokens=strip_delta_tokens, ontology_dir=None, allow_active_starts=True
+            cfg,
+            split,
+            strip_delta_tokens=strip_delta_tokens,
+            ontology_dir=None if ontology_dir is None else str(ontology_dir),
+            allow_active_starts=True,
         )
 
         if self.n_grid_rows is None:

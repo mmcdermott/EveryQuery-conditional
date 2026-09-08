@@ -131,6 +131,9 @@ def build_predict_datamodule(
     max_windows: int | None = None,
     batch_size: int | None = None,
     num_workers: int | None = None,
+    base_vocab_size: int | None = None,
+    ontology_dir: str | Path | None = None,
+    cohort_vocab_fingerprint: str | None = None,
 ) -> ConditionalMultitaskDataModule:
     """The prediction datamodule: the checkpoint's cohort settings, pointed at the grid.
 
@@ -147,24 +150,38 @@ def build_predict_datamodule(
     nothing here reads it.  Everything else - ``tensorized_cohort_dir``, ``max_seq_len``,
     ``seq_sampling_strategy``, ``static_inclusion_mode``, ``batch_mode`` - is the checkpoint's.
 
-    Two consistency checks guard the checkpoint against the cohort.  ``strip_delta_tokens`` (from
-    ``dataset_kwargs``) must agree with the model's ``use_rope_time``: a mismatch would feed a
-    RoPE-time model token-index positions (or vice versa) and score garbage without an error.  The
-    cohort's vocabulary width must equal the model's tied-embedding width (``train.py`` sizes the
-    latter from the former, and the multitask model has no ontology extension), so a checkpoint
-    pointed at a different cohort fails here rather than scoring codes through the wrong embedding
-    rows.
+    Four consistency checks guard the checkpoint against the cohort and the ontology.
+    ``strip_delta_tokens`` (from ``dataset_kwargs``) must agree with the model's ``use_rope_time``:
+    a mismatch would feed a RoPE-time model token-index positions (or vice versa) and score garbage
+    without an error.  The cohort's vocabulary width must equal the model's **cohort** width
+    (``base_vocab_size``; ``train.py`` sizes the model from the cohort), so a checkpoint pointed at
+    a different cohort fails here rather than scoring codes through the wrong embedding rows.  With
+    an ontology, the ontology's extended width must equal the model's tied-embedding width
+    (``expected_vocab_size``), so the two widths are checked separately and fail with distinct
+    messages: the first names the cohort, the second the ontology.  And when the checkpoint recorded
+    the training cohort's vocabulary fingerprint (``cohort_vocab_fingerprint``), the cohort on this
+    machine must digest to it: a width cannot tell two cohorts apart, a fingerprint can.  (The
+    ontology itself is checked against that fingerprint by the model at load, and against this
+    cohort's ``codes.parquet`` row for row by the evaluation adapter.)
 
     Args:
         train_cfg: The OmegaConf of the run's ``resolved_config.yaml`` (``setup_model`` returns it).
         tasks_dir: The grid's ``eval/`` root.
         split: The grid split to score; one of ``EVAL_SPLITS`` (the datamodule refuses ``train``).
-        expected_vocab_size: The model's tied-embedding width (``model.vocab_size``).
+        expected_vocab_size: The model's tied-embedding width (``model.vocab_size``; ``V_ext`` under
+            an ontology).  The evaluation adapter rejects grid codes at or past it.
         use_rope_time: The model's ``use_rope_time``.
         max_windows: The model's window budget, forwarded so an over-long grid row is rejected when
             the dataset is built rather than inside a forward pass.
         batch_size: Overrides the checkpoint's ``datamodule.batch_size`` when given.
         num_workers: Overrides the checkpoint's ``datamodule.num_workers`` when given.
+        base_vocab_size: The model's cohort width (``model.base_vocab_size``), which the cohort on
+            this machine must match.  Defaults to ``expected_vocab_size`` (no ontology).
+        ontology_dir: The model's ``ontology_dir``; forwarded to the evaluation adapter so ancestor
+            query / start / bound names resolve, and checked against ``expected_vocab_size``.
+        cohort_vocab_fingerprint: The model's ``cohort_vocab_fingerprint`` (the training cohort's
+            :func:`~every_query.utils.digest.vocab_fingerprint`), which this machine's cohort must
+            digest to.  ``None`` (a checkpoint from before it was recorded) skips the check.
     """
     dm_cfg = train_cfg.datamodule
     dataset_kwargs = dm_cfg.get("dataset_kwargs") or {}
@@ -174,6 +191,23 @@ def build_predict_datamodule(
             f"the checkpoint's datamodule strips delta tokens={strip_delta_tokens} but its model has "
             f"use_rope_time={use_rope_time}; resolved_config.yaml is inconsistent."
         )
+    if base_vocab_size is None:
+        base_vocab_size = expected_vocab_size
+    if ontology_dir is None and int(base_vocab_size) != int(expected_vocab_size):
+        raise ValueError(
+            f"the checkpoint's tied embedding table is {expected_vocab_size} wide but its cohort width is "
+            f"{base_vocab_size} and it has no ontology to account for the difference."
+        )
+    if ontology_dir is not None:
+        from every_query.data.ontology import extended_vocab_size
+
+        v_ext = extended_vocab_size(ontology_dir)
+        if v_ext != int(expected_vocab_size):
+            raise ValueError(
+                f"the ontology at {ontology_dir} extends the vocabulary to V_ext={v_ext} but the "
+                f"checkpoint's tied embedding table is {expected_vocab_size} wide; the model was trained "
+                "under a different ontology."
+            )
     # ``task_labels_dir`` here is a placeholder that must merely exist: the checkpoint records the
     # TRAINING labels root, which need not be present on this machine, and ``__post_init__`` raises
     # FileNotFoundError on a missing one.  Nothing on this path reads it - the grid is reached through
@@ -181,12 +215,29 @@ def build_predict_datamodule(
     # keeps ``__post_init__``'s ``seq_sampling_strategy == to_end`` check firing here, where the error
     # names the checkpoint, instead of later inside ``eval_config``.
     data_cfg = instantiate(dm_cfg.config, task_labels_dir=str(tasks_dir))
-    if int(data_cfg.vocab_size) != int(expected_vocab_size):
-        raise ValueError(
-            f"the cohort at {data_cfg.tensorized_cohort_dir} has vocab_size={data_cfg.vocab_size} but the "
-            f"checkpoint's tied embedding table is {expected_vocab_size} wide; the model was trained on a "
-            "different codes.parquet."
+    if int(data_cfg.vocab_size) != int(base_vocab_size):
+        detail = (
+            f"the checkpoint's tied embedding table is {expected_vocab_size} wide"
+            if ontology_dir is None
+            else f"the checkpoint was trained on a cohort of vocab_size={base_vocab_size} (its tied "
+            f"embedding table is {expected_vocab_size} wide with the ontology's ancestor rows)"
         )
+        raise ValueError(
+            f"the cohort at {data_cfg.tensorized_cohort_dir} has vocab_size={data_cfg.vocab_size} but "
+            f"{detail}; the model was trained on a different codes.parquet."
+        )
+    if cohort_vocab_fingerprint is not None:
+        from every_query.data.ontology import cohort_code_map
+        from every_query.utils.digest import vocab_fingerprint
+
+        actual = vocab_fingerprint(cohort_code_map(data_cfg.code_metadata_fp))
+        if actual != cohort_vocab_fingerprint:
+            raise ValueError(
+                f"the cohort at {data_cfg.tensorized_cohort_dir} has the checkpoint's vocab_size="
+                f"{base_vocab_size} but its vocabulary digests to {actual[:12]}... where the checkpoint "
+                f"recorded {cohort_vocab_fingerprint[:12]}...; the model was trained on a different "
+                "codes.parquet (same width, other codes or a different numbering)."
+            )
     if batch_size is None:
         batch_size = dm_cfg.batch_size
     if num_workers is None:
@@ -198,12 +249,91 @@ def build_predict_datamodule(
         pin_memory=dm_cfg.get("pin_memory"),
         dataset_kwargs={
             "strip_delta_tokens": strip_delta_tokens,
-            "expected_vocab_size": int(expected_vocab_size),
+            "expected_vocab_size": int(base_vocab_size),
+            "ontology_dir": None if ontology_dir is None else str(ontology_dir),
         },
         eval_tasks_dir=tasks_dir,
         max_windows=max_windows,
         predict_split=split,
     )
+
+
+def check_grid_ontology_provenance(tasks_dir: Path, split: str, ontology_dir: str | Path | None) -> None:
+    """Refuse a grid whose provenance sidecars were labeled under a *different* closure than the model's.
+
+    ``EQ_generate_evaluation_query_sequences`` writes, per output shard, a sidecar under
+    ``{out_dir}_artifacts/_labeled/`` whose ``ontology_fingerprint`` is
+    ``"{closure}|{universe}"`` (``None`` for a leaf-only run).  Only the closure half decides what an
+    ancestor query's label means, so that is what is compared against
+    :func:`~every_query.data.ontology.closure_fingerprint` of the checkpoint's ontology.  The
+    combinations:
+
+    - both present and equal: fine;
+    - both present and different: **error** - the grid's ancestor labels do not mean what this
+      model was trained to predict;
+    - grid labeled without an ontology: fine whatever the model has (leaf labels are ontology
+      independent), nothing to compare;
+    - grid labeled with an ontology, model without: a warning only; any ancestor *name* in the grid
+      is then rejected by the dataset as an unknown code, and a leaf-only grid labels identically;
+    - no sidecar (a grid copied without its ``_artifacts`` sibling, or written by an older sampler):
+      a warning; there is nothing to check against.
+
+    Args:
+        tasks_dir: The grid's ``eval/`` root (the sampler's ``out_dir / "eval"``).
+        split: The split being scored.
+        ontology_dir: The model's ``ontology_dir``, or ``None``.
+    """
+    # Lazy: the sampler module is the owner of the sidecar layout and its parsing.
+    from every_query.generate_tasks.sample_evaluation_query_sequences import (
+        _recorded_fingerprint,
+        split_ontology_fingerprint,
+    )
+
+    model_closure = None
+    if ontology_dir is not None:
+        from every_query.data.ontology import closure_fingerprint
+
+        model_closure = closure_fingerprint(ontology_dir)
+
+    out_dir = Path(tasks_dir).parent
+    # ``rglob``, not ``glob``: the dataset selects every shard with the split directory anywhere in
+    # its parents, so a hand-merged grid with nested shards would otherwise be scored while this
+    # gate silently inspected nothing.
+    shards = sorted((Path(tasks_dir) / split).rglob("*.parquet"))
+    without_sidecar: list[str] = []
+    foreign: list[str] = []
+    for fp in shards:
+        recorded = _recorded_fingerprint(out_dir, fp)
+        if recorded is None:
+            without_sidecar.append(fp.name)
+            continue
+        grid_closure, _ = split_ontology_fingerprint(recorded.get("ontology_fingerprint"))
+        if grid_closure is None:
+            continue
+        if model_closure is None:
+            foreign.append(fp.name)
+        elif grid_closure != model_closure:
+            raise ValueError(
+                f"the grid shard {fp} was labeled under an ontology whose closure ({grid_closure}) differs "
+                f"from the checkpoint's ({model_closure}, {ontology_dir}); its ancestor labels do not mean "
+                "what this model predicts. Regenerate the grid with the checkpoint's ontology_dir."
+            )
+    if without_sidecar:
+        logger.warning(
+            "%d grid shard(s) under %s carry no provenance sidecar (%s); the ontology they were labeled "
+            "under cannot be checked against the checkpoint's.",
+            len(without_sidecar),
+            tasks_dir / split,
+            without_sidecar[:3],
+        )
+    if foreign:
+        logger.warning(
+            "%d grid shard(s) under %s were labeled with an ontology but the checkpoint has none (%s); "
+            "leaf labels are unaffected, and any ancestor query name is rejected as an unknown code.",
+            len(foreign),
+            tasks_dir / split,
+            foreign[:3],
+        )
 
 
 def build_eval_dataset(
@@ -214,6 +344,8 @@ def build_eval_dataset(
     expected_vocab_size: int,
     use_rope_time: bool,
     max_windows: int | None = None,
+    base_vocab_size: int | None = None,
+    ontology_dir: str | Path | None = None,
 ) -> QuerySeqMultitaskEvalDataset:
     """The prediction datamodule's ``predict_dataset``; see :func:`build_predict_datamodule`."""
     return build_predict_datamodule(
@@ -223,6 +355,8 @@ def build_eval_dataset(
         expected_vocab_size=expected_vocab_size,
         use_rope_time=use_rope_time,
         max_windows=max_windows,
+        base_vocab_size=base_vocab_size,
+        ontology_dir=ontology_dir,
     ).predict_dataset
 
 
@@ -506,6 +640,10 @@ def main(cfg: DictConfig) -> None:
         model_run_dir, ckpt_name=cfg.get("ckpt_name"), module_cls=ConditionalMultitaskLightningModule
     )
 
+    # The widths and the ontology come from the loaded model itself (``vocab_size`` is the table,
+    # ``base_vocab_size`` the cohort, both read from its ontology at construction), so a run dir
+    # from before the multitask model knew about ontologies is handled exactly like a current one.
+    check_grid_ontology_provenance(tasks_dir, split, model.model.ontology_dir)
     datamodule = build_predict_datamodule(
         train_cfg,
         tasks_dir,
@@ -515,6 +653,9 @@ def main(cfg: DictConfig) -> None:
         max_windows=model.model.max_windows,
         batch_size=cfg.get("batch_size"),
         num_workers=cfg.get("num_workers"),
+        base_vocab_size=model.model.base_vocab_size,
+        ontology_dir=model.model.ontology_dir,
+        cohort_vocab_fingerprint=model.model.cohort_vocab_fingerprint,
     )
     dataset = datamodule.predict_dataset
     logger.info(f"Loaded {len(dataset)} grid rows from {tasks_dir} (split={split})")

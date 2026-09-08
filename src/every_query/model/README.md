@@ -29,6 +29,21 @@ shape, no Hydra entry points, no configs.
 - **`conditional_lightning.py`** — `ConditionalQueryLightningModule`. One Lightning wrapper for
     both conditional architectures; checkpoints record which one they hold via the model's
     `architecture` hparam (absent = encoder–decoder, so pre-rename checkpoints load unchanged).
+- **`conditional_multitask_ar_model.py`** — `ConditionalMultitaskARModel`: the decoder-only
+    *all-vocabulary* architecture over ordered windows `[patient, W0, C0, A0, …, W(K-1)]`. Each
+    window's hidden state is projected onto the tied input-embedding table (one logit per code,
+    masked BCE against packed `(B, K, V)` targets); `score_final_query` scores one code at one
+    window for QuerySeq grids without building `(B, K, V)`. With `ontology_dir` the table is the
+    ancestor-mixed `V_ext` one on both the input and readout sides, and leaf-only `(B, K, V)`
+    targets are widened to `V_ext` inside `forward` (`derive_ancestor_targets`: an ancestor's bit
+    is the OR of its descendant leaves'), so the sampler's sidecars stay leaf-only. The closure is
+    checked against the cohort by *identity*, not width: `train.py` records the cohort's vocabulary
+    fingerprint (`cohort_vocab_fingerprint`, the multitask manifest's `vocab_fingerprint`) as a
+    model hparam, and every construction, checkpoint loads included, requires the ontology's
+    observed nodes to digest to it, so a same-width foreign or renumbered ontology is refused.
+- **`conditional_multitask_lightning.py`** — `ConditionalMultitaskLightningModule`: fit /
+    validation on `MultitaskBoundaryBatch` (dense loss), test / predict on `MultitaskEvalBatch`
+    (target-only scoring).
 - **`ontology_embedding.py`** — `OntologyEmbedding` + `wrap_tok_embeddings`: ancestor-mixed
     code embeddings installed through `get_input_embeddings()`/`set_input_embeddings()`, shared
     by every architecture's patient, query-code and boundary-code lookups.

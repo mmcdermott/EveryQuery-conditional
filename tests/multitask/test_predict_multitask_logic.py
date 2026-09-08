@@ -63,6 +63,7 @@ from every_query.predict.predict_multitask import (
     build_eval_dataset,
     build_predict_datamodule,
     build_predict_trainer,
+    check_grid_ontology_provenance,
     check_single_device,
     check_single_process,
     launcher_world_size,
@@ -70,6 +71,7 @@ from every_query.predict.predict_multitask import (
     resolve_accelerator,
     run_inference,
 )
+from tests.multitask.conftest import write_cohort_ontology
 
 # Real codes of the fixture cohort.
 Q1, Q2, Q3 = "HR", "TEMP", "DISCHARGE"
@@ -407,6 +409,296 @@ def test_build_predict_datamodule_checks_the_checkpoint_against_the_cohort(tenso
         build_eval_dataset(cfg, grid, tuning_split, **kw, max_windows=2)
     with pytest.raises(ValueError, match="predict_split must be one of"):
         build_predict_datamodule(cfg, grid, train_split, **kw)
+
+
+# --- 14: an ontology separates the cohort width from the table width ---------------------------------
+
+
+@pytest.fixture(scope="module")
+def cohort_ontology_dir(tensorized_cohort_dir: Path, tmp_path_factory) -> Path:
+    """An ontology built from the fixture cohort's own ``codes.parquet``."""
+    return write_cohort_ontology(tensorized_cohort_dir, tmp_path_factory.mktemp("cohort_ontology"))
+
+
+def _an_ancestor(ontology_dir: Path, prefer: str = "ADMISSION") -> tuple[str, int]:
+    """``(name, index)`` of one pure ancestor node of the ontology (``prefer`` when it is one)."""
+    from every_query.data.ontology import load_nodes
+
+    nodes = load_nodes(ontology_dir).filter(~pl.col("is_observed_code")).sort("token_id")
+    names = nodes["node_name"].to_list()
+    name = prefer if prefer in names else names[0]
+    return name, int(nodes.filter(pl.col("node_name") == name)["token_id"][0])
+
+
+def _tiny_ontology_model(v_ext: int, ontology_dir: Path) -> ConditionalMultitaskARModel:
+    torch.manual_seed(0)
+    return ConditionalMultitaskARModel(
+        config_overrides={
+            "hidden_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+            "intermediate_size": 32,
+            "max_position_embeddings": 64 + 15,
+            "vocab_size": v_ext,
+            "pad_token_id": 0,
+            "attention_dropout": 0.0,
+        },
+        max_windows=5,
+        ontology_dir=str(ontology_dir),
+    ).eval()
+
+
+def test_build_predict_datamodule_separates_cohort_width_from_table_width(
+    tensorized_cohort_dir, tmp_path, cohort_ontology_dir
+):
+    """With an ontology the cohort on this machine is checked against the checkpoint's **cohort** width and
+    the ontology against its **table** width, with distinct messages; the adapter's ceiling is the table width
+    and the training-side kwarg the cohort width."""
+    from every_query.data.ontology import extended_vocab_size
+
+    grid = _write_grid(tmp_path / "grid", _eval_rows(), split=tuning_split)
+    cfg = _train_cfg(tensorized_cohort_dir)
+    v = _vocab_size(tensorized_cohort_dir, grid)
+    v_ext = extended_vocab_size(cohort_ontology_dir)
+    assert v_ext > v
+    kw = {"use_rope_time": False, "max_windows": 5}
+
+    dm = build_predict_datamodule(
+        cfg,
+        grid,
+        tuning_split,
+        expected_vocab_size=v_ext,
+        base_vocab_size=v,
+        ontology_dir=cohort_ontology_dir,
+        **kw,
+    )
+    assert dm.ontology_dir == cohort_ontology_dir and dm.dataset_kwargs["expected_vocab_size"] == v
+    ds = dm.predict_dataset
+    assert ds.expected_vocab_size == v_ext and ds.ontology_dir == str(cohort_ontology_dir) and len(ds) == 4
+    assert _an_ancestor(cohort_ontology_dir)[0] in ds.code_to_index
+
+    # The cohort is not the checkpoint's: the message names the cohort width, not the table.
+    with pytest.raises(ValueError, match=rf"trained on a cohort of vocab_size={v + 1}"):
+        build_predict_datamodule(
+            cfg,
+            grid,
+            tuning_split,
+            expected_vocab_size=v_ext,
+            base_vocab_size=v + 1,
+            ontology_dir=cohort_ontology_dir,
+            **kw,
+        )
+    # The ontology is not the checkpoint's: the message names the ontology.
+    with pytest.raises(ValueError, match="different ontology"):
+        build_predict_datamodule(
+            cfg,
+            grid,
+            tuning_split,
+            expected_vocab_size=v_ext + 1,
+            base_vocab_size=v,
+            ontology_dir=cohort_ontology_dir,
+            **kw,
+        )
+    # Two widths without an ontology to explain them is an inconsistent checkpoint.
+    with pytest.raises(ValueError, match="no ontology to account"):
+        build_predict_datamodule(cfg, grid, tuning_split, expected_vocab_size=v + 1, base_vocab_size=v, **kw)
+    # The pre-ontology call shape keeps its meaning: one width, the cohort must match it.
+    with pytest.raises(ValueError, match="tied embedding table"):
+        build_predict_datamodule(cfg, grid, tuning_split, expected_vocab_size=v_ext, **kw)
+
+
+def test_build_predict_datamodule_checks_the_cohort_identity_not_just_its_width(
+    tensorized_cohort_dir, tmp_path, cohort_ontology_dir
+):
+    """Regression for the PR #32 review.
+
+    A checkpoint that recorded its training cohort's vocabulary
+    fingerprint refuses a same-width cohort whose ``codes.parquet`` digests differently, with or without an
+    ontology; and an ontology of this cohort's codes at two swapped indices (same ``V``, same ``V_ext``)
+    passes every width check here and is refused by the evaluation adapter, code by code.
+    """
+    from every_query.data.ontology import cohort_code_map, extended_vocab_size
+    from every_query.utils.digest import vocab_fingerprint
+
+    grid = _write_grid(tmp_path / "grid", _eval_rows(), split=tuning_split)
+    cfg = _train_cfg(tensorized_cohort_dir)
+    v = _vocab_size(tensorized_cohort_dir, grid)
+    v_ext = extended_vocab_size(cohort_ontology_dir)
+    cohort = cohort_code_map(_data_config(tensorized_cohort_dir, grid).code_metadata_fp)
+    fingerprint = vocab_fingerprint(cohort)
+    kw = {"use_rope_time": False, "max_windows": 5}
+
+    # The cohort on this machine is the checkpoint's: accepted with and without an ontology.
+    with_onto = build_predict_datamodule(
+        cfg,
+        grid,
+        tuning_split,
+        expected_vocab_size=v_ext,
+        base_vocab_size=v,
+        ontology_dir=cohort_ontology_dir,
+        cohort_vocab_fingerprint=fingerprint,
+        **kw,
+    )
+    assert len(with_onto.predict_dataset) == 4
+    plain = build_predict_datamodule(
+        cfg, grid, tuning_split, expected_vocab_size=v, cohort_vocab_fingerprint=fingerprint, **kw
+    )
+    assert len(plain.predict_dataset) == 4
+    # Same width, different codes.parquet (one code moved to the free PAD slot): the width check passes,
+    # the fingerprint check does not.
+    other = vocab_fingerprint({**cohort, Q1: 0})
+    for onto_kw in ({}, {"ontology_dir": cohort_ontology_dir, "base_vocab_size": v}):
+        table = v_ext if onto_kw else v
+        with pytest.raises(ValueError, match=r"same width, other codes or a different numbering"):
+            build_predict_datamodule(
+                cfg,
+                grid,
+                tuning_split,
+                expected_vocab_size=table,
+                cohort_vocab_fingerprint=other,
+                **onto_kw,
+                **kw,
+            )
+    # A pre-fingerprint checkpoint (``None``) keeps the width-only behaviour.
+    legacy = build_predict_datamodule(cfg, grid, tuning_split, expected_vocab_size=v, **kw)
+    assert len(legacy.predict_dataset) == 4
+
+    # A permuted ontology of this very cohort: widths agree everywhere, the adapter refuses it by name.
+    permuted = write_cohort_ontology(tensorized_cohort_dir, tmp_path / "permuted", swap=(Q1, Q2))
+    assert extended_vocab_size(permuted) == v_ext
+    dm = build_predict_datamodule(
+        cfg, grid, tuning_split, expected_vocab_size=v_ext, base_vocab_size=v, ontology_dir=permuted, **kw
+    )
+    by_name = rf"different codes\.parquet.*'{Q1}': ontology {cohort[Q2]} vs cohort {cohort[Q1]}.*'{Q2}'"
+    with pytest.raises(ValueError, match=by_name):
+        _ = dm.predict_dataset
+    # ...and the model itself refuses to be built on it once it knows the cohort.
+    with pytest.raises(ValueError, match=r"different codes\.parquet than this cohort"):
+        ConditionalMultitaskARModel(
+            config_overrides={
+                "hidden_size": 16,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "intermediate_size": 32,
+                "max_position_embeddings": 64 + 15,
+                "vocab_size": v_ext,
+                "pad_token_id": 0,
+            },
+            max_windows=5,
+            ontology_dir=str(permuted),
+            cohort_vocab_fingerprint=fingerprint,
+        )
+
+
+def test_ancestor_query_scores_through_the_predict_datamodule(
+    tensorized_cohort_dir, tmp_path, cohort_ontology_dir
+):
+    """A grid naming an ancestor node scores under an ontology checkpoint - through the same sequential
+    loader, ``score_final_query`` and ``predictions_to_df`` as a leaf grid - and cannot even be tensorized
+    for a leaf-width checkpoint (the name is an unknown code there)."""
+    from every_query.data.ontology import extended_vocab_size
+
+    name, index = _an_ancestor(cohort_ontology_dir)
+    s = TUNING_SUBJECT
+    rows = [_row(s, [name], [True]), _row(s, [Q1, name], [False, True]), _row(s, [name, Q2], [True, False])]
+    grid = _write_grid(tmp_path / "grid", rows, split=tuning_split)
+    cfg = _train_cfg(tensorized_cohort_dir)
+    v = _vocab_size(tensorized_cohort_dir, grid)
+    v_ext = extended_vocab_size(cohort_ontology_dir)
+    assert index >= v
+
+    with pytest.raises(ValueError, match="not in this run's vocabulary"):
+        build_eval_dataset(cfg, grid, tuning_split, expected_vocab_size=v, use_rope_time=False)
+
+    dm = build_predict_datamodule(
+        cfg,
+        grid,
+        tuning_split,
+        expected_vocab_size=v_ext,
+        base_vocab_size=v,
+        ontology_dir=cohort_ontology_dir,
+        use_rope_time=False,
+        max_windows=5,
+        batch_size=2,
+    )
+    module = ConditionalMultitaskLightningModule(
+        model=_tiny_ontology_model(v_ext, cohort_ontology_dir), optimizer=partial(torch.optim.AdamW, lr=1e-4)
+    ).eval()
+    probs, labels, codes = run_inference(module, dm, _cpu_trainer())
+    ds = dm.predict_dataset
+    assert codes.tolist() == [index, index, ds.code_to_index[Q2]]
+    assert labels.tolist() == [True, True, False]
+    assert probs.shape == (3,) and (probs > 0.0).all() and (probs < 1.0).all()
+    with torch.no_grad():
+        expected = torch.cat(
+            [
+                torch.sigmoid(module.model.score_final_query(b, b.scored_codes))
+                for b in dm.predict_dataloader()
+            ]
+        )
+    torch.testing.assert_close(torch.from_numpy(probs), expected.float())
+    out = predictions_to_df(ds, probs, labels, codes)
+    assert out["target_code"].to_list() == [name, name, Q2]
+    assert out["queries"].to_list() == [r["queries"] for r in rows]
+
+
+def test_grid_provenance_gate_compares_the_closure_halves(
+    tmp_path, cohort_ontology_dir, tensorized_cohort_dir, caplog
+):
+    """``check_grid_ontology_provenance``: only a grid labeled under a *different* closure than the model's
+    ontology is refused; a missing sidecar, a leaf-only grid and an ontology grid scored by a leaf model only
+    warn."""
+    import json
+    import logging
+
+    from every_query.data.ontology import closure_fingerprint
+    from every_query.generate_tasks.sample_evaluation_query_sequences import _provenance_path
+
+    root = tmp_path / "grid"
+    tasks = root / "eval"
+    _write_grid(tasks, _eval_rows(), split=tuning_split)
+    fp = tasks / tuning_split / "0.parquet"
+
+    def record(fingerprint: str | None) -> None:
+        sidecar = _provenance_path(root, fp)
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"ontology_fingerprint": fingerprint, "specs_fingerprint": "s", "cohort_fingerprint": "c"}
+        sidecar.write_text(json.dumps(payload))
+
+    # A second ontology, built from a cohort missing one code: same universe shape, different closure.
+    codes = pl.read_parquet(tensorized_cohort_dir / "metadata" / "codes.parquet")
+    hierarchical = codes.filter(pl.col("code").str.contains("//"))["code"].to_list()
+    stale_cohort = tmp_path / "stale_cohort"
+    (stale_cohort / "metadata").mkdir(parents=True)
+    codes.filter(pl.col("code") != hierarchical[0]).write_parquet(stale_cohort / "metadata" / "codes.parquet")
+    stale = write_cohort_ontology(stale_cohort, tmp_path / "stale_ontology")
+    closure, stale_closure = closure_fingerprint(cohort_ontology_dir), closure_fingerprint(stale)
+    assert closure != stale_closure
+
+    with caplog.at_level(logging.WARNING):
+        check_grid_ontology_provenance(tasks, tuning_split, cohort_ontology_dir)
+    assert "no provenance sidecar" in caplog.text
+
+    record(None)  # a leaf-only grid: nothing to compare, whatever the model has
+    caplog.clear()
+    check_grid_ontology_provenance(tasks, tuning_split, cohort_ontology_dir)
+    check_grid_ontology_provenance(tasks, tuning_split, None)
+    assert not caplog.text
+
+    record(f"{closure}|universe")  # the model's own closure
+    check_grid_ontology_provenance(tasks, tuning_split, cohort_ontology_dir)
+    assert not caplog.text
+
+    record(f"{stale_closure}|universe")  # a different closure: refused
+    with pytest.raises(ValueError, match="differs from the checkpoint's"):
+        check_grid_ontology_provenance(tasks, tuning_split, cohort_ontology_dir)
+    # ...but a leaf model only warns: the grid's leaf labels are unaffected and its ancestor names
+    # are rejected as unknown codes by the dataset.
+    with caplog.at_level(logging.WARNING):
+        check_grid_ontology_provenance(tasks, tuning_split, None)
+    assert "checkpoint has none" in caplog.text
 
 
 # --- 5 / 6 / 7: conditions, final code and label under padding -------------------------------

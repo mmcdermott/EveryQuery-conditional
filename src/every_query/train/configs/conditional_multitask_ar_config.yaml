@@ -36,7 +36,13 @@ datamodule:
     max_seq_len: 256
   dataset_kwargs:
     strip_delta_tokens: ${lightning_module.model.use_rope_time}
+    # The COHORT's vocabulary width V, which the leaf-only training sidecars are checked against.
+    # train.py overwrites this with the cohort's V after sizing the model, so with an ontology the
+    # model's config_overrides.vocab_size (V_ext) and this number differ and both are recorded.
     expected_vocab_size: ${lightning_module.model.config_overrides.vocab_size}
+    # Set once on the model; the evaluation adapter resolves ancestor query / start / bound names
+    # through it.  The training datasets never read it (their labels are leaf-only).
+    ontology_dir: ${lightning_module.model.ontology_dir}
   # Optional QuerySeq evaluation-grid `eval/` root (EQ_generate_evaluation_query_sequences), an
   # artifact independent of task_labels_dir.  Only trainer.test / trainer.predict /
   # EQ_predict_multitask read it; fit never does, so null is fine for training.
@@ -55,7 +61,17 @@ lightning_module:
     precision: ${trainer.precision}
     max_windows: 5
     use_rope_time: true
+    # Optional EQ_build_ontology output.  When set, train.py sizes config_overrides.vocab_size to
+    # the ontology's V_ext, the input/readout table is ancestor-mixed, and the leaf-only training
+    # targets are widened to V_ext inside the model's forward (ancestor bit = OR of its leaves).
+    # The training sampler needs no ontology; `datamodule.dataset_kwargs.ontology_dir` interpolates
+    # from here for the evaluation adapter.
     ontology_dir: null
+    # Leave null: train.py fills in the cohort's vocabulary fingerprint (the multitask manifest's
+    # `vocab_fingerprint`, recomputed from metadata/codes.parquet).  Persisted in the checkpoint so an
+    # `ontology_dir` is re-verified against *this* cohort on every load and EQ_predict_multitask can
+    # refuse a same-width but different cohort.
+    cohort_vocab_fingerprint: null
     config_overrides:
       hidden_size: 384
       num_hidden_layers: 12

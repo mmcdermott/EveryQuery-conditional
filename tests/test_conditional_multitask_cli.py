@@ -1,7 +1,10 @@
 """CLI integration for multitask sampling, training, checkpoint restoration and grid prediction."""
 
 import filecmp
+import os
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -412,3 +415,233 @@ def test_predict_multitask_probabilities_match_a_direct_score_final_query(
     assert reference.shape == (fp32.height,) and len(np.unique(np.round(reference, 5))) > 1
     np.testing.assert_allclose(fp32["prob"].to_numpy(), reference, atol=1e-4, rtol=0.0)
     np.testing.assert_allclose(default["prob"].to_numpy(), reference, atol=2e-2, rtol=0.0)
+
+
+# ---------------------------------------------------------------------------
+# Ontology: train with derived ancestor targets, score an ancestor query
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def multitask_ontology_dir(eq_preprocessed_dataset: Path, tmp_path_factory) -> Path:
+    """``EQ_build_ontology`` over the demo cohort (module invocation, as in ``test_features_e2e_cli``)."""
+    out = tmp_path_factory.mktemp("multitask_ontology")
+    run_and_check(
+        [
+            sys.executable,
+            "-m",
+            "every_query.data.build_ontology",
+            f"tensorized_cohort_dir={eq_preprocessed_dataset!s}",
+            f"out_dir={out!s}",
+            "decay=0.5",
+        ],
+        timeout=120.0,
+    )
+    return out
+
+
+def _an_ancestor(ontology_dir: Path, prefer: str = "ADMISSION") -> str:
+    nodes = pl.read_parquet(ontology_dir / "ontology_vocab.parquet").filter(~pl.col("is_observed_code"))
+    names = sorted(nodes["node_name"].to_list())
+    assert names, "the demo cohort's hierarchical names must mint ancestor nodes"
+    return prefer if prefer in names else names[0]
+
+
+@pytest.fixture(scope="module")
+def conditional_multitask_ontology_trained_dir(
+    eq_preprocessed_dataset: Path,
+    conditional_multitask_labels_dir: Path,
+    multitask_ontology_dir: Path,
+    tmp_path_factory,
+) -> Path:
+    """The demo multitask config trained on the *same leaf-only labels* with ``ontology_dir`` set."""
+    output_dir = tmp_path_factory.mktemp("conditional_multitask_train_ontology")
+    run_and_check(
+        _train_cmd(
+            eq_preprocessed_dataset,
+            conditional_multitask_labels_dir,
+            output_dir,
+            f"lightning_module.model.ontology_dir={multitask_ontology_dir!s}",
+        ),
+        timeout=300.0,
+    )
+    return output_dir
+
+
+def test_ontology_training_records_both_widths_and_needs_no_new_labels(
+    conditional_multitask_ontology_trained_dir: Path,
+    conditional_multitask_labels_dir: Path,
+    multitask_ontology_dir: Path,
+    eq_preprocessed_dataset: Path,
+):
+    """Training with an ontology reads the leaf-only sidecars unchanged: ``resolved_config.yaml`` records the
+    ontology's ``V_ext`` on the model, the cohort's ``V`` on the datamodule and the cohort's vocabulary
+    fingerprint (the manifest's) on the model, and the reloaded model reports all three."""
+    from every_query.data.ontology import cohort_code_map, extended_vocab_size, ontology_vocab_fingerprint
+    from every_query.generate_tasks.sample_multitask_sequences import read_manifest
+    from every_query.utils.digest import vocab_fingerprint
+
+    cfg = yaml.safe_load((conditional_multitask_ontology_trained_dir / "resolved_config.yaml").read_text())
+    v_ext = extended_vocab_size(multitask_ontology_dir)
+    manifest = read_manifest(conditional_multitask_labels_dir / train_split)
+    v = int(manifest["vocab_size"])
+    codes_fp = eq_preprocessed_dataset / "metadata" / "codes.parquet"
+    codes = pl.read_parquet(codes_fp)
+    assert v == int(codes["code/vocab_index"].max()) + 1 < v_ext
+    model_cfg = cfg["lightning_module"]["model"]
+    assert model_cfg["ontology_dir"] == str(multitask_ontology_dir)
+    assert model_cfg["config_overrides"]["vocab_size"] == v_ext
+    # One digest, three artifacts: the cohort's codes.parquet, the leaf manifest and the ontology's leaves.
+    fingerprint = vocab_fingerprint(cohort_code_map(codes_fp))
+    assert model_cfg["cohort_vocab_fingerprint"] == fingerprint
+    assert manifest["vocab_fingerprint"] == fingerprint == ontology_vocab_fingerprint(multitask_ontology_dir)
+    dm_kwargs = cfg["datamodule"]["dataset_kwargs"]
+    assert dm_kwargs["expected_vocab_size"] == v, (
+        "the training datasets are checked against the leaf manifest"
+    )
+    assert dm_kwargs["ontology_dir"] == str(multitask_ontology_dir)
+
+    _, module, _ = setup_model(
+        conditional_multitask_ontology_trained_dir, module_cls=ConditionalMultitaskLightningModule
+    )
+    assert module.model.vocab_size == v_ext and module.model.base_vocab_size == v
+    assert module.model.code_bias.shape == (v_ext,)
+    assert module.model.cohort_vocab_fingerprint == fingerprint
+
+
+def test_train_refuses_a_same_width_permuted_ontology(
+    eq_preprocessed_dataset: Path, conditional_multitask_labels_dir: Path, tmp_path: Path
+):
+    """Regression for the PR #32 review: an ontology built from this cohort's codes with two indices swapped
+    has the cohort's ``V`` and the genuine ontology's ``V_ext``, so every width check passes.
+
+    ``EQ_train``
+    must still refuse it before a single step, naming the renumbered codes.
+    """
+    from every_query.data.ontology import cohort_code_map
+    from tests.multitask.conftest import write_cohort_ontology
+
+    first, second = sorted(cohort_code_map(eq_preprocessed_dataset / "metadata" / "codes.parquet"))[:2]
+    permuted = write_cohort_ontology(eq_preprocessed_dataset, tmp_path / "permuted", swap=(first, second))
+    output_dir = tmp_path / "train_permuted"
+    with pytest.raises(RuntimeError, match=r"different codes\.parquet than this cohort") as info:
+        run_and_check(
+            _train_cmd(
+                eq_preprocessed_dataset,
+                conditional_multitask_labels_dir,
+                output_dir,
+                f"lightning_module.model.ontology_dir={permuted!s}",
+            ),
+            timeout=300.0,
+        )
+    assert "2 code(s) sit at a different index" in str(info.value)
+    assert not (output_dir / "resolved_config.yaml").exists(), "refused before the run directory was written"
+
+
+@pytest.fixture(scope="module")
+def ancestor_queryseq_grid(
+    eq_preprocessed_dataset: Path, multitask_ontology_dir: Path, tmp_path_factory
+) -> tuple[Path, str]:
+    """An evaluation grid labeled *with* the ontology whose sequences ask an ancestor node."""
+    ancestor = _an_ancestor(multitask_ontology_dir)
+    root = tmp_path_factory.mktemp("ancestor_queryseq_grid")
+    intermediate = eq_preprocessed_dataset.parent / "intermediate"
+    shard = pl.read_parquet(next((intermediate / "data" / tuning_split).rglob("*.parquet")))
+    cohort = shard.group_by("subject_id").agg(pl.col("time").drop_nulls().min().alias("prediction_time"))
+    cohort_fp = root / "cohort.parquet"
+    cohort.write_parquet(cohort_fp)
+    specs_fp = root / "specs.yaml"
+    specs_fp.write_text(
+        yaml.safe_dump(
+            {
+                "family": [[ancestor, 30]],
+                "leaf_then_family": [["TIMELINE//END", 1], [ancestor, 30]],
+                "family_then_leaf": [[ancestor, 30], ["DISCHARGE", 30]],
+            }
+        )
+    )
+    grid_dir = root / "grid"
+    run_and_check(
+        [
+            "EQ_generate_evaluation_query_sequences",
+            f"data_dir={intermediate!s}",
+            f"out_dir={grid_dir!s}",
+            f"query_codes={eq_preprocessed_dataset!s}",
+            f"split={tuning_split}",
+            f"contexts_path={cohort_fp!s}",
+            f"sequences_path={specs_fp!s}",
+            f"ontology_dir={multitask_ontology_dir!s}",
+        ],
+        timeout=180.0,
+    )
+    return grid_dir, ancestor
+
+
+def test_predict_multitask_scores_an_ancestor_query(
+    conditional_multitask_ontology_trained_dir: Path,
+    conditional_multitask_trained_dir: Path,
+    ancestor_queryseq_grid: tuple[Path, str],
+    multitask_ontology_dir: Path,
+    tmp_path: Path,
+):
+    """End to end: a grid asking an ancestor node (labeled with the ontology) is scored by the ontology
+    checkpoint, one probability per row, matching a direct ``score_final_query``; the leaf checkpoint
+    refuses the same grid because the ancestor name is not in its vocabulary."""
+    grid_dir, ancestor = ancestor_queryseq_grid
+    grid = _read_grid(grid_dir)
+    assert grid.height == 3 * grid.select("subject_id").n_unique()
+    assert any(ancestor in q for q in grid["queries"].to_list())
+    # The grid's provenance names the ontology's closure, which is what the predictor checks.
+    sidecars = sorted(
+        (grid_dir.parent / "grid_artifacts" / "_labeled" / "eval" / tuning_split).glob("*.json")
+    )
+    assert sidecars
+
+    quiet = ("device=cpu", "enable_progress_bar=false")
+    preds = _predict_multitask(
+        conditional_multitask_ontology_trained_dir, grid_dir, tmp_path / "ancestor.parquet", *quiet
+    )
+    assert preds.height == grid.height
+    assert preds["prob"].is_between(0.0, 1.0).all()
+    assert preds["target_code"].to_list() == [q[-1] for q in preds["queries"].to_list()]
+    assert (preds["target_code"] == ancestor).sum() == 2 * grid.select("subject_id").n_unique()
+    key = ["subject_id", "prediction_time", "queries"]
+    joined = preds.join(grid, on=key, how="inner", suffix="_grid")
+    assert joined.height == grid.height and joined["answers"].to_list() == joined["answers_grid"].to_list()
+
+    train_cfg, module, _ = setup_model(
+        conditional_multitask_ontology_trained_dir, module_cls=ConditionalMultitaskLightningModule
+    )
+    model = module.model.cpu().eval()
+    ds = build_eval_dataset(
+        train_cfg,
+        grid_dir / "eval",
+        tuning_split,
+        expected_vocab_size=model.vocab_size,
+        base_vocab_size=model.base_vocab_size,
+        ontology_dir=model.ontology_dir,
+        use_rope_time=model.use_rope_time,
+        max_windows=model.max_windows,
+    )
+    assert ds.code_to_index[ancestor] >= model.base_vocab_size
+    loader = DataLoader(ds, batch_size=4, shuffle=False, collate_fn=ds.collate)
+    with torch.no_grad():
+        reference = torch.cat([torch.sigmoid(model.score_final_query(b, b.scored_codes)) for b in loader])
+    np.testing.assert_allclose(preds["prob"].to_numpy(), reference.float().numpy(), atol=2e-2, rtol=0.0)
+
+    # The leaf checkpoint has no row for the ancestor: refused at dataset construction, not scored.
+    cmd = [
+        "EQ_predict_multitask",
+        f"model_run_dir={conditional_multitask_trained_dir!s}",
+        f"tasks_dir={grid_dir / 'eval'!s}",
+        f"output_parquet={tmp_path / 'leaf.parquet'!s}",
+        f"split={tuning_split}",
+        *quiet,
+    ]
+    from conftest import _VENV_BIN
+
+    env = dict(os.environ, PATH=_VENV_BIN + os.pathsep + os.environ.get("PATH", ""))
+    result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=300.0)
+    assert result.returncode != 0
+    assert "not in this run's vocabulary" in result.stderr + result.stdout
+    assert not (tmp_path / "leaf.parquet").exists()

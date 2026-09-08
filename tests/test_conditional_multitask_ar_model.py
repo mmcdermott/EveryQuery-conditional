@@ -3,6 +3,7 @@
 from functools import partial
 from pathlib import Path
 
+import polars as pl
 import pytest
 import torch
 import yaml
@@ -10,12 +11,24 @@ from omegaconf import OmegaConf
 
 from every_query.data.multitask_dataset import MultitaskBoundaryBatch
 from every_query.data.multitask_eval_dataset import MultitaskEvalBatch
+from every_query.data.ontology import (
+    EMBEDDING_MIX_FILE,
+    EVENT_TO_QUERY_NODES_FILE,
+    ONTOLOGY_VOCAB_FILE,
+    build_event_to_query_nodes,
+    build_ontology,
+    derive_ancestor_targets,
+    extended_vocab_size,
+    load_closure_index,
+    load_nodes,
+)
 from every_query.model.conditional_multitask_ar_model import (
     TYPE_CONDITION_ANSWER,
     TYPE_CONDITION_CODE,
     TYPE_WINDOW,
     ConditionalMultitaskARModel,
 )
+from every_query.model.ontology_embedding import OntologyEmbedding
 
 
 @pytest.fixture(autouse=True)
@@ -370,9 +383,6 @@ def test_validation_errors_without_dataclass_reconstruction():
     with pytest.raises(ValueError, match="max_position_embeddings"):
         short_positions(make_batch())
 
-    with pytest.raises(NotImplementedError, match="ontology"):
-        tiny_model(ontology_dir="unused")
-
 
 def test_rope_time_pair_and_future_starts_do_not_advance_time():
     model = tiny_model(use_rope_time=True)
@@ -445,7 +455,13 @@ def test_configs_and_position_budget():
         assert dm_cfg["config"]["task_labels_dir"] == "???"
         assert dm_cfg["eval_tasks_dir"] is None
         assert dm_cfg["max_windows"] == "${lightning_module.model.max_windows}"
-        assert "ontology_dir" not in dm_cfg["dataset_kwargs"]
+        # The ontology is set once, on the model; the datamodule's copy (for the evaluation adapter)
+        # interpolates from it, as the scalar configs' does.
+        assert dm_cfg["dataset_kwargs"]["ontology_dir"] == "${lightning_module.model.ontology_dir}"
+        assert cfg["lightning_module"]["model"]["ontology_dir"] is None
+        # train.py fills this in from the cohort's codes.parquet; shipping it as an explicit null is
+        # what makes the key present for that assignment and inert for a run without an ontology.
+        assert cfg["lightning_module"]["model"]["cohort_vocab_fingerprint"] is None
         assert dm_cfg["dataset_kwargs"]["expected_vocab_size"].endswith("config_overrides.vocab_size}")
         assert cfg["lightning_module"]["model"]["max_windows"] == 5
     model_cfg = OmegaConf.create(
@@ -564,3 +580,254 @@ def test_training_forward_is_the_window_hidden_states_projection():
     torch.testing.assert_close(out.logits, logits)
     assert torch.equal(out.valid_mask, valid.expand(2, 3, -1))
     torch.testing.assert_close(loss, expected_loss)
+
+
+# ---------------------------------------------------------------------------
+# Ontology: derived-at-load ancestor targets, the mixed readout, both widths
+# ---------------------------------------------------------------------------
+
+# Leaf names for indices 1..VOCAB-1: a dual-role name (``A//B`` is a leaf and the prefix of two
+# leaves, so it gains ``A//B//ANY``), a leaf with no ancestor at all (``E``), a multi-parent leaf
+# (``F//G`` under ``F`` by prefix and under ``P//Q`` by ``parent_codes``), and a big ``Z`` family.
+_LEAF_NAMES = ["A//B//C", "A//B//D", "A//B", "E", "F//G"] + [f"Z//{i}" for i in range(6, VOCAB)]
+_DECLARED_PARENTS = {"F//G": ["P//Q"]}
+
+
+def write_tiny_ontology(root: Path, names: list[str] = _LEAF_NAMES) -> tuple[Path, int]:
+    """Write the three ``EQ_build_ontology`` artifacts for ``names`` (leaf ids 1..VOCAB-1).
+
+    ``names`` defaults to ``_LEAF_NAMES``; passing it with two entries swapped writes a *same-width*
+    ontology of the same codes at a permuted numbering.  Overwrites in place, as re-running
+    ``EQ_build_ontology`` into the same directory does.
+    """
+    frame = pl.DataFrame(
+        {
+            "code": names,
+            "code/vocab_index": list(range(1, VOCAB)),
+            "parent_codes": [_DECLARED_PARENTS.get(c) for c in names],
+        }
+    )
+    nodes, mix = build_ontology(frame)
+    root.mkdir(parents=True, exist_ok=True)
+    nodes.write_parquet(root / ONTOLOGY_VOCAB_FILE)
+    mix.write_parquet(root / EMBEDDING_MIX_FILE)
+    build_event_to_query_nodes(nodes, mix).write_parquet(root / EVENT_TO_QUERY_NODES_FILE)
+    return root, extended_vocab_size(root)
+
+
+def ontology_model(tmp_path: Path, **kwargs) -> tuple[ConditionalMultitaskARModel, Path, int]:
+    onto, v_ext = write_tiny_ontology(tmp_path / "ontology")
+    overrides = dict(kwargs.pop("config_overrides", {}), vocab_size=v_ext)
+    return tiny_model(ontology_dir=str(onto), config_overrides=overrides, **kwargs), onto, v_ext
+
+
+def _node_ids(onto: Path) -> dict[str, int]:
+    nodes = load_nodes(onto)
+    return dict(zip(nodes["node_name"].to_list(), nodes["token_id"].to_list(), strict=True))
+
+
+def test_ontology_dir_installs_the_mixed_table_and_exposes_both_widths(tmp_path):
+    """``ontology_dir`` is a supported option: the input table is the ancestor-mixed one, the model reports
+    the cohort width beside the table width, and the closure rides in non-persistent buffers."""
+    model, onto, v_ext = ontology_model(tmp_path)
+    assert v_ext > VOCAB, "the fixture ontology must mint ancestor nodes"
+    assert isinstance(model.HF_model.get_input_embeddings(), OntologyEmbedding)
+    assert model.vocab_size == v_ext and model.base_vocab_size == VOCAB and model.has_ontology
+    assert model.code_bias.shape == (v_ext,)
+    assert model.hparams["ontology_dir"] == str(onto)
+    assert not any(k.startswith("closure_") for k in model.state_dict())
+    ids = _node_ids(onto)
+    assert {"A", "A//B//ANY", "F", "P", "P//Q", "Z"} <= {n for n, i in ids.items() if i >= VOCAB}
+    closure = model._closure()
+    pairs = set(zip(closure.leaf_ids.tolist(), closure.ancestor_ids.tolist(), strict=True))
+    assert (ids["A//B//C"], ids["A"]) in pairs and (ids["A//B"], ids["A//B//ANY"]) in pairs
+    assert (ids["F//G"], ids["P//Q"]) in pairs and (ids["F//G"], ids["F"]) in pairs
+    assert not any(leaf == ids["E"] for leaf, _ in pairs)
+    assert all(leaf < VOCAB <= ancestor for leaf, ancestor in pairs)
+
+    # No ontology: one width, no wrapper, no buffers.
+    plain = tiny_model()
+    assert plain.base_vocab_size == plain.vocab_size == VOCAB and not plain.has_ontology
+    assert not isinstance(plain.HF_model.get_input_embeddings(), OntologyEmbedding)
+
+    # The table must be sized to V_ext (train.py's job); the cohort width is refused loudly.
+    with pytest.raises(ValueError, match="V_ext"):
+        tiny_model(ontology_dir=str(onto))
+
+
+def test_forward_with_leaf_targets_equals_forward_with_extended_targets(tmp_path):
+    """Leaf-only ``(B, K, V)`` targets are widened in ``forward`` to exactly what a pre-derived ``(B, K,
+    V_ext)`` batch gives: same loss, same logits, same mask."""
+    model, onto, v_ext = ontology_model(tmp_path)
+    ids = _node_ids(onto)
+    leaf = make_batch()
+    assert leaf.targets.shape[-1] == VOCAB
+    wide_targets = derive_ancestor_targets(leaf.targets, load_closure_index(onto, VOCAB))
+    assert wide_targets.shape == (2, 3, v_ext)
+    # ``make_batch`` sets leaf 2 (``A//B//D``) true everywhere, so both of its ancestors derive true.
+    assert wide_targets[..., ids["A"]].all() and wide_targets[..., ids["A//B//ANY"]].all()
+    assert not wide_targets[..., ids["Z"]].any() and not wide_targets[..., ids["P//Q"]].any()
+
+    wide = make_batch()
+    wide.targets = wide_targets
+    loss_leaf, out_leaf = model(leaf)
+    loss_wide, out_wide = model(wide)
+    torch.testing.assert_close(loss_leaf, loss_wide)
+    torch.testing.assert_close(out_leaf.logits, out_wide.logits)
+    assert torch.equal(out_leaf.valid_mask, out_wide.valid_mask)
+    assert out_leaf.logits.shape == out_leaf.valid_mask.shape == (2, 3, v_ext)
+    assert not out_leaf.valid_mask[:, :, 0].any()
+    # The derivation changes the loss: an ancestor column that is true costs more than one left false.
+    unrelated = make_batch()
+    unrelated.targets = torch.cat([leaf.targets, torch.zeros(2, 3, v_ext - VOCAB, dtype=torch.bool)], -1)
+    assert not torch.allclose(model(unrelated)[0], loss_leaf)
+
+    # Any other width is neither a leaf batch nor a full batch.
+    for width in (VOCAB - 1, VOCAB + 1, v_ext + 1):
+        bad = make_batch()
+        bad.targets = torch.zeros(2, 3, width, dtype=torch.bool)
+        with pytest.raises(ValueError, match="vocabulary width"):
+            model(bad)
+
+
+def test_tied_readout_uses_the_mixed_table_under_an_ontology(tmp_path):
+    """Both projections read the **effective** table ``A @ W`` - the rows the input side sees - not the
+    raw parameter, and the gradient reaches raw ancestor rows through the mix."""
+    model, _, v_ext = ontology_model(tmp_path)
+    embedding = model.HF_model.get_input_embeddings()
+    raw = embedding.weight
+    assert raw.shape[0] == v_ext
+    mixed = torch.sparse.mm(embedding.mix, raw.detach())
+    assert not torch.allclose(mixed, raw), "the mix must actually move the ancestor rows"
+    batch = make_batch()
+    hidden = model.window_hidden_states(batch)
+    loss, out = model(batch)
+    expected = hidden.float() @ mixed.float().T + model.code_bias.float()
+    torch.testing.assert_close(out.logits, expected)
+    assert not torch.allclose(out.logits, hidden.float() @ raw.detach().float().T + model.code_bias.float())
+
+    loss.backward()
+    assert raw.grad is not None and raw.grad.isfinite().all()
+    assert raw.grad[VOCAB:].abs().sum() > 0, "ancestor rows must receive gradient through the mix"
+    assert raw.grad[1:VOCAB].abs().sum() > 0
+
+
+@pytest.mark.parametrize("autocast", [False, True], ids=["fp32", "bf16-autocast"])
+def test_score_final_query_on_an_ancestor_code_matches_the_dense_forward(tmp_path, autocast):
+    model, onto, v_ext = ontology_model(tmp_path)
+    ids = _node_ids(onto)
+    q_mask = [[True, True, True], [True, False, False], [True, True, False], [True, True, True]]
+    code = [[2, 3, 4, 5], [7, 8, 0, 0], [9, 10, 11, 0], [12, 13, 14, 15]]
+    batch = make_batch(code=code, q_mask=q_mask)
+    scored = torch.tensor([ids["A"], ids["Z"], 5, v_ext - 1], dtype=torch.long)
+    assert (scored[[0, 1, 3]] >= VOCAB).all()
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16, enabled=autocast):
+        _, out = model(batch)
+        target_only = model.score_final_query(batch, scored)
+    torch.testing.assert_close(
+        target_only, _gather_final(out.logits, batch.q_mask, scored), atol=1e-5, rtol=1e-5
+    )
+    assert len({round(v, 4) for v in target_only.tolist()}) > 1
+    with pytest.raises(ValueError, match=rf"lie in \[0, {v_ext}\)"):
+        model.score_final_query(batch, torch.tensor([2, v_ext, 3, 4]))
+
+
+def test_score_final_query_shares_one_mixed_table_per_pass(tmp_path):
+    """``score_final_query`` never goes through ``forward``, so the per-forward cache the wrapper's pre-hook
+    clears would otherwise go stale: the mixed table must be recomputed for every pass and read the
+    current weights."""
+    model, onto, _ = ontology_model(tmp_path)
+    ids = _node_ids(onto)
+    batch = make_batch()
+    scored = torch.tensor([ids["A"], 2], dtype=torch.long)
+    before = model.score_final_query(batch, scored)
+    # ``A``'s raw row is a component of its own mixed row and of every ``A//...`` leaf's.
+    with torch.no_grad():
+        model.HF_model.get_input_embeddings().weight[ids["A"]] += 1.0
+    after = model.score_final_query(batch, scored)
+    assert not torch.allclose(before, after), "a stale cached table would not see the weight change"
+    # And the dense forward, which goes through the pre-hook, agrees with the direct path afterwards.
+    _, out = model(batch)
+    torch.testing.assert_close(after, _gather_final(out.logits, batch.q_mask, scored), atol=1e-5, rtol=1e-5)
+
+
+def test_checkpoint_round_trip_with_an_ontology(tmp_path):
+    from every_query.model.conditional_multitask_lightning import ConditionalMultitaskLightningModule
+
+    model, onto, v_ext = ontology_model(tmp_path)
+    module = ConditionalMultitaskLightningModule(model=model, optimizer=partial(torch.optim.AdamW, lr=1e-4))
+    ckpt = tmp_path / "onto.ckpt"
+    _save_checkpoint(module, ckpt)
+    loaded = ConditionalMultitaskLightningModule.load_from_checkpoint(str(ckpt))
+    assert loaded.model.ontology_dir == str(onto)
+    assert loaded.model.vocab_size == v_ext and loaded.model.base_vocab_size == VOCAB
+    assert isinstance(loaded.model.HF_model.get_input_embeddings(), OntologyEmbedding)
+    loaded.model.eval()
+    batch = make_batch()
+    loss, out = model(batch)
+    loss_loaded, out_loaded = loaded.model(batch)
+    torch.testing.assert_close(loss, loss_loaded)
+    torch.testing.assert_close(out.logits, out_loaded.logits)
+    ids = _node_ids(onto)
+    scored = torch.tensor([ids["A"], ids["Z"]], dtype=torch.long)
+    torch.testing.assert_close(
+        model.score_final_query(batch, scored), loaded.model.score_final_query(batch, scored)
+    )
+
+
+def test_cohort_vocab_fingerprint_guards_the_ontology_and_round_trips(tmp_path):
+    """``cohort_vocab_fingerprint`` (``train.py`` fills it from the cohort's ``codes.parquet``) turns the
+    model's own closure load into an identity check: the tiny ontology passes against its cohort's fingerprint
+    and is refused against a same-width cohort with two codes swapped, which every width check accepts.
+
+    It is a hyperparameter, so a reloaded checkpoint re-runs the check against whatever now sits
+    at ``ontology_dir``.
+    """
+    from every_query.model.conditional_multitask_lightning import ConditionalMultitaskLightningModule
+    from every_query.utils.digest import vocab_fingerprint
+
+    cohort = dict(zip(_LEAF_NAMES, range(1, VOCAB), strict=True))
+    fingerprint = vocab_fingerprint(cohort)
+    model, onto, v_ext = ontology_model(tmp_path, cohort_vocab_fingerprint=fingerprint)
+    assert model.cohort_vocab_fingerprint == model.hparams["cohort_vocab_fingerprint"] == fingerprint
+    assert model.vocab_size == v_ext and model.base_vocab_size == VOCAB
+    plain = tiny_model()
+    assert plain.cohort_vocab_fingerprint is None and plain.hparams["cohort_vocab_fingerprint"] is None
+    # Without an ontology the fingerprint is only recorded (EQ_predict_multitask checks the cohort against
+    # it).
+    recorded = tiny_model(cohort_vocab_fingerprint="not-checked-here")
+    assert (
+        recorded.cohort_vocab_fingerprint
+        == recorded.hparams["cohort_vocab_fingerprint"]
+        == "not-checked-here"
+    )
+
+    # The cohort with two codes swapped has the same V; only the fingerprint tells the model it is not
+    # this one.
+    swapped_names = list(_LEAF_NAMES)
+    a, b = swapped_names.index("A//B//C"), swapped_names.index("E")
+    swapped_names[a], swapped_names[b] = swapped_names[b], swapped_names[a]
+    swapped = dict(zip(swapped_names, range(1, VOCAB), strict=True))
+    assert vocab_fingerprint(swapped) != fingerprint
+    with pytest.raises(ValueError, match=r"different codes\.parquet than this cohort.*observed nodes digest"):
+        tiny_model(
+            ontology_dir=str(onto),
+            config_overrides={"vocab_size": v_ext},
+            cohort_vocab_fingerprint=vocab_fingerprint(swapped),
+        )
+
+    module = ConditionalMultitaskLightningModule(model=model, optimizer=partial(torch.optim.AdamW, lr=1e-4))
+    ckpt = tmp_path / "fingerprinted.ckpt"
+    _save_checkpoint(module, ckpt)
+    loaded = ConditionalMultitaskLightningModule.load_from_checkpoint(str(ckpt))
+    assert loaded.model.cohort_vocab_fingerprint == fingerprint
+    batch = make_batch()
+    torch.testing.assert_close(model(batch)[1].logits, loaded.model.eval()(batch)[1].logits)
+
+    # Rebuild the ontology in place from the swapped numbering (same V_ext, so the table still fits): the
+    # checkpoint now refuses to load, where a width-only check would have paired every leaf with the wrong
+    # rows.
+    _, v_ext_swapped = write_tiny_ontology(onto, swapped_names)
+    assert v_ext_swapped == v_ext
+    with pytest.raises(ValueError, match=r"different codes\.parquet than this cohort"):
+        ConditionalMultitaskLightningModule.load_from_checkpoint(str(ckpt))

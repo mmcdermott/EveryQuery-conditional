@@ -10,7 +10,8 @@ test / predict side reads a ``QuerySeqSchema`` evaluation grid (``eval_tasks_dir
 4. nothing grid-related is touched by construction or the fit loaders, and a missing grid root is
    refused with an error naming ``eval_tasks_dir``;
 5. ``predict_split`` selects the grid split and ``train`` is rejected;
-6. ``strip_delta_tokens`` / ``expected_vocab_size`` / ``max_windows`` reach the evaluation adapter;
+6. ``strip_delta_tokens`` / ``expected_vocab_size`` / ``max_windows`` reach the evaluation adapter, and
+   ``ontology_dir`` reaches *only* it (the training datasets stay at the leaf manifest's width);
 7. the demo train config's ``datamodule`` node instantiates this class through Hydra.
 
 The training labels are generated in-process by the multitask sampler against the session fixture
@@ -42,7 +43,7 @@ from every_query.data.conditional_multitask_datamodule import (
 from every_query.data.multitask_dataset import MultitaskBoundaryBatch, MultitaskBoundaryPytorchDataset
 from every_query.data.multitask_eval_dataset import MultitaskEvalBatch, QuerySeqMultitaskEvalDataset
 from every_query.generate_tasks import sample_multitask_sequences as sms
-from tests.multitask.conftest import base_cfg
+from tests.multitask.conftest import base_cfg, write_cohort_ontology
 
 TRAIN_CONFIGS = str(files("every_query") / "train" / "configs")
 
@@ -303,11 +304,104 @@ def test_hyperparameters_record_the_grid_settings(data_config, grid_dir):
     assert hp["max_windows"] == 5
     assert hp["predict_split"] == tuning_split
     assert hp["dataset_kwargs"] == {"expected_vocab_size": data_config.vocab_size}
+    assert hp["ontology_dir"] is None
     # The parent's entries survive the merge.
     assert hp["batch_size"] == 2
     assert hp["config"]["max_seq_len"] == 64
     assert dict(dm.hparams_initial) == dict(hp)
     assert _datamodule(data_config).hparams["eval_tasks_dir"] is None
+
+
+# --- 6b: an ontology reaches the evaluation adapter only; the training side stays leaf-wide -----------
+
+
+@pytest.fixture(scope="module")
+def cohort_ontology_dir(tensorized_cohort_dir: Path, tmp_path_factory) -> Path:
+    """An ontology built from the fixture cohort's own ``codes.parquet`` (so leaf ids match its manifest)."""
+    return write_cohort_ontology(tensorized_cohort_dir, tmp_path_factory.mktemp("cohort_ontology"))
+
+
+def test_training_dataset_width_is_the_leaf_manifest_under_an_ontology(
+    data_config, grid_dir, cohort_ontology_dir, multitask_labels_dir
+):
+    """``dataset_kwargs["ontology_dir"]`` is lifted out before the training datasets are built - their
+    manifest is leaf-only and ``expected_vocab_size`` stays the cohort's V - and reaches the evaluation
+    adapter, whose width ceiling becomes the ontology's V_ext and whose code map resolves ancestor names."""
+    from every_query.data.ontology import extend_code_map, extended_vocab_size, load_nodes
+
+    v = data_config.vocab_size
+    v_ext = extended_vocab_size(cohort_ontology_dir)
+    assert v_ext > v, "the fixture cohort's hierarchical names must mint ancestor nodes"
+    dm = _datamodule(
+        data_config,
+        eval_tasks_dir=grid_dir,
+        max_windows=5,
+        dataset_kwargs={"expected_vocab_size": v, "ontology_dir": str(cohort_ontology_dir)},
+    )
+    assert dm.ontology_dir == cohort_ontology_dir
+    assert dm.dataset_kwargs == {"expected_vocab_size": v}, "the training datasets never see the ontology"
+    assert dm.hparams["ontology_dir"] == str(cohort_ontology_dir)
+    assert dm.hparams["dataset_kwargs"] == {"expected_vocab_size": v}
+
+    # Training side: the leaf manifest is accepted against the cohort width...
+    train = dm.train_dataset
+    assert isinstance(train, MultitaskBoundaryPytorchDataset) and train.vocab_size == v
+    batch = next(iter(dm.train_dataloader()))
+    assert isinstance(batch, MultitaskBoundaryBatch) and batch.targets.shape[-1] == v
+    # ...and would be rejected against V_ext, which is why train.py pins the cohort width explicitly.
+    widened = _datamodule(
+        data_config, dataset_kwargs={"expected_vocab_size": v_ext, "ontology_dir": str(cohort_ontology_dir)}
+    )
+    with pytest.raises(ValueError, match="vocab_size mismatch"):
+        _ = widened.train_dataset
+
+    # Evaluation side: V_ext is the ceiling and every ancestor name is addressable.
+    assert dm.eval_vocab_size == v_ext
+    ds = dm.test_dataset
+    assert isinstance(ds, QuerySeqMultitaskEvalDataset)
+    assert ds.expected_vocab_size == v_ext and ds.ontology_dir == str(cohort_ontology_dir)
+    nodes = load_nodes(cohort_ontology_dir)
+    ancestors = dict(zip(nodes["node_name"], nodes["token_id"], strict=True))
+    ancestors = {n: int(i) for n, i in ancestors.items() if int(i) >= v}
+    assert ancestors and all(ds.code_to_index[n] == i for n, i in ancestors.items())
+    assert ds.code_to_index == extend_code_map(
+        _datamodule(data_config, eval_tasks_dir=grid_dir).test_dataset.code_to_index, cohort_ontology_dir
+    )
+    # Without an ontology the ceiling is the cohort width and no ancestor name resolves.
+    plain = _datamodule(data_config, eval_tasks_dir=grid_dir).test_dataset
+    assert plain.expected_vocab_size == v and not (set(ancestors) & set(plain.code_to_index))
+
+
+def test_evaluation_adapter_refuses_a_same_width_permuted_ontology(
+    data_config, grid_dir, tensorized_cohort_dir, cohort_ontology_dir, tmp_path
+):
+    """Regression for the PR #32 review.  The adapter grafts the ontology's ancestor indices onto the cohort's
+    code map, so the ontology's leaves must *be* this cohort's ``codes.parquet`` rows.  One built.
+
+    from the same codes with two indices swapped has the cohort's ``V`` and the genuine ontology's ``V_ext``
+    - every width check passes, and the datamodule's width view is unchanged - and is refused when the
+    dataset is built, naming the renumbered codes.
+    """
+    from every_query.data.ontology import extended_vocab_size
+
+    permuted = write_cohort_ontology(tensorized_cohort_dir, tmp_path / "permuted", swap=("HR", "TEMP"))
+    v, v_ext = data_config.vocab_size, extended_vocab_size(cohort_ontology_dir)
+    assert extended_vocab_size(permuted) == v_ext
+    dm = _datamodule(
+        data_config,
+        eval_tasks_dir=grid_dir,
+        max_windows=5,
+        dataset_kwargs={"expected_vocab_size": v, "ontology_dir": str(permuted)},
+    )
+    assert dm.eval_vocab_size == v_ext, "widths alone cannot see the permutation"
+    by_name = (
+        r"different codes\.parquet.*2 code\(s\) sit at a different index "
+        r"\('HR': ontology \d+ vs cohort \d+, 'TEMP'"
+    )
+    with pytest.raises(ValueError, match=by_name):
+        _ = dm.test_dataset
+    # The training side never touches the ontology and is unaffected either way.
+    assert dm.train_dataset.vocab_size == v
 
 
 # --- 7: Hydra ------------------------------------------------------------------------------------

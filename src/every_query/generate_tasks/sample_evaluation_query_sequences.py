@@ -136,6 +136,7 @@ from every_query.generate_tasks.sample_tasks import (
     default_artifacts_dir,
     read_query_codes,
 )
+from every_query.utils.digest import frame_digest
 from every_query.utils.seeds import derive_seed
 
 logger = logging.getLogger(__name__)
@@ -1110,12 +1111,11 @@ def assert_subjects_in_split(data_dir: Path, split: str, shards: list[str], subj
 def _frame_digest(df: pl.DataFrame) -> str:
     """Serialization-independent digest of a frame's logical rows: ``"{height}:{hash16}"``.
 
-    The same construction :func:`~every_query.generate_tasks.sample_tasks._index_fingerprint` uses
-    for Stage 4's index partitions — polars' vectorized ``hash_rows`` summed over rows, combined
-    with the row count — so a rewritten-but-identical parquet digests the same.
+    :func:`every_query.utils.digest.frame_digest` — the same construction
+    :func:`~every_query.generate_tasks.sample_tasks._index_fingerprint` uses for Stage 4's index
+    partitions, and the one a checkpoint's closure check digests with.
     """
-    total = int(df.hash_rows(seed=0).sum()) if df.height else 0
-    return f"{df.height}:{total & 0xFFFFFFFFFFFFFFFF:016x}"
+    return frame_digest(df)
 
 
 def _ontology_fingerprint(ontology_dir: str | Path | None, query_codes: Sequence[str]) -> str | None:
@@ -1125,23 +1125,41 @@ def _ontology_fingerprint(ontology_dir: str | Path | None, query_codes: Sequence
     land on the same file and an existence-only skip would silently keep the first one's labels.
     The two things that would make those labels wrong are covered here:
 
-    - the **closure**, which decides whether an ancestor query labels ``True`` at all, and
+    - the **closure**, which decides whether an ancestor query labels ``True`` at all
+      (:func:`~every_query.data.ontology.closure_fingerprint`, the same digest
+      ``EQ_predict_multitask`` compares a checkpoint's ontology against), and
     - the **query universe**, which is where the ontology's ancestor nodes (and the leaf
       vocabulary) land after
       :func:`~every_query.generate_tasks.sample_query_sequences.build_query_universe`; the
       universe is digested with its slot index, since order steers the draw.
 
+    The two halves are joined by ``"|"``; :func:`split_ontology_fingerprint` takes them apart.
     ``None`` when no ontology is configured; it is one component of :func:`_run_fingerprint`.
     """
     if not ontology_dir:
         return None
-    from every_query.data.ontology import load_event_to_query_nodes
+    from every_query.data.ontology import closure_fingerprint
 
     universe = pl.DataFrame(
         {"slot": list(range(len(query_codes))), "code": list(query_codes)},
         schema={"slot": pl.Int64, "code": pl.String},
     )
-    return f"{_frame_digest(load_event_to_query_nodes(ontology_dir))}|{_frame_digest(universe)}"
+    return f"{closure_fingerprint(ontology_dir)}|{_frame_digest(universe)}"
+
+
+def split_ontology_fingerprint(fingerprint: str | None) -> tuple[str | None, str | None]:
+    """``(closure, universe)`` halves of a recorded ``ontology_fingerprint``; ``(None, None)`` for ``None``.
+
+    Examples:
+        >>> split_ontology_fingerprint("3:00ab|5:00cd")
+        ('3:00ab', '5:00cd')
+        >>> split_ontology_fingerprint(None)
+        (None, None)
+    """
+    if fingerprint is None:
+        return None, None
+    closure, _, universe = str(fingerprint).partition("|")
+    return closure, universe or None
 
 
 def _specs_fingerprint(specs: list[SequenceSpec]) -> str:
