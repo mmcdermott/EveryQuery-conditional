@@ -1,0 +1,158 @@
+{
+  "variant": "new_bf16",
+  "grid": "canonical",
+  "split": "held_out",
+  "size": "small",
+  "n_rows": 568440,
+  "n_contexts": 14211,
+  "overall": {
+    "n_tasks": 40,
+    "n_tasks_defined": 40,
+    "macro_auroc": 0.8454847045035692,
+    "macro_auroc_ci95": [
+      0.8197578608215906,
+      0.8706774749315727
+    ],
+    "median_auroc": 0.856582476456428,
+    "macro_auprc": 0.16232174928354062,
+    "mean_base_rate": 0.02735732882977975
+  },
+  "by_start_form": {
+    "prediction_time": {
+      "n_tasks": 10,
+      "n_tasks_defined": 10,
+      "macro_auroc": 0.8542197015576163,
+      "macro_auroc_ci95": [
+        0.7908700615687099,
+        0.9130702118029209
+      ],
+      "median_auroc": 0.8742051338500606,
+      "macro_auprc": 0.37441541825469016,
+      "mean_base_rate": 0.058862852719724156
+    },
+    "event": {
+      "n_tasks": 20,
+      "n_tasks_defined": 20,
+      "macro_auroc": 0.8539003041108819,
+      "macro_auroc_ci95": [
+        0.8220650221315156,
+        0.8840393369531493
+      ],
+      "median_auroc": 0.8631608537429662,
+      "macro_auprc": 0.07625782895658173,
+      "mean_base_rate": 0.009742453029343465
+    },
+    "delayed": {
+      "n_tasks": 10,
+      "n_tasks_defined": 10,
+      "macro_auroc": 0.8199185082348974,
+      "macro_auroc_ci95": [
+        0.7732195979475794,
+        0.8664503204629702
+      ],
+      "median_auroc": 0.8262907091881341,
+      "macro_auprc": 0.12235592096630885,
+      "mean_base_rate": 0.031081556540707905
+    }
+  },
+  "by_end_form": {
+    "event": {
+      "n_tasks": 17,
+      "n_tasks_defined": 17,
+      "macro_auroc": 0.8408728616045432,
+      "macro_auroc_ci95": [
+        0.8017151485386278,
+        0.877930261767122
+      ],
+      "median_auroc": 0.8309204218600192,
+      "macro_auprc": 0.15769084911031275,
+      "mean_base_rate": 0.02693025700886223
+    },
+    "duration": {
+      "n_tasks": 23,
+      "n_tasks_defined": 23,
+      "macro_auroc": 0.8488934579506756,
+      "macro_auroc_ci95": [
+        0.8152023877906691,
+        0.8813208222250295
+      ],
+      "median_auroc": 0.8586592106455413,
+      "macro_auprc": 0.1657445885420134,
+      "mean_base_rate": 0.027672990610457904
+    }
+  },
+  "by_window_type": {
+    "delayed_start/duration_end": {
+      "n_tasks": 3,
+      "n_tasks_defined": 3,
+      "macro_auroc": 0.7945291468110702,
+      "macro_auroc_ci95": [
+        0.6646234420513619,
+        0.9177632338016494
+      ],
+      "median_auroc": 0.8012007645801995,
+      "macro_auprc": 0.09880822501192943,
+      "mean_base_rate": 0.01735744610982103
+    },
+    "delayed_start/event_end": {
+      "n_tasks": 7,
+      "n_tasks_defined": 7,
+      "macro_auroc": 0.8307996631308232,
+      "macro_auroc_ci95": [
+        0.7898267134284914,
+        0.8717726128331549
+      ],
+      "median_auroc": 0.8296060763847591,
+      "macro_auprc": 0.13244779066104292,
+      "mean_base_rate": 0.036963318153945136
+    },
+    "event_start/duration_end": {
+      "n_tasks": 14,
+      "n_tasks_defined": 14,
+      "macro_auroc": 0.8568135430303008,
+      "macro_auroc_ci95": [
+        0.8211950132688661,
+        0.8875073155649172
+      ],
+      "median_auroc": 0.8615419893986043,
+      "macro_auprc": 0.06923942377195555,
+      "mean_base_rate": 0.010208389879067522
+    },
+    "event_start/event_end": {
+      "n_tasks": 6,
+      "n_tasks_defined": 6,
+      "macro_auroc": 0.8471027466322373,
+      "macro_auroc_ci95": [
+        0.782367975674756,
+        0.9062499666555078
+      ],
+      "median_auroc": 0.8826033840707418,
+      "macro_auprc": 0.09263410772070947,
+      "mean_base_rate": 0.008655267046654
+    },
+    "prediction_time_start/duration_end": {
+      "n_tasks": 6,
+      "n_tasks_defined": 6,
+      "macro_auroc": 0.857595415001352,
+      "macro_auroc_ci95": [
+        0.7753835764419179,
+        0.9237163476329974
+      ],
+      "median_auroc": 0.8742051338500606,
+      "macro_auprc": 0.424391488103857,
+      "mean_base_rate": 0.07358149790068726
+    },
+    "prediction_time_start/event_end": {
+      "n_tasks": 4,
+      "n_tasks_defined": 4,
+      "macro_auroc": 0.8491561313920125,
+      "macro_auroc_ci95": [
+        0.74904512413569,
+        0.9492671386483349
+      ],
+      "median_auroc": 0.8774498177957002,
+      "macro_auprc": 0.29945131348093984,
+      "mean_base_rate": 0.0367848849482795
+    }
+  }
+}

@@ -1,0 +1,139 @@
+{
+  "runs": {
+    "small_old_a": {
+      "run_dir": "/home/gkondas/eq-new-exps/dev-lightning-refactor-check-in/runs/small_old_a/2026-09-07/23-57-32",
+      "final_logged": {
+        "tuning/loss": 0.0385,
+        "tuning/loss_trajectory": [
+          0.0418,
+          0.0397,
+          0.0387,
+          0.0385
+        ],
+        "train/loss_epoch": 0.0418
+      },
+      "n_params": 2600149,
+      "macro_auroc": 0.842499761610864,
+      "median_auroc": 0.8484987469044901,
+      "macro_auprc": 0.1551558138962681
+    },
+    "small_old_b": {
+      "run_dir": "/home/gkondas/eq-new-exps/dev-lightning-refactor-check-in/runs/small_old_b/2026-09-08/00-15-25",
+      "final_logged": {
+        "tuning/loss": 0.0385,
+        "tuning/loss_trajectory": [
+          0.0418,
+          0.0397,
+          0.0387,
+          0.0385
+        ],
+        "train/loss_epoch": 0.0418
+      },
+      "n_params": 2600149,
+      "macro_auroc": 0.8424375352826798,
+      "median_auroc": 0.8485337736698881,
+      "macro_auprc": 0.15524078278436024
+    },
+    "small_new_a": {
+      "run_dir": "/home/gkondas/eq-new-exps/dev-lightning-refactor-check-in/runs/small_new_a/2026-09-08/00-33-54",
+      "final_logged": {
+        "tuning/loss": 0.0385,
+        "tuning/loss_trajectory": [
+          0.0418,
+          0.0397,
+          0.0387,
+          0.0385
+        ],
+        "train/loss_epoch": 0.0418
+      },
+      "n_params": 2600149,
+      "macro_auroc": 0.8425327875133526,
+      "median_auroc": 0.8485244707209745,
+      "macro_auprc": 0.15518536144872042
+    },
+    "small_stored": {
+      "run_dir": "/home/gkondas/eq-new-exps/multitask-canonical-eval/runs/small/2026-09-05/04-09-29",
+      "final_logged": {
+        "tuning/loss": 0.0385,
+        "tuning/loss_trajectory": [
+          0.0418,
+          0.0397,
+          0.0387,
+          0.0385
+        ],
+        "train/loss_epoch": 0.0418
+      },
+      "n_params": 2600149,
+      "macro_auroc": 0.842463621731443,
+      "median_auroc": 0.8485622955752388,
+      "macro_auprc": 0.15511675253433044
+    }
+  },
+  "pairs": {
+    "small_old_a - small_old_b": {
+      "why": "old code vs old code, same seed (run-to-run noise floor)",
+      "delta_macro_auroc": 6.22263281843033e-05,
+      "ci95": [
+        -1.0952478042761739e-05,
+        0.0001530029503020556
+      ],
+      "max_abs_dauroc_task": 0.0010600695824742878,
+      "mean_abs_dauroc_task": 0.0001499873409959579,
+      "tasks_a_higher": 20,
+      "tasks_b_higher": 20,
+      "n_tasks": 40
+    },
+    "small_new_a - small_old_a": {
+      "why": "dev code vs old code, same seed",
+      "delta_macro_auroc": 3.3025902488506564e-05,
+      "ci95": [
+        -7.257629673678662e-05,
+        0.00015980816232886712
+      ],
+      "max_abs_dauroc_task": 0.0018736321697918612,
+      "mean_abs_dauroc_task": 0.0001803967003972201,
+      "tasks_a_higher": 24,
+      "tasks_b_higher": 14,
+      "n_tasks": 40
+    },
+    "small_new_a - small_old_b": {
+      "why": "dev code vs old code (second run), same seed",
+      "delta_macro_auroc": 9.525223067280986e-05,
+      "ci95": [
+        -2.440018471256529e-05,
+        0.0002637193337477265
+      ],
+      "max_abs_dauroc_task": 0.002859650780155265,
+      "mean_abs_dauroc_task": 0.00019403893207359246,
+      "tasks_a_higher": 24,
+      "tasks_b_higher": 16,
+      "n_tasks": 40
+    },
+    "small_new_a - small_stored": {
+      "why": "dev code vs the stored 2026-09-05 small run",
+      "delta_macro_auroc": 6.91657819096525e-05,
+      "ci95": [
+        -9.106324977207453e-05,
+        0.0002896164180931937
+      ],
+      "max_abs_dauroc_task": 0.0035878481570701393,
+      "mean_abs_dauroc_task": 0.0002494687305936216,
+      "tasks_a_higher": 25,
+      "tasks_b_higher": 15,
+      "n_tasks": 40
+    },
+    "small_old_a - small_stored": {
+      "why": "old code today vs the stored 2026-09-05 small run",
+      "delta_macro_auroc": 3.613987942114594e-05,
+      "ci95": [
+        -5.7088378749603206e-05,
+        0.00015095010466483416
+      ],
+      "max_abs_dauroc_task": 0.001714215987278278,
+      "mean_abs_dauroc_task": 0.00017389617484131205,
+      "tasks_a_higher": 19,
+      "tasks_b_higher": 21,
+      "n_tasks": 40
+    }
+  }
+}

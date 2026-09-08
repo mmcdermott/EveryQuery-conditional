@@ -30,3 +30,16 @@ EXP=../../experiments
 
 The three summary JSONs are produced by `eval_macro_position.py`, `eval_clinical.py`, and
 `eval_occurs_uncensored.py` respectively (see `../docs/CONDITIONAL_QUERIES.md`).
+
+## `dev-lightning-refactor-check-in/` — does the #30 refactor change the multitask evaluation numbers?
+
+Re-scores the three checkpoints of the 2026-09-05 MIMIC-IV multitask canonical evaluation (small /
+base / large) on its two tuning grids with the `origin/dev` `EQ_predict_multitask` (PR #31:
+`Trainer.predict` + `ConditionalMultitaskDataModule`) and compares with the stored predictions row for
+row.  At `precision=32-true` the dev code is bit-identical to the old manual loop on all 3.8M rows; the
+new default `bf16-mixed` moves probabilities by ~1e-4 (max 3e-2), no per-task AUROC by more than
+1.4e-3 and no macro AUROC by more than 2e-5.  Also: updated numbers on the never-scored held_out
+grids, a same-seed retrain check of the fit path, and an adversarially verified static review of the
+diff.  `README.md` there is the report; `metrics/` holds the aggregates; `scripts/` the pipeline.
+Predictions, logs and retrained checkpoints live outside the repo under
+`~/eq-new-exps/dev-lightning-refactor-check-in/`.
