@@ -8,11 +8,12 @@ do_resume: false
 seed: 1
 
 datamodule:
-  _target_: every_query.data.datamodule.ResumableDatamodule
-  data_class: every_query.data.multitask_dataset.MultitaskBoundaryPytorchDataset
+  _target_: every_query.data.conditional_multitask_datamodule.ConditionalMultitaskDataModule
   config:
     _target_: meds_torchdata.MEDSTorchDataConfig
     tensorized_cohort_dir: ???
+    # TRAINING multitask labels: the out_dir of EQ_generate_multitask_sequences.  Read by the fit
+    # loop only; it is NOT the evaluation grid (see eval_tasks_dir below).
     task_labels_dir: ???
     static_inclusion_mode: omit
     seq_sampling_strategy: to_end
@@ -21,6 +22,10 @@ datamodule:
   dataset_kwargs:
     strip_delta_tokens: false
     expected_vocab_size: ${lightning_module.model.config_overrides.vocab_size}
+  # Optional QuerySeq evaluation-grid `eval/` root (EQ_generate_evaluation_query_sequences); only
+  # trainer.test / trainer.predict / EQ_predict_multitask need it, fit never reads it.
+  eval_tasks_dir: null
+  max_windows: ${lightning_module.model.max_windows}
   batch_size: 2
   num_workers: 0
   pin_memory: false

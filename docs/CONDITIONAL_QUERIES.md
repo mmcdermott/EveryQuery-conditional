@@ -137,7 +137,13 @@ window opened at the prediction time — while the multitask model consumes acti
 multitask *training* sampler (`EQ_generate_multitask_sequences`) remains a separate, all-vocabulary
 pipeline with packed targets; multitask *evaluation* writes one scalar final-query prediction per
 QuerySeq row and reads no packed labels, manifest or sidecar (the former multitask evaluation
-generator and its sidecar contract were removed in #29).
+generator and its sidecar contract were removed in #29). `EQ_predict_multitask` runs the Lightning
+predict loop (`Trainer.predict`) over a `ConditionalMultitaskDataModule` built from the checkpoint's
+cohort settings with only the label root swapped for the grid (#30); it is single-device and
+single-process by construction (a multi-device trainer or a `torchrun` / `srun --ntasks>1` launch
+is refused), since the output is concatenated in loader order and must stay row-aligned with the
+grid (`device=` picks the accelerator), and the collated final-query labels and scored codes are
+re-checked row by row against the grid before anything is written.
 
 Key source modules:
 
