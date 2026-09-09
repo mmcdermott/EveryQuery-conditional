@@ -41,7 +41,9 @@ datamodule:
     # model's config_overrides.vocab_size (V_ext) and this number differ and both are recorded.
     expected_vocab_size: ${lightning_module.model.config_overrides.vocab_size}
     # Set once on the model; the evaluation adapter resolves ancestor query / start / bound names
-    # through it.  The training datasets never read it (their labels are leaf-only).
+    # through it.  The training datasets also receive it: their target bits are leaf-only either
+    # way, but a labels dir sampled with `ontology_mode` other than "none" carries ancestor-valued
+    # start / bound / conditioning codes that only resolve through the ontology that numbered them.
     ontology_dir: ${lightning_module.model.ontology_dir}
   # Optional QuerySeq evaluation-grid `eval/` root (EQ_generate_evaluation_query_sequences), an
   # artifact independent of task_labels_dir.  Only trainer.test / trainer.predict /
@@ -64,8 +66,9 @@ lightning_module:
     # Optional EQ_build_ontology output.  When set, train.py sizes config_overrides.vocab_size to
     # the ontology's V_ext, the input/readout table is ancestor-mixed, and the leaf-only training
     # targets are widened to V_ext inside the model's forward (ancestor bit = OR of its leaves).
-    # The training sampler needs no ontology; `datamodule.dataset_kwargs.ontology_dir` interpolates
-    # from here for the evaluation adapter.
+    # The training sampler needs no ontology for ancestor *targets*; it takes the same directory
+    # only to let an ancestor bound / start / condition a window (see its `ontology_mode`).
+    # `datamodule.dataset_kwargs.ontology_dir` interpolates from here.
     ontology_dir: null
     # Leave null: train.py fills in the cohort's vocabulary fingerprint (the multitask manifest's
     # `vocab_fingerprint`, recomputed from metadata/codes.parquet).  Persisted in the checkpoint so an

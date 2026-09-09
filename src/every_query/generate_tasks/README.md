@@ -355,7 +355,10 @@ shard:
                                               duration_end_reference: resolved_start,
                                               missing_event_start: empty_window,
                                               missing_event_end: infinity), vocabulary fingerprint,
-                                              ontology_mode: "none"
+                                              and the event-vocabulary provenance
+                                              (ontology_mode, ontology_fingerprint,
+                                              boundary_vocab_size) — "none" / null / V without
+                                              an ontology
 ```
 
 Unpack with `np.unpackbits(packed, axis=-1, count=V, bitorder="little")`; bit 0 (PAD) is always false
@@ -384,18 +387,50 @@ are rejected), exactly one start and one end representation must be active per s
 parquets written before #24 (format 2, no start columns) load as prediction-time starts — a split may
 mix format 2 and 3 shards. No start is ever sampled in the dataset.
 
-**Leaf-only by design.** The sampler labels observable leaf codes only; a non-null `ontology_dir`
-raises before Stage 0 and events are never closure-expanded. That is not a gap for ancestor
-*targets*: under the window rule an ancestor's bit is the OR of its descendant leaves' bits, so the
-multitask model derives them per batch from these leaf sidecars and the ontology closure when it is
-trained with `lightning_module.model.ontology_dir` set (`derive_ancestor_targets` in
-`every_query.data.ontology`) — `.labels.npy`, the manifest and `vocab_size` are byte-identical with
-or without an ontology. The manifest's `vocab_fingerprint` is the same digest the ontology's
-observed nodes are checked against (`ontology_vocab_fingerprint`) and the one `train.py` records on
-the model (`cohort_vocab_fingerprint`), so the labels, the ontology and the checkpoint all name one
-`codes.parquet`. What is not yet supported is an ancestor acting as an *event*
-(ancestor-valued `start_event` / `bound_event`) or as a conditioning code; those plug in through the
-seams `build_target_vocabulary`, `prepare_events_for_labeling` and `resolve_event_boundaries`.
+**Leaf-only targets, ancestors as events.** The *bits* are always the cohort's observable leaf
+codes. That is not a gap for ancestor targets: under the window rule an ancestor's bit is the OR of
+its descendant leaves' bits, so the multitask model derives them per batch from these leaf sidecars
+and the ontology closure when it is trained with `lightning_module.model.ontology_dir` set
+(`derive_ancestor_targets` in `every_query.data.ontology`) — `.labels.npy`, `vocab_size`,
+`packed_width_bytes` and `vocab_fingerprint` are identical with or without an ontology. The
+manifest's `vocab_fingerprint` is the same digest the ontology's observed nodes are checked against
+(`ontology_vocab_fingerprint`) and the one `train.py` records on the model
+(`cohort_vocab_fingerprint`), so the labels, the ontology and the checkpoint all name one
+`codes.parquet`.
+
+What an `ontology_dir` *does* change here is the other half of a window: an ancestor node may act as
+an **event** — an ancestor-valued `start_event` / `bound_event` ("until the next occurrence of any
+`LAB//220645//*`") — and as a **conditioning code**. Set `ontology_dir` and, optionally,
+`ontology_mode`:
+
+| `ontology_mode` | ancestor start / bound events | ancestor conditioning codes |
+|---|---|---|
+| `none` (the default without an `ontology_dir`) | no | no |
+| `boundaries` | yes | no |
+| `conditions` | no | yes |
+| `boundaries+conditions` (the default *with* one) | yes | yes |
+
+Mechanically: `build_target_vocabulary` widens the *event* names to the ontology's nodes at their
+`[V, V_ext)` token ids (checking the ontology against this cohort by identity, not width),
+`prepare_events_for_labeling` explodes the stream through `event_to_query_nodes.parquet` so an
+ancestor has ordinary intervals, and `resolve_event_boundaries` then needs no ancestor-specific code
+at all. Labeling reads a **leaf-only** interval table rebuilt from the `code_index < V` rows of the
+expanded stream — which the closure's leaf self-pairs make identical to the unexpanded stream — so
+the packed bytes cannot observe the expansion. A `null` `boundary_codes` / `start_event_codes` pool
+becomes every non-PAD base code *plus* every ancestor node in a boundaries mode; an explicit pool may
+name ancestors in any mode. `exclude_boundary_prefixes` filters ancestor names by the same prefix
+rule (so `TIMELINE` drops the ancestor node as well as the leaves under it). Under
+`code_weighting: prevalence` an ancestor's statistic is the sum of its descendants' — it has no
+`codes.parquet` row of its own.
+
+The manifest gains three keys: `ontology_mode`, `ontology_fingerprint` (the bare
+`closure_fingerprint` digest of `event_to_query_nodes.parquet` — *not* the composite
+`"{closure}|{universe}"` string the evaluation grid's provenance sidecar stores under the same name)
+and `boundary_vocab_size` (`V_ext`). They join the reuse gate, so changing the closure or the mode
+relabels; a leaf-only run's `config_fingerprint` is unchanged, so existing leaf outputs stay
+reusable. `format_version` stays 3. `MultitaskBoundaryPytorchDataset` takes the matching
+`ontology_dir` — required when `ontology_mode` is not `none`, harmless otherwise — and checks the
+closure digest and `V_ext` against the manifest before resolving any name.
 
 ### Evaluating the multitask model — the same QuerySeq grid
 

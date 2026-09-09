@@ -54,8 +54,9 @@ duration_distribution: log-uniform # uniform | log-uniform
 
 # Per slot, independently: Bernoulli(eventbound_fraction) decides event- vs duration-bounded.  An
 # event-bounded slot draws its boundary code iid uniform WITH replacement from `boundary_codes`;
-# null => every base observable code (vocab index >= 1) of `query_codes`.  Repeated durations and
-# repeated boundary codes within one context are allowed.
+# null => every base observable code (vocab index >= 1) of `query_codes`, plus every ontology node
+# when `ontology_mode` allows ancestor boundaries.  An explicit list may name ontology nodes in any
+# mode.  Repeated durations and repeated boundary codes within one context are allowed.
 eventbound_fraction: 0.5
 boundary_codes: null
 
@@ -70,15 +71,19 @@ boundary_codes: null
 # the same codes.parquet as `query_codes`, so common codes - the ones that actually recur in a
 # patient's timeline - bound most windows.  power 1.0 is proportional to prevalence, 0.5 is
 # square-root damped, 0.0 is uniform again.  Codes whose statistic is null or zero are floored at
-# the pool's smallest positive value rather than dropped.  The policy applies to BOTH the end-
-# boundary pool and the start-event pool; conditioning codes and the all-vocabulary target set are
-# untouched, so only which windows exist changes, never what a label bit means.
+# the pool's smallest positive value rather than dropped.  An ontology node has no row in
+# codes.parquet at all, so it takes the SUM of its closure descendants' statistic - the honest
+# prevalence of "any descendant occurred", up to co-occurrence within a timestamp.  The policy
+# applies to BOTH the end-boundary pool and the start-event pool; conditioning codes and the
+# all-vocabulary target set are untouched, so only which windows exist changes, never what a label
+# bit means.
 code_weighting: null # null | prevalence
 code_weight_column: code/n_occurrences # code/n_occurrences | code/n_subjects
 code_weight_power: 1.0
 
 # Codes whose name starts with any of these prefixes are removed from the boundary AND start-event
-# pools (never from the targets or the conditioning codes).  `TIMELINE//DELTA` - the quantized
+# pools (never from the targets or the conditioning codes).  Ontology node names are filtered by the
+# same rule, so `TIMELINE` drops the ancestor node as well as every leaf under it.  `TIMELINE//DELTA` - the quantized
 # time-delta tokens - is the usual entry: they carry ~10% of all occurrences in a MIMIC-style
 # cohort, so prevalence weighting would spend a tenth of its event windows on boundaries that a
 # `use_rope_time` model never even sees in its input stream.
@@ -100,13 +105,16 @@ start_duration_min: 1
 start_duration_max: 180
 start_duration_distribution: log-uniform # uniform | log-uniform
 # Pool for event-defined starts, drawn iid uniform with replacement; null => every base observable
-# non-PAD code.  Drawn from its own RNG streams (`start_forms`, `start_durations`, `start_codes`), so
-# changing any start setting perturbs neither the contexts nor the end / conditioning draws.
+# non-PAD code, plus every ontology node when `ontology_mode` allows ancestor boundaries.  Drawn from
+# its own RNG streams (`start_forms`, `start_durations`, `start_codes`), so changing any start
+# setting perturbs neither the contexts nor the end / conditioning draws.
 start_event_codes: null
 # Issue #22: every context also carries `num_bounds - 1` conditioning codes (iid uniform with
-# replacement over every non-PAD base code, from a dedicated RNG stream) and their materialized
-# answers (`condition_answers[j]` = target bit of `condition_codes[j]` at boundary `j`).  Not
-# configurable in the MVP.
+# replacement over every non-PAD base code, from a dedicated RNG stream - or over every non-PAD
+# ontology node when `ontology_mode` allows ancestor conditioning codes, which the manifest records
+# as `condition_policy`) and their materialized answers (`condition_answers[j]` = target bit of
+# `condition_codes[j]` at boundary `j`; for an ontology node, the OR of that bit over its closure
+# descendants).  The pool is not otherwise configurable.
 
 # Minimum prior prediction times a subject needs before a prediction time is eligible (Stage 0).
 min_prediction_times_per_subject: 50
@@ -116,8 +124,20 @@ min_prediction_times_per_subject: 50
 max_workers: null
 label_chunk_rows: 2000
 
-# MVP: observable leaf codes only.  Any non-null value raises NotImplementedError before Stage 0.
+# Targets are ALWAYS the observable leaf codes: an ontology never widens the label bits (the model
+# derives an ancestor's bit as the OR of its descendants' from these leaf sidecars).  What an
+# `EQ_build_ontology` directory adds here is the *event* half of a window - an ancestor-valued
+# `bound_event` / `start_event` ("until the next occurrence of any `LAB//220645//*`") and an
+# ancestor-valued conditioning code - by exploding the event stream through the closure so an
+# ancestor node has ordinary intervals.  `vocab_size`, `packed_width_bytes` and `vocab_fingerprint`
+# are unchanged; the manifest gains `ontology_mode`, `ontology_fingerprint` and `boundary_vocab_size`.
+# The ontology must have been built from this cohort's codes.parquet (checked by identity, not width).
 ontology_dir: null
+# null => `boundaries+conditions` when `ontology_dir` is set, `none` when it is not.  Narrow it to
+# `boundaries` (ancestor starts/bounds only), `conditions` (ancestor conditioning codes only), or
+# `none` (keep the ontology on disk but sample exactly the leaf-only draws).  Explicit ancestor names
+# in `boundary_codes` / `start_event_codes` resolve in every mode; the mode governs the null-pool draw.
+ontology_mode: null
 overwrite: false
 
 hydra:
