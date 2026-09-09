@@ -89,12 +89,15 @@ class MultitaskBoundaryBatch(MEDSTorchBatch):
             written before issue #24); ``None`` only on a hand-built batch, which the model reads as
             zero-duration starts.
         q_start_codes: ``(B, K)`` int64 - vocabulary index of the start event; ``NO_BOUND_INDEX`` (0)
-            for duration / prediction-time starts, never PAD when active.  Filled together with
+            for duration / prediction-time starts, never PAD when active; an ontology node in
+            ``[V, V_ext)`` under a boundaries ontology mode.  Filled together with
             ``q_start_durations``: exactly one of the two being ``None`` is an error.
         q_durations: ``(B, K)`` float - horizon in days after the **resolved start**;
             ``EVENT_BOUND_DURATION_SENTINEL`` at event-bounded slots.
         q_bound_codes: ``(B, K)`` long - boundary vocabulary index; ``NO_BOUND_INDEX`` (0) for a
-            duration-bounded slot.
+            duration-bounded slot.  May be an ontology node in ``[V, V_ext)`` when the labels were
+            sampled in a boundaries ontology mode, where it means "the next occurrence of any
+            descendant leaf".
         q_mask: ``(B, K)`` bool - True at real slots (all True: ``K`` is fixed; kept for the model
             contract).
         targets: ``(B, K, V)`` bool - ``targets[b, k, v]`` is "code ``v`` occurs strictly inside the

@@ -1132,3 +1132,39 @@ def test_an_ancestor_subject_count_is_the_max_not_the_sum(synthetic_cohort: Path
     assert n_leaves_under_c > 1
     assert by_subjects["C"] == 10.0, "a subject count must not exceed its largest descendant's"
     assert by_occurrences["C"] == 10.0 * n_leaves_under_c
+
+
+def test_an_unknown_event_code_never_becomes_a_phantom_ancestor(tmp_path: Path) -> None:
+    """An out-of-vocabulary event code that happens to *be* an ontology node name is still unknown.
+
+    ``expand_events_to_query_nodes`` passes a code the closure does not know through unexploded, and
+    the extended map would then resolve that string to the node of the same name - an occurrence of
+    an ancestor none of whose descendants occurred.  The stored answer would be true while every
+    descendant leaf bit is false, which is precisely the disagreement ``derive_ancestor_targets``
+    reports and the dataset's ``collate`` check raises on.
+    """
+    cohort = tmp_path / "cohort"
+    make_codes_parquet(cohort, ["C//0", "C//1", "OTHER"], first_index=1)
+    onto = write_cohort_ontology(cohort, tmp_path / "onto")
+    vocab = build_target_vocabulary(cohort, str(onto), "conditions")
+    assert "C" in vocab.ancestor_names, "fixture must mint the ancestor whose name we impersonate"
+
+    # No C//* leaf ever occurs; a literal event coded "C" does, and "C" is not in codes.parquet.
+    events = pl.DataFrame(
+        {
+            "subject_id": [1, 1],
+            "time": [datetime(2024, 1, 5), datetime(2024, 1, 6)],
+            "code": ["C", "OTHER"],
+        }
+    ).with_columns(pl.col("time").cast(pl.Datetime("us")), pl.col("subject_id").cast(pl.Int64))
+    idx = make_index([(1, datetime(2024, 1, 1))], [[(30.0, None), (30.0, None)]], fill_condition="C")
+
+    meta, packed, stats = sms.label_multitask_index(idx, events, vocab, 2, ontology_dir=str(onto))
+    dense = np.unpackbits(packed, axis=-1, count=vocab.size, bitorder="little")
+    leaves_under_c = [i for c, i in vocab.code_to_index().items() if c.startswith("C//")]
+    assert not dense[0, :, leaves_under_c].any(), "no descendant leaf occurred, by construction"
+    assert meta["condition_answers"].to_list() == [[False]], (
+        "the ancestor's answer must be the OR over its descendants, not a phantom occurrence of "
+        "an event that merely shares its name"
+    )
+    assert stats.n_unknown_code_events == 1, "the dropped event must still be counted as unknown"

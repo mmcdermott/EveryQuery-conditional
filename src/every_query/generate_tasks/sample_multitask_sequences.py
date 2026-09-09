@@ -1394,6 +1394,53 @@ def validate_index(index_df: pl.DataFrame, num_bounds: int) -> None:
     _check_slot_pair(index_df, START_DURATIONS_COL, START_EVENTS_COL, "start")
 
 
+def _all_codes_unknown_msg(n_unknown: int) -> str:
+    """A shard where *nothing* matched is not a sparse shard, it is the wrong input.
+
+    String codes that are not in ``codes.parquet`` - most likely the string-coded
+    ``tokenized_events`` instead of the vocab-indexed intermediate ``data_dir``.  Every label would
+    silently be false.
+    """
+    return (
+        f"all {n_unknown} timed event(s) of this shard carry codes outside the target vocabulary; "
+        "no label could ever be true. Check that data_dir is the preprocessing *intermediate* "
+        "dir (vocab-indexed codes, matching query_codes/codes.parquet) rather than the "
+        "string-coded tokenized_events."
+    )
+
+
+def restrict_to_labelable_events(
+    events_df: pl.DataFrame, vocab: TargetVocabulary
+) -> tuple[pl.DataFrame, int]:
+    """Drop what the cohort vocabulary cannot label, *before* the closure expansion.
+
+    On the leaf-only path this filtering happens after encoding and nothing else can go wrong.  Under
+    an ontology the expansion runs first, and two kinds of event would otherwise mint ancestor rows
+    that no leaf bit backs:
+
+    - **a code absent from ``codes.parquet``.**
+      :func:`~every_query.data.ontology.expand_events_to_query_nodes` passes an unknown code through
+      unexploded, and if that string happens to *be* an ontology node's name the extended map then
+      resolves it to that node - a phantom occurrence of an ancestor none of whose descendants
+      occurred.  Its window would close, and its conditioning answer would be true while every
+      descendant leaf bit is false: exactly the disagreement ``derive_ancestor_targets`` reports,
+      which is what the dataset's ``collate`` check raises on.
+    - **a code at vocabulary index 0.**  Its own bit is false by construction, so the ancestors above
+      it must not be true either.
+
+    Returns the filtered frame and the number of *timed* rows dropped as unknown, which the caller
+    folds into the same statistic :func:`_encode_events` reports on the leaf-only path.
+    """
+    c2i = vocab.code_to_index()
+    code = pl.col(DataSchema.code_name).cast(pl.Utf8)
+    timed = pl.col(DataSchema.time_name).is_not_null()
+    n_unknown = int(events_df.filter(timed & ~code.is_in(list(c2i.keys()))).height)
+    kept = events_df.filter(code.is_in([c for c, i in c2i.items() if i > 0]))
+    if kept.filter(timed).height == 0 and n_unknown > 0:
+        raise ValueError(_all_codes_unknown_msg(n_unknown))
+    return kept, n_unknown
+
+
 def _encode_events(
     events_df: pl.DataFrame, vocab: TargetVocabulary
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
@@ -1418,15 +1465,7 @@ def _encode_events(
     n_unknown = int(ev["_code_index"].null_count())
     ev = ev.filter(pl.col("_code_index") > 0)  # drops unknown (null) and PAD (0)
     if ev.height == 0 and n_unknown > 0:
-        # A shard where *nothing* matched is not a sparse shard, it is the wrong input: string codes
-        # that are not in codes.parquet, most likely the string-coded ``tokenized_events`` instead
-        # of the vocab-indexed intermediate ``data_dir``.  Every label would silently be false.
-        raise ValueError(
-            f"all {n_unknown} timed event(s) of this shard carry codes outside the target vocabulary; "
-            "no label could ever be true. Check that data_dir is the preprocessing *intermediate* "
-            "dir (vocab-indexed codes, matching query_codes/codes.parquet) rather than the "
-            "string-coded tokenized_events."
-        )
+        raise ValueError(_all_codes_unknown_msg(n_unknown))
     sid = ev[SID].to_numpy().astype(np.int64)
     t = ev[DataSchema.time_name].cast(pl.Datetime("us")).cast(pl.Int64).to_numpy().astype(np.int64)
     ci = ev["_code_index"].to_numpy().astype(np.int64)
@@ -1608,17 +1647,12 @@ def label_multitask_index(
     stats.n_contexts = n
 
     t0 = time.perf_counter()
+    n_unlabelable = 0
     if ontology_dir is not None:
-        # Index 0 is dropped after encoding, so a code sitting there has a permanently false bit.
-        # Drop its events *before* the expansion too, or the ancestor rows minted from them would
-        # survive and an ancestor's answer would OR in a leaf whose own bit is false by construction
-        # - disagreeing with ``derive_ancestor_targets``, which the dataset re-checks against.
-        pad_codes = [c for c, i in vocab.code_to_index().items() if i == 0]
-        if pad_codes:
-            events_df = events_df.filter(~pl.col(DataSchema.code_name).cast(pl.Utf8).is_in(pad_codes))
+        events_df, n_unlabelable = restrict_to_labelable_events(events_df, vocab)
     events_df = prepare_events_for_labeling(events_df, ontology_dir)
     ev_sid, ev_t, ev_ci, n_unknown = _encode_events(events_df, vocab)
-    stats.n_unknown_code_events = n_unknown
+    stats.n_unknown_code_events = n_unknown + n_unlabelable
     # Two tables under an ontology, one without.  ``table`` is leaf-only and is the ONLY one that ever
     # labels a bit, so the packed output cannot depend on the expansion; ``event_table`` spans
     # [0, V_ext) and exists purely so an ancestor id resolves as a start / bound / conditioning event.
