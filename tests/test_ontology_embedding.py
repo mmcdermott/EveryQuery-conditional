@@ -4,6 +4,14 @@ Every claim here is asserted at the level where the effect lives.  The handoff's
 throughout: a bare ``assert not torch.equal(a, b)`` is satisfied by one ULP of float32 rounding,
 and a randomly-initialised decoder compresses an 8e-05 encoder difference to ~1e-07 at the logits.
 So liveness is asserted with a margin, and against the embedding output rather than the logits.
+
+The model-level halves — the pre-hook in section 3, all of section 4, and the checkpoint /
+determinism tests in section 5 — were originally driven through ``ConditionalQueryModel``, the
+encoder-decoder conditional-sequence model, because that was the only model that installed the
+wrapper.  They now run against
+:class:`~every_query.model.conditional_multitask_ar_model.ConditionalMultitaskARModel`.
+``OntologyEmbedding`` and ``wrap_tok_embeddings`` themselves are shared and unchanged, so every
+section-1/2 claim is model-independent and untouched.
 """
 
 from __future__ import annotations
@@ -22,8 +30,10 @@ from every_query.data.ontology import (
     build_ontology,
     load_mix_matrix,
 )
-from every_query.model.conditional_model import ConditionalQueryModel
 from every_query.model.ontology_embedding import OntologyEmbedding, wrap_tok_embeddings
+
+# The multitask model's own construction idiom, reused rather than re-invented.
+from tests.test_conditional_multitask_ar_model import make_batch, ontology_model, tiny_model
 
 #: Liveness margin.  Anything smaller is float noise, not an effect.
 LIVE = 1e-4
@@ -64,45 +74,13 @@ def _write_ontology(out, codes: list[str]):
     return out
 
 
-def _tiny_model(vocab_size: int = 16, **kwargs) -> ConditionalQueryModel:
-    model = ConditionalQueryModel(
-        num_hidden_layers=2,
-        config_overrides={
-            "hidden_size": 32,
-            "num_attention_heads": 2,
-            "intermediate_size": 64,
-            "vocab_size": vocab_size,
-            "max_position_embeddings": 64,
-            "pad_token_id": 0,
-        },
-        decoder_layers=1,
-        decoder_heads=2,
-        decoder_ffn_mult=2,
-        max_queries=8,
-        mlp_dropout=0.0,
-        **kwargs,
-    )
-    model.eval()
-    return model
+def _unwrapped_model(vocab_size: int):
+    """A multitask model sized to ``vocab_size`` with no ontology installed.
 
-
-def _batch(q_codes=(7, 8), patient=(3, 4, 5, 6), bounds=None):
-    from every_query.data.seq_dataset import ANSWER_NO, ANSWER_YES, ConditionalQueryBatch
-
-    kw = {}
-    if bounds is not None:
-        kw["q_bounds"] = torch.tensor([list(bounds)])
-    return ConditionalQueryBatch(
-        code=torch.tensor([list(patient)]),
-        numeric_value=torch.zeros(1, len(patient)),
-        numeric_value_mask=torch.zeros(1, len(patient), dtype=torch.bool),
-        time_delta_days=torch.zeros(1, len(patient)),
-        q_codes=torch.tensor([list(q_codes)]),
-        q_durations=torch.tensor([[30.0, 7.0]]),
-        q_answers=torch.tensor([[ANSWER_YES, ANSWER_NO]]),
-        q_mask=torch.tensor([[True, True]]),
-        **kw,
-    )
+    Used by the ``wrap_tok_embeddings`` size checks, which must construct the mismatch that a
+    correctly-sized ``ontology_model`` never can.
+    """
+    return tiny_model(config_overrides={"vocab_size": vocab_size})
 
 
 # ── 1. the mixed table itself ───────────────────────────────────────────
@@ -123,9 +101,8 @@ def test_lookup_equals_the_explicit_matrix_product():
 def test_orientation_is_row_is_node_not_column_is_node():
     """Row ``i`` of ``A`` must be node ``i``'s recipe, not its contribution to others.
 
-    The two orientations are only distinguishable on an asymmetric matrix, so node 1 mixes
-    node 0 while node 0 mixes nothing.  Under the transposed reading node 0 would be the mixed
-    one, which this pins.
+    The two orientations are only distinguishable on an asymmetric matrix, so node 1 mixes node 0 while node 0
+    mixes nothing.  Under the transposed reading node 0 would be the mixed one, which this pins.
     """
     n, h = 3, 2
     raw = _raw(n, h)
@@ -250,9 +227,7 @@ def test_the_model_pre_hook_clears_the_cache_once_per_forward(tmp_path):
     Asserted through the real hook that ``wrap_tok_embeddings`` registers, not a hand-fired
     stand-in: the registration itself is half of what could break.
     """
-    _write_ontology(tmp_path, [f"G//{i}" for i in range(1, 15)])
-    v_ext = int(pl.read_parquet(tmp_path / ONTOLOGY_VOCAB_FILE)["token_id"].max()) + 1
-    model = _tiny_model(vocab_size=v_ext, ontology_dir=str(tmp_path))
+    model, _, _ = ontology_model(tmp_path)
     table = model.HF_model.get_input_embeddings()
 
     # Warm the cache outside a forward, then mutate the raw weights underneath it.
@@ -261,12 +236,32 @@ def test_the_model_pre_hook_clears_the_cache_once_per_forward(tmp_path):
         table.weight[3] += 5.0
 
     with torch.no_grad():
-        model(_batch())
+        model(make_batch())
 
     fresh = table.mixed_weight()
     assert (fresh - stale).abs().max() > LIVE, (
         "the forward reused a cached table computed before the weight change: the pre-hook "
         "either was not registered or did not fire"
+    )
+
+
+def test_the_evaluation_path_clears_the_cache_without_going_through_forward(tmp_path):
+    """The pre-hook is registered on ``forward``, and the evaluation path does not call it.
+
+    ``ConditionalMultitaskARModel.score_final_query`` reaches ``window_hidden_states`` directly,
+    so the registration above covers only half of this model.  ``window_hidden_states`` clears
+    the cache itself for exactly that reason; without it, every evaluation pass after the first
+    would score against the mixed table as it stood at the last training forward.  The
+    encoder-decoder model had a single entry point and so could not express this failure.
+    """
+    model, _, _ = ontology_model(tmp_path)
+    table = model.HF_model.get_input_embeddings()
+    stale = table.mixed_weight().clone()
+    with torch.no_grad():
+        table.weight[3] += 5.0
+        model.score_final_query(make_batch(), torch.tensor([2, 3]))
+    assert (table.mixed_weight() - stale).abs().max() > LIVE, (
+        "score_final_query reused a table cached before the weight change"
     )
 
 
@@ -287,11 +282,11 @@ def test_two_backward_passes_do_not_reuse_one_graph():
 def test_wrap_installs_through_get_and_set_input_embeddings(tmp_path):
     _write_ontology(tmp_path, [f"G//{i}" for i in range(1, 15)])
     v_ext = int(pl.read_parquet(tmp_path / ONTOLOGY_VOCAB_FILE)["token_id"].max()) + 1
-    model = _tiny_model(vocab_size=v_ext)
+    model = _unwrapped_model(v_ext)
 
     wrapper = wrap_tok_embeddings(model, load_mix_matrix(tmp_path))
     assert model.HF_model.get_input_embeddings() is wrapper, (
-        "the wrapper is not what the encoder hands out; the shared-table claim is void"
+        "the wrapper is not what the backbone hands out; the shared-table claim is void"
     )
     assert isinstance(wrapper, OntologyEmbedding)
 
@@ -299,47 +294,74 @@ def test_wrap_installs_through_get_and_set_input_embeddings(tmp_path):
 def test_wrap_refuses_a_table_that_is_not_v_ext(tmp_path):
     """Too few rows means every ancestor index is out of range — fail loudly, not later."""
     _write_ontology(tmp_path, [f"G//{i}" for i in range(1, 15)])
-    model = _tiny_model(vocab_size=8)
+    model = _unwrapped_model(8)
     with pytest.raises(ValueError, match="V_ext"):
         wrap_tok_embeddings(model, load_mix_matrix(tmp_path))
 
 
-def test_patient_query_and_boundary_codes_share_one_mixed_table(tmp_path):
-    """The composition claim: all three call sites reach the same module.
+def test_every_code_slot_shares_one_mixed_table(tmp_path):
+    """The composition claim: every call site reaches the same module.
 
-    Asserted functionally rather than by identity — the same code id must produce the same
-    vector whichever slot it is read through.
+    On the encoder-decoder model the three slots were patient stream / query code / boundary
+    code.  ``ConditionalMultitaskARModel`` has four — the patient stream, a window's start event,
+    a window's boundary event, and the conditioning code — and substituting the module rather
+    than the call sites is what makes all four inherit the ontology for free.  Asserted by
+    recording the id tensors themselves, not their shapes: ``condition_codes`` and
+    ``q_bound_codes`` are both ``(B, K)``-ish, so a shape alone cannot tell which reached it.
     """
-    _write_ontology(tmp_path, [f"G//{i}" for i in range(1, 15)])
-    v_ext = int(pl.read_parquet(tmp_path / ONTOLOGY_VOCAB_FILE)["token_id"].max()) + 1
-    model = _tiny_model(vocab_size=v_ext, ontology_dir=str(tmp_path))
-
+    model, _, _ = ontology_model(tmp_path)
     table = model.HF_model.get_input_embeddings()
     assert isinstance(table, OntologyEmbedding)
 
+    batch = make_batch()
+    calls: list[torch.Tensor] = []
+    original = table.forward
+    table.forward = lambda ids: (calls.append(ids.detach().clone()), original(ids))[1]
+    try:
+        with torch.no_grad():
+            model(batch)
+    finally:
+        table.forward = original
+
+    def was_passed(t):
+        return any(c.shape == t.shape and torch.equal(c, t) for c in calls)
+
+    assert was_passed(batch.code), "the patient stream must go through the wrapper"
+    assert was_passed(batch.q_start_codes), "window start events must go through the wrapper"
+    assert was_passed(batch.q_bound_codes), "window boundary events must go through the wrapper"
+    assert was_passed(batch.condition_codes), "conditioning codes must go through the wrapper"
+
+    # And the same id read twice gives the same vector — the module is one shared table, not a
+    # per-slot copy that could drift.
     ids = torch.tensor([3, 4])
     once = table(ids).clone()
     table.clear_cache()
-    twice = table(ids)
-    torch.testing.assert_close(once, twice)
-
-    # And the module the encoder uses is the module the query/bound paths use.
+    torch.testing.assert_close(once, table(ids))
     assert model.HF_model.get_input_embeddings() is table
 
 
-def test_the_answer_head_does_not_tie_to_the_raw_table(tmp_path):
-    """There is no tied output head here; if one is added it must use the MIXED table.
+def test_the_readout_uses_the_mixed_table_not_the_raw_one(tmp_path):
+    """The assumption the encoder-decoder version could only state, now checkable.
 
-    Stated as a test so the assumption is checked rather than remembered.
+    That model had no tied output head, so this test asserted "there is no tied output head here;
+    if one is added it must use the MIXED table".  ``ConditionalMultitaskARModel`` adds exactly
+    that head, so the conditional becomes a fact: the readout is the effective table ``A @ W``
+    that every input lookup reads, and no parameter outside the backbone aliases the raw one.
+    (The numerical equality of readout and mixed table is pinned in
+    ``test_conditional_multitask_ar_model.py::test_tied_readout_uses_the_mixed_table_under_an_ontology``.)
     """
-    _write_ontology(tmp_path, [f"G//{i}" for i in range(1, 15)])
-    v_ext = int(pl.read_parquet(tmp_path / ONTOLOGY_VOCAB_FILE)["token_id"].max()) + 1
-    model = _tiny_model(vocab_size=v_ext, ontology_dir=str(tmp_path))
-
+    model, _, _ = ontology_model(tmp_path)
     table = model.HF_model.get_input_embeddings()
     raw_w = table.weight  # the underlying learned parameter
     tied = [name for name, p in model.named_parameters() if p is raw_w and not name.startswith("HF_model.")]
-    assert not tied, f"a non-encoder parameter is tied to the raw embedding table: {tied}"
+    assert not tied, f"a non-backbone parameter is tied to the raw embedding table: {tied}"
+    assert "lm_head" not in dict(model.named_modules())
+
+    readout = model._readout_weight()
+    assert readout is not raw_w
+    assert (readout - raw_w.detach()).abs().max() > LIVE, (
+        "the readout projects onto the raw table, scoring ancestors through rows the input side never sees"
+    )
 
 
 # ── 5. checkpoint, dtype and device ─────────────────────────────────────
@@ -347,20 +369,26 @@ def test_the_answer_head_does_not_tie_to_the_raw_table(tmp_path):
 
 def test_checkpoint_round_trip_preserves_predictions(tmp_path):
     """The wrapper changes state-dict keys, so a silent key mismatch is the failure mode."""
-    _write_ontology(tmp_path, [f"G//{i}" for i in range(1, 15)])
-    v_ext = int(pl.read_parquet(tmp_path / ONTOLOGY_VOCAB_FILE)["token_id"].max()) + 1
-    model = _tiny_model(vocab_size=v_ext, ontology_dir=str(tmp_path))
-
-    batch = _batch()
+    model, _, _ = ontology_model(tmp_path)
+    # ``tiny_model`` seeds, so two constructions are bit-identical: perturb one, or the reload
+    # below would be indistinguishable from doing nothing.
     with torch.no_grad():
-        before = model(batch)[1].answer_logits.clone()
+        for p in model.parameters():
+            p.add_(torch.randn_like(p) * 0.1)
+
+    batch = make_batch()
+    with torch.no_grad():
+        before = model(batch)[1].logits.clone()
 
     state = copy.deepcopy(model.state_dict())
-    reloaded = _tiny_model(vocab_size=v_ext, ontology_dir=str(tmp_path))
+    reloaded, _, _ = ontology_model(tmp_path)
+    with torch.no_grad():
+        assert not torch.allclose(reloaded(batch)[1].logits, before), "the reload cannot be vacuous"
+
     missing, unexpected = reloaded.load_state_dict(state, strict=True), None
     assert unexpected is None
     with torch.no_grad():
-        after = reloaded(batch)[1].answer_logits
+        after = reloaded(batch)[1].logits
 
     torch.testing.assert_close(before, after)
     assert missing is not None  # load_state_dict returns a NamedTuple; keys matched under strict
@@ -369,12 +397,10 @@ def test_checkpoint_round_trip_preserves_predictions(tmp_path):
 def test_the_sparse_mix_is_not_persisted_but_is_rebuilt(tmp_path):
     """`mix` is a non-persistent buffer: it must be absent from the state dict AND rebuilt on load.
 
-    If it were persisted, a checkpoint would silently pin an old ontology; if it were neither
-    persisted nor rebuilt, the model would load with no mixing at all and look fine.
+    If it were persisted, a checkpoint would silently pin an old ontology; if it were neither persisted nor
+    rebuilt, the model would load with no mixing at all and look fine.
     """
-    _write_ontology(tmp_path, [f"G//{i}" for i in range(1, 15)])
-    v_ext = int(pl.read_parquet(tmp_path / ONTOLOGY_VOCAB_FILE)["token_id"].max()) + 1
-    model = _tiny_model(vocab_size=v_ext, ontology_dir=str(tmp_path))
+    model, _, _ = ontology_model(tmp_path)
 
     keys = [k for k in model.state_dict() if k.endswith(".mix")]
     assert not keys, f"the sparse mix was persisted into the state dict: {keys}"
@@ -415,12 +441,10 @@ def test_cpu_and_gpu_agree_within_tolerance():
 
 def test_lookup_is_deterministic_across_repeated_calls(tmp_path):
     """Single-device determinism is the precondition for any DDP-equality claim."""
-    _write_ontology(tmp_path, [f"G//{i}" for i in range(1, 15)])
-    v_ext = int(pl.read_parquet(tmp_path / ONTOLOGY_VOCAB_FILE)["token_id"].max()) + 1
-    model = _tiny_model(vocab_size=v_ext, ontology_dir=str(tmp_path))
-    batch = _batch()
+    model, _, _ = ontology_model(tmp_path)
+    batch = make_batch()
 
     with torch.no_grad():
-        runs = [model(batch)[1].answer_logits.clone() for _ in range(3)]
+        runs = [model(batch)[1].logits.clone() for _ in range(3)]
     for later in runs[1:]:
         torch.testing.assert_close(runs[0], later)

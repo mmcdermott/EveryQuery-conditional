@@ -102,13 +102,14 @@ time-bounded single-code queries, so if merely attaching the feature machinery p
 score would describe a different model than the one trained.
 
 One measurement rule, learned from a false negative: **assert at the level where the effect lives**,
-not downstream of an untrained head. A randomly-initialised decoder and head compress an 8e-05
-encoder-output difference down to ~1e-07 at the logits — the same magnitude as float noise. The RoPE
-probe therefore reads the encoder's `last_hidden_state` directly.
+not downstream of an untrained head. A randomly-initialised readout compresses an 8e-05 difference
+in the backbone's representation down to ~1e-07 at the logits — the same magnitude as float noise.
+The RoPE probe therefore reads the tensor the readout projects, directly: `window_hidden_states` on
+`ConditionalMultitaskARModel`.
 
 There is also a guard, `tests/test_rope_strip_guard.py`, for a configuration that is silently
 acceptable rather than wrong-by-construction: stripping delta tokens without the time representation
-that replaces them yields an encoder with *zero* elapsed-time information, and it trains, validates
+that replaces them yields a backbone with *zero* elapsed-time information, and it trains, validates
 and checkpoints with normal-looking numbers.
 
 ### Rehoming

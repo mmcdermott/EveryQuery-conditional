@@ -1,102 +1,72 @@
 """All three ported features enabled at once.
 
-Each feature has its own suite; this one exists because the reason they were folded into
-``ConditionalQueryModel`` behind flags — rather than shipped as the upstream forks' separate
-subclass towers — was so that any combination could run together.  That claim needs a test, not
-just an argument.
+Each feature has its own suite; this one exists because the reason they were folded into one
+model behind flags — rather than shipped as the upstream forks' separate subclass towers — was so
+that any combination could run together.  That claim needs a test, not just an argument.
 
 The interactions that could plausibly break are checked individually below:
 
 - RoPE strips the delta tokens and drives rotary from elapsed time; event bounds put a code in
-  the duration slot.  They touch the encoder and the decoder respectively and must not interact.
-- The ontology wrapper substitutes the shared token table, so a query's boundary code goes
-  through it too — which is the intended generalisation, and worth pinning.
+  the window's end slot.  They touch the position ids and the token embeddings respectively and
+  must not interact.
+- The ontology wrapper substitutes the shared token table, so a window's boundary code and start
+  code go through it too — which is the intended generalisation, and worth pinning.
 - ``TIMELINE//END`` must survive the delta strip, because it is this model's entire censoring
   mechanism.
+
+Originally written against ``ConditionalQueryModel``, the encoder-decoder conditional-sequence
+model, which was the only model carrying all three flags when they landed.  It now drives
+:class:`~every_query.model.conditional_multitask_ar_model.ConditionalMultitaskARModel`.  The
+composition claim is if anything sharper there: that model has *four* code slots reading the
+shared table (patient stream, window start event, window boundary event, conditioning code), and
+its window token carries a start spec and an end spec rather than a single duration slot.
 """
 
-import polars as pl
 import torch
 
-from every_query.data.ontology import (
-    EMBEDDING_MIX_FILE,
-    EVENT_TO_QUERY_NODES_FILE,
-    ONTOLOGY_VOCAB_FILE,
-    build_event_to_query_nodes,
-    build_ontology,
-    extended_vocab_size,
-)
 from every_query.data.rope_time import DELTA_TOKEN_PREFIX, build_keep_mask, delta_vocab_ids
-from every_query.data.seq_dataset import (
-    EOS_CODE,
-    NO_BOUND_INDEX,
-    ConditionalQueryBatch,
-)
-from every_query.model.conditional_model import ANSWER_NO, ANSWER_YES, ConditionalQueryModel
+from every_query.data.seq_dataset import EOS_CODE, NO_BOUND_INDEX
+from every_query.model.conditional_multitask_ar_model import TOKENS_PER_WINDOW
 from every_query.model.ontology_embedding import OntologyEmbedding
 
+# The multitask model's own construction idiom, reused rather than re-invented.
+from tests.test_conditional_multitask_ar_model import VOCAB, make_batch, ontology_model
 
-def _write_ontology(tmp_path):
-    codes = [f"GRP//{i}" for i in range(1, 20)]
-    codes_df = pl.DataFrame({"code": codes, "code/vocab_index": list(range(1, len(codes) + 1))})
-    nodes, mix = build_ontology(codes_df)
-    nodes.write_parquet(tmp_path / ONTOLOGY_VOCAB_FILE)
-    mix.write_parquet(tmp_path / EMBEDDING_MIX_FILE)
-    build_event_to_query_nodes(nodes, mix).write_parquet(tmp_path / EVENT_TO_QUERY_NODES_FILE)
-    return extended_vocab_size(tmp_path)
+# ``make_batch``'s patient stream is four tokens wide (row 1 right-padded to two).
+TIMES = torch.tensor([[0, 24, 36, 84], [0, 24, 0, 0]])
 
 
-def _all_features_model(tmp_path) -> ConditionalQueryModel:
-    v_ext = _write_ontology(tmp_path)
-    model = ConditionalQueryModel(
-        num_hidden_layers=2,
-        config_overrides={
-            "hidden_size": 32,
-            "num_attention_heads": 2,
-            "intermediate_size": 64,
-            "vocab_size": v_ext,
-            "max_position_embeddings": 64,
-            "pad_token_id": 0,
-        },
-        decoder_layers=1,
-        decoder_heads=2,
-        decoder_ffn_mult=2,
-        max_queries=8,
-        mlp_dropout=0.0,
-        use_rope_time=True,
-        ontology_dir=str(tmp_path),
-    )
-    model.eval()
-    return model
+def _all_features_model(tmp_path):
+    """RoPE time + event bounds + ontology, all on one ``ConditionalMultitaskARModel``."""
+    return ontology_model(tmp_path, use_rope_time=True)
 
 
-def _all_features_batch() -> ConditionalQueryBatch:
-    """Two queries: one event-bounded, one time-bounded.  Plus RoPE time positions."""
-    return ConditionalQueryBatch(
-        code=torch.tensor([[3, 4, 5, 6]]),
-        numeric_value=torch.zeros(1, 4),
-        numeric_value_mask=torch.zeros(1, 4, dtype=torch.bool),
-        time_delta_days=torch.tensor([[0.0, 1.0, 0.5, 2.0]]),
-        time_pos_ids=torch.tensor([[0, 24, 36, 84]]),
-        q_codes=torch.tensor([[7, 10]]),
-        q_durations=torch.tensor([[-1.0, 30.0]]),
-        q_answers=torch.tensor([[ANSWER_YES, ANSWER_NO]]),
-        q_mask=torch.tensor([[True, True]]),
-        q_bound_codes=torch.tensor([[9, NO_BOUND_INDEX]]),
-    )
+def _all_features_batch():
+    """Three windows: one event-bounded, one event-started, all timed.  Plus RoPE positions.
+
+    ``make_batch``'s defaults already span the three features — window 1 ends at boundary code
+    10, window 2 opens at start event 9, and the rest are duration specs — so the batch is taken
+    from the shared idiom rather than hand-rolled here.
+    """
+    batch = make_batch(time_pos_ids=TIMES)
+    assert batch.q_bound_codes[0].tolist() == [NO_BOUND_INDEX, 10, NO_BOUND_INDEX]
+    assert batch.q_start_codes[0].tolist() == [NO_BOUND_INDEX, NO_BOUND_INDEX, 9]
+    return batch
 
 
 def test_all_three_features_run_together(tmp_path):
     """The composability claim: RoPE + event bounds + ontology in one forward."""
-    model = _all_features_model(tmp_path)
+    model, _, v_ext = _all_features_model(tmp_path)
     loss, out = model(_all_features_batch())
     assert loss.isfinite()
-    assert out.answer_logits.shape == (1, 2)
-    assert out.answer_logits.isfinite().all()
+    assert out.logits.shape == (2, 3, v_ext)
+    assert out.logits.isfinite().all()
+    # Leaf-only targets were widened against the ontology, not merely accepted at face value.
+    assert v_ext > VOCAB and model.base_vocab_size == VOCAB
 
 
 def test_all_three_features_train_together(tmp_path):
-    model = _all_features_model(tmp_path)
+    model, _, _ = _all_features_model(tmp_path)
     model.train()
     loss, _ = model(_all_features_batch())
     loss.backward()
@@ -106,21 +76,23 @@ def test_all_three_features_train_together(tmp_path):
     for name, param in (
         ("ontology raw table", raw.weight),
         ("bound_marker", model.bound_marker),
+        ("start_marker", model.start_marker),
     ):
         assert param.grad is not None, f"{name} got no gradient"
         assert torch.isfinite(param.grad).all(), f"{name} gradient is not finite"
+        assert param.grad.abs().sum() > 0, f"{name} gradient is identically zero"
 
 
 def test_ontology_wrapper_covers_the_query_slots_too(tmp_path):
-    """A query's boundary code must go through the mixed table, not around it."""
-    model = _all_features_model(tmp_path)
+    """A window's boundary and start codes must go through the mixed table, not around it."""
+    model, _, _ = _all_features_model(tmp_path)
     assert isinstance(model.HF_model.get_input_embeddings(), OntologyEmbedding)
 
     batch = _all_features_batch()
     wrapper = model.HF_model.get_input_embeddings()
 
-    # Record the id tensors themselves, not their shapes: q_codes and q_bound_codes are both
-    # (B, L), so a shape alone cannot tell which of them reached the wrapper.
+    # Record the id tensors themselves, not their shapes: q_bound_codes and q_start_codes are
+    # both (B, K), so a shape alone cannot tell which of them reached the wrapper.
     calls = []
     original = wrapper.forward
     wrapper.forward = lambda ids: (calls.append(ids.detach().clone()), original(ids))[1]
@@ -134,26 +106,22 @@ def test_ontology_wrapper_covers_the_query_slots_too(tmp_path):
         return any(c.shape == t.shape and torch.equal(c, t) for c in calls)
 
     assert was_passed(batch.code), "patient stream must go through the wrapper"
-    assert was_passed(batch.q_codes), "query codes must go through the wrapper"
     assert was_passed(batch.q_bound_codes), "boundary codes must go through the wrapper"
+    assert was_passed(batch.q_start_codes), "start codes must go through the wrapper"
+    assert was_passed(batch.condition_codes), "conditioning codes must go through the wrapper"
 
 
-def test_rope_time_still_moves_the_encoder_with_everything_on(tmp_path):
-    """RoPE must not be neutralised by the other features sharing the encoder."""
-    model = _all_features_model(tmp_path)
-    batch = _all_features_batch()
+def test_rope_time_still_moves_the_backbone_with_everything_on(tmp_path):
+    """RoPE must not be neutralised by the other features sharing the backbone."""
+    model, _, _ = _all_features_model(tmp_path)
 
-    def encode(time_pos):
-        batch.time_pos_ids = time_pos
+    def hidden(time_pos):
+        batch = make_batch(time_pos_ids=time_pos)
         with torch.no_grad():
-            return model.HF_model(
-                input_ids=batch.code,
-                attention_mask=batch.code != ConditionalQueryBatch.PAD_INDEX,
-                **model._encoder_position_kwargs(batch),
-            ).last_hidden_state
+            return model.window_hidden_states(batch)
 
-    near = encode(torch.tensor([[0, 1, 2, 3]]))
-    far = encode(torch.tensor([[0, 240, 1000, 5000]]))
+    near = hidden(torch.tensor([[0, 1, 2, 3], [0, 1, 0, 0]]))
+    far = hidden(torch.tensor([[0, 240, 1000, 5000], [0, 900, 0, 0]]))
     assert not torch.allclose(near, far)
 
 
@@ -173,30 +141,40 @@ def test_eos_code_survives_the_delta_strip():
     assert keep.tolist() == [[True, False, True, False]]
 
 
-def test_event_bounds_own_the_duration_slot_and_leave_the_code_slot_alone(tmp_path):
-    """A boundary replaces *what bounds the window*, never *what is being asked about*."""
-    model = _all_features_model(tmp_path)
-    batch = _all_features_batch()
+def test_event_bounds_own_the_window_end_and_leave_the_conditioning_alone(tmp_path):
+    """A boundary replaces *what closes the window*, never *what is being asked about*.
+
+    On the encoder-decoder model that meant "the duration slot, not the code slot" of a query
+    block.  Here a window token has no code of its own — the model scores the whole vocabulary —
+    so the thing that must stay untouched is the conditioning stream ``C_i`` / ``A_i``, and the
+    thing that must move is the bounded window's own token and no other.
+    """
+    model, _, _ = _all_features_model(tmp_path)
+    bounded = _all_features_batch()
+    unbounded = _all_features_batch()
+    # Window 1 alone changes: its boundary is dropped and its sentinel duration becomes a real
+    # horizon.  Every other window's spec is left byte-identical, so a difference anywhere else
+    # is the boundary leaking, not the fixture moving.
+    unbounded.q_bound_codes[:, 1] = NO_BOUND_INDEX
+    unbounded.q_durations[:, 1] = 30.0
 
     with torch.no_grad():
-        code_slot = model._query_code_embeds(batch)
-        dur_slot = model._query_duration_embeds(batch)
-        plain_code = model.HF_model.get_input_embeddings()(batch.q_codes)
-        plain_dur = model.duration_embed((batch.q_durations / 365.0).unsqueeze(-1))
+        a = model._query_tokens(bounded)
+        b = model._query_tokens(unbounded)
 
-    assert code_slot.shape == dur_slot.shape == (1, 2, 32)
+    torch.testing.assert_close(a[:, 1::TOKENS_PER_WINDOW], b[:, 1::TOKENS_PER_WINDOW])
+    torch.testing.assert_close(a[:, 2::TOKENS_PER_WINDOW], b[:, 2::TOKENS_PER_WINDOW])
 
-    # The code slot is the plain lookup for both queries — bounded or not.
-    assert torch.allclose(code_slot, plain_code), "a boundary must not touch the code slot"
-
-    # Query 0 is event-bounded: its duration slot is the boundary embedding, not the scalar MLP.
-    assert not torch.allclose(dur_slot[:, 0], plain_dur[:, 0]), "the bounded query's slot is replaced"
-    # Query 1 is time-bounded: its duration slot is exactly the scalar path.
-    assert torch.allclose(dur_slot[:, 1], plain_dur[:, 1]), "an unbounded query's slot is untouched"
+    windows_a, windows_b = a[:, 0::TOKENS_PER_WINDOW], b[:, 0::TOKENS_PER_WINDOW]
+    moved = [k for k in range(3) if not torch.equal(windows_a[:, k], windows_b[:, k])]
+    assert moved == [1], f"a boundary on window 1 changed windows {moved}"
 
 
 def test_batch_validates_every_optional_tensor_together(tmp_path):
-    """All the optional per-query tensors are shape-checked in the combined configuration."""
+    """All the optional per-window tensors are shape-checked in the combined configuration."""
     batch = _all_features_batch()
-    assert batch.q_bound_codes.shape == (1, 2)
+    expected = (batch.batch_size, batch.num_bounds)
+    assert batch.q_bound_codes.shape == expected
+    assert batch.q_start_codes.shape == batch.q_start_durations.shape == expected
+    assert batch.condition_codes.shape == batch.condition_answers.shape == (expected[0], expected[1] - 1)
     assert batch.time_pos_ids.shape == batch.code.shape

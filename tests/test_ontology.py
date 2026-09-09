@@ -9,8 +9,15 @@ Covered in pipeline order:
    cache actually being a cache.
 3. Query addressing — ancestors becoming queryable, and the universe mixing that keeps the
    sampler's RNG contract intact.
-4. Model integration — that the wrapper composes with the query slots rather than only the
-   patient encoder.
+4. Model integration — that the wrapper composes with the window and condition slots rather than
+   only the patient stream.
+
+Section 4 (and the two ``wrap_tok_embeddings`` size checks in section 2) were originally written
+against ``ConditionalQueryModel``, the encoder-decoder conditional-sequence model, because that
+was the only model when the ontology landed.  They now run against
+:class:`~every_query.model.conditional_multitask_ar_model.ConditionalMultitaskARModel`, the
+surviving consumer.  Sections 1-3 are about :mod:`every_query.data.ontology` and the query
+universe and are model-independent.
 """
 
 import polars as pl
@@ -30,8 +37,10 @@ from every_query.data.ontology import (
     string_ancestors,
 )
 from every_query.generate_tasks.sample_query_sequences import build_query_universe
-from every_query.model.conditional_model import ANSWER_NO, ANSWER_YES, ConditionalQueryModel
 from every_query.model.ontology_embedding import OntologyEmbedding, wrap_tok_embeddings
+
+# The multitask model's own construction idiom, reused rather than re-invented.
+from tests.test_conditional_multitask_ar_model import make_batch, ontology_model, tiny_model
 
 
 def _codes(codes, parents=None) -> pl.DataFrame:
@@ -194,8 +203,8 @@ def _identity_mix(v_ext: int) -> torch.Tensor:
 
 
 def test_wrap_rejects_an_undersized_table():
-    """Sizing the encoder to V rather than V_ext puts every ancestor index out of range."""
-    model = _tiny_model(vocab_size=4)
+    """Sizing the backbone to V rather than V_ext puts every ancestor index out of range."""
+    model = tiny_model(config_overrides={"vocab_size": 4})
     with pytest.raises(ValueError, match="V_ext"):
         wrap_tok_embeddings(model, _identity_mix(16))
 
@@ -203,10 +212,10 @@ def test_wrap_rejects_an_undersized_table():
 def test_wrap_rejects_an_oversized_table():
     """``(V_ext, V_ext) @ (V_model, H)`` needs equality, not just enough rows.
 
-    An encoder left at ModernBERT's own 50k vocabulary satisfies "big enough" while being just
-    as wrong as an undersized one — and would fail deep inside ``torch.sparse.mm`` instead.
+    A backbone left at a stock 50k vocabulary satisfies "big enough" while being just as wrong
+    as an undersized one — and would fail deep inside ``torch.sparse.mm`` instead.
     """
-    model = _tiny_model(vocab_size=99)
+    model = tiny_model(config_overrides={"vocab_size": 99})
     with pytest.raises(ValueError, match="V_ext"):
         wrap_tok_embeddings(model, _identity_mix(16))
 
@@ -272,64 +281,24 @@ def test_query_universe_excludes_tautological_timeline_ancestors(tmp_path):
 # ── 4. model integration ────────────────────────────────────────────────
 
 
-def _tiny_model(vocab_size: int = 16, **kwargs) -> ConditionalQueryModel:
-    model = ConditionalQueryModel(
-        num_hidden_layers=2,
-        config_overrides={
-            "hidden_size": 32,
-            "num_attention_heads": 2,
-            "intermediate_size": 64,
-            "vocab_size": vocab_size,
-            "max_position_embeddings": 64,
-            "pad_token_id": 0,
-        },
-        decoder_layers=1,
-        decoder_heads=2,
-        decoder_ffn_mult=2,
-        max_queries=8,
-        mlp_dropout=0.0,
-        **kwargs,
-    )
-    model.eval()
-    return model
-
-
-def _batch(q_codes=(7, 8)):
-    from every_query.data.seq_dataset import ConditionalQueryBatch
-
-    return ConditionalQueryBatch(
-        code=torch.tensor([[3, 4, 5, 6]]),
-        numeric_value=torch.zeros(1, 4),
-        numeric_value_mask=torch.zeros(1, 4, dtype=torch.bool),
-        time_delta_days=torch.zeros(1, 4),
-        q_codes=torch.tensor([list(q_codes)]),
-        q_durations=torch.tensor([[30.0, 7.0]]),
-        q_answers=torch.tensor([[ANSWER_YES, ANSWER_NO]]),
-        q_mask=torch.tensor([[True, True]]),
-    )
-
-
 def test_ontology_dir_is_recorded_in_hparams(tmp_path):
     """Checkpoints must round-trip it: the wrapper changes state-dict keys."""
-    _write_ontology(tmp_path, _codes([f"G//{i}" for i in range(1, 15)]))
-    model = _tiny_model(vocab_size=extended_vocab_size(tmp_path), ontology_dir=str(tmp_path))
-    assert model.hparams["ontology_dir"] == str(tmp_path)
-    assert _tiny_model().hparams["ontology_dir"] is None
+    model, onto, _ = ontology_model(tmp_path)
+    assert model.hparams["ontology_dir"] == str(onto)
+    assert tiny_model().hparams["ontology_dir"] is None
 
 
 def test_wrapper_is_installed_on_the_shared_table(tmp_path):
-    """It must be the encoder's input embedding, which is what the query slots also read."""
-    _write_ontology(tmp_path, _codes([f"G//{i}" for i in range(1, 15)]))
-    model = _tiny_model(vocab_size=extended_vocab_size(tmp_path), ontology_dir=str(tmp_path))
+    """It must be the backbone's input embedding, which is what every code slot also reads."""
+    model, _, _ = ontology_model(tmp_path)
     assert isinstance(model.HF_model.get_input_embeddings(), OntologyEmbedding)
 
 
 def test_ontology_model_runs_and_trains(tmp_path):
-    _write_ontology(tmp_path, _codes([f"G//{i}" for i in range(1, 15)]))
-    model = _tiny_model(vocab_size=extended_vocab_size(tmp_path), ontology_dir=str(tmp_path))
+    model, _, v_ext = ontology_model(tmp_path)
     model.train()
-    loss, out = model(_batch())
-    assert loss.isfinite() and out.answer_logits.shape == (1, 2)
+    loss, out = model(make_batch())
+    assert loss.isfinite() and out.logits.shape == (2, 3, v_ext)
     loss.backward()
     raw = model.HF_model.get_input_embeddings().tok
     assert raw.weight.grad is not None and torch.isfinite(raw.weight.grad).all()
@@ -337,9 +306,8 @@ def test_ontology_model_runs_and_trains(tmp_path):
 
 def test_cache_is_cleared_between_forwards(tmp_path):
     """Without the pre-hook, a cached product would be reused across backward passes."""
-    _write_ontology(tmp_path, _codes([f"G//{i}" for i in range(1, 15)]))
-    model = _tiny_model(vocab_size=extended_vocab_size(tmp_path), ontology_dir=str(tmp_path))
+    model, _, _ = ontology_model(tmp_path)
     model.train()
     for _ in range(2):
-        loss, _ = model(_batch())
+        loss, _ = model(make_batch())
         loss.backward()  # would raise "backward through the graph a second time" if stale

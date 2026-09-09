@@ -12,8 +12,16 @@ fixed horizon.  Covered here, in pipeline order:
    boundary pool is the query universe itself.
 3. Dataset/batch — that ``bound_events`` is optional on disk, and that an unknown boundary code
    raises instead of silently decaying into an unbounded query.
-4. Model — that the boundary reaches the duration slot, that it is block-local, and that a
-   bound-free batch is answered *identically* to a model without the feature.
+4. Model — that the boundary reaches the window's end slot, that it is causally local, and that
+   a bound-free batch is answered *identically* to a model without the feature.
+
+Section 4 was originally written against ``ConditionalQueryModel``, the encoder-decoder
+conditional-sequence model, because that was the only model when event bounds landed.  The
+surviving consumer is :class:`~every_query.model.conditional_multitask_ar_model.ConditionalMultitaskARModel`,
+whose windows carry a *pair* of specs — the boundary owns the window's **end**, and the issue-#27
+start event owns its beginning — so "the duration slot" below is the end half of the window
+token, and "block-local" is the causal ``[..., W_i, C_i, A_i, W_{i+1}, ...]`` stream rather than
+a block-causal decoder mask.
 """
 
 from datetime import datetime
@@ -37,7 +45,15 @@ from every_query.generate_tasks.sample_query_sequences import (
     label_with_event_bounds,
     log_degenerate_bounds,
 )
-from every_query.model.conditional_model import ANSWER_NO, ANSWER_YES, ConditionalQueryModel
+from every_query.model.conditional_model import ANSWER_NO, ANSWER_YES
+from every_query.model.conditional_multitask_ar_model import TYPE_WINDOW
+
+# The multitask model's own construction idiom, reused rather than re-invented.
+from tests.test_conditional_multitask_ar_model import make_batch, tiny_model
+
+# The margin that separates "the feature is live" from float32 rounding, shared with
+# ``test_feature_liveness`` so it cannot drift between the files that measure it.
+from tests.test_feature_liveness import LIVE
 
 PT = datetime(2024, 1, 1)
 
@@ -300,85 +316,130 @@ def test_batch_validates_bound_shape():
 
 # ── 4. model ────────────────────────────────────────────────────────────
 
-
-def _tiny_model() -> ConditionalQueryModel:
-    model = ConditionalQueryModel(
-        num_hidden_layers=2,
-        config_overrides={
-            "hidden_size": 32,
-            "num_attention_heads": 2,
-            "intermediate_size": 64,
-            "vocab_size": 16,
-            "max_position_embeddings": 64,
-            "pad_token_id": 0,
-        },
-        decoder_layers=1,
-        decoder_heads=2,
-        decoder_ffn_mult=2,
-        max_queries=8,
-        mlp_dropout=0.0,
-    )
-    model.eval()
-    return model
+# ``make_batch``'s default windows: window 0 is duration-bounded (7d), window 1 ends at boundary
+# code 10, window 2 opens at start event 9 and is duration-bounded.  Indices are derived from the
+# multitask stream layout, not transliterated from the encoder-decoder version's query blocks.
+BOUNDED_WINDOW = 1
 
 
-def _batch(q_bound_codes=None, n_queries: int = 2) -> ConditionalQueryBatch:
-    return ConditionalQueryBatch(
-        code=torch.tensor([[3, 4, 5, 6]]),
-        numeric_value=torch.zeros(1, 4),
-        numeric_value_mask=torch.zeros(1, 4, dtype=torch.bool),
-        time_delta_days=torch.zeros(1, 4),
-        q_codes=torch.tensor([[7, 8][:n_queries]]),
-        q_durations=torch.tensor([[30.0, 7.0][:n_queries]]),
-        q_answers=torch.tensor([[ANSWER_YES, ANSWER_NO][:n_queries]]),
-        q_mask=torch.tensor([[True, True][:n_queries]]),
-        q_bound_codes=None if q_bound_codes is None else torch.tensor([q_bound_codes]),
-    )
+def _unbounded_batch(**over):
+    """``make_batch`` with every window duration-bounded — the shape of the evaluation grid."""
+    batch = make_batch(**over)
+    batch.q_durations = torch.tensor([[7.0, 30.0, 4.0, 2.0, 1.0][: batch.q_durations.shape[1]]] * 2)
+    batch.q_bound_codes = torch.zeros_like(batch.q_bound_codes)
+    return batch
+
+
+def _bound(batch, code: int, window: int = BOUNDED_WINDOW):
+    batch.q_bound_codes[:, window] = code
+    batch.q_durations[:, window] = EVENT_BOUND_DURATION_SENTINEL
+    return batch
 
 
 def test_no_bounds_is_identical_to_the_feature_being_absent():
-    """The safety property: an all-zero bound column changes nothing at all."""
-    model = _tiny_model()
+    """The safety property: an all-zero bound column changes nothing at all.
+
+    Stated as "changing the feature's only parameter must not move the answer", which is a
+    stronger claim than the encoder-decoder original could make: there the bound column could be
+    left off the batch entirely, whereas ``q_bound_codes`` is a required field of
+    ``MultitaskBoundaryBatch``, so ``NO_BOUND_INDEX`` *is* the "feature absent" form.
+    """
+    model = tiny_model()
+    batch = _unbounded_batch()
+    assert (batch.q_bound_codes == NO_BOUND_INDEX).all()
     with torch.no_grad():
-        _, without = model(_batch())
-        _, all_zero = model(_batch(q_bound_codes=[NO_BOUND_INDEX, NO_BOUND_INDEX]))
-    assert torch.equal(without.answer_logits, all_zero.answer_logits)
+        _, before = model(batch)
+        model.bound_marker.add_(10.0)
+        _, after = model(batch)
+    assert torch.equal(before.logits, after.logits), (
+        "the boundary machinery reaches a window that carries no boundary"
+    )
 
 
 def test_boundary_code_changes_the_prediction():
-    model = _tiny_model()
+    """And it is the boundary *code* that moves the answer, not merely the sentinel duration.
+
+    Bounding a window does two things at once — it writes ``EVENT_BOUND_DURATION_SENTINEL`` into
+    ``q_durations`` and a code into ``q_bound_codes`` — so a comparison against the unbounded
+    batch alone is satisfied by a model that reads the sentinel through the duration MLP and
+    ignores the code entirely.  The sentinel-only control separates the two.
+    """
+    model = tiny_model()
+    sentinel_only = _unbounded_batch()
+    sentinel_only.q_durations[:, BOUNDED_WINDOW] = EVENT_BOUND_DURATION_SENTINEL
     with torch.no_grad():
-        _, unbounded = model(_batch(q_bound_codes=[NO_BOUND_INDEX, NO_BOUND_INDEX]))
-        _, bounded = model(_batch(q_bound_codes=[9, NO_BOUND_INDEX]))
-    assert not torch.equal(unbounded.answer_logits, bounded.answer_logits)
+        _, unbounded = model(_unbounded_batch())
+        _, sentinel = model(sentinel_only)
+        _, bounded = model(_bound(_unbounded_batch(), 9))
+    assert (bounded.logits - unbounded.logits).abs().max().item() > LIVE
+    assert (bounded.logits - sentinel.logits).abs().max().item() > LIVE
 
 
 def test_different_boundaries_give_different_predictions():
     """'before discharge' and 'before death' must not be the same question."""
-    model = _tiny_model()
+    model = tiny_model()
     with torch.no_grad():
-        _, a = model(_batch(q_bound_codes=[9, NO_BOUND_INDEX]))
-        _, b = model(_batch(q_bound_codes=[10, NO_BOUND_INDEX]))
-    assert not torch.equal(a.answer_logits, b.answer_logits)
+        _, a = model(_bound(_unbounded_batch(), 9))
+        _, b = model(_bound(_unbounded_batch(), 10))
+    assert (b.logits - a.logits).abs().max().item() > LIVE
 
 
-def test_bound_does_not_leak_backwards_across_blocks():
-    """Block-causal structure holds: bounding block 1 must not move block 0's answer."""
-    model = _tiny_model()
+def test_bound_does_not_leak_backwards_across_windows():
+    """Causal structure holds: bounding a later window must not move an earlier one's answer.
+
+    ``W_1`` physically follows ``W_0`` in the combined stream, so no property of window 1 — its
+    boundary included — can reach window 0's hidden state.  The encoder-decoder version made the
+    same claim about its block-causal decoder mask; here it is the ordinary causal mask over
+    ``[patient..., W0, C0, A0, W1, C1, A1, W2]``.
+    """
+    model = tiny_model()
     with torch.no_grad():
-        _, base = model(_batch(q_bound_codes=[NO_BOUND_INDEX, NO_BOUND_INDEX]))
-        _, later = model(_batch(q_bound_codes=[NO_BOUND_INDEX, 9]))
-    assert torch.equal(base.answer_logits[:, 0], later.answer_logits[:, 0]), (
-        "a bound on a later query must not change an earlier query's answer"
+        _, base = model(_unbounded_batch())
+        _, later = model(_bound(_unbounded_batch(), 11, window=2))
+    assert torch.equal(base.logits[:, :2], later.logits[:, :2]), (
+        "a bound on a later window must not change an earlier window's answer"
     )
-    assert not torch.equal(base.answer_logits[:, 1], later.answer_logits[:, 1])
+    assert (later.logits[:, 2] - base.logits[:, 2]).abs().max().item() > LIVE
+
+
+def test_boundary_owns_the_window_end_and_leaves_the_start_alone():
+    """A boundary replaces *what closes the window*, never *when it opens*.
+
+    ``_window_embeds`` sums a start spec and an end spec; an event bound must swap the end
+    spec's scalar-duration path for ``embedding(code) + bound_marker`` and touch nothing else.
+    """
+    model = tiny_model()
+    batch = _bound(_unbounded_batch(), 9)
+    with torch.no_grad():
+        got = model._window_embeds(batch)
+        starts, start_codes = model._start_fields(batch)
+        embedding = model.HF_model.get_input_embeddings()
+        start_spec = torch.where(
+            (start_codes > 0).unsqueeze(-1),
+            embedding(start_codes) + model.start_marker,
+            model.start_duration_embed((starts / 365.0).unsqueeze(-1)),
+        )
+        end_duration = model.end_duration_embed((batch.q_durations / 365.0).unsqueeze(-1))
+        end_event = embedding(batch.q_bound_codes) + model.bound_marker
+        rest = model.token_type_embed.weight[TYPE_WINDOW] + model.block_pos_embed(
+            torch.arange(batch.q_durations.shape[1])
+        ).unsqueeze(0)
+
+    # The bounded window's end spec is the boundary embedding, not the scalar MLP.
+    torch.testing.assert_close(got[:, BOUNDED_WINDOW], (start_spec + end_event + rest)[:, BOUNDED_WINDOW])
+    assert (
+        got[:, BOUNDED_WINDOW] - (start_spec + end_duration + rest)[:, BOUNDED_WINDOW]
+    ).abs().max().item() > LIVE, "the bounded window's end slot is replaced"
+    # Every other window keeps the scalar path exactly.
+    other = [k for k in range(batch.q_durations.shape[1]) if k != BOUNDED_WINDOW]
+    torch.testing.assert_close(got[:, other], (start_spec + end_duration + rest)[:, other])
 
 
 def test_bound_marker_receives_gradient():
     """The marker is what separates 'bounded by X' from 'asking about X'; it must train."""
-    model = _tiny_model()
+    model = tiny_model()
     model.train()
-    loss, _ = model(_batch(q_bound_codes=[9, NO_BOUND_INDEX]))
+    loss, _ = model(_bound(_unbounded_batch(), 9))
     loss.backward()
     assert model.bound_marker.grad is not None
     assert torch.isfinite(model.bound_marker.grad).all()
