@@ -404,12 +404,20 @@ the final query's answer. Prior answers are context, not identity, and not the l
 **Headline** = mean of the non-null `auroc` over cells, reported alongside `n_tasks_scored` and
 `n_tasks_null` so a macro over 12 of 64 cells cannot pass as a macro over 64.
 
-**Summary** — `<metrics_stem>.summary.parquet`, one row: `macro_auroc`, `macro_auroc_ci_lo`,
-`macro_auroc_ci_hi`, `n_tasks_scored`, `n_tasks_null`, `macro_bootstrap`, `n_resamples`,
-`bootstrap_seed`. The last three are written so a reported interval is reproducible, and so it
-carries which axis it was resampled over rather than leaving that to memory.
+**Summary** — `<metrics_stem>.summary.parquet`, one row: `macro_auroc`, then three CI pairs —
+`macro_auroc_ci_{lo,hi}_tasks`, `_subjects`, `_nested` — plus `n_tasks_scored`, `n_tasks_null`,
+`n_resamples`, `bootstrap_seed`. All three intervals are emitted rather than selected by a flag: they
+answer different questions, they come out of the same computation (below), and naming the axis in the
+column means an interval read six months later carries its own definition.
 
 #### Bootstrap 95% CIs
+
+**Always computed, never opt-in.** Both levels — the per-cell interval on every row of
+`by_task.parquet` and all three macro intervals in `summary.parquet` — are produced on every run.
+There is no `--bootstrap` flag and no mode selector: a point AUROC without an interval invites being
+quoted as if it were precise, and the intervals cost one pass that this design is already paying for
+(see "One bootstrap pass" below). The only knob is `n_resamples` (default `1000`), which trades
+runtime for interval resolution; it is not a way to switch the intervals off.
 
 Match the convention on `upstream/task-auroc-ci`, which adds exactly this to
 `task_auroc_callback.py` — `scipy.stats.bootstrap`, `n_resamples=1000`, `confidence_level=0.95`,
@@ -429,44 +437,57 @@ understate the spread and quietly narrow every interval. Resample distinct `subj
 their rows (`eval_per_position.py:92` does the same thing one level up, resampling whole sequences so
 positions stay correlated within one).
 
-**Per-cell CI** — subject-cluster bootstrap within the cell. A resample can land single-class, where
-AUROC is undefined; use `np.nan` for that replicate and `np.nanpercentile` for the bounds (the
-pattern already in `eval_per_position.py:132`), and count how often it happens so a cell whose
-interval rests on a handful of usable replicates is visible rather than silently wide.
+**One bootstrap pass produces every interval.** Per replicate `b`:
 
-**Macro CI** — resample the **task cells**, mean of their point AUROCs. This is what upstream's
-callback does (its `indicators` list holds one score per task, so resampling it resamples tasks), and
-it answers "would this macro hold up under a different draw of query specs?".
+1. Draw a subject index `S_b` — `n_subjects` distinct `subject_id`s with replacement — **shared
+   across all cells**, not redrawn per cell.
+2. For each cell `c`, recompute `AUROC[c, b]` over the rows of `c` whose subject is in `S_b`.
 
-It is worth being explicit that this is *not* the same question as "would it hold up on a different
-cohort". Because the grid is dense, every cell holds the **same** subjects, so cells are correlated
-through shared patients. Answering the cohort question needs one shared subject-level bootstrap index
-per replicate applied across all cells at once, then the macro recomputed inside each replicate —
-resampling cells independently would understate that correlation. Offer it behind a flag
-(`macro_bootstrap: tasks | subjects`, default `tasks`) rather than silently picking one; the two
-intervals answer different questions and a reader cannot tell them apart from the column name.
+That single `n_cells x n_resamples` grid of AUROCs yields all four numbers:
 
-**What each interval is bootstrapped over, stated plainly:**
-
-| interval | resampling unit | draws per replicate | the question it answers |
+| interval | read off the grid as | resampling axis | the question it answers |
 | --- | --- | --- | --- |
-| `auroc_ci_lo/hi` (per cell) | subjects **within that cell** | `n_subjects`, with replacement, all their rows | would this task's AUROC hold on a different draw of patients? |
-| `macro_auroc_ci_*`, `macro_bootstrap: tasks` | the task cells | `n_tasks_scored` point AUROCs, with replacement | would the macro hold on a different draw of query specs? |
-| `macro_auroc_ci_*`, `macro_bootstrap: subjects` | subjects, **one shared index across all cells** | `n_subjects`, then every cell re-scored under it | would the macro hold on a different cohort? |
+| `auroc_ci_{lo,hi}` (per cell `c`) | percentiles of `AUROC[c, :]` | subjects | would *this task's* AUROC hold on a different draw of patients? |
+| `macro_auroc_ci_*_subjects` | percentiles of `mean_c AUROC[:, b]` | subjects | would the macro hold on a different cohort, holding the query specs fixed? |
+| `macro_auroc_ci_*_nested` | within each `b`, resample cells with replacement from `AUROC[:, b]`, take the mean; percentiles over `b` | subjects **and** tasks | would the macro hold on a different cohort *and* a different draw of specs? |
+| `macro_auroc_ci_*_tasks` | resample the *point* AUROCs with replacement, take the mean | tasks | would the macro hold on a different draw of specs, holding the cohort fixed? |
 
-**Neither macro variant covers both axes, and the output should not pretend otherwise.** `tasks`
-treats each cell's AUROC as exact and measures only between-task spread; `subjects` conditions on the
-fixed `N` specs and measures only patient noise. A CI over both needs a nested resample — draw tasks,
-then draw subjects within the drawn tasks — at roughly `n_tasks` times the cost, which is why it is
-not the default. Write the chosen mode into the summary row (`macro_bootstrap`) next to
-`n_resamples` and `bootstrap_seed`, so an interval read six months later carries its own definition
-instead of relying on whoever ran it to remember which axis it covered.
+The sharing in step 1 is what makes the macro rows valid: the grid is dense, so every cell holds the
+**same** subjects and the cells are correlated through them. Redrawing per cell would destroy that
+correlation and narrow the macro intervals. It costs the per-cell rows nothing — each cell's marginal
+distribution `AUROC[c, :]` is still an ordinary subject bootstrap of that cell.
 
-**Cost.** Roughly `n_cells x n_resamples` AUROC evaluations, each `O(n log n)` — 64 cells at 1000
-resamples is 64k `roc_auc_score` calls, a minute or so at 10k rows per cell and closer to ten at
-100k. Keep `n_resamples` a config knob. If it becomes the bottleneck, the fallback is DeLong's
-analytic AUROC variance for the per-cell intervals (one `O(n log n)` pass, no resampling), keeping
-the bootstrap only for the macro.
+**Quote `_nested` as the headline uncertainty.** It is the only one of the three that resamples both
+axes; `_tasks` treats each cell's AUROC as exact and sees only between-task spread, `_subjects`
+conditions on the fixed `N` specs and sees only patient noise. Keep `_tasks` anyway — it is what
+`upstream/task-auroc-ci`'s callback computes, so it is the number the training-time logs are directly
+comparable to.
+
+> **Correction to an earlier draft of this plan**, which called the nested interval "roughly
+> `n_tasks` times the cost, which is why it is not the default". That compared it against the
+> *`tasks`* bootstrap, which is a mean over 64 floats and essentially free. Against the per-cell
+> bootstrap — which this design already pays for — the nested interval is **free**: step 2 is the
+> same `n_cells x n_resamples` AUROC grid either way, and `_nested` is a mean over numbers already in
+> it. There is no cost argument for omitting it.
+
+**Degenerate replicates.** A resample can land single-class, where AUROC is undefined; use `np.nan`
+for that cell-replicate and `np.nanpercentile` for the bounds (the pattern already in
+`eval_per_position.py:132`), and record how often it happens so a cell whose interval rests on a
+handful of usable replicates is visible rather than silently wide.
+
+**Grid invariant worth asserting.** The macro rows assume every cell holds the same subject set —
+true by construction for a dense grid, since each spec is labelled at every context. Check it rather
+than trust it: a malformed or partially-written grid would otherwise produce a shared index that
+intersects different cells to different degrees, and the macro intervals would be quietly wrong
+rather than absent.
+
+**Cost.** The whole thing is one `n_cells x n_resamples` grid of AUROC evaluations, each
+`O(n log n)` — 64 cells at 1000 resamples is 64k `roc_auc_score` calls, a minute or so at 10k rows
+per cell and closer to ten at 100k. Every interval above is a percentile over that one grid, so the
+cost is set entirely by wanting per-cell CIs at all; the macro variants add nothing measurable. Keep
+`n_resamples` a config knob. If the grid becomes the bottleneck, the fallback is DeLong's analytic
+AUROC variance for the per-cell intervals (one `O(n log n)` pass, no resampling) — but note that
+dropping the grid also drops `_subjects` and `_nested`, leaving only the `_tasks` interval.
 
 #### Defensive test for the list-column `group_by`
 
@@ -511,7 +532,7 @@ collapse without rework, since the ordering is already dependency-clean.
 
 | | Question | Answer |
 | --- | --- | --- |
-| **D1** | The missing multitask evaluator | **Port `EQ_evaluate_multitask`.** Adapt `evaluate_sequences.py` to the one-row-per-grid-row schema; group by the query spec `(queries, durations, start_durations, start_events, bound_events)`, excluding `answers[:-1]`; macro-average AUROC over task cells with 95% bootstrap CIs following the `upstream/task-auroc-ci` convention; guard the list-column `group_by` with a defensive test. Shipping an inference CLI with no evaluator was judged the wrong look on an upstream PR. Full design in §6 "Step 5". |
+| **D1** | The missing multitask evaluator | **Port `EQ_evaluate_multitask`.** Adapt `evaluate_sequences.py` to the one-row-per-grid-row schema; group by the query spec `(queries, durations, start_durations, start_events, bound_events)`, excluding `answers[:-1]`; macro-average AUROC over task cells; emit 95% bootstrap CIs both **per cell** and on the **macro** (three macro variants — tasks, subjects, nested — all falling out of one shared-subject-index bootstrap pass) following the `upstream/task-auroc-ci` convention; guard the list-column `group_by` with a defensive test. Shipping an inference CLI with no evaluator was judged the wrong look on an upstream PR. Full design in §6 "Step 5". |
 | **D2** | `scripts/experiments/` | **Delete entirely.** Machine-local and redundant with the README's Hydra invocations. Salvage the venv/`PYTHONPATH` warning into prose first (§5.2). |
 | **D3** | Vestigial names | **Rename both.** `seq_dataset.py` → `query_seq_dataset.py` (class → `QuerySeqPytorchDataset`), `sample_query_sequences.py` → `query_sequence_labeling.py`. Pure renames show as `R100`; no surviving YAML names the class (§3.2). |
 | **D4** | `docs/CONDITIONAL_QUERIES.md` | **Rewrite as `docs/MULTITASK.md`, drop the results sections.** They quote the conditional-seq `big_v2` run; add multitask numbers once PR #33's model is measured (§5.4). |
