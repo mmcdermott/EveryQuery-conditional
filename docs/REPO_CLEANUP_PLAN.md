@@ -241,7 +241,8 @@ CLIs removed: EQ_generate_query_sequences, EQ_predict_sequences, EQ_evaluate_seq
 > **So the trim leaves EQ-multitask with no evaluate step.** Resolved by D1: port
 > `EQ_evaluate_multitask` before the upstream PR. `evaluate_sequences.py` is therefore *moved and
 > adapted*, not deleted — it is the starting point for the new CLI, so do step 5 of §6 before
-> deleting it, or delete it and recover the file from history.
+> deleting it, or delete it and recover the file from history. The design, including its grouping
+> key, is in §6 "Step 5".
 
 ### 5.2 scripts (4,453 lines)
 
@@ -344,7 +345,7 @@ Six PRs into `dev`, then one PR to upstream. Each step leaves the suite green.
 | 2 | **Delete the analysis scripts, PDFs, reports/, stale docs** (§5.2–5.4). Pure removal, no code touched. | trivial |
 | 3 | **Extract the shared symbols** (§3.1–3.3): new `model/answers.py`, trim `seq_dataset`, demote `sample_query_sequences` to a library. No deletions yet — both pipelines still import fine. | low |
 | 4 | **Delete the conditional-seq pipeline** (§5.1 + §4.1) and fix `train.py` / `model_loader.py`. | low, after 1 & 3 |
-| 5 | **Port `EQ_evaluate_multitask`** (D1) by adapting `evaluate_sequences.py` to group by `(target_code, duration_bucket)` over the one-row-per-grid-row schema and report macro AUROC. | medium — new code |
+| 5 | **Port `EQ_evaluate_multitask`** (D1) — group by the query *spec*, macro-average AUROC over task cells. Design below. | medium — new code |
 | 6 | **Rewrite README + `docs/MULTITASK.md`** (§5.5, §5.4), results sections omitted. | low |
 | 7 | **Stacked PR series to `payalchandak/EveryQuery`** (D5). | — |
 
@@ -352,9 +353,77 @@ Step 0 is a hard gate, not a formality — see the status note at the top.
 
 Doing 1 before 4 is the point of the ordering: it is the only step that can silently cost coverage.
 
-Step 5 has an ordering constraint of its own: `evaluate_sequences.py` is the template for the new
-CLI, so either write `EQ_evaluate_multitask` before step 4 deletes it, or accept recovering the file
-from history.
+### Step 5 — `EQ_evaluate_multitask`
+
+Ordering constraint first: `evaluate_sequences.py` is the template, so either write this before step
+4 deletes it, or accept recovering the file from history.
+
+**Input.** The `EQ_predict_multitask` parquet, one row per grid row:
+
+```
+subject_id, prediction_time,
+queries, start_durations, start_events, durations, bound_events, answers,   # list columns
+target_code, label, prob
+```
+
+**Grouping key — the query specification, five list columns:**
+
+```python
+TASK_KEY = ["queries", "durations", "start_durations", "start_events", "bound_events"]
+```
+
+That *is* the task. `sample_evaluation_query_sequences` resolves `N` `SequenceSpec`s once
+(`num_evaluation_sequences`, default 64) and labels **every one at every context**, so grouping on
+the spec recovers exactly those `N` cells, each populated by the whole cohort — its own docstring
+puts it as "for a given sequence the only thing varying across its rows is the patient, which is
+what per-sequence metrics need." Pooling instead measures cross-query base-rate separation.
+
+This supersedes the `(target_code, duration_bucket)` key floated in the first draft of this plan.
+Bucketing lumps distinct horizons, and at `K > 1` it pools rows whose conditioning contexts differ,
+which is the axis most worth separating.
+
+**`answers[:-1]` is deliberately not in the key.** The conditioning answers vary per context, so
+adding them would split each spec cell into up to `2^(K-1)` sub-buckets, skewed hard toward
+all-False (most codes are rare) — and AUROC is undefined on a single-class cell, so most of the
+partition would come back null. The score is `prob`; the class label is `label`, i.e. `answers[-1]`,
+the final query's answer. Prior answers are context, not identity, and not the label.
+
+**Output** — `<metrics_stem>.by_task.parquet`, one row per spec:
+
+| column | |
+| --- | --- |
+| the five `TASK_KEY` columns | the spec itself |
+| `target_code` | `queries[-1]`, for readability |
+| `n_queries` | `len(queries)`; `1` means no conditioning |
+| `duration_bucket` | bucket of the final query's horizon, descriptive only — for rollups, never a key |
+| `n_rows`, `n_positive`, `prevalence` | over the cell |
+| `auroc` | within-cell, null when single-class (`_auroc_or_none`) |
+
+**Headline** = mean of the non-null `auroc` over cells, reported alongside `n_tasks_scored` and
+`n_tasks_null` so a macro over 12 of 64 cells cannot pass as a macro over 64.
+
+#### Defensive test for the list-column `group_by`
+
+Group directly on the list columns rather than hashing them to a `task_id` — it keeps the spec
+legible in the output — but pin the behaviour, since `pyproject` allows `polars>=1.35,<2` and this
+is not a heavily exercised polars path. Verified working on **polars 1.40.0** (2026-09-08): distinct
+specs partition correctly, nulls inside lists do not collapse distinct specs, and the `-1.0`
+sentinel separates from real horizons. The test guards the rest of the 1.x range.
+
+1. **No collision.** Same codes with different `durations` → two cells; same codes with one position
+   event-bounded (`durations` `-1.0` + a `bound_events` code) → two cells.
+2. **Nulls inside lists are significant.** `bound_events` `[None, None]` and `[None, "DISCHARGE"]`
+   must not group together.
+3. **Sentinel floats.** `-1.0` in `durations` / `start_durations` groups by exact equality and never
+   merges with a real horizon.
+4. **Round-trip against the grid** — the strongest of the five, since it catches collision *and*
+   fragmentation in one assertion: cell count equals the number of distinct `SequenceSpec`s in the
+   input grid, and `sum(n_rows)` equals the input height (nothing dropped, nothing double-counted).
+5. **Order independence.** Shuffling the input rows yields identical cells and identical metrics.
+
+If a future polars breaks any of these, the fallback is a derived `task_id` —
+`pl.struct(TASK_KEY).hash()`, or `utils/digest.py` — which reconstitutes the identifier
+`predict_multitask` deliberately dropped, in the place it belongs.
 
 ### Step 7 — the stacked series
 
@@ -376,7 +445,7 @@ collapse without rework, since the ordering is already dependency-clean.
 
 | | Question | Answer |
 | --- | --- | --- |
-| **D1** | The missing multitask evaluator | **Port `EQ_evaluate_multitask`.** Adapt `evaluate_sequences.py` to the one-row-per-grid-row schema, group by `(target_code, duration_bucket)`, report macro AUROC. Shipping an inference CLI with no evaluator was judged the wrong look on an upstream PR. Step 5 of §6. |
+| **D1** | The missing multitask evaluator | **Port `EQ_evaluate_multitask`.** Adapt `evaluate_sequences.py` to the one-row-per-grid-row schema; group by the query spec `(queries, durations, start_durations, start_events, bound_events)`, excluding `answers[:-1]`; macro-average AUROC over task cells; guard the list-column `group_by` with a defensive test. Shipping an inference CLI with no evaluator was judged the wrong look on an upstream PR. Full design in §6 "Step 5". |
 | **D2** | `scripts/experiments/` | **Delete entirely.** Machine-local and redundant with the README's Hydra invocations. Salvage the venv/`PYTHONPATH` warning into prose first (§5.2). |
 | **D3** | Vestigial names | **Rename both.** `seq_dataset.py` → `query_seq_dataset.py` (class → `QuerySeqPytorchDataset`), `sample_query_sequences.py` → `query_sequence_labeling.py`. Pure renames show as `R100`; no surviving YAML names the class (§3.2). |
 | **D4** | `docs/CONDITIONAL_QUERIES.md` | **Rewrite as `docs/MULTITASK.md`, drop the results sections.** They quote the conditional-seq `big_v2` run; add multitask numbers once PR #33's model is measured (§5.4). |
