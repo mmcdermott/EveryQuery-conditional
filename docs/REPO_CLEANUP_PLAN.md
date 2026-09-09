@@ -1,0 +1,381 @@
+# Repo cleanup plan — trimming to two pipelines before the upstream PR
+
+**Status:** proposal for review. Nothing has been deleted. Written 2026-09-08 against `dev` at
+`d8ba8f8` (PR #32 merged; PR #33 `feat/multitask-ontology-boundaries` still open).
+
+**Goal.** Land PR #33, then reduce `mmcdermott/EveryQuery-conditional` to exactly two pipelines and
+open a PR against `payalchandak/EveryQuery`:
+
+1. **EQ-single** — the original single-code / single-duration EveryQuery model. This is
+   *verbatim upstream*: `upstream/main` contains it and nothing else.
+2. **EQ-multitask** — `ConditionalMultitaskARModel`: the decoder-only, all-vocabulary,
+   multi-boundary model with ontology-derived targets.
+
+Everything else goes. The bulk of "everything else" is one coherent thing: the **conditional
+query-sequence pipeline** (`ConditionalQueryEncoderDecoderModel` and its decoder-only sibling
+`ConditionalQueryARModel`), plus the ~4.5k lines of one-off analysis scripts and three report PDFs
+that exist only to measure it.
+
+---
+
+## 1. The headline number
+
+Tracked Python in the fork today: **49,712 lines**.
+
+| Bucket | Lines | Confidence |
+| --- | ---: | --- |
+| Straight deletions — src modules that only the conditional-seq pipeline uses | 897 | high |
+| Straight deletions — one-off analysis / report scripts | 4,453 | high |
+| Straight deletions — tests that only exercise the conditional-seq pipeline | 2,512 | high |
+| Partial deletions inside shared modules (see §3) | ~700 | medium |
+| Tests that must be **rehomed onto the multitask model**, not deleted (see §4) | 1,876 | this is the real work |
+| Docs / notes | 1,146 | high |
+| Tracked PDFs | 1.2 MB binary | high |
+
+Roughly **8.5k lines of Python deleted outright**, ~1.9k lines of feature tests rewritten, ~1.2 MB
+of binaries dropped from git.
+
+---
+
+## 2. What survives, in full
+
+### 2.1 EQ-single (identical to `upstream/main`)
+
+Do not touch these. They are what the upstream maintainer already has, and the PR diff should show
+zero changes to them beyond what PRs #20–#33 legitimately added.
+
+```
+src/every_query/data/{dataset,datamodule,schema}.py, data/__init__.py, data/README.md
+src/every_query/model/{model,lightning_module,task_auroc_callback}.py, model/__init__.py, README.md
+src/every_query/generate_tasks/{sample_tasks,sample_evaluation_tasks,sample_task_tracking_pairs}.py
+src/every_query/{train,predict,evaluate,preprocessing,utils}/  — minus the files listed in §3
+src/every_query/predict/external_tasks/**
+CLIs: EQ_process_data, EQ_generate_training_tasks, EQ_generate_evaluation_tasks,
+      EQ_sample_task_tracking_pairs, EQ_train, EQ_predict, EQ_evaluate
+```
+
+Note `data/schema.py` has grown `QuerySeqSchema` and `MultitaskBoundarySchema` on top of upstream's
+`TaskQuerySchema` — both are needed by EQ-multitask, so the file stays extended.
+
+### 2.2 EQ-multitask
+
+```
+src/every_query/data/multitask_dataset.py                      676
+src/every_query/data/multitask_eval_dataset.py                 369
+src/every_query/data/conditional_multitask_datamodule.py       293
+src/every_query/data/ontology.py                               832
+src/every_query/data/build_ontology.py + configs/              108
+src/every_query/data/rope_time.py                              224
+src/every_query/model/conditional_multitask_ar_model.py        538
+src/every_query/model/conditional_multitask_lightning.py       185
+src/every_query/model/ontology_embedding.py                    149
+src/every_query/generate_tasks/sample_multitask_sequences.py  1764
+src/every_query/generate_tasks/interval_table.py               647
+src/every_query/generate_tasks/sample_evaluation_query_sequences.py  1562
+src/every_query/predict/predict_multitask.py                   681
+configs: conditional_multitask_ar_config.yaml, _demo_train_conditional_multitask_ar.yaml,
+         predict_multitask.yaml, sample_multitask_sequences_config.yaml,
+         sample_evaluation_query_sequences_config.yaml, build_ontology.yaml
+CLIs: EQ_build_ontology, EQ_generate_multitask_sequences,
+      EQ_generate_evaluation_query_sequences, EQ_predict_multitask
+```
+
+`sample_evaluation_query_sequences.py` is worth calling out: its name says "query sequences", but
+it is **the** evaluation-grid generator for the multitask model — `EQ_predict_multitask` reads
+exactly its output, and only it can emit the explicit window starts the multitask model consumes.
+It stays.
+
+---
+
+## 3. The entanglement — this is where the actual work is
+
+The multitask pipeline was built on top of the conditional-seq pipeline, so four surviving modules
+import from four dying ones. You cannot just `git rm` the conditional-seq files; each needs a small
+extraction first.
+
+### 3.1 `model/conditional_model.py` (581 lines) — split, don't delete
+
+| Symbol | Used by | Fate |
+| --- | --- | --- |
+| `ANSWER_NO`, `ANSWER_YES`, `N_ANSWER_CLASSES` | `seq_dataset`, multitask model, tests | **keep** |
+| `_init_aux_embeddings`, `validate_rope_time_pair` | `conditional_multitask_ar_model` | **keep** |
+| `TOKEN_CODE/DURATION/ANSWER`, `TOKENS_PER_QUERY` | `conditional_ar_model`, `train.py` size-inference | **delete** (multitask has its own `TOKENS_PER_WINDOW`) |
+| `build_block_causal_mask`, `masked_bce`, `ConditionalQueryOutput` | conditional-seq only | **delete** |
+| `ConditionalQueryEncoderDecoderModel` (+ `ConditionalQueryModel` alias) | conditional-seq only | **delete** (~430 lines) |
+
+**Action:** move the five surviving symbols into a new `src/every_query/model/answers.py` (or fold
+them into `model/__init__.py`), repoint `seq_dataset` and `conditional_multitask_ar_model`, then
+delete `conditional_model.py` entirely. Deleting the file rather than gutting it in place keeps the
+upstream diff honest — a file called `conditional_model.py` holding five constants would confuse a
+reviewer.
+
+### 3.2 `data/seq_dataset.py` (628 lines) — keep, rename
+
+`QuerySeqMultitaskEvalDataset` **subclasses** `ConditionalQueryPytorchDataset`, and
+`multitask_dataset` / `predict_multitask` / `sample_multitask_sequences` all pull its column-name and
+sentinel constants (`EVENT_BOUND_DURATION_SENTINEL`, `NO_BOUND_INDEX`, `ALL_SEQ_LABEL_COLS`, …).
+
+Only `ConditionalQueryBatch` (the conditional-seq collate output, lines 91–181) is dead once
+`conditional_lightning` goes.
+
+**Action:** delete `ConditionalQueryBatch`, keep the rest, and consider renaming the module to
+`query_seq_dataset.py` and the class to something that does not say "conditional" — the name is now
+misleading, since its only remaining consumer is the multitask eval path. Rename is optional; flag
+it as a judgment call (§7).
+
+### 3.3 `generate_tasks/sample_query_sequences.py` (1,398 lines) — demote to a library
+
+Two survivors import from it:
+
+- `sample_evaluation_query_sequences` → `QuerySequenceDistribution`, `build_query_universe`,
+  `label_query_sequences`, `maybe_expand_to_matching_query_nodes`, `label_with_event_bounds`,
+  `label_with_explicit_starts`, and the `_ctx_id` / `_position` / bound / start column names.
+- `sample_multitask_sequences` → `resolve_prediction_times`.
+
+Dead once `EQ_generate_query_sequences` goes: `label_one_sequence_shard`, `_label_sequence_shards`,
+`_validate_sequence_count`, `label_sequence_shards`, `run`, `main`, and (pending a check)
+`_expand_sequences`, `_attach_queries_to_contexts`, `build_sequence_index` — roughly lines 1150–1398
+plus a few above, ~300 lines.
+
+**Action:** drop the `EQ_generate_query_sequences` entry point, delete the shard-orchestration and
+Hydra `run`/`main` tail, rename the module to `query_sequence_labeling.py`, and delete its config
+`sample_query_sequences_config.yaml`.
+
+> ⚠️ `build_sequence_index` is currently only imported by `tests/test_conditional_queries.py` (which
+> is on the delete list) — but `sample_evaluation_query_sequences` has two comments asserting its
+> output is *shaped exactly like* `build_sequence_index`'s. Confirm it is genuinely unreferenced
+> before removing, and move those comments' invariant into the eval-grid module.
+
+### 3.4 `train/train.py` and `utils/model_loader.py` — small edits
+
+- `train.py:45–71` — the model-size-from-data inference branches on `ConditionalQueryARModel` and
+  imports `TOKENS_PER_QUERY` from `conditional_model`. Delete that branch and its doctest; keep the
+  `ConditionalMultitaskARModel` branch above it.
+- `model_loader.py:43–44` — a docstring reference to `ConditionalQueryLightningModule`. One-line fix.
+
+---
+
+## 4. Tests — the one place this plan can lose real coverage
+
+### 4.1 Delete outright (2,512 lines)
+
+| File | Lines | Why |
+| --- | ---: | --- |
+| `tests/test_conditional_ar_model.py` | 730 | tests `ConditionalQueryARModel` |
+| `tests/test_conditional_cli.py` | 709 | end-to-end for `EQ_generate_query_sequences` → `EQ_predict_sequences` |
+| `tests/test_conditional_queries.py` | 1,073 | the conditional-seq sampler + lightning module |
+
+### 4.2 Rehome onto `ConditionalMultitaskARModel` — do **not** delete (1,876 lines)
+
+These are the feature tests for RoPE-time, event bounds and ontology embeddings. They are the
+strongest tests in the repo — several were written specifically because a data run found *silently
+wrong labels* that a green suite had missed (`docs/history/2026-08-21-three-features-verification.md`
+is the post-mortem). They happen to drive those features through `ConditionalQueryModel` because
+that was the only model when they were written.
+
+| File | Lines | What to do |
+| --- | ---: | --- |
+| `tests/test_rope_time.py` | 518 | swap the model under test for `ConditionalMultitaskARModel`; the sampler/dataset halves need no change |
+| `tests/test_ontology_embedding.py` | 426 | same — `OntologyEmbedding` / `wrap_tok_embeddings` are shared |
+| `tests/test_event_bounded.py` | 385 | most of it is labeller-level and survives as-is; only the model-forward assertions move |
+| `tests/test_ontology.py` | 345 | mostly `data/ontology.py` — only the `ConditionalQueryModel` liveness checks move |
+| `tests/test_feature_composition.py` | 202 | all three features at once; must move wholesale |
+| `tests/test_feature_liveness.py` | 151 | pure model-liveness; move wholesale, or delete if `tests/test_conditional_multitask_ar_model.py` already covers each toggle |
+
+**Budget this honestly.** It is a day of work, not an afternoon, and it is the step where the trim
+can quietly reduce the quality of the thing you are trying to upstream. Recommendation: do it as its
+own PR, *before* the deletions land, so the suite is never red and so a reviewer can see coverage
+move rather than vanish.
+
+### 4.3 Keep unchanged
+
+`tests/multitask/**`, `tests/ontology_suite/**`, `tests/test_ontology_golden.py`,
+`tests/test_ontology_differential.py`, `tests/test_multitask_*.py`,
+`tests/test_conditional_multitask_{ar_model,cli}.py`, `tests/test_queryseq_starts.py`,
+`tests/test_window_bounds_contract.py`, `tests/test_event_bounds_oracle.py`,
+`tests/test_rope_strip_{guard,oracle}.py`, `tests/test_eval_ontology_plumbing.py`,
+`tests/sampler/**`, and every upstream test.
+
+### 4.4 `conftest.py`
+
+The root conftest's `seq_task_labels_dir` / `seq_dataset` / `seq_sample_batch` fixtures
+(lines 393–469) serve the conditional-seq tests. Check whether the rehomed tests in §4.2 still want
+them (they probably do, for the dataset half) before deleting.
+
+---
+
+## 5. Straight deletions — no untangling needed
+
+### 5.1 src
+
+```
+src/every_query/model/conditional_ar_model.py          377
+src/every_query/model/conditional_lightning.py         221
+src/every_query/predict/predict_sequences.py           147   + configs/predict_sequences.yaml
+src/every_query/evaluate/evaluate_sequences.py         152   + configs/evaluate_sequences.yaml
+src/every_query/train/configs/conditional_config.yaml
+src/every_query/train/configs/conditional_ar_config.yaml
+src/every_query/train/configs/_demo_train_conditional.yaml
+src/every_query/train/configs/_demo_train_conditional_ar.yaml
+src/every_query/generate_tasks/configs/sample_query_sequences_config.yaml
+CLIs removed: EQ_generate_query_sequences, EQ_predict_sequences, EQ_evaluate_sequences
+```
+
+> ⚠️ **`EQ_evaluate_sequences` is the multitask pipeline's only nearby evaluator, and it does not
+> actually fit.** It consumes the per-query-position parquet from `EQ_predict_sequences` and groups
+> by sequence position. `EQ_predict_multitask` writes a different schema — one row per grid row, with
+> `target_code` / `label` / `prob`. Nothing in the repo consumes that today; the headline numbers
+> came from the `scripts/eval_*.py` one-offs being deleted in §5.2.
+>
+> **So the trim leaves EQ-multitask with no evaluate step.** See decision D1 in §7.
+
+### 5.2 scripts (4,453 lines)
+
+All of these were built to measure the conditional-seq model and feed the report PDFs:
+
+```
+scripts/build_report.py                686
+scripts/build_report_v2.py             357
+scripts/build_report_final.py          495
+scripts/eval_v2.py                     443
+scripts/eval_v3.py                     458
+scripts/run_full_evaluation.py         546
+scripts/eval_macro_position.py         309
+scripts/eval_clinical.py               237
+scripts/make_clinical_task_sequences.py 192
+scripts/eval_occurs_uncensored.py      186
+scripts/eval_position_effect.py        172
+scripts/make_position_probe.py         166
+scripts/eval_per_position.py           158
+scripts/generate_mimic_sequences.py     48   (its own docstring says "Superseded")
+```
+
+**Keep** `scripts/bench_multitask_dataset.py` (110) — it benchmarks the surviving dataset.
+
+`tests/test_cli_smoke.py::test_script_imports` import-checks every file under `scripts/`, so this
+deletion shrinks that test's parametrisation automatically — no edit needed, but expect the test
+count to drop.
+
+`scripts/experiments/{00_build_ontology.sh,_common.sh}` are useful but machine-local: `_common.sh`
+hardcodes `/home/gkondas/EveryQuery-conditional/.venv` and sources a gitignored `env.sh`. Either
+generalise them or drop them from the upstream PR — see D2.
+
+### 5.3 Binaries and reports (1.2 MB)
+
+```
+EveryQuery_Conditional_Report.pdf         727 KB   (tracked at repo root)
+EveryQuery_Conditional_Report_v2.pdf      142 KB   (tracked at repo root)
+reports/EveryQuery_Conditional_Report_FINAL.pdf  338 KB
+reports/README.md                                  (reproduce instructions for the deleted scripts)
+reports/ontology_evaluation_audit.md               (13 KB; check for anything worth keeping first)
+```
+
+All three PDFs report on the conditional-seq `big_v2` run. They stay in git history; deleting them
+from the tree is enough. Add `*.pdf` to `.gitignore`.
+
+Also untracked-but-present and worth sweeping: `build_ontology.log`, `tea_debug.log`,
+`node_modules/`, `outputs/`, `__pycache__/`, `.pytest_cache/`, `.ruff_cache/`. `.gitignore` already
+covers `outputs/` and `*.log`; it does **not** cover `node_modules/` or `*.pdf` — add both.
+
+### 5.4 docs (1,146 lines)
+
+| File | Lines | Fate |
+| --- | ---: | --- |
+| `docs/COHORT_INFERENCE_NOTES.md` | 376 | **delete** — self-described "reference notes, not a plan", dated 2026-07-24, about an archived checkpoint at a path that no longer matters |
+| `docs/history/2026-08-18-conditional-v2-integration-plan.md` | 318 | **delete** — port plan, fully executed |
+| `docs/history/2026-08-21-ontology-handoff.md` | 278 | **delete** — session handoff, resolved |
+| `docs/history/2026-08-21-three-features-verification.md` | 174 | **keep, or salvage** — this is the "why the tests look like that" document. Fold its argument into a `tests/README.md` before deleting; do not lose it |
+| `docs/CONDITIONAL_QUERIES.md` | 280 | **rewrite** — it is the design doc for the dying encoder-decoder model, but §§ on censoring-as-a-query, event bounds, ontology queries and the macro-vs-pooled AUROC argument all still describe EQ-multitask. Rewrite as `docs/MULTITASK.md` |
+| `src/every_query/generate_tasks/redesign-spec.md` | — | **keep** — exists upstream |
+
+Git history keeps every deleted doc; the `docs/history/` files exist to brief a cold session, and
+that job is done.
+
+### 5.5 README
+
+The README is currently *entirely* about the conditional-seq pipeline: its 7-step walkthrough is
+`EQ_generate_query_sequences` → `EQ_predict_sequences` → `EQ_evaluate_sequences`, and its mermaid
+diagram names all three. It needs a rewrite, not an edit — the walkthrough becomes
+`EQ_build_ontology` → `EQ_generate_multitask_sequences` →
+`EQ_generate_evaluation_query_sequences` → `EQ_train --config-name=conditional_multitask_ar_config`
+→ `EQ_predict_multitask`, with a short section pointing at the upstream single-query CLIs rather
+than the current dismissive one-liner ("still ships in the tree but is not covered here").
+
+The badge at the top already points at `payalchandak/EveryQuery` Actions, which is right for the
+upstream PR.
+
+### 5.6 Branches
+
+24 local branches, most merged or dead. Not part of the upstream PR, but worth pruning in the same
+sweep: `git branch --merged dev` first, and keep `main`, `dev`, and #33's branch.
+
+---
+
+## 6. Suggested sequencing
+
+Six PRs into `dev`, then one PR to upstream. Each step leaves the suite green.
+
+| # | PR | Risk |
+| --- | --- | --- |
+| 0 | Land #33 | — |
+| 1 | **Rehome the feature tests** (§4.2) onto `ConditionalMultitaskARModel`. Adds tests, deletes nothing. | medium — the real work |
+| 2 | **Delete the analysis scripts, PDFs, reports/, stale docs** (§5.2–5.4). Pure removal, no code touched. | trivial |
+| 3 | **Extract the shared symbols** (§3.1–3.3): new `model/answers.py`, trim `seq_dataset`, demote `sample_query_sequences` to a library. No deletions yet — both pipelines still import fine. | low |
+| 4 | **Delete the conditional-seq pipeline** (§5.1 + §4.1) and fix `train.py` / `model_loader.py`. | low, after 1 & 3 |
+| 5 | **Answer D1** — either port an evaluator for `EQ_predict_multitask` output or document the gap. | see D1 |
+| 6 | **Rewrite README + `docs/MULTITASK.md`** (§5.5, §5.4). | low |
+| 7 | **PR to `payalchandak/EveryQuery`** from the trimmed `dev`. | — |
+
+Doing 1 before 4 is the point of the ordering: it is the only step that can silently cost coverage.
+
+---
+
+## 7. Decisions I need from you
+
+**D1 — the missing multitask evaluator.** After the trim, `EQ_predict_multitask` writes a parquet
+that nothing reads. Three options:
+
+- **(a)** Port `evaluate_sequences.py` into an `EQ_evaluate_multitask` that groups by
+  `(target_code, duration_bucket)` over the one-row-per-grid-row schema, and report macro AUROC.
+  ~1 day. My recommendation: an inference CLI with no evaluator is a bad look on an upstream PR.
+- **(b)** Salvage the macro-AUROC estimator out of `scripts/eval_macro_position.py` into a proper
+  module first. More faithful to the headline numbers, more work.
+- **(c)** Ship without one and say so in the README.
+
+**D2 — `scripts/experiments/`.** The shell wrappers encode real operational knowledge (the venv/
+`PYTHONPATH` trap that once made a measurement compare a branch against itself) but hardcode your
+paths. Generalise, or drop from the upstream PR and keep locally?
+
+**D3 — renames.** `seq_dataset.py` / `ConditionalQueryPytorchDataset` and
+`sample_query_sequences.py` keep names that will read as vestigial once their only consumer is the
+multitask eval path. Rename for clarity, or leave them and take the smaller diff?
+
+**D4 — how much of `docs/CONDITIONAL_QUERIES.md` is still true?** I can rewrite it as
+`docs/MULTITASK.md`, but the results sections quote numbers from the `big_v2` conditional-seq run.
+Do you have equivalent multitask numbers to put there, or should the results section be dropped
+until PR #33's model is measured?
+
+**D5 — upstream PR shape.** One large PR, or a stacked series (ontology → multitask sampler →
+multitask model → eval)? The stacked version is far more reviewable but needs upstream to accept a
+chain against `payalchandak/EveryQuery:main`.
+
+---
+
+## 8. Verification for each step
+
+```bash
+# after every deletion PR
+uv run pytest tests/ -x -q                       # full suite
+uv run python -c "import every_query, pkgutil, importlib; \
+    [importlib.import_module(m.name) for m in pkgutil.walk_packages(every_query.__path__, 'every_query.')]"
+uv run pre-commit run --all-files
+for cli in EQ_process_data EQ_train EQ_predict EQ_evaluate EQ_build_ontology \
+           EQ_generate_multitask_sequences EQ_generate_evaluation_query_sequences \
+           EQ_predict_multitask; do "$cli" --help >/dev/null || echo "BROKEN: $cli"; done
+git grep -nE 'conditional_model|conditional_ar_model|conditional_lightning|predict_sequences|evaluate_sequences'
+```
+
+The last `git grep` should return nothing outside the multitask model's own `answers.py` import
+after step 4. `tests/test_cli_smoke.py` enumerates the entry points and will fail loudly on a
+`pyproject.toml` script that no longer resolves — that is the cheapest guard against a half-removed
+CLI.
