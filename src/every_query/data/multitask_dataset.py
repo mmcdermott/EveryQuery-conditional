@@ -341,9 +341,16 @@ class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
     def _check_code_width(self, codes: np.ndarray, what: str) -> None:
         """Refuse an index past the event vocabulary the labels were built with.
 
-        Membership in ``code_to_index`` is not enough once that map carries ontology nodes: it says a
-        name is known, not that its id fits the table a model will embed it from.  Mirrors
+        Membership in ``code_to_index`` is not enough: it says a name is known, not that its id fits
+        the table a model will embed it from.  Mirrors
         :meth:`~every_query.data.multitask_eval_dataset.QuerySeqMultitaskEvalDataset._check_codes`.
+
+        Defence in depth rather than the front line.  When a real ontology is attached the width
+        equality above it (``extended_vocab_size == boundary_vocab_size``) has already run, and
+        ``extend_code_map`` cannot mint an id at or past ``extended_vocab_size``, so this can only
+        fire on a manifest whose ``boundary_vocab_size`` disagrees with the labels it describes - a
+        hand-edited one, or one written by a future sampler - and on the ``"none"``-mode path, where
+        the ontology branch is skipped entirely and this is the only width check there is.
         """
         if codes.size and int(codes.max()) >= self.boundary_vocab_size:
             raise ValueError(
@@ -453,6 +460,7 @@ class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
                 check_ontology_cohort,
                 closure_fingerprint,
                 extend_code_map,
+                extended_vocab_size,
                 load_closure_index,
             )
 
@@ -472,8 +480,6 @@ class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
             # number that says an ancestor id in the labels is embeddable.  Comparing it here turns
             # an out-of-range lookup - a device-side assert with no attribution on CUDA - into a
             # sentence, and catches an ontology grown or pruned since the labels were sampled.
-            from every_query.data.ontology import extended_vocab_size
-
             v_ext = extended_vocab_size(ontology_dir)
             if v_ext != self.boundary_vocab_size:
                 raise ValueError(
@@ -483,14 +489,15 @@ class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
                     "their ancestor codes."
                 )
             self.code_to_index = extend_code_map(self.code_to_index, ontology_dir)
-            if self.manifest["ontology_mode"] in ("conditions", "boundaries+conditions"):
-                # Only the conditioning path needs the closure itself: ``collate`` re-derives an
-                # ancestor's answer as the OR over its descendant leaves to check the stored one.
-                self._closure = load_closure_index(
-                    ontology_dir,
-                    base_vocab_size=self.vocab_size,
-                    vocab_fingerprint=self.vocab_fingerprint,
-                )
+            # Loaded for every ontology mode, not just the conditioning ones: ``collate`` needs it to
+            # re-derive an ancestor conditioning answer as the OR over its descendant leaves, and a
+            # *supplied* index may carry an ancestor conditioning code even in a mode whose draw pool
+            # would never produce one.  Without it that gather would run off the leaf block.
+            self._closure = load_closure_index(
+                ontology_dir,
+                base_vocab_size=self.vocab_size,
+                vocab_fingerprint=self.vocab_fingerprint,
+            )
 
         n = self.schema_df.height
         durations = self.schema_df[DURATIONS_COL]

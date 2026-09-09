@@ -11,7 +11,8 @@ test / predict side reads a ``QuerySeqSchema`` evaluation grid (``eval_tasks_dir
    refused with an error naming ``eval_tasks_dir``;
 5. ``predict_split`` selects the grid split and ``train`` is rejected;
 6. ``strip_delta_tokens`` / ``expected_vocab_size`` / ``max_windows`` reach the evaluation adapter, and
-   ``ontology_dir`` reaches *only* it (the training datasets stay at the leaf manifest's width);
+   ``ontology_dir`` reaches it *and* the training datasets (which need it to read ancestor-valued
+   start / bound / conditioning codes) while their target width stays the leaf manifest's ``V``;
 7. the demo train config's ``datamodule`` node instantiates this class through Hydra.
 
 The training labels are generated in-process by the multitask sampler against the session fixture
@@ -19,6 +20,8 @@ cohort's vocabulary, so the manifest fingerprint matches the cohort the datasets
 """
 
 import dataclasses
+import json
+import shutil
 from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
@@ -40,7 +43,11 @@ from every_query.data.conditional_multitask_datamodule import (
     MISSING_EVAL_TASKS_DIR_MSG,
     ConditionalMultitaskDataModule,
 )
-from every_query.data.multitask_dataset import MultitaskBoundaryBatch, MultitaskBoundaryPytorchDataset
+from every_query.data.multitask_dataset import (
+    MANIFEST_NAME,
+    MultitaskBoundaryBatch,
+    MultitaskBoundaryPytorchDataset,
+)
 from every_query.data.multitask_eval_dataset import MultitaskEvalBatch, QuerySeqMultitaskEvalDataset
 from every_query.generate_tasks import sample_multitask_sequences as sms
 from tests.multitask.conftest import base_cfg, write_cohort_ontology
@@ -312,7 +319,7 @@ def test_hyperparameters_record_the_grid_settings(data_config, grid_dir):
     assert _datamodule(data_config).hparams["eval_tasks_dir"] is None
 
 
-# --- 6b: an ontology reaches the evaluation adapter only; the training side stays leaf-wide -----------
+# --- 6b: an ontology reaches both sides; only the evaluation adapter widens ---------------------------
 
 
 @pytest.fixture(scope="module")
@@ -321,31 +328,61 @@ def cohort_ontology_dir(tensorized_cohort_dir: Path, tmp_path_factory) -> Path:
     return write_cohort_ontology(tensorized_cohort_dir, tmp_path_factory.mktemp("cohort_ontology"))
 
 
-def test_training_dataset_width_is_the_leaf_manifest_under_an_ontology(
+def test_the_training_dataset_gets_the_ontology_but_is_still_checked_against_the_leaf_manifest(
     data_config, grid_dir, cohort_ontology_dir, multitask_labels_dir
 ):
-    """``dataset_kwargs["ontology_dir"]`` is lifted out before the training datasets are built - their
-    manifest is leaf-only and ``expected_vocab_size`` stays the cohort's V - and reaches the evaluation
-    adapter, whose width ceiling becomes the ontology's V_ext and whose code map resolves ancestor names."""
+    """``dataset_kwargs["ontology_dir"]`` reaches *both* sides; only the evaluation adapter widens.
+
+    The ontology is lifted out of ``dataset_kwargs`` so it can be handed to the evaluation adapter
+    explicitly - there it makes ancestor query / start / bound names resolvable and raises the width
+    ceiling from ``V`` to ``V_ext`` - and then put back, because a labels directory sampled with
+    ancestor-valued start / bound / conditioning codes can only be read through the ontology that
+    numbered them (see
+    :func:`test_an_ancestor_bearing_labels_dir_needs_the_ontology_in_dataset_kwargs`).  Against these
+    leaf-only labels the training datasets are handed it and simply do not use it.
+
+    What must **not** move is the training width.  The packed target bits are leaf-only in every
+    ontology mode, so the manifest here records ``vocab_size == boundary_vocab_size == V`` and
+    ``expected_vocab_size`` stays the cohort's ``V``.  ``V_ext`` is the model's *embedding* width and
+    passing it here is the mistake this pins - it is refused, loudly, at dataset build.
+    """
     from every_query.data.ontology import extend_code_map, extended_vocab_size, load_nodes
 
     v = data_config.vocab_size
     v_ext = extended_vocab_size(cohort_ontology_dir)
     assert v_ext > v, "the fixture cohort's hierarchical names must mint ancestor nodes"
+    expected_kwargs = {"expected_vocab_size": v, "ontology_dir": str(cohort_ontology_dir)}
     dm = _datamodule(
-        data_config,
-        eval_tasks_dir=grid_dir,
-        max_windows=5,
-        dataset_kwargs={"expected_vocab_size": v, "ontology_dir": str(cohort_ontology_dir)},
+        data_config, eval_tasks_dir=grid_dir, max_windows=5, dataset_kwargs=dict(expected_kwargs)
     )
     assert dm.ontology_dir == cohort_ontology_dir
-    assert dm.dataset_kwargs == {"expected_vocab_size": v}, "the training datasets never see the ontology"
+    assert dm.dataset_kwargs == expected_kwargs, (
+        "the ontology must be put back into dataset_kwargs after being lifted for the eval adapter"
+    )
     assert dm.hparams["ontology_dir"] == str(cohort_ontology_dir)
-    assert dm.hparams["dataset_kwargs"] == {"expected_vocab_size": v}
+    assert dm.hparams["dataset_kwargs"] == expected_kwargs
 
-    # Training side: the leaf manifest is accepted against the cohort width...
+    # Training side: the ontology is actually handed to the training dataset's constructor.  Recorded
+    # rather than inferred from ``dataset_kwargs``, since the leaf manifest makes it a no-op here and
+    # nothing on the built dataset would show it had arrived.
+    seen: list[dict] = []
+
+    class _RecordingDataset(MultitaskBoundaryPytorchDataset):
+        def __init__(self, cfg, **kwargs):
+            seen.append(dict(kwargs))
+            super().__init__(cfg, **kwargs)
+
+    dm.data_class = _RecordingDataset
     train = dm.train_dataset
-    assert isinstance(train, MultitaskBoundaryPytorchDataset) and train.vocab_size == v
+    assert seen == [{"split": train_split, **expected_kwargs}], (
+        f"the training dataset was not built with the ontology: {seen}"
+    )
+
+    # ...and the leaf manifest it reads is accepted against the cohort width, unwidened.
+    assert isinstance(train, MultitaskBoundaryPytorchDataset)
+    assert (train.vocab_size, train.boundary_vocab_size) == (v, v)
+    assert train.manifest["vocab_size"] == v and train.manifest["boundary_vocab_size"] == v
+    assert train.ontology_mode == "none", "these labels were sampled leaf-only"
     batch = next(iter(dm.train_dataloader()))
     assert isinstance(batch, MultitaskBoundaryBatch) and batch.targets.shape[-1] == v
     # ...and would be rejected against V_ext, which is why train.py pins the cohort width explicitly.
@@ -400,8 +437,65 @@ def test_evaluation_adapter_refuses_a_same_width_permuted_ontology(
     )
     with pytest.raises(ValueError, match=by_name):
         _ = dm.test_dataset
-    # The training side never touches the ontology and is unaffected either way.
+    # The training side is handed the same permuted ontology, but these labels are leaf-only
+    # (``ontology_mode: "none"``), so it never resolves a name through it and is unaffected.
     assert dm.train_dataset.vocab_size == v
+
+
+def test_an_ancestor_bearing_labels_dir_needs_the_ontology_in_dataset_kwargs(
+    data_config, multitask_labels_dir, cohort_ontology_dir, tmp_path
+):
+    """Labels sampled in an ontology mode are unreadable without the ontology that numbered them.
+
+    This is the reason ``ontology_dir`` is put *back* into ``dataset_kwargs``: when the sampler drew
+    ancestor-valued start / bound / conditioning codes, the ids in the sidecars reach into
+    ``[V, V_ext)`` and only that ontology says which node each one is.  The dataset refuses such a
+    labels directory outright rather than reading ancestor ids as leaves, so a datamodule that kept
+    the ontology to itself could not build a training dataset at all.
+
+    The manifest is rewritten by hand rather than resampled: the three keys patched here are exactly
+    what the dataset's check reads, and the labels themselves stay leaf-valued, so a pass cannot come
+    from the ancestor path being skipped for want of an ancestor id.
+    """
+    from every_query.data.ontology import closure_fingerprint, extended_vocab_size
+
+    labels = tmp_path / "ancestor_labels"
+    shutil.copytree(multitask_labels_dir, labels)
+    v, v_ext = data_config.vocab_size, extended_vocab_size(cohort_ontology_dir)
+    manifests = sorted(labels.rglob(MANIFEST_NAME))
+    assert manifests, f"no manifest under {labels}; the sampler fixture changed shape"
+    for fp in manifests:
+        manifest = json.loads(fp.read_text())
+        assert manifest["ontology_mode"] == "none", "fixture drift: the sampler run must be leaf-only"
+        fp.write_text(
+            json.dumps(
+                {
+                    **manifest,
+                    "ontology_mode": "boundaries",
+                    "ontology_fingerprint": closure_fingerprint(cohort_ontology_dir),
+                    "boundary_vocab_size": v_ext,
+                }
+            )
+        )
+    config = dataclasses.replace(data_config, task_labels_dir=str(labels))
+
+    without = _datamodule(config, dataset_kwargs={"expected_vocab_size": v})
+    assert "ontology_dir" not in without.dataset_kwargs
+    with pytest.raises(ValueError, match=r"ontology_mode 'boundaries'.*no ontology_dir was given"):
+        _ = without.train_dataset
+
+    # With it in ``dataset_kwargs`` the same directory loads: the ontology is forwarded, its ancestor
+    # names are grafted onto the cohort's code map, and the targets stay leaf-wide.
+    with_ontology = _datamodule(
+        config, dataset_kwargs={"expected_vocab_size": v, "ontology_dir": str(cohort_ontology_dir)}
+    )
+    assert with_ontology.dataset_kwargs["ontology_dir"] == str(cohort_ontology_dir)
+    train = with_ontology.train_dataset
+    assert (train.vocab_size, train.boundary_vocab_size) == (v, v_ext)
+    ancestors = {n: i for n, i in train.code_to_index.items() if i >= v}
+    assert ancestors, "the ontology's ancestor nodes were not grafted onto the training code map"
+    batch = next(iter(with_ontology.train_dataloader()))
+    assert isinstance(batch, MultitaskBoundaryBatch) and batch.targets.shape[-1] == v
 
 
 # --- 7: Hydra ------------------------------------------------------------------------------------
