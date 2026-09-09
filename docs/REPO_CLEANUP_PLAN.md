@@ -405,8 +405,9 @@ the final query's answer. Prior answers are context, not identity, and not the l
 `n_tasks_null` so a macro over 12 of 64 cells cannot pass as a macro over 64.
 
 **Summary** — `<metrics_stem>.summary.parquet`, one row: `macro_auroc`, `macro_auroc_ci_lo`,
-`macro_auroc_ci_hi`, `n_tasks_scored`, `n_tasks_null`, `n_resamples`, `bootstrap_seed`. The last two
-are written so a reported interval is reproducible rather than merely plausible.
+`macro_auroc_ci_hi`, `n_tasks_scored`, `n_tasks_null`, `macro_bootstrap`, `n_resamples`,
+`bootstrap_seed`. The last three are written so a reported interval is reproducible, and so it
+carries which axis it was resampled over rather than leaving that to memory.
 
 #### Bootstrap 95% CIs
 
@@ -444,6 +445,22 @@ per replicate applied across all cells at once, then the macro recomputed inside
 resampling cells independently would understate that correlation. Offer it behind a flag
 (`macro_bootstrap: tasks | subjects`, default `tasks`) rather than silently picking one; the two
 intervals answer different questions and a reader cannot tell them apart from the column name.
+
+**What each interval is bootstrapped over, stated plainly:**
+
+| interval | resampling unit | draws per replicate | the question it answers |
+| --- | --- | --- | --- |
+| `auroc_ci_lo/hi` (per cell) | subjects **within that cell** | `n_subjects`, with replacement, all their rows | would this task's AUROC hold on a different draw of patients? |
+| `macro_auroc_ci_*`, `macro_bootstrap: tasks` | the task cells | `n_tasks_scored` point AUROCs, with replacement | would the macro hold on a different draw of query specs? |
+| `macro_auroc_ci_*`, `macro_bootstrap: subjects` | subjects, **one shared index across all cells** | `n_subjects`, then every cell re-scored under it | would the macro hold on a different cohort? |
+
+**Neither macro variant covers both axes, and the output should not pretend otherwise.** `tasks`
+treats each cell's AUROC as exact and measures only between-task spread; `subjects` conditions on the
+fixed `N` specs and measures only patient noise. A CI over both needs a nested resample — draw tasks,
+then draw subjects within the drawn tasks — at roughly `n_tasks` times the cost, which is why it is
+not the default. Write the chosen mode into the summary row (`macro_bootstrap`) next to
+`n_resamples` and `bootstrap_seed`, so an interval read six months later carries its own definition
+instead of relying on whoever ran it to remember which axis it covered.
 
 **Cost.** Roughly `n_cells x n_resamples` AUROC evaluations, each `O(n log n)` — 64 cells at 1000
 resamples is 64k `roc_auc_score` calls, a minute or so at 10k rows per cell and closer to ten at
