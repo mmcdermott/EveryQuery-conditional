@@ -391,9 +391,13 @@ mix format 2 and 3 shards. No start is ever sampled in the dataset.
 codes. That is not a gap for ancestor targets: under the window rule an ancestor's bit is the OR of
 its descendant leaves' bits, so the multitask model derives them per batch from these leaf sidecars
 and the ontology closure when it is trained with `lightning_module.model.ontology_dir` set
-(`derive_ancestor_targets` in `every_query.data.ontology`) — `.labels.npy`, `vocab_size`,
-`packed_width_bytes` and `vocab_fingerprint` are identical with or without an ontology. The
-manifest's `vocab_fingerprint` is the same digest the ontology's observed nodes are checked against
+(`derive_ancestor_targets` in `every_query.data.ontology`). The target *representation* is
+ontology-invariant in every mode: `vocab_size`, `packed_width_bytes` and `vocab_fingerprint` never
+move. The packed bits in `.labels.npy` are byte-identical too — but for the *same contexts and
+resolved windows in the same row order*. A sampler-side `ontology_dir` in a boundaries mode changes
+which windows get drawn (below), and so changes what those bits contain; what it cannot change is
+what a bit means or where it sits. The manifest's `vocab_fingerprint` is the same digest the
+ontology's observed nodes are checked against
 (`ontology_vocab_fingerprint`) and the one `train.py` records on the model
 (`cohort_vocab_fingerprint`), so the labels, the ontology and the checkpoint all name one
 `codes.parquet`.
@@ -429,7 +433,11 @@ cannot express "any of these except those".
 
 Under `code_weighting: prevalence` an ancestor has no `codes.parquet` row and aggregates its
 descendants': the **sum** for `code/n_occurrences`, the **max** for `code/n_subjects` (summing would
-count a subject once per descendant code they carry, letting a wide subtree exceed the cohort).
+count a subject once per descendant code they carry, letting a wide subtree exceed the cohort). The
+max is a sampling *proxy*, not the node's true subject count — two descendants each present in 10
+disjoint subjects give 10 where the truth is 20, and the per-code counts carry no overlap
+information to do better. It is a lower bound, so it under-weights a broad shallow node rather than
+inventing prevalence for it.
 
 The manifest gains three keys: `ontology_mode`, `ontology_fingerprint` (the bare
 `closure_fingerprint` digest of `event_to_query_nodes.parquet` — *not* the composite

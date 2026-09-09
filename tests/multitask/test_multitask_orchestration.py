@@ -330,8 +330,8 @@ def test_events_are_not_closure_expanded_without_an_ontology(
 def test_events_are_closure_expanded_with_an_ontology(
     synthetic_cohort: Path, tmp_path: Path, monkeypatch
 ) -> None:
-    """With an ontology the labeler sees a *different*, closure-expanded frame: every ancestor node
-    name is an ordinary code in it, which is what makes an ancestor boundary a plain lookup."""
+    """With an ontology the labeler sees a *different*, closure-expanded frame: every ancestor node name is an
+    ordinary code in it, which is what makes an ancestor boundary a plain lookup."""
     onto = write_cohort_ontology(synthetic_cohort, tmp_path / "onto")
     ancestors = set(_ancestor_names(onto))
     assert ancestors == {"C", "TIMELINE"}, f"unexpected fixture ancestors {sorted(ancestors)}"
@@ -933,8 +933,8 @@ def test_a_changed_closure_relabels_and_an_unchanged_one_is_reused(
 
 
 def test_a_permuted_ontology_is_refused_by_cohort_identity(synthetic_cohort: Path, tmp_path: Path) -> None:
-    """A same-width ontology of the same codes at permuted indices would pair every target column with
-    the wrong closure; the vocabulary refuses it by identity, which no width check could do."""
+    """A same-width ontology of the same codes at permuted indices would pair every target column with the
+    wrong closure; the vocabulary refuses it by identity, which no width check could do."""
     from every_query.data.ontology import extended_vocab_size
 
     honest = write_cohort_ontology(synthetic_cohort, tmp_path / "honest")
@@ -952,9 +952,9 @@ def test_a_permuted_ontology_is_refused_by_cohort_identity(synthetic_cohort: Pat
 def test_the_worker_refuses_a_different_ontology_than_the_manifest(
     synthetic_cohort: Path, tmp_path: Path
 ) -> None:
-    """Nothing ontology-shaped crosses the process boundary, so a Stage 4M worker re-attaches the
-    ontology itself and must fail rather than label a shard against a closure the driver never saw -
-    including the case of no ontology at all against an ontology manifest."""
+    """Nothing ontology-shaped crosses the process boundary, so a Stage 4M worker re-attaches the ontology
+    itself and must fail rather than label a shard against a closure the driver never saw - including the case
+    of no ontology at all against an ontology manifest."""
     onto_a = write_cohort_ontology(synthetic_cohort, tmp_path / "onto_a")
     out = tmp_path / "mt"
     _run(
@@ -1123,6 +1123,10 @@ def test_an_ancestor_subject_count_is_the_max_not_the_sum(synthetic_cohort: Path
 
     A wide subtree could then claim more subjects than the cohort has.  Occurrence counts still sum -
     those really do add up - so the aggregation depends on what the column counts.
+
+    The max is a sampling *proxy*, not the node's true subject count: descendants reaching disjoint
+    subjects make the truth larger than any one of them, and the per-code counts carry no overlap
+    information to recover it.  What is pinned here is the chosen proxy, not a bound on the truth.
     """
     onto = write_cohort_ontology(synthetic_cohort, tmp_path / "onto")
     stat: dict[str, object] = dict.fromkeys(CODES, 10.0)
@@ -1130,7 +1134,7 @@ def test_an_ancestor_subject_count_is_the_max_not_the_sum(synthetic_cohort: Path
     by_occurrences = sms._ancestor_code_weights(stat, onto, "code/n_occurrences")
     n_leaves_under_c = sum(1 for c in CODES if c.startswith("C//"))
     assert n_leaves_under_c > 1
-    assert by_subjects["C"] == 10.0, "a subject count must not exceed its largest descendant's"
+    assert by_subjects["C"] == 10.0, "the proxy must equal the largest descendant's subject count"
     assert by_occurrences["C"] == 10.0 * n_leaves_under_c
 
 

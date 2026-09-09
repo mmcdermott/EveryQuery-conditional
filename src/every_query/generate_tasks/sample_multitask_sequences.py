@@ -659,9 +659,11 @@ def build_code_weights(
     positive weight in the pool rather than zero, so no pool member becomes undrawable.  Returns
     weights normalized to sum to 1, aligned to ``codes`` positionally.
 
-    An ancestor node has no row in ``codes.parquet``; given an ``ontology_dir`` it inherits the sum
-    of its descendants' statistic (:func:`_ancestor_code_weights`), which is what makes a weighted
-    draw over an ancestor-bearing pool prefer the ancestors that actually recur.
+    An ancestor node has no row in ``codes.parquet``; given an ``ontology_dir`` it inherits an
+    aggregate of its descendants' statistic - the **sum** for an occurrence count, the **max** for a
+    subject count, where the max is a lower-bound proxy rather than the true union
+    (:func:`_ancestor_code_weights` explains why the two columns cannot combine the same way).  That
+    is what makes a weighted draw over an ancestor-bearing pool prefer the ancestors that recur.
     """
     if power < 0:
         raise ValueError(f"code_weight_power must be >= 0 (got {power})")
@@ -1316,7 +1318,10 @@ def prepare_events_for_labeling(events_df: pl.DataFrame, ontology_dir: object = 
 
     The closure keeps each leaf paired with *itself*, so the ``code_index < V`` rows of the expanded
     stream are exactly the unexpanded stream: the leaf interval table built from them - the only one
-    that ever labels a bit - is unchanged, which is what keeps ``.labels.npy`` byte-identical.
+    that ever labels a bit - is unchanged.  Given the same resolved windows, labeling therefore
+    writes byte-identical bits.  That is a statement about *this* seam only: a boundaries mode still
+    changes which windows get drawn, and so what the bits contain.  What the expansion cannot touch
+    is the target vocabulary, the packed width, or what any one bit means.
     """
     if ontology_dir is None:
         return events_df

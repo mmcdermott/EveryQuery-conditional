@@ -77,11 +77,12 @@ boundary_codes: null
 # (`code/n_occurrences`), which is the honest "any descendant occurred" up to co-occurrence within a
 # timestamp, but the MAX for a subject count (`code/n_subjects`), because summing would count a
 # subject once per descendant code they carry and let a wide subtree exceed the whole cohort.  The
-# max is a true lower bound and under-weights only a node whose descendants reach disjoint subjects.
-# The policy
-# applies to BOTH the end-boundary pool and the start-event pool; conditioning codes and the
-# all-vocabulary target set are untouched, so only which windows exist changes, never what a label
-# bit means.
+# max is a sampling PROXY, not the node's real subject count - two descendants each present in 10
+# disjoint subjects give 10 where the truth is 20, and per-code counts carry no overlap information
+# to do better.  It errs low, so it under-weights a broad shallow node rather than inventing
+# prevalence for it.  The policy applies to BOTH the end-boundary pool and the start-event pool;
+# conditioning codes and the all-vocabulary target set are untouched, so only which windows exist
+# changes, never what a label bit means.
 code_weighting: null # null | prevalence
 code_weight_column: code/n_occurrences # code/n_occurrences | code/n_subjects
 code_weight_power: 1.0
