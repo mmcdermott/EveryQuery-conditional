@@ -397,10 +397,59 @@ the final query's answer. Prior answers are context, not identity, and not the l
 | `n_queries` | `len(queries)`; `1` means no conditioning |
 | `duration_bucket` | bucket of the final query's horizon, descriptive only — for rollups, never a key |
 | `n_rows`, `n_positive`, `prevalence` | over the cell |
+| `n_subjects` | distinct `subject_id` in the cell — the bootstrap's resampling unit |
 | `auroc` | within-cell, null when single-class (`_auroc_or_none`) |
+| `auroc_ci_lo`, `auroc_ci_hi` | 95% subject-cluster bootstrap, null wherever `auroc` is |
 
 **Headline** = mean of the non-null `auroc` over cells, reported alongside `n_tasks_scored` and
 `n_tasks_null` so a macro over 12 of 64 cells cannot pass as a macro over 64.
+
+**Summary** — `<metrics_stem>.summary.parquet`, one row: `macro_auroc`, `macro_auroc_ci_lo`,
+`macro_auroc_ci_hi`, `n_tasks_scored`, `n_tasks_null`, `n_resamples`, `bootstrap_seed`. The last two
+are written so a reported interval is reproducible rather than merely plausible.
+
+#### Bootstrap 95% CIs
+
+Match the convention on `upstream/task-auroc-ci`, which adds exactly this to
+`task_auroc_callback.py` — `scipy.stats.bootstrap`, `n_resamples=1000`, `confidence_level=0.95`,
+`method="percentile"`, `rng=np.random.default_rng(0)`, columns suffixed `_ci_lo` / `_ci_hi`, and the
+task count logged next to the estimate. Adopting it verbatim means the evaluator's intervals and the
+training-time callback's intervals mean the same thing and are named the same way.
+
+> ⚠️ That branch is **not merged into `upstream/main`**. It also adds `scipy>=1.15,<2` as a direct
+> dependency (1.15 is where `bootstrap` takes `rng=` rather than `random_state=`). If it lands
+> before our U4, we inherit both; if it does not, U4 introduces scipy itself. Check before writing
+> the import, and say so in the PR description either way.
+
+**The resampling unit is the subject, not the row.** `prediction_times_per_subject` defaults to `1`,
+so rows and subjects coincide at the defaults — but the evaluator must not assume it. Raise that knob
+and a subject contributes several correlated rows to the same cell; resampling rows would then
+understate the spread and quietly narrow every interval. Resample distinct `subject_id`s and take all
+their rows (`eval_per_position.py:92` does the same thing one level up, resampling whole sequences so
+positions stay correlated within one).
+
+**Per-cell CI** — subject-cluster bootstrap within the cell. A resample can land single-class, where
+AUROC is undefined; use `np.nan` for that replicate and `np.nanpercentile` for the bounds (the
+pattern already in `eval_per_position.py:132`), and count how often it happens so a cell whose
+interval rests on a handful of usable replicates is visible rather than silently wide.
+
+**Macro CI** — resample the **task cells**, mean of their point AUROCs. This is what upstream's
+callback does (its `indicators` list holds one score per task, so resampling it resamples tasks), and
+it answers "would this macro hold up under a different draw of query specs?".
+
+It is worth being explicit that this is *not* the same question as "would it hold up on a different
+cohort". Because the grid is dense, every cell holds the **same** subjects, so cells are correlated
+through shared patients. Answering the cohort question needs one shared subject-level bootstrap index
+per replicate applied across all cells at once, then the macro recomputed inside each replicate —
+resampling cells independently would understate that correlation. Offer it behind a flag
+(`macro_bootstrap: tasks | subjects`, default `tasks`) rather than silently picking one; the two
+intervals answer different questions and a reader cannot tell them apart from the column name.
+
+**Cost.** Roughly `n_cells x n_resamples` AUROC evaluations, each `O(n log n)` — 64 cells at 1000
+resamples is 64k `roc_auc_score` calls, a minute or so at 10k rows per cell and closer to ten at
+100k. Keep `n_resamples` a config knob. If it becomes the bottleneck, the fallback is DeLong's
+analytic AUROC variance for the per-cell intervals (one `O(n log n)` pass, no resampling), keeping
+the bootstrap only for the macro.
 
 #### Defensive test for the list-column `group_by`
 
@@ -434,7 +483,7 @@ Per D5, four PRs against `payalchandak/EveryQuery:main` rather than one, each de
 | U1 | **Ontology** — `data/ontology.py`, `data/build_ontology.py`, `model/ontology_embedding.py`, `EQ_build_ontology`, `tests/ontology_suite/**`, `test_ontology*.py`. Self-contained and useful on its own; the natural first ask. |
 | U2 | **Multitask sampler** — `sample_multitask_sequences.py`, `interval_table.py`, `query_sequence_labeling.py`, `MultitaskBoundarySchema` / `QuerySeqSchema`, `EQ_generate_multitask_sequences`, the sampler half of `tests/multitask/`. |
 | U3 | **Multitask model** — `conditional_multitask_ar_model.py`, `conditional_multitask_lightning.py`, the datamodule and datasets, `rope_time.py`, the train config, and the rehomed feature tests from §4.2. |
-| U4 | **Evaluation** — `sample_evaluation_query_sequences.py`, `predict_multitask.py`, `EQ_evaluate_multitask`, `docs/MULTITASK.md`, README rewrite. |
+| U4 | **Evaluation** — `sample_evaluation_query_sequences.py`, `predict_multitask.py`, `EQ_evaluate_multitask` (+ `scipy` if `upstream/task-auroc-ci` has not landed), `docs/MULTITASK.md`, README rewrite. |
 
 Confirm upstream will take a chain before splitting; if they would rather have one PR, U1–U4
 collapse without rework, since the ordering is already dependency-clean.
@@ -445,7 +494,7 @@ collapse without rework, since the ordering is already dependency-clean.
 
 | | Question | Answer |
 | --- | --- | --- |
-| **D1** | The missing multitask evaluator | **Port `EQ_evaluate_multitask`.** Adapt `evaluate_sequences.py` to the one-row-per-grid-row schema; group by the query spec `(queries, durations, start_durations, start_events, bound_events)`, excluding `answers[:-1]`; macro-average AUROC over task cells; guard the list-column `group_by` with a defensive test. Shipping an inference CLI with no evaluator was judged the wrong look on an upstream PR. Full design in §6 "Step 5". |
+| **D1** | The missing multitask evaluator | **Port `EQ_evaluate_multitask`.** Adapt `evaluate_sequences.py` to the one-row-per-grid-row schema; group by the query spec `(queries, durations, start_durations, start_events, bound_events)`, excluding `answers[:-1]`; macro-average AUROC over task cells with 95% bootstrap CIs following the `upstream/task-auroc-ci` convention; guard the list-column `group_by` with a defensive test. Shipping an inference CLI with no evaluator was judged the wrong look on an upstream PR. Full design in §6 "Step 5". |
 | **D2** | `scripts/experiments/` | **Delete entirely.** Machine-local and redundant with the README's Hydra invocations. Salvage the venv/`PYTHONPATH` warning into prose first (§5.2). |
 | **D3** | Vestigial names | **Rename both.** `seq_dataset.py` → `query_seq_dataset.py` (class → `QuerySeqPytorchDataset`), `sample_query_sequences.py` → `query_sequence_labeling.py`. Pure renames show as `R100`; no surviving YAML names the class (§3.2). |
 | **D4** | `docs/CONDITIONAL_QUERIES.md` | **Rewrite as `docs/MULTITASK.md`, drop the results sections.** They quote the conditional-seq `big_v2` run; add multitask numbers once PR #33's model is measured (§5.4). |
