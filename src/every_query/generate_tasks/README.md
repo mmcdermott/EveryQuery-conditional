@@ -418,10 +418,18 @@ at all. Labeling reads a **leaf-only** interval table rebuilt from the `code_ind
 expanded stream — which the closure's leaf self-pairs make identical to the unexpanded stream — so
 the packed bytes cannot observe the expansion. A `null` `boundary_codes` / `start_event_codes` pool
 becomes every non-PAD base code *plus* every ancestor node in a boundaries mode; an explicit pool may
-name ancestors in any mode. `exclude_boundary_prefixes` filters ancestor names by the same prefix
-rule (so `TIMELINE` drops the ancestor node as well as the leaves under it). Under
-`code_weighting: prevalence` an ancestor's statistic is the sum of its descendants' — it has no
-`codes.parquet` row of its own.
+name ancestors in any *attached* mode (any mode but `none`, which detaches the ontology entirely).
+
+`exclude_boundary_prefixes` follows the **closure**, not just the name: a node covering an excluded
+leaf is dropped too. A name test cannot reach it — an ancestor's name is shorter than its leaves', so
+`TIMELINE` never starts with `TIMELINE//DELTA` — yet drawing `TIMELINE` means "the next occurrence of
+any `TIMELINE//*` event", which is precisely what excluding the delta tokens was meant to prevent.
+One excluded descendant removes the node, because a node covering both excluded and wanted leaves
+cannot express "any of these except those".
+
+Under `code_weighting: prevalence` an ancestor has no `codes.parquet` row and aggregates its
+descendants': the **sum** for `code/n_occurrences`, the **max** for `code/n_subjects` (summing would
+count a subject once per descendant code they carry, letting a wide subtree exceed the cohort).
 
 The manifest gains three keys: `ontology_mode`, `ontology_fingerprint` (the bare
 `closure_fingerprint` digest of `event_to_query_nodes.parquet` — *not* the composite

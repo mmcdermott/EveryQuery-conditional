@@ -135,7 +135,7 @@ from every_query.utils.digest import vocab_fingerprint
 from every_query.utils.seeds import derive_seed
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Collection, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -467,22 +467,30 @@ def attach_ontology(vocab: TargetVocabulary, ontology_dir: str | Path, mode: str
 
 
 def read_boundary_codes(
-    spec: object, vocab: TargetVocabulary, exclude_prefixes: Sequence[str] = ()
+    spec: object,
+    vocab: TargetVocabulary,
+    exclude_prefixes: Sequence[str] = (),
+    ontology_dir: str | Path | None = None,
 ) -> list[str]:
     """Resolve the boundary-code pool: ``None`` => all base codes (index >= 1); else a list / YAML path.
 
     Every listed code must be in the vocabulary and must not be PAD; unknown codes are hard errors.
     Order-preserving dedup.  ``exclude_prefixes`` drops codes by name prefix *after* resolution, so an
-    explicit pool and the all-vocabulary default are filtered the same way.
+    explicit pool and the all-vocabulary default are filtered the same way - and with an
+    ``ontology_dir`` it also drops any node sitting above an excluded leaf
+    (:func:`nodes_over_excluded_leaves`), which a name-prefix test alone cannot reach.
     """
-    return _read_code_pool(spec, vocab, "boundary", exclude_prefixes)
+    return _read_code_pool(spec, vocab, "boundary", exclude_prefixes, ontology_dir)
 
 
 def read_start_event_codes(
-    spec: object, vocab: TargetVocabulary, exclude_prefixes: Sequence[str] = ()
+    spec: object,
+    vocab: TargetVocabulary,
+    exclude_prefixes: Sequence[str] = (),
+    ontology_dir: str | Path | None = None,
 ) -> list[str]:
     """Resolve the start-event pool (issue #24) with exactly the :func:`read_boundary_codes` rules."""
-    return _read_code_pool(spec, vocab, "start_event", exclude_prefixes)
+    return _read_code_pool(spec, vocab, "start_event", exclude_prefixes, ontology_dir)
 
 
 def read_exclude_prefixes(spec: object) -> tuple[str, ...]:
@@ -504,10 +512,17 @@ def read_exclude_prefixes(spec: object) -> tuple[str, ...]:
 
 
 def _read_code_pool(
-    spec: object, vocab: TargetVocabulary, what: str, exclude_prefixes: Sequence[str] = ()
+    spec: object,
+    vocab: TargetVocabulary,
+    what: str,
+    exclude_prefixes: Sequence[str] = (),
+    ontology_dir: str | Path | None = None,
 ) -> list[str]:
+    over_excluded: Collection[str] = ()
+    if ontology_dir is not None and exclude_prefixes:
+        over_excluded = nodes_over_excluded_leaves(ontology_dir, exclude_prefixes)
     if spec is None:
-        return _apply_prefix_exclusions(vocab.boundary_candidates(), exclude_prefixes, what)
+        return _apply_prefix_exclusions(vocab.boundary_candidates(), exclude_prefixes, what, over_excluded)
     if isinstance(spec, list | tuple | ListConfig):
         raw = list(spec)
     else:
@@ -527,38 +542,88 @@ def _read_code_pool(
     pad = [c for c in codes if c2i[c] == 0]
     if pad:
         raise ValueError(f"{what} code(s) at vocab index 0 (PAD) are not allowed: {pad}")
-    return _apply_prefix_exclusions(codes, exclude_prefixes, what)
+    return _apply_prefix_exclusions(codes, exclude_prefixes, what, over_excluded)
 
 
-def _apply_prefix_exclusions(codes: list[str], exclude_prefixes: Sequence[str], what: str) -> list[str]:
-    """Drop every code whose name starts with one of ``exclude_prefixes``.
+def nodes_over_excluded_leaves(ontology_dir: str | Path, exclude_prefixes: Sequence[str]) -> set[str]:
+    """Ontology nodes that cover at least one leaf whose name matches ``exclude_prefixes``.
+
+    A name-prefix filter cannot reach these on its own: an ancestor's name is a *shorter* string than
+    the leaves under it, so ``TIMELINE`` never starts with ``TIMELINE//DELTA``.  Yet drawing
+    ``TIMELINE`` as a boundary means "the next occurrence of any ``TIMELINE//*`` event", delta tokens
+    included - exactly what the exclusion exists to prevent.  The closure is the only thing that
+    knows, so it decides.
+
+    Conservative on purpose: one excluded descendant removes the node.  A node that covers both
+    excluded and wanted leaves cannot express "any of these except those", so keeping it would
+    silently reintroduce the excluded events.
+    """
+    from every_query.data.ontology import load_event_to_query_nodes
+
+    prefixes = tuple(exclude_prefixes)
+    if not prefixes:
+        return set()
+    closure = load_event_to_query_nodes(ontology_dir)
+    matched = pl.col("event_code").str.starts_with(prefixes[0])
+    for p in prefixes[1:]:
+        matched = matched | pl.col("event_code").str.starts_with(p)
+    return set(closure.filter(matched)["query_node"].to_list())
+
+
+def _apply_prefix_exclusions(
+    codes: list[str],
+    exclude_prefixes: Sequence[str],
+    what: str,
+    also_exclude: Collection[str] = (),
+) -> list[str]:
+    """Drop every code whose name starts with one of ``exclude_prefixes``, plus ``also_exclude``.
+
+    ``also_exclude`` carries the ontology nodes :func:`nodes_over_excluded_leaves` found sitting above
+    an excluded leaf; without it a prefix exclusion would drop a subtree's leaves and leave a node
+    that draws them all back in.
 
     Examples:
         >>> _apply_prefix_exclusions(["A", "T//1", "T//2"], ("T//",), "boundary")
         ['A']
         >>> _apply_prefix_exclusions(["A", "B"], (), "boundary")
         ['A', 'B']
+        >>> _apply_prefix_exclusions(["A", "T"], ("T//",), "boundary", also_exclude={"T"})
+        ['A']
         >>> _apply_prefix_exclusions(["T//1"], ("T//",), "boundary")
         Traceback (most recent call last):
             ...
         ValueError: excluding prefixes ('T//',) empties the boundary pool
     """
-    if not exclude_prefixes:
+    if not exclude_prefixes and not also_exclude:
         return codes
     prefixes = tuple(exclude_prefixes)
-    kept = [c for c in codes if not c.startswith(prefixes)]
+    drop = set(also_exclude)
+    kept = [c for c in codes if c not in drop and not (prefixes and c.startswith(prefixes))]
     if not kept:
         raise ValueError(f"excluding prefixes {prefixes} empties the {what} pool")
     return kept
 
 
-def _ancestor_code_weights(stat: dict[str, object], ontology_dir: str | Path) -> dict[str, float]:
-    """``node -> summed descendant statistic`` for every ontology node the cohort file does not carry.
+def _ancestor_code_weights(
+    stat: dict[str, object], ontology_dir: str | Path, column: str
+) -> dict[str, float]:
+    """``node -> aggregated descendant statistic`` for every ontology node ``codes.parquet`` lacks.
 
-    An ancestor occurs whenever any descendant does, so its prevalence is the sum of theirs over the
-    closure - the same table that decides its labels.  Only names absent from ``stat`` are added, so
-    every leaf keeps the exact statistic ``codes.parquet`` gives it and a weighted leaf-only pool
-    draws identically with and without an ontology.
+    How the descendants combine depends on what the statistic counts, and getting this wrong is not a
+    rounding error:
+
+    - a **count of occurrences** adds up.  An ancestor occurs whenever any descendant does, so its
+      occurrence count is the sum over the closure - the same table that decides its labels - up to
+      several descendants sharing a timestamp.
+    - a **count of subjects** does not.  A subject carrying two descendant codes would be counted
+      twice, so a wide subtree's "n_subjects" can exceed the cohort's subject count by the mean
+      number of distinct descendant codes per subject.  The maximum is used instead: a true lower
+      bound on "how many subjects have any descendant", and never absurd.  It under-weights a node
+      whose descendants reach disjoint subjects, which is the safe direction.
+
+    Only names absent from ``stat`` are added, so every leaf keeps the exact statistic
+    ``codes.parquet`` gives it and a weighted leaf-only pool draws identically with and without an
+    ontology.
     """
     from every_query.data.ontology import load_event_to_query_nodes
 
@@ -570,11 +635,8 @@ def _ancestor_code_weights(stat: dict[str, object], ontology_dir: str | Path) ->
         },
         schema={"event_code": pl.Utf8, "_stat": pl.Float64},
     )
-    agg = (
-        closure.join(leaf_stat, on="event_code", how="inner")
-        .group_by("query_node")
-        .agg(pl.col("_stat").sum())
-    )
+    combine = pl.col("_stat").max() if "subject" in column else pl.col("_stat").sum()
+    agg = closure.join(leaf_stat, on="event_code", how="inner").group_by("query_node").agg(combine)
     return {
         n: float(s)
         for n, s in zip(agg["query_node"].to_list(), agg["_stat"].to_list(), strict=True)
@@ -607,7 +669,7 @@ def build_code_weights(
     df = pl.read_parquet(fp, columns=["code", column])
     stat: dict[str, object] = dict(zip(df["code"].to_list(), df[column].to_list(), strict=True))
     if ontology_dir is not None:
-        stat.update(_ancestor_code_weights(stat, ontology_dir))
+        stat.update(_ancestor_code_weights(stat, ontology_dir, column))
     missing = [c for c in codes if c not in stat]
     if missing:
         raise ValueError(f"{len(missing)} weighted code(s) are absent from {fp}: {missing[:10]}")
@@ -632,9 +694,13 @@ def resolve_boundary_pools(
     Returns ``(boundary_codes, boundary_weights, start_event_codes, start_event_weights)``; the
     weight tuples are empty when weighting is off.
     """
+    # Keyed on "is an ontology attached", NOT on "does this mode draw ancestors": an *explicit* pool
+    # may name ancestor nodes in any attached mode (that is what ``boundary_code_to_index`` is for),
+    # and such a pool needs both the closure-aware exclusion and the ancestor statistics.
+    onto = None if vocab.ontology_mode == ONTOLOGY_MODE_NONE else cfg.get("ontology_dir")
     exclude = read_exclude_prefixes(cfg.get("exclude_boundary_prefixes"))
-    boundary_codes = read_boundary_codes(cfg.get("boundary_codes"), vocab, exclude)
-    start_event_codes = read_start_event_codes(cfg.get("start_event_codes"), vocab, exclude)
+    boundary_codes = read_boundary_codes(cfg.get("boundary_codes"), vocab, exclude, onto)
+    start_event_codes = read_start_event_codes(cfg.get("start_event_codes"), vocab, exclude, onto)
 
     weighting = cfg.get("code_weighting")
     if weighting is None or str(weighting).lower() in ("", "null", "none", "uniform"):
@@ -644,7 +710,6 @@ def resolve_boundary_pools(
     column = str(cfg.get("code_weight_column", "code/n_occurrences"))
     power = float(cfg.get("code_weight_power", 1.0))
     source = cfg.get("query_codes")
-    onto = cfg.get("ontology_dir") if ontology_boundaries_enabled(vocab.ontology_mode) else None
     return (
         boundary_codes,
         build_code_weights(source, boundary_codes, column, power, onto),
@@ -1208,8 +1273,13 @@ def validate_manifest(manifest: dict) -> dict:
             raise ValueError(
                 f"manifest ontology_mode is {ONTOLOGY_MODE_NONE!r} but it records an ontology_fingerprint"
             )
-    elif not manifest.get("ontology_fingerprint"):
-        raise ValueError(f"manifest ontology_mode is {mode!r} but it records no ontology_fingerprint")
+    else:
+        # Both keys, so the writer and ``every_query.data.multitask_dataset.read_manifest`` agree on
+        # what an ancestor-bearing manifest must carry: the width bounds the ids, the digest says
+        # which closure gives them meaning.
+        absent = [k for k in ("ontology_fingerprint", "boundary_vocab_size") if not manifest.get(k)]
+        if absent:
+            raise ValueError(f"manifest ontology_mode is {mode!r} but it records no {' or '.join(absent)}")
     if int(manifest["num_bounds"]) < 1:
         raise ValueError("manifest num_bounds must be >= 1")
     return manifest
@@ -1538,6 +1608,14 @@ def label_multitask_index(
     stats.n_contexts = n
 
     t0 = time.perf_counter()
+    if ontology_dir is not None:
+        # Index 0 is dropped after encoding, so a code sitting there has a permanently false bit.
+        # Drop its events *before* the expansion too, or the ancestor rows minted from them would
+        # survive and an ancestor's answer would OR in a leaf whose own bit is false by construction
+        # - disagreeing with ``derive_ancestor_targets``, which the dataset re-checks against.
+        pad_codes = [c for c, i in vocab.code_to_index().items() if i == 0]
+        if pad_codes:
+            events_df = events_df.filter(~pl.col(DataSchema.code_name).cast(pl.Utf8).is_in(pad_codes))
     events_df = prepare_events_for_labeling(events_df, ontology_dir)
     ev_sid, ev_t, ev_ci, n_unknown = _encode_events(events_df, vocab)
     stats.n_unknown_code_events = n_unknown

@@ -27,8 +27,9 @@ Targets are always the cohort's leaf codes, ``V`` wide.  *Event* names - starts,
 codes - may reach ``[V, V_ext)`` when the sampler ran with an ontology (the manifest's
 ``ontology_mode`` is not ``"none"``); pass that ``ontology_dir`` and they resolve through
 ``extend_code_map``, bounded by the manifest's ``boundary_vocab_size``.  An ancestor conditioning
-code's stored answer is the OR over its closure descendants, and ``collate`` re-derives it with
-``derive_ancestor_targets`` - the same widening the model applies - to check it.
+code's stored answer is the OR over its closure descendants - the value ``derive_ancestor_targets``
+would put in that column - and ``collate`` re-derives exactly the ancestor slots a batch names to
+check it, rather than widening the whole block to ``V_ext`` to read back a handful of bits.
 
 It fails loudly at init when the cohort's ``codes.parquet`` (or an explicit ``expected_vocab_size`` /
 ``expected_vocab_fingerprint``) disagrees with the manifest, and when the ontology it is given is not
@@ -252,12 +253,14 @@ def read_manifest(split_dir: Path) -> dict:
     # boundaries existed carry neither it nor ``ontology_fingerprint``, and must keep loading.  A
     # manifest that *claims* an ontology mode without it is corrupt, though - the width is the only
     # thing that says how far an ancestor start / bound / condition code may reach.
-    if manifest["ontology_mode"] != ONTOLOGY_MODE_NONE and not manifest.get("boundary_vocab_size"):
-        raise ValueError(
-            f"multitask manifest {fp} has ontology_mode {manifest['ontology_mode']!r} but no "
-            "boundary_vocab_size; regenerate the labels with the current "
-            "EQ_generate_multitask_sequences."
-        )
+    if manifest["ontology_mode"] != ONTOLOGY_MODE_NONE:
+        missing = [k for k in ("boundary_vocab_size", "ontology_fingerprint") if not manifest.get(k)]
+        if missing:
+            raise ValueError(
+                f"multitask manifest {fp} has ontology_mode {manifest['ontology_mode']!r} but no "
+                f"{' or '.join(missing)}; regenerate the labels with the current "
+                "EQ_generate_multitask_sequences."
+            )
     # Format 2 (issue #20/#22: every window opens at the prediction time, no start columns) and
     # format 3 (issue #24: explicit starts) are both readable; a missing key means legacy format 2.
     version = manifest.get("format_version", 2)
@@ -455,6 +458,8 @@ class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
             for c, i in zip(code_meta["code"].to_list(), code_meta["code/vocab_index"].to_list(), strict=True)
         }
         self._closure = None
+        self._descendant_leaves: torch.Tensor | None = None
+        self._descendant_offsets: torch.Tensor | None = None
         if ontology_dir is not None and self.ontology_mode != ONTOLOGY_MODE_NONE:
             from every_query.data.ontology import (
                 check_ontology_cohort,
@@ -468,6 +473,8 @@ class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
             # permuted indices - would pair every ancestor name with the wrong descendants.  Checked
             # against the *base* map, before the extension adds the nodes being vouched for.
             check_ontology_cohort(ontology_dir, code_to_index=self.code_to_index)
+            # ``read_manifest`` has already refused an ancestor mode without one, so this is never
+            # skipped for a manifest that claims to use ancestors.
             recorded = self.manifest.get("ontology_fingerprint")
             actual = closure_fingerprint(ontology_dir)
             if recorded and actual != recorded:
@@ -497,6 +504,16 @@ class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
                 ontology_dir,
                 base_vocab_size=self.vocab_size,
                 vocab_fingerprint=self.vocab_fingerprint,
+            )
+            # The closure as a CSR-style ancestor -> descendant-leaf index, so ``collate`` can OR the
+            # handful of ancestor columns a batch actually names instead of materialising the whole
+            # (B, K-1, V_ext) block to read back B*(K-1) bits.  Two int64 vectors; pickles to the
+            # dataloader workers with the rest of the dataset.
+            anc = self._closure.ancestor_ids - self.vocab_size
+            order = torch.argsort(anc, stable=True)
+            self._descendant_leaves = self._closure.leaf_ids[order]
+            self._descendant_offsets = torch.searchsorted(
+                anc[order], torch.arange(self._closure.n_ancestors + 1)
             )
 
         n = self.schema_df.height
@@ -739,6 +756,38 @@ class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
         dense = np.unpackbits(packed, axis=-1, count=self.vocab_size, bitorder=BITORDER)
         return torch.from_numpy(dense.astype(bool, copy=False))
 
+    def _ancestor_answers(
+        self,
+        leaf_targets: torch.Tensor,
+        condition_codes: torch.LongTensor,
+        ancestor: torch.Tensor,
+        expect: torch.BoolTensor,
+    ) -> torch.BoolTensor:
+        """Fill ``expect`` at the ancestor slots with the OR over each code's descendant leaves.
+
+        Deliberately not ``derive_ancestor_targets``: that is the right shape for the model, which
+        needs every ``V_ext`` column for its loss, but here at most ``B * (K-1)`` bits are wanted and
+        widening the whole block to read them costs a transient ``(B, K-1, V_ext)`` allocation per
+        batch, in a dataloader worker, on CPU.  One pass per *distinct* ancestor code in the batch -
+        typically a handful - reads the same bits from the leaf block directly.
+        """
+        if self._closure is None:
+            raise ValueError(
+                "the labels name ontology nodes as conditioning codes but this dataset has no "
+                "closure; construct it with the ontology_dir the labels were sampled with."
+            )
+        expect = expect.clone()
+        for code in torch.unique(condition_codes[ancestor]).tolist():
+            slot = int(code) - self.vocab_size
+            lo, hi = int(self._descendant_offsets[slot]), int(self._descendant_offsets[slot + 1])
+            here = ancestor & (condition_codes == code)
+            if lo == hi:  # a node with no descendant leaf can never be true
+                expect[here] = False
+                continue
+            b, j = here.nonzero(as_tuple=True)
+            expect[here] = leaf_targets[b, j][:, self._descendant_leaves[lo:hi]].any(dim=-1)
+        return expect
+
     def collate(self, batch: list[dict]) -> MultitaskBoundaryBatch:
         out = dict(super().collate(batch).items())
         out.pop("boolean_value", None)
@@ -766,17 +815,15 @@ class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
 
         # The stored answer must be the target bit of its code at its boundary (the sampler's
         # contract).  For an ancestor code there is no such column - ``targets`` is leaf-only - and
-        # the contract is instead the OR over the code's closure descendants, which is exactly what
-        # the model's own ``derive_ancestor_targets`` computes, so the check widens through it and
-        # gathers from the same extended row the model would read.
+        # the contract is instead the OR over the code's closure descendants, the same value the
+        # model's ``derive_ancestor_targets`` puts in that column.
         kc = self.num_bounds - 1
         if kc:
-            wide = targets[:, :kc]
-            if self._closure is not None and bool((condition_codes >= self.vocab_size).any()):
-                from every_query.data.ontology import derive_ancestor_targets
-
-                wide = derive_ancestor_targets(wide, self._closure)
-            expect = wide.gather(2, condition_codes.unsqueeze(-1)).squeeze(-1)
+            leaf = torch.clamp(condition_codes, max=self.vocab_size - 1)
+            expect = targets[:, :kc].gather(2, leaf.unsqueeze(-1)).squeeze(-1)
+            ancestor = condition_codes >= self.vocab_size
+            if bool(ancestor.any()):
+                expect = self._ancestor_answers(targets[:, :kc], condition_codes, ancestor, expect)
             if not torch.equal(expect, condition_answers):
                 bad = (expect != condition_answers).nonzero()[:5].tolist()
                 raise ValueError(

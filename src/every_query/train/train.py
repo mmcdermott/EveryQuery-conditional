@@ -560,6 +560,20 @@ def main(cfg: DictConfig) -> float | None:
     dataset_kwargs = cfg.datamodule.get("dataset_kwargs")
     if dataset_kwargs is not None and "expected_vocab_size" in dataset_kwargs:
         cfg.datamodule.dataset_kwargs.expected_vocab_size = cohort_vocab_size
+    # The datasets' ``ontology_dir`` interpolates from the model's in every shipped config, but an
+    # override can desync them - and then a labels directory sampled with ancestor-valued start /
+    # bound / conditioning codes hands ids in [V, V_ext) to an embedding table the model sized for a
+    # different (or no) ontology.  Nothing downstream can attribute that: on CUDA it is an
+    # asynchronous device-side assert.  One comparison here turns it into a sentence.
+    if dataset_kwargs is not None and "ontology_dir" in dataset_kwargs:
+        data_onto = dataset_kwargs.get("ontology_dir")
+        if (data_onto or None) != (ontology_dir or None):
+            raise ValueError(
+                f"datamodule.dataset_kwargs.ontology_dir ({data_onto!r}) and "
+                f"lightning_module.model.ontology_dir ({ontology_dir!r}) must name the same ontology: "
+                "the datasets resolve ancestor start / bound / conditioning codes through the first "
+                "and the model embeds them from a table sized by the second."
+            )
     cfg.lightning_module.model.config_overrides.max_position_embeddings = required_position_embeddings(
         cfg.lightning_module.model, ds_cfg.max_seq_len
     )

@@ -223,10 +223,12 @@ class MultitaskBoundarySchema(LabelSchema):
             ``prediction_time + start_duration``; an event-defined start holds
             ``EVENT_BOUND_DURATION_SENTINEL`` (``-1.0``).
         start_events: ``K`` start codes aligned with ``start_durations``: null for a duration-defined
-            start, a base-vocabulary code for an event-defined one (the window opens at its first
-            occurrence strictly after ``prediction_time``; if there is none the window is empty).
-            Exactly one representation is active per slot.  Parquets written before #24 lack both
-            start columns and are read as ``[0.0] * K`` / ``[null] * K``.
+            start, an event code for an event-defined one (the window opens at its first occurrence
+            strictly after ``prediction_time``; if there is none the window is empty).  Normally a
+            base code; an ontology node name in a boundaries ontology mode, where "its occurrence"
+            means an occurrence of any descendant leaf.  Exactly one representation is active per
+            slot.  Parquets written before #24 lack both start columns and are read as ``[0.0] * K``
+            / ``[null] * K``.
         durations: ``K`` horizons in days after the **resolved start** (``float32``).  A
             duration-bounded slot holds ``>= 0``; an event-bounded slot holds
             ``EVENT_BOUND_DURATION_SENTINEL`` (``-1.0``).

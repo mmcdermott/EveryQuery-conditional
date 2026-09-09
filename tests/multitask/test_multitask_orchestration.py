@@ -1031,3 +1031,104 @@ def test_the_ontology_mode_decides_which_pools_carry_ancestors(
         ), f"{mode}: condition_policy"
         assert manifest["vocab_size"] == vocab.size and manifest["packed_width_bytes"] == vocab.packed_width
         assert manifest["boundary_vocab_size"] == (vocab.size if mode == "none" else vocab.size + 2)
+
+
+# --- PR C/D review fixes: pools, exclusions and weighting under an ontology ------------------------
+
+
+def _weighted_hierarchical_cohort(tmp_path: Path) -> Path:
+    """A metadata root with the prevalence columns *and* a two-level code hierarchy.
+
+    ``tests.multitask.conftest``'s cohort has the hierarchy but no statistics;
+    ``test_prevalence_weighting``'s has the statistics but flat codes.  The ancestor weighting needs
+    both.  Four ``C//*`` leaves at 10 occurrences each and one ``TIMELINE//END`` at 1, so a correct
+    closure sum gives ``C`` exactly 40.
+    """
+    root = tmp_path / "weighted_cohort"
+    (root / "metadata").mkdir(parents=True, exist_ok=True)
+    codes = [f"C//{i}" for i in range(4)] + ["TIMELINE//END"]
+    pl.DataFrame(
+        {
+            "code": codes,
+            "code/vocab_index": list(range(1, len(codes) + 1)),
+            "code/n_occurrences": [10, 10, 10, 10, 1],
+            "code/n_subjects": [7, 7, 7, 7, 1],
+        }
+    ).write_parquet(root / "metadata" / "codes.parquet")
+    return root
+
+
+def test_an_ancestor_over_an_excluded_leaf_is_excluded_too(synthetic_cohort: Path, tmp_path: Path) -> None:
+    """``exclude_boundary_prefixes`` follows the closure, not just the name.
+
+    An ancestor's name is a *shorter* string than the leaves under it, so ``C`` never starts with
+    ``C//``; a pure name filter drops the leaves and leaves the node that draws every one of them back
+    in.  That defeats the documented use of the knob - excluding ``TIMELINE//DELTA``, whose ancestor
+    ``TIMELINE`` means "the next delta token".
+    """
+    onto = write_cohort_ontology(synthetic_cohort, tmp_path / "onto")
+    vocab = build_target_vocabulary(synthetic_cohort, str(onto), "boundaries")
+    assert "C" in vocab.ancestor_names and "TIMELINE" in vocab.ancestor_names
+
+    # Without the closure the name filter keeps ``C`` while dropping every ``C//*`` leaf under it.
+    assert "C" in sms.read_boundary_codes(None, vocab, ("C//",)), (
+        "fixture no longer exercises the gap this test is about"
+    )
+
+    kept = sms.read_boundary_codes(None, vocab, ("C//",), str(onto))
+    assert "C" not in kept, "the node above the excluded subtree survived the exclusion"
+    assert not any(c.startswith("C//") for c in kept)
+    assert "TIMELINE" in kept and "TIMELINE//END" in kept, "an unrelated subtree must be untouched"
+
+    # An explicit pool is filtered by the same rule.
+    with pytest.raises(ValueError, match="empties the boundary pool"):
+        sms.read_boundary_codes(["C"], vocab, ("C//",), str(onto))
+
+
+def test_prevalence_weighting_takes_an_explicit_ancestor_pool_in_every_attached_mode(
+    synthetic_cohort: Path, tmp_path: Path
+) -> None:
+    """The weighting needs the ontology whenever one is attached, not only in a boundaries mode.
+
+    An explicit pool may name ontology nodes in any attached mode, and such a node has no
+    ``codes.parquet`` row - so gating the ontology on "does this mode draw ancestors" made a
+    documented configuration abort in Stage 0 with "weighted code(s) are absent from ...".
+    """
+    cohort = _weighted_hierarchical_cohort(tmp_path)
+    onto = write_cohort_ontology(cohort, tmp_path / "onto")
+    for mode in ("boundaries", "conditions", "boundaries+conditions"):
+        vocab = build_target_vocabulary(cohort, str(onto), mode)
+        cfg = OmegaConf.create(
+            {
+                "query_codes": str(cohort),
+                "ontology_dir": str(onto),
+                "boundary_codes": ["C"],
+                "start_event_codes": ["C", "TIMELINE//END"],
+                "exclude_boundary_prefixes": [],
+                "code_weighting": "prevalence",
+                "code_weight_column": "code/n_occurrences",
+                "code_weight_power": 1.0,
+            }
+        )
+        codes, weights, starts, start_weights = sms.resolve_boundary_pools(cfg, vocab)
+        assert codes == ["C"] and weights == (1.0,), f"{mode}: single-member pool must normalize to 1"
+        assert starts == ["C", "TIMELINE//END"], mode
+        # C covers 40 occurrences (4 leaves x 10), TIMELINE//END has 1.
+        assert abs(sum(start_weights) - 1.0) < 1e-9, mode
+        assert abs(start_weights[0] - 40 / 41) < 1e-9, f"{mode}: the ancestor must sum its leaves"
+
+
+def test_an_ancestor_subject_count_is_the_max_not_the_sum(synthetic_cohort: Path, tmp_path: Path) -> None:
+    """Summing ``code/n_subjects`` over descendants counts a subject once per code they carry.
+
+    A wide subtree could then claim more subjects than the cohort has.  Occurrence counts still sum -
+    those really do add up - so the aggregation depends on what the column counts.
+    """
+    onto = write_cohort_ontology(synthetic_cohort, tmp_path / "onto")
+    stat: dict[str, object] = dict.fromkeys(CODES, 10.0)
+    by_subjects = sms._ancestor_code_weights(stat, onto, "code/n_subjects")
+    by_occurrences = sms._ancestor_code_weights(stat, onto, "code/n_occurrences")
+    n_leaves_under_c = sum(1 for c in CODES if c.startswith("C//"))
+    assert n_leaves_under_c > 1
+    assert by_subjects["C"] == 10.0, "a subject count must not exceed its largest descendant's"
+    assert by_occurrences["C"] == 10.0 * n_leaves_under_c

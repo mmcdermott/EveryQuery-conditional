@@ -56,7 +56,8 @@ duration_distribution: log-uniform # uniform | log-uniform
 # event-bounded slot draws its boundary code iid uniform WITH replacement from `boundary_codes`;
 # null => every base observable code (vocab index >= 1) of `query_codes`, plus every ontology node
 # when `ontology_mode` allows ancestor boundaries.  An explicit list may name ontology nodes in any
-# mode.  Repeated durations and repeated boundary codes within one context are allowed.
+# *attached* mode (any mode but `none`).  Repeated durations and repeated boundary codes within one
+# context are allowed.
 eventbound_fraction: 0.5
 boundary_codes: null
 
@@ -72,8 +73,12 @@ boundary_codes: null
 # patient's timeline - bound most windows.  power 1.0 is proportional to prevalence, 0.5 is
 # square-root damped, 0.0 is uniform again.  Codes whose statistic is null or zero are floored at
 # the pool's smallest positive value rather than dropped.  An ontology node has no row in
-# codes.parquet at all, so it takes the SUM of its closure descendants' statistic - the honest
-# prevalence of "any descendant occurred", up to co-occurrence within a timestamp.  The policy
+# codes.parquet at all, so it aggregates its closure descendants': the SUM for an occurrence count
+# (`code/n_occurrences`), which is the honest "any descendant occurred" up to co-occurrence within a
+# timestamp, but the MAX for a subject count (`code/n_subjects`), because summing would count a
+# subject once per descendant code they carry and let a wide subtree exceed the whole cohort.  The
+# max is a true lower bound and under-weights only a node whose descendants reach disjoint subjects.
+# The policy
 # applies to BOTH the end-boundary pool and the start-event pool; conditioning codes and the
 # all-vocabulary target set are untouched, so only which windows exist changes, never what a label
 # bit means.
@@ -82,11 +87,17 @@ code_weight_column: code/n_occurrences # code/n_occurrences | code/n_subjects
 code_weight_power: 1.0
 
 # Codes whose name starts with any of these prefixes are removed from the boundary AND start-event
-# pools (never from the targets or the conditioning codes).  Ontology node names are filtered by the
-# same rule, so `TIMELINE` drops the ancestor node as well as every leaf under it.  `TIMELINE//DELTA` - the quantized
+# pools (never from the targets or the conditioning codes).  `TIMELINE//DELTA` - the quantized
 # time-delta tokens - is the usual entry: they carry ~10% of all occurrences in a MIMIC-style
 # cohort, so prevalence weighting would spend a tenth of its event windows on boundaries that a
 # `use_rope_time` model never even sees in its input stream.
+#
+# With an ontology the exclusion follows the CLOSURE, not just the name: any node covering an
+# excluded leaf is removed too.  A name test could not do this - an ancestor's name is shorter than
+# its leaves', so `TIMELINE` never starts with `TIMELINE//DELTA` - yet drawing `TIMELINE` means "the
+# next occurrence of any `TIMELINE//*` event", delta tokens included, which is exactly what the
+# exclusion is for.  One excluded descendant removes the node: a node covering both excluded and
+# wanted leaves cannot express "any of these except those".
 exclude_boundary_prefixes: []
 
 # Start specification (issue #24).  Per slot, independently, one uniform draw picks the form:
@@ -139,7 +150,8 @@ ontology_dir: null
 # null => `boundaries+conditions` when `ontology_dir` is set, `none` when it is not.  Narrow it to
 # `boundaries` (ancestor starts/bounds only), `conditions` (ancestor conditioning codes only), or
 # `none` (keep the ontology on disk but sample exactly the leaf-only draws).  Explicit ancestor names
-# in `boundary_codes` / `start_event_codes` resolve in every mode; the mode governs the null-pool draw.
+# in `boundary_codes` / `start_event_codes` resolve in any *attached* mode (not under `none`, which
+# detaches the ontology entirely); the mode governs only the null-pool draw.
 ontology_mode: null
 overwrite: false
 
