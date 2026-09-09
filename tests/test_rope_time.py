@@ -4,7 +4,7 @@ Covers, in pipeline order:
 
 1. :mod:`every_query.data.rope_time` — strip semantics, elapsed-time preservation, row
    isolation, and agreement between the keep mask and the strip.
-2. :class:`~every_query.data.seq_dataset.ConditionalQueryPytorchDataset` — that
+2. :class:`~every_query.data.query_seq_dataset.QuerySeqPytorchDataset` — that
    ``strip_delta_tokens=True`` removes the delta tokens from the collated encoder input,
    emits aligned ``time_pos_ids``, and leaves the query tensors untouched.
 3. :class:`~every_query.model.conditional_multitask_ar_model.ConditionalMultitaskARModel` — that
@@ -39,6 +39,7 @@ import torch
 from meds import train_split
 from meds_torchdata import MEDSTorchDataConfig
 
+from every_query.data.query_seq_dataset import QuerySeqBatch, QuerySeqPytorchDataset
 from every_query.data.rope_time import (
     DELTA_TOKEN_PREFIX,
     build_keep_mask,
@@ -46,8 +47,7 @@ from every_query.data.rope_time import (
     delta_vocab_ids,
     strip_delta_tokens,
 )
-from every_query.data.seq_dataset import ConditionalQueryBatch, ConditionalQueryPytorchDataset
-from every_query.model.conditional_model import validate_rope_time_pair
+from every_query.model.answers import validate_rope_time_pair
 from every_query.model.conditional_multitask_ar_model import TOKENS_PER_WINDOW
 
 # The multitask model's own construction idiom, reused rather than re-invented.
@@ -203,7 +203,7 @@ def test_dataset_without_strip_emits_no_time_pos_ids(seq_sample_batch):
 
 def test_dataset_strip_emits_aligned_time_pos_ids(tensorized_cohort_dir, seq_task_labels_dir):
     """With stripping on, ``time_pos_ids`` aligns to ``code`` and no delta token survives."""
-    ds = ConditionalQueryPytorchDataset(
+    ds = QuerySeqPytorchDataset(
         _seq_cfg(tensorized_cohort_dir, seq_task_labels_dir),
         split=train_split,
         strip_delta_tokens=True,
@@ -214,7 +214,7 @@ def test_dataset_strip_emits_aligned_time_pos_ids(tensorized_cohort_dir, seq_tas
     assert batch.time_pos_ids.shape == batch.code.shape
     assert not torch.isin(batch.code, ds.delta_ids).any(), "no delta token may survive the strip"
     # Elapsed time never runs backwards within a row.
-    real = batch.code != ConditionalQueryBatch.PAD_INDEX
+    real = batch.code != QuerySeqBatch.PAD_INDEX
     for i in range(batch.code.shape[0]):
         row = batch.time_pos_ids[i][real[i]]
         assert (row.diff() >= 0).all() if row.numel() > 1 else True
@@ -229,13 +229,13 @@ def test_dataset_strip_compacts_the_real_collated_stream(tensorized_cohort_dir, 
     aligned, and the surviving tokens keep their order.
     """
     cfg = _seq_cfg(tensorized_cohort_dir, seq_task_labels_dir)
-    plain = ConditionalQueryPytorchDataset(cfg, split=train_split)
+    plain = QuerySeqPytorchDataset(cfg, split=train_split)
     before = plain.collate([plain[i] for i in range(len(plain))])
 
-    real = before.code[before.code != ConditionalQueryBatch.PAD_INDEX]
+    real = before.code[before.code != QuerySeqBatch.PAD_INDEX]
     victim = int(real.mode().values.item())  # the most common real token
 
-    ds = ConditionalQueryPytorchDataset(cfg, split=train_split, strip_delta_tokens=True)
+    ds = QuerySeqPytorchDataset(cfg, split=train_split, strip_delta_tokens=True)
     ds.delta_ids = torch.tensor([victim])
     after = ds.collate([ds[i] for i in range(len(ds))])
 
@@ -246,8 +246,8 @@ def test_dataset_strip_compacts_the_real_collated_stream(tensorized_cohort_dir, 
     assert after.numeric_value_mask.shape == after.code.shape
 
     for i in range(before.code.shape[0]):
-        kept = [int(c) for c in before.code[i] if int(c) not in (victim, ConditionalQueryBatch.PAD_INDEX)]
-        got = [int(c) for c in after.code[i] if int(c) != ConditionalQueryBatch.PAD_INDEX]
+        kept = [int(c) for c in before.code[i] if int(c) not in (victim, QuerySeqBatch.PAD_INDEX)]
+        got = [int(c) for c in after.code[i] if int(c) != QuerySeqBatch.PAD_INDEX]
         assert got == kept, "surviving tokens must keep their original order"
 
 
@@ -256,7 +256,7 @@ def test_strip_emits_times_even_when_the_cohort_has_no_delta_tokens(
 ):
     """``time_pos_ids`` means "the strip was requested", not "delta tokens were deleted".
 
-    ``ConditionalQueryPytorchDataset`` handles the empty-``delta_ids`` cohort explicitly — it
+    ``QuerySeqPytorchDataset`` handles the empty-``delta_ids`` cohort explicitly — it
     warns and carries on, emitting ``time_pos_ids`` while deleting nothing — so the presence of
     the field is not by itself proof that ``batch.code`` was rewritten.  Pinned here because
     ``_encoder_position_kwargs``'s docstring reasons about what that presence implies, and
@@ -266,8 +266,8 @@ def test_strip_emits_times_even_when_the_cohort_has_no_delta_tokens(
     the mismatch reported, not smoothed over.
     """
     cfg = _seq_cfg(tensorized_cohort_dir, seq_task_labels_dir)
-    plain = ConditionalQueryPytorchDataset(cfg, split=train_split)
-    ds = ConditionalQueryPytorchDataset(cfg, split=train_split, strip_delta_tokens=True)
+    plain = QuerySeqPytorchDataset(cfg, split=train_split)
+    ds = QuerySeqPytorchDataset(cfg, split=train_split, strip_delta_tokens=True)
     assert ds.delta_ids.numel() == 0, "this fixture cohort must have no TIMELINE//DELTA* codes"
 
     before = plain.collate([plain[i] for i in range(len(plain))])
@@ -275,7 +275,7 @@ def test_strip_emits_times_even_when_the_cohort_has_no_delta_tokens(
 
     assert after.time_pos_ids is not None, "the positions are emitted even with nothing to strip"
     assert after.time_pos_ids.shape == after.code.shape
-    pad = ConditionalQueryBatch.PAD_INDEX
+    pad = QuerySeqBatch.PAD_INDEX
     for i in range(before.code.shape[0]):
         kept = [int(c) for c in before.code[i] if int(c) != pad]
         got = [int(c) for c in after.code[i] if int(c) != pad]
@@ -309,17 +309,15 @@ def test_dataset_strip_never_touches_the_static_table(tensorized_cohort_dir, seq
 
     plain = before = None
     for max_seq_len in range(1, 9):
-        plain = ConditionalQueryPytorchDataset(cfg(max_seq_len), split=train_split)
+        plain = QuerySeqPytorchDataset(cfg(max_seq_len), split=train_split)
         before = plain.collate([plain[i] for i in range(len(plain))])
         if before.code.shape[1] == before.static_code.shape[1]:
             break
     assert before.code.shape[1] == before.static_code.shape[1], "fixture never lines the widths up"
 
-    real = before.code[before.code != ConditionalQueryBatch.PAD_INDEX]
+    real = before.code[before.code != QuerySeqBatch.PAD_INDEX]
     victim = int(real.mode().values.item())
-    ds = ConditionalQueryPytorchDataset(
-        cfg(plain.config.max_seq_len), split=train_split, strip_delta_tokens=True
-    )
+    ds = QuerySeqPytorchDataset(cfg(plain.config.max_seq_len), split=train_split, strip_delta_tokens=True)
     ds.delta_ids = torch.tensor([victim])
     after = ds.collate([ds[i] for i in range(len(ds))])
 
@@ -332,8 +330,8 @@ def test_dataset_strip_never_touches_the_static_table(tensorized_cohort_dir, seq
 def test_dataset_strip_leaves_query_tensors_untouched(tensorized_cohort_dir, seq_task_labels_dir):
     """Stripping touches the encoder stream only; the decoder's query blocks are unaffected."""
     cfg = _seq_cfg(tensorized_cohort_dir, seq_task_labels_dir)
-    plain = ConditionalQueryPytorchDataset(cfg, split=train_split)
-    stripped = ConditionalQueryPytorchDataset(cfg, split=train_split, strip_delta_tokens=True)
+    plain = QuerySeqPytorchDataset(cfg, split=train_split)
+    stripped = QuerySeqPytorchDataset(cfg, split=train_split, strip_delta_tokens=True)
 
     a = plain.collate([plain[i] for i in range(len(plain))])
     b = stripped.collate([stripped[i] for i in range(len(stripped))])

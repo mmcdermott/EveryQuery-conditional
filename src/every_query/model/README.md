@@ -16,8 +16,13 @@ shape, no Hydra entry points, no configs.
     `ConditionalQueryModel`): the conditional query-sequence architecture with a bidirectional
     ModernBERT patient encoder, a cross-attending `nn.TransformerDecoder` over
     `[code, duration, answer]` query blocks and the custom `build_block_causal_mask`. Also home
-    to the pieces both conditional architectures share (`ConditionalQueryOutput`, answer
-    constants, `masked_bce`, `validate_rope_time_pair`).
+    to the pieces both conditional architectures share (`ConditionalQueryOutput`, the token-type
+    constants, `masked_bce`).
+- **`answers.py`** — the architecture-independent pieces every query-answering model needs: the
+    binary answer vocabulary (`ANSWER_NO` / `ANSWER_YES` / `N_ANSWER_CLASSES`),
+    `validate_rope_time_pair` (keeps the model's `use_rope_time` and the batch's `time_pos_ids`
+    from drifting apart) and `_init_aux_embeddings` (re-inits tables built outside the HF
+    backbone to the backbone's scale).
 - **`conditional_ar_model.py`** — `ConditionalQueryARModel`: the decoder-only conditional
     architecture. One Hugging Face `LlamaModel` (trained from scratch) jointly attends over
     `[patient events, c₁, d₁, a₁, …]` under a plain token-level causal mask; predictions are

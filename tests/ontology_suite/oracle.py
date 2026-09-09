@@ -5,7 +5,7 @@ production implementation, and it must never import one:
 
 * no :mod:`every_query.data.ontology` (no ``build_event_to_query_nodes``, no
   ``expand_events_to_query_nodes``);
-* no :mod:`every_query.generate_tasks.sample_query_sequences` labelers.
+* no :mod:`every_query.generate_tasks.query_sequence_labeling` labelers.
 
 Everything is plain Python over a list of ``Event`` tuples.  It is O(n) per query on purpose --
 readability is the only thing being optimised, because a subtle oracle is worthless.
@@ -115,9 +115,7 @@ class Ontology:
     ):
         self.leaves: set[str] = set(leaves)
         self.subtree_suffix = subtree_suffix
-        self._declared: dict[str, list[str]] = {
-            k: list(v) for k, v in (declared_parents or {}).items()
-        }
+        self._declared: dict[str, list[str]] = {k: list(v) for k, v in (declared_parents or {}).items()}
 
         # Direct-parent map over every name reachable from a leaf, closed to a fixed point so
         # that a declared grouper's own prefixes (and its own declared parents) join the DAG.
@@ -129,9 +127,7 @@ class Ontology:
             if name in seen:
                 continue
             seen.add(name)
-            parents = set(prefix_parents(name)) | {
-                p for p in self._declared.get(name, ()) if p and p != name
-            }
+            parents = set(prefix_parents(name)) | {p for p in self._declared.get(name, ()) if p and p != name}
             self.direct[name] = parents
             frontier.extend(parents)
 
@@ -234,9 +230,7 @@ class Ontology:
 
 def subject_events(events: Sequence[Event], subject_id: int) -> list[Event]:
     """This subject's events, oldest first.  Ties keep input order (never consulted below)."""
-    return sorted(
-        (e for e in events if e.subject_id == subject_id), key=lambda e: e.time
-    )
+    return sorted((e for e in events if e.subject_id == subject_id), key=lambda e: e.time)
 
 
 def occurs_in_open_interval(
@@ -270,9 +264,7 @@ def label_duration(
     duration_days: float,
 ) -> bool:
     """Duration-bounded occurrence over the OPEN interval ``(t, t + duration_days)``."""
-    return occurs_in_open_interval(
-        events, subject_id, onto, query, t, t + timedelta(days=duration_days)
-    )
+    return occurs_in_open_interval(events, subject_id, onto, query, t, t + timedelta(days=duration_days))
 
 
 def first_boundary_after(

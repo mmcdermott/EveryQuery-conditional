@@ -153,7 +153,7 @@ class QuerySeqSchema(LabelSchema):
             together; absent means ``[0.0] * K`` / ``[None] * K``.  Parquets written before starts
             existed carry neither and remain valid.  ``align`` itself only types the columns; the
             pairing, alignment and representation rules are enforced by the readers
-            (``ConditionalQueryPytorchDataset`` and the ``label_query_sequences`` dispatch).  The
+            (``QuerySeqPytorchDataset`` and the ``label_query_sequences`` dispatch).  The
             ordinary sequence models (``EQ_predict_sequences``) accept only the default form;
             active starts are consumed by the multitask predictor.
 

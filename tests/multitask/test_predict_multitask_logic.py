@@ -50,12 +50,12 @@ from conftest import _PRED_TIMES, _TRAIN_SUBJECTS, _TUNING_SUBJECTS
 from every_query.data.conditional_multitask_datamodule import ConditionalMultitaskDataModule
 from every_query.data.multitask_dataset import MultitaskBoundaryBatch
 from every_query.data.multitask_eval_dataset import MultitaskEvalBatch, QuerySeqMultitaskEvalDataset
-from every_query.data.seq_dataset import (
+from every_query.data.query_seq_dataset import (
     EVENT_BOUND_DURATION_SENTINEL as SENTINEL,
 )
-from every_query.data.seq_dataset import (
+from every_query.data.query_seq_dataset import (
     NO_BOUND_INDEX,
-    ConditionalQueryPytorchDataset,
+    QuerySeqPytorchDataset,
 )
 from every_query.model.conditional_multitask_ar_model import ConditionalMultitaskARModel
 from every_query.model.conditional_multitask_lightning import ConditionalMultitaskLightningModule
@@ -219,7 +219,7 @@ def test_active_starts_and_bounds_tensorize_with_the_cohort_indices(tensorized_c
     grid = _write_grid(tmp_path / "grid", rows)
     # The ordinary sequence path must refuse this grid; the adapter is the opt-in.
     with pytest.raises(ValueError, match="active start"):
-        ConditionalQueryPytorchDataset(_data_config(tensorized_cohort_dir, grid), split=train_split)
+        QuerySeqPytorchDataset(_data_config(tensorized_cohort_dir, grid), split=train_split)
 
     ds = _dataset(tensorized_cohort_dir, grid)
     assert ds.has_starts and ds.has_bound_events

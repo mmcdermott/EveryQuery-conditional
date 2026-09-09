@@ -36,7 +36,7 @@ from every_query.data.ontology import (
     load_mix_matrix,
     string_ancestors,
 )
-from every_query.generate_tasks.sample_query_sequences import build_query_universe
+from every_query.generate_tasks.query_sequence_labeling import build_query_universe
 from every_query.model.ontology_embedding import OntologyEmbedding, wrap_tok_embeddings
 
 # The multitask model's own construction idiom, reused rather than re-invented.

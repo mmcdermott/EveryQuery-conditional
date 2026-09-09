@@ -2,9 +2,12 @@
 
 This module holds the **encoder-decoder** architecture
 (:class:`ConditionalQueryEncoderDecoderModel`, aliased as ``ConditionalQueryModel`` for backward
-compatibility) plus the pieces both conditional architectures share: the answer/token-type
-constants, :class:`ConditionalQueryOutput`, :func:`masked_bce` and
-:func:`validate_rope_time_pair`.  The alternative **decoder-only** architecture — one Llama
+compatibility) plus the pieces both conditional architectures share: the token-type constants,
+:class:`ConditionalQueryOutput` and :func:`masked_bce`.  The architecture-independent pieces —
+the answer vocabulary, :func:`~every_query.model.answers.validate_rope_time_pair` and
+:func:`~every_query.model.answers._init_aux_embeddings` — live in
+:mod:`every_query.model.answers` and are re-exported here for this module's own consumers.
+The alternative **decoder-only** architecture — one Llama
 backbone jointly attending over patient history and query stream — lives in
 :mod:`every_query.model.conditional_ar_model`.
 
@@ -49,20 +52,16 @@ import torch
 from transformers import AutoConfig, ModernBertConfig, ModernBertModel
 from transformers.modeling_outputs import BaseModelOutput
 
+from every_query.model.answers import (  # noqa: F401  (re-exported for this module's consumers)
+    ANSWER_NO,
+    ANSWER_YES,
+    N_ANSWER_CLASSES,
+    _init_aux_embeddings,
+    validate_rope_time_pair,
+)
 from every_query.model.model import MLP
 
 logger = logging.getLogger(__name__)
-
-# Answer-token vocabulary for teacher forcing.  Answers are binary: every query asks
-# "is this code observed in (t, t+d)?" and the answer is YES/NO.  There is no separate
-# "censored" answer class — censoring is expressed *as a query*, by asking about the
-# end-of-timeline code (TIMELINE//END): "[TIMELINE//END, d]" answered YES means the record
-# ends within d (the window is not fully observed), NO means data continue past t+d.  A
-# downstream query conditions on that answer, which is strictly more expressive than the
-# original EveryQuery's implicit "P(occurs | data exist after d)".
-ANSWER_NO = 0
-ANSWER_YES = 1
-N_ANSWER_CLASSES = 2
 
 # Token-type indices within a query block.
 TOKEN_CODE = 0
@@ -168,59 +167,6 @@ def masked_bce(
     return criterion(logits, target)
 
 
-def validate_rope_time_pair(use_rope_time: bool, time_pos: torch.Tensor | None) -> torch.Tensor | None:
-    """Enforce that ``use_rope_time`` (model) and ``time_pos_ids`` (batch) arrive as a pair.
-
-    Returns the validated ``time_pos`` tensor (``None`` when rope-time is off).  Both
-    half-configurations are hard errors rather than silent fallbacks — either direction yields a
-    model that trains, validates and checkpoints with normal-looking numbers while its backbone
-    is missing the elapsed-time signal (see
-    :meth:`ConditionalQueryEncoderDecoderModel._encoder_position_kwargs` for the full
-    post-mortem this guard encodes).  Shared by both conditional architectures so the AR model
-    cannot silently drift from the encoder-decoder model's contract.
-    """
-    if not use_rope_time:
-        if time_pos is not None:
-            raise ValueError(
-                "use_rope_time=False but the batch carries time_pos_ids, which only "
-                "ConditionalQueryPytorchDataset(..., strip_delta_tokens=True) emits — so the "
-                "TIMELINE//DELTA* tokens have already been stripped from the model input, "
-                "and token-index positions would leave the model with no elapsed-time "
-                "information at all.  Either half of the pair fixes it: set "
-                "`lightning_module.model.use_rope_time=true` to consume the positions (most "
-                "likely what was meant, since the strip was switched on deliberately), or "
-                "`datamodule.dataset_kwargs.strip_delta_tokens=false` to keep the delta "
-                "tokens in the stream.  Refusing to silently discard elapsed time."
-            )
-        return None
-    if time_pos is None:
-        raise ValueError(
-            "use_rope_time=True but the batch carries no time_pos_ids.  Build the dataset "
-            "with ConditionalQueryPytorchDataset(..., strip_delta_tokens=True) — via "
-            "`datamodule.dataset_kwargs.strip_delta_tokens=true` — so elapsed-hour positions "
-            "are emitted.  Refusing to fall back to token-index positions silently."
-        )
-    return time_pos
-
-
-def _init_aux_embeddings(std: float, *embeddings: torch.nn.Embedding) -> None:
-    """Re-init embedding tables built outside the HF backbone to the backbone's scale.
-
-    HF models initialize their own submodules in ``post_init()`` with
-    ``config.initializer_range`` (0.02).  Tables constructed afterwards on the wrapper keep
-    ``nn.Embedding``'s default ``N(0, 1)``, ~50x wider, so shared type/position vectors
-    dominate the summed input at init.  Call this instead of ``self.apply(...)``, which would
-    also reinitialize the already-initialized backbone.
-
-        >>> emb = torch.nn.Embedding(1000, 64)
-        >>> _init_aux_embeddings(0.02, emb)
-        >>> bool(0.015 < emb.weight.std().item() < 0.025)
-        True
-    """
-    for embedding in embeddings:
-        torch.nn.init.normal_(embedding.weight, mean=0.0, std=std)
-
-
 @dataclass
 class ConditionalQueryOutput(BaseModelOutput):
     """Output container for both conditional query-sequence architectures.
@@ -293,7 +239,7 @@ class ConditionalQueryEncoderDecoderModel(torch.nn.Module):
             codes and an event-bounded query's boundary codes inherit the structure too.
         use_rope_time: Drive the encoder's rotary positions from ``batch.time_pos_ids``
             (elapsed integer hours) instead of token index.  Pair with
-            ``ConditionalQueryPytorchDataset(strip_delta_tokens=True)``, which removes the
+            ``QuerySeqPytorchDataset(strip_delta_tokens=True)``, which removes the
             quantized ``TIMELINE//DELTA*`` tokens and emits those positions.  Attention then
             sees continuous relative time rather than token distance.  This flag and the
             dataset's ``strip_delta_tokens`` must be set together: a mismatch in *either*
@@ -445,7 +391,7 @@ class ConditionalQueryEncoderDecoderModel(torch.nn.Module):
           with a dataset built without ``strip_delta_tokens=True``.
         * ``use_rope_time=False`` with ``time_pos_ids`` present — worse, and the reason this
           direction is checked at all.  ``time_pos_ids`` is emitted by exactly one code path,
-          ``ConditionalQueryPytorchDataset(strip_delta_tokens=True)``, so its presence on the
+          ``QuerySeqPytorchDataset(strip_delta_tokens=True)``, so its presence on the
           batch means the strip was **asked for**, and normally that the ``TIMELINE//DELTA*``
           tokens have already been deleted from ``batch.code``.  Ignoring the positions then
           leaves the encoder with **no elapsed-time information at all**: the delta tokens are
@@ -456,7 +402,7 @@ class ConditionalQueryEncoderDecoderModel(torch.nn.Module):
 
           One case emits the positions without deleting anything: a cohort whose vocabulary has
           no ``TIMELINE//DELTA*`` codes at all, where the dataset warns and carries on
-          (:mod:`every_query.data.seq_dataset`).  Refusing is still correct there — the strip
+          (:mod:`every_query.data.query_seq_dataset`).  Refusing is still correct there — the strip
           was requested deliberately, nothing is consuming the positions, and the run is
           misconfigured in a way the user needs told about rather than smoothed over.
 
@@ -505,7 +451,7 @@ class ConditionalQueryEncoderDecoderModel(torch.nn.Module):
         return torch.where((q_bounds > 0).unsqueeze(-1), bound_emb, dur_emb)
 
     def _decoder_tokens(self, batch) -> torch.Tensor:
-        """Build the interleaved ``(B, 3L, H)`` decoder input from a ConditionalQueryBatch.
+        """Build the interleaved ``(B, 3L, H)`` decoder input from a QuerySeqBatch.
 
         Exactly three tokens per query block.  Nothing here may add a fourth: ``TOKENS_PER_QUERY``
         is baked into :func:`build_block_causal_mask`, the ``TOKEN_DURATION::TOKENS_PER_QUERY``
@@ -531,7 +477,7 @@ class ConditionalQueryEncoderDecoderModel(torch.nn.Module):
     def forward(self, batch) -> tuple[torch.FloatTensor, ConditionalQueryOutput]:
         """Run encoder + block-autoregressive decoder; return ``(loss, outputs)``.
 
-        Expects a ``ConditionalQueryBatch`` with ``code`` (patient tokens), ``q_codes``,
+        Expects a ``QuerySeqBatch`` with ``code`` (patient tokens), ``q_codes``,
         ``q_durations``, ``q_answers`` and ``q_mask``.
         """
         _, L = batch.q_codes.shape

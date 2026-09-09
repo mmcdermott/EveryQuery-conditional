@@ -31,13 +31,12 @@ import polars as pl
 import pytest
 import torch
 
-from every_query.data.seq_dataset import (
+from every_query.data.query_seq_dataset import (
     EVENT_BOUND_DURATION_SENTINEL,
     NO_BOUND_INDEX,
-    ConditionalQueryBatch,
+    QuerySeqBatch,
 )
-from every_query.generate_tasks.sample_evaluation_query_sequences import sample_sequence_specs
-from every_query.generate_tasks.sample_query_sequences import (
+from every_query.generate_tasks.query_sequence_labeling import (
     BOUND_COL,
     QuerySequenceDistribution,
     label_binary_occurrence,
@@ -45,7 +44,8 @@ from every_query.generate_tasks.sample_query_sequences import (
     label_with_event_bounds,
     log_degenerate_bounds,
 )
-from every_query.model.conditional_model import ANSWER_NO, ANSWER_YES
+from every_query.generate_tasks.sample_evaluation_query_sequences import sample_sequence_specs
+from every_query.model.answers import ANSWER_NO, ANSWER_YES
 from every_query.model.conditional_multitask_ar_model import TYPE_WINDOW
 
 # The multitask model's own construction idiom, reused rather than re-invented.
@@ -286,7 +286,7 @@ def test_boundaries_are_drawn_from_the_query_universe():
 
 def test_batch_without_bounds_is_still_valid():
     """The column is optional end to end; a pre-feature dataset must keep working."""
-    batch = ConditionalQueryBatch(
+    batch = QuerySeqBatch(
         code=torch.tensor([[3, 4]]),
         numeric_value=torch.zeros(1, 2),
         numeric_value_mask=torch.zeros(1, 2, dtype=torch.bool),
@@ -301,7 +301,7 @@ def test_batch_without_bounds_is_still_valid():
 
 def test_batch_validates_bound_shape():
     with pytest.raises(ValueError, match="q_bound_codes"):
-        ConditionalQueryBatch(
+        QuerySeqBatch(
             code=torch.tensor([[3, 4]]),
             numeric_value=torch.zeros(1, 2),
             numeric_value_mask=torch.zeros(1, 2, dtype=torch.bool),

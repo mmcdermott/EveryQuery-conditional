@@ -44,7 +44,7 @@ import polars as pl
 from omegaconf import DictConfig
 from sklearn.metrics import roc_auc_score
 
-from every_query.data.seq_dataset import (
+from every_query.data.query_seq_dataset import (
     BOUND_EVENTS_COL,
     DURATIONS_COL,
     QUERIES_COL,

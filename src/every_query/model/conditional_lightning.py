@@ -24,7 +24,7 @@ import torch
 from meds import held_out_split, train_split, tuning_split
 from torchmetrics.classification import BinaryAUROC
 
-from every_query.data.seq_dataset import ConditionalQueryBatch
+from every_query.data.query_seq_dataset import QuerySeqBatch
 from every_query.model.conditional_ar_model import ConditionalQueryARModel
 from every_query.model.conditional_model import (
     ANSWER_YES,
@@ -87,7 +87,7 @@ class ConditionalQueryLightningModule(EveryQueryLightningModule):
         self,
         loss: torch.Tensor,
         outputs: ConditionalQueryOutput,
-        batch: ConditionalQueryBatch,
+        batch: QuerySeqBatch,
         split: Literal[train_split, tuning_split, held_out_split],
     ):
         batch_size = batch.batch_size
@@ -129,7 +129,7 @@ class ConditionalQueryLightningModule(EveryQueryLightningModule):
                     target=targets[:, j][sel_j],
                 )
 
-    def training_step(self, batch: ConditionalQueryBatch) -> torch.Tensor:
+    def training_step(self, batch: QuerySeqBatch) -> torch.Tensor:
         """Forward pass and metric logging for one training batch.
 
         Overrides the parent rather than inheriting it: upstream's ``training_step`` logs *per-task*
@@ -166,7 +166,7 @@ class ConditionalQueryLightningModule(EveryQueryLightningModule):
             self.log("train/grad_norm", float(total), on_step=True, on_epoch=False)
 
     @torch.no_grad()
-    def predict_step(self, batch: ConditionalQueryBatch) -> dict[str, torch.Tensor]:
+    def predict_step(self, batch: QuerySeqBatch) -> dict[str, torch.Tensor]:
         """Per-position probabilities + the batch's query tensors for downstream stitching."""
         _, outputs = self.model(batch)
         return {

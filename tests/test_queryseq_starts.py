@@ -12,7 +12,7 @@ end of the record.  Every labeling test below is checked against a plain-Python 
 that sentence and sharing no code with the labeler.
 
 The dataset half pins the safety property: the ordinary sequence models cannot represent a window
-that opens away from the prediction time, so ``ConditionalQueryPytorchDataset`` must refuse such a
+that opens away from the prediction time, so ``QuerySeqPytorchDataset`` must refuse such a
 grid unless the caller opts in (``allow_active_starts=True``, the multitask prediction adapter),
 while absent and all-default start columns keep loading as before.
 """
@@ -31,16 +31,16 @@ from meds import train_split
 from meds_torchdata.config import MEDSTorchDataConfig
 
 from conftest import _PRED_TIMES, _TRAIN_SUBJECTS
-from every_query.data.schema import QuerySeqSchema
-from every_query.data.seq_dataset import (
+from every_query.data.query_seq_dataset import (
     EVENT_BOUND_DURATION_SENTINEL,
     NO_BOUND_INDEX,
-    ConditionalQueryBatch,
-    ConditionalQueryPytorchDataset,
+    QuerySeqBatch,
+    QuerySeqPytorchDataset,
 )
+from every_query.data.schema import QuerySeqSchema
+from every_query.generate_tasks import query_sequence_labeling as sqs
 from every_query.generate_tasks import sample_multitask_sequences as sms
-from every_query.generate_tasks import sample_query_sequences as sqs
-from every_query.generate_tasks.sample_query_sequences import (
+from every_query.generate_tasks.query_sequence_labeling import (
     BOUND_COL,
     START_DURATION_COL,
     START_EVENT_COL,
@@ -540,7 +540,7 @@ def _rows(starts: list[tuple[list[float], list[str | None]]] | None) -> list[dic
     return rows
 
 
-def _dataset(cohort: Path, labels: Path, **kw) -> ConditionalQueryPytorchDataset:
+def _dataset(cohort: Path, labels: Path, **kw) -> QuerySeqPytorchDataset:
     cfg = MEDSTorchDataConfig(
         tensorized_cohort_dir=str(cohort),
         task_labels_dir=str(labels),
@@ -549,7 +549,7 @@ def _dataset(cohort: Path, labels: Path, **kw) -> ConditionalQueryPytorchDataset
         static_inclusion_mode="omit",
         batch_mode="SM",
     )
-    return ConditionalQueryPytorchDataset(cfg, split=train_split, **kw)
+    return QuerySeqPytorchDataset(cfg, split=train_split, **kw)
 
 
 DEFAULT_STARTS = [([0.0, 0.0, 0.0], [None, None, None])]
@@ -584,7 +584,7 @@ def test_opt_in_tensorizes_active_starts(tensorized_cohort_dir, tmp_path):
         allow_active_starts=True,
     )
     batch = ds.collate([ds[i] for i in range(len(ds))])
-    assert isinstance(batch, ConditionalQueryBatch)
+    assert isinstance(batch, QuerySeqBatch)
     assert batch.q_start_durations.shape == batch.q_codes.shape == batch.q_start_codes.shape
     hr = ds.code_to_index["HR"]
     for i in range(len(ds)):
@@ -655,14 +655,14 @@ def test_batch_requires_both_start_tensors_or_neither():
         "q_answers": torch.tensor([[1, 0]]),
         "q_mask": torch.tensor([[True, True]]),
     }
-    assert ConditionalQueryBatch(**kw).q_start_durations is None
+    assert QuerySeqBatch(**kw).q_start_durations is None
     with pytest.raises(ValueError, match="given together"):
-        ConditionalQueryBatch(**kw, q_start_durations=torch.zeros(1, 2))
+        QuerySeqBatch(**kw, q_start_durations=torch.zeros(1, 2))
     with pytest.raises(ValueError, match="q_start_codes"):
-        ConditionalQueryBatch(
+        QuerySeqBatch(
             **kw, q_start_durations=torch.zeros(1, 2), q_start_codes=torch.zeros(1, 3, dtype=torch.long)
         )
-    ok = ConditionalQueryBatch(
+    ok = QuerySeqBatch(
         **kw, q_start_durations=torch.zeros(1, 2), q_start_codes=torch.zeros(1, 2, dtype=torch.long)
     )
     assert ok.q_start_codes.shape == (1, 2)

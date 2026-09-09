@@ -50,7 +50,7 @@ from meds_torchdata import MEDSPytorchDataset
 from meds_torchdata.config import MEDSTorchDataConfig
 from meds_torchdata.types import MEDSTorchBatch
 
-from every_query.data.seq_dataset import EVENT_BOUND_DURATION_SENTINEL, NO_BOUND_INDEX
+from every_query.data.query_seq_dataset import EVENT_BOUND_DURATION_SENTINEL, NO_BOUND_INDEX
 
 logger = logging.getLogger(__name__)
 
@@ -174,7 +174,7 @@ class MultitaskBoundaryBatch(MEDSTorchBatch):
     q_start_durations: torch.FloatTensor | None = None
     q_start_codes: torch.LongTensor | None = None
     # Per-patient-token elapsed hours for rotary time encoding; ``None`` unless the dataset strips
-    # delta tokens (mirrors ``ConditionalQueryBatch.time_pos_ids``).
+    # delta tokens (mirrors ``QuerySeqBatch.time_pos_ids``).
     time_pos_ids: torch.LongTensor | None = None
 
     LABEL_TENSOR_NAMES: ClassVar[tuple[str]] = (
@@ -387,7 +387,7 @@ class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
                 equal the manifest's.
             check_cohort_vocabulary: Also recompute the fingerprint from the cohort's
                 ``codes.parquet`` (``cfg.code_metadata_fp``) and require it to match the manifest.
-            strip_delta_tokens: As in :class:`~every_query.data.seq_dataset.ConditionalQueryPytorchDataset`.
+            strip_delta_tokens: As in :class:`~every_query.data.query_seq_dataset.QuerySeqPytorchDataset`.
             ontology_dir: The ``EQ_build_ontology`` directory whose node names the labels' ancestor
                 start / bound / conditioning codes resolve through.  **Required** when the manifest's
                 ``ontology_mode`` is not ``"none"``; harmless (and unused for the labels) otherwise,
@@ -797,9 +797,9 @@ class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
 
         time_pos_ids = None
         if self.strip_delta_tokens:
-            from every_query.data.seq_dataset import ConditionalQueryPytorchDataset
+            from every_query.data.query_seq_dataset import QuerySeqPytorchDataset
 
-            time_pos_ids = ConditionalQueryPytorchDataset._apply_rope_time(self, out)
+            time_pos_ids = QuerySeqPytorchDataset._apply_rope_time(self, out)
 
         B = len(batch)
         # Start tensors are always emitted (zeros / NO_BOUND_INDEX for legacy files), exactly float32 / int64.

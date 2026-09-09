@@ -105,7 +105,7 @@ class ConditionalQueryARModel(torch.nn.Module):
             hours) instead of token index, exactly as the encoder-decoder model does for its
             encoder.  Every query token shares the last patient event's hour — the prediction
             time — since no clinical time passes while the queries are asked.
-            Must be paired with ``ConditionalQueryPytorchDataset(strip_delta_tokens=True)``;
+            Must be paired with ``QuerySeqPytorchDataset(strip_delta_tokens=True)``;
             a mismatch in either direction is a hard error (see
             :func:`~every_query.model.conditional_model.validate_rope_time_pair`).
         ontology_dir: Directory of ontology artifacts.  When set, the backbone's
@@ -298,7 +298,7 @@ class ConditionalQueryARModel(torch.nn.Module):
     def forward(self, batch) -> tuple[torch.FloatTensor, ConditionalQueryOutput]:
         """One causal pass over ``[patient, queries]``; return ``(loss, outputs)``.
 
-        Expects a ``ConditionalQueryBatch`` with ``code`` (patient tokens), ``q_codes``,
+        Expects a ``QuerySeqBatch`` with ``code`` (patient tokens), ``q_codes``,
         ``q_durations``, ``q_answers`` and ``q_mask`` (plus optional ``q_bound_codes`` /
         ``time_pos_ids``).  Output contract matches the encoder-decoder model:
         ``answer_logits`` and ``valid_mask`` are both ``(batch, n_queries)``.

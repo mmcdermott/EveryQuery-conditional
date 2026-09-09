@@ -24,8 +24,8 @@ its window token carries a start spec and an end spec rather than a single durat
 
 import torch
 
+from every_query.data.query_seq_dataset import EOS_CODE, NO_BOUND_INDEX
 from every_query.data.rope_time import DELTA_TOKEN_PREFIX, build_keep_mask, delta_vocab_ids
-from every_query.data.seq_dataset import EOS_CODE, NO_BOUND_INDEX
 from every_query.model.conditional_multitask_ar_model import TOKENS_PER_WINDOW
 from every_query.model.ontology_embedding import OntologyEmbedding
 

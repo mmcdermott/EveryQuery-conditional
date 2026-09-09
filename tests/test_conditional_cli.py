@@ -1,12 +1,14 @@
 """End-to-end CLI tests for the conditional query-sequence pipeline.
 
-Chain: ``EQ_generate_query_sequences`` → ``EQ_train --config-name=_demo_train_conditional`` →
+Chain: ``python -m every_query.generate_tasks.query_sequence_labeling`` →
+``EQ_train --config-name=_demo_train_conditional`` →
 ``EQ_predict_sequences`` → ``EQ_evaluate_sequences``, all as real subprocesses against the
 session fixture cohort (mirrors the single-query CLI chain in ``conftest.py``).
 """
 
 import importlib.util
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -29,7 +31,6 @@ def _load_eval_v3():
 
 
 NEW_CLIS = [
-    "EQ_generate_query_sequences",
     "EQ_generate_evaluation_query_sequences",
     "EQ_predict_sequences",
     "EQ_evaluate_sequences",
@@ -44,7 +45,7 @@ def test_cli_help_exits_zero(cli):
 
 @pytest.fixture(scope="session")
 def cq_sequence_tasks_dir(eq_preprocessed_dataset: Path, tmp_path_factory) -> Path:
-    """Runs the sampled 5-stage ``EQ_generate_query_sequences`` for train + tuning splits.
+    """Runs the sampled 5-stage ``query_sequence_labeling`` pipeline for train + tuning splits.
 
     Exercises the Phase-2 pipeline end to end: Stage 0 builds the prediction-time map, Stage 1'
     draws the sequences, Stage 2 the contexts, Stage 3' the per-shard index, and Stage 4' fans out
@@ -56,7 +57,9 @@ def cq_sequence_tasks_dir(eq_preprocessed_dataset: Path, tmp_path_factory) -> Pa
     for split in (train_split, tuning_split):
         run_and_check(
             [
-                "EQ_generate_query_sequences",
+                sys.executable,
+                "-m",
+                "every_query.generate_tasks.query_sequence_labeling",
                 f"data_dir={intermediate!s}",
                 f"out_dir={out_dir!s}",
                 f"query_codes={eq_preprocessed_dataset!s}",
@@ -474,7 +477,9 @@ def test_eval_v3_scores_supplied_sequences(
     tasks_dir = tmp_path / "tasks"
     run_and_check(
         [
-            "EQ_generate_query_sequences",
+            sys.executable,
+            "-m",
+            "every_query.generate_tasks.query_sequence_labeling",
             f"data_dir={intermediate!s}",
             f"out_dir={tasks_dir!s}",
             f"query_codes={eq_preprocessed_dataset!s}",

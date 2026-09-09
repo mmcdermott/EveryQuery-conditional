@@ -86,9 +86,10 @@ EQ_predict = "every_query.predict.predict:main"
 # EQ_gen_eval_index / EQ_gen_eval_tasks / EQ_select_model) has been deleted per
 # the #83 consolidation wave; recover from git history if needed.
 EQ_evaluate = "every_query.evaluate.evaluate:main"
-# Conditional query-sequence pipeline (block-autoregressive decoder over query/answer
-# blocks; see src/every_query/model/conditional_model.py).
-EQ_generate_query_sequences = "every_query.generate_tasks.sample_query_sequences:main"
+# No EQ_generate_query_sequences: every_query.generate_tasks.query_sequence_labeling is a library
+# now, not a CLI.  Its labellers are the shared seam under the evaluation-grid generator, the
+# multitask sampler's prediction-time resolver and the multitask labeller's correctness oracle; its
+# Hydra `run`/`main` survive only as the differential test's training-pipeline arm.
 # All-vocabulary multi-bound multitask sampler (#20): K boundaries per context, one packed target bit
 # per base-vocabulary code per boundary, written as row-aligned `<shard>.labels.npy` sidecars.
 EQ_generate_multitask_sequences = "every_query.generate_tasks.sample_multitask_sequences:main"

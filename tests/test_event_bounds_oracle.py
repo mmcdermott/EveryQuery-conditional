@@ -152,7 +152,7 @@ import polars as pl
 import pytest
 
 from every_query.data.schema import QuerySeqSchema
-from every_query.generate_tasks.sample_query_sequences import (
+from every_query.generate_tasks.query_sequence_labeling import (
     EVENT_BOUND_DURATION_SENTINEL,
     QuerySequenceDistribution,
     label_binary_occurrence,

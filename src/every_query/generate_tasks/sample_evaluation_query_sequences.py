@@ -1,6 +1,6 @@
 """Dense-grid evaluation-task generator for conditional query *sequences*.
 
-Sibling of :mod:`~every_query.generate_tasks.sample_query_sequences` (scattered shape: every
+Sibling of :mod:`~every_query.generate_tasks.query_sequence_labeling` (scattered shape: every
 context draws its own independent query sequence).  This module produces the **dense** shape:
 a fixed set of ``N`` query sequences, each labeled at **every** context of one cohort.  For a
 given sequence the only thing varying across its rows is the patient, which is what per-sequence
@@ -30,15 +30,15 @@ Pipeline, one worker per shard of ``{data_dir}/data/{split}/*.parquet`` (all sha
        on the same ``("subject_subsample" | "prediction_times", split, shard)`` seed axes.
     3. Cross-join cohort x specs into the flat per-query index frame
        (:func:`build_dense_sequence_index_df`), label with
-       :func:`~every_query.generate_tasks.sample_query_sequences.label_query_sequences`, align to
+       :func:`~every_query.generate_tasks.query_sequence_labeling.label_query_sequences`, align to
        ``QuerySeqSchema``, write.
 
 Ontology support mirrors the training sampler on both of its halves, because a grid that mirrors
 only one measures the wrong thing without ever failing: ``ontology_dir`` extends the query
-universe (:func:`~every_query.generate_tasks.sample_query_sequences.build_query_universe`) so
+universe (:func:`~every_query.generate_tasks.query_sequence_labeling.build_query_universe`) so
 ancestor nodes are drawn - as queries and as boundaries - and accepted as designed-spec codes, and
 it explodes the event stream through the closure
-(:func:`~every_query.generate_tasks.sample_query_sequences.maybe_expand_to_matching_query_nodes`) so an
+(:func:`~every_query.generate_tasks.query_sequence_labeling.maybe_expand_to_matching_query_nodes`) so an
 ancestor query is labeled by ordinary occurrence.  Without the explosion an ancestor query is
 labeled ``False`` at every context — the ancestor's *name* is in no event stream, only its
 descendants' are — which is a well-formed parquet of wrong answers, not an error.
@@ -74,7 +74,7 @@ measured from the *resolved start*::
                                                 no end event after a resolved start => end of record)
 
 These are the multitask sampler's semantics, labeled here through the same ``interval_table``
-(:func:`~every_query.generate_tasks.sample_query_sequences.label_with_explicit_starts`), so a
+(:func:`~every_query.generate_tasks.query_sequence_labeling.label_with_explicit_starts`), so a
 multitask model can be scored on this grid.  Designed specs set starts explicitly (the mapping entry
 form, or the parquet ``start_duration_days`` / ``start_event`` columns); sampled specs draw them from
 the ``eventstart_fraction`` / ``prediction_time_start_fraction`` / ``start_duration_*`` /
@@ -107,15 +107,9 @@ import numpy as np
 import polars as pl
 from omegaconf import DictConfig
 
+from every_query.data.query_seq_dataset import EVENT_BOUND_DURATION_SENTINEL
 from every_query.data.schema import QuerySeqSchema, TaskQuerySchema
-from every_query.data.seq_dataset import EVENT_BOUND_DURATION_SENTINEL
-from every_query.generate_tasks.sample_evaluation_tasks import (
-    _labels_fp,
-    _unique_fp,
-    sample_prediction_times_per_subject,
-    subsample_subject_ids,
-)
-from every_query.generate_tasks.sample_query_sequences import (
+from every_query.generate_tasks.query_sequence_labeling import (
     BOUND_COL,
     CTX_ID_COL,
     POSITION_COL,
@@ -125,6 +119,12 @@ from every_query.generate_tasks.sample_query_sequences import (
     build_query_universe,
     label_query_sequences,
     maybe_expand_to_matching_query_nodes,
+)
+from every_query.generate_tasks.sample_evaluation_tasks import (
+    _labels_fp,
+    _unique_fp,
+    sample_prediction_times_per_subject,
+    subsample_subject_ids,
 )
 from every_query.generate_tasks.sample_tasks import (
     LABELED_DIRNAME,
@@ -661,14 +661,14 @@ def sample_sequence_specs(
     """Draw ``n_sequences`` specs from the *training* query distribution, once.
 
     Delegates to
-    :class:`~every_query.generate_tasks.sample_query_sequences.QuerySequenceDistribution` on the
+    :class:`~every_query.generate_tasks.query_sequence_labeling.QuerySequenceDistribution` on the
     same three seed axes the scattered sampler uses, so the code/duration/bound draw is
     byte-for-byte the one training saw — an evaluation grid drawn from a subtly different
     distribution than training is the kind of drift that shows up as unexplained metric shifts.
     No contexts are involved: these specs are then applied to *every* real context.
 
     **Window starts (issue #27) and the parity decision.**  The query / duration / end-bound draw
-    above stays parity-anchored to ``sample_query_sequences.py``.  Only the *start* component
+    above stays parity-anchored to ``query_sequence_labeling.py``.  Only the *start* component
     mirrors the multitask sampler (``BoundaryDistribution.sample``): per query one uniform ``u``
     picks the form — ``u < eventstart_fraction`` an event-defined start (code iid uniform over
     ``start_event_codes``, ``None`` = the whole query universe), ``u < eventstart_fraction +
@@ -836,7 +836,7 @@ def build_dense_sequence_index_df(
 
     The output is shaped exactly like ``build_sequence_index``'s — ``(_ctx_id, _position,
     subject_id, prediction_time, query, duration_days)`` — so
-    :func:`~every_query.generate_tasks.sample_query_sequences.label_binary_occurrence` consumes it
+    :func:`~every_query.generate_tasks.query_sequence_labeling.label_binary_occurrence` consumes it
     unchanged.  ``_ctx_id = context_row * len(specs) + spec_index``, so sorting by ``_ctx_id`` puts
     the frame in context-major order: labeled row ``i`` is ``(contexts[i // N], specs[i % N])``.
 
@@ -1000,7 +1000,7 @@ def resolve_specs(
 
 
 def model_query_vocab(query_codes: Sequence[str], ontology_dir: str | Path | None) -> set[str]:
-    """Every name ``ConditionalQueryPytorchDataset.encode_query`` will accept for this run.
+    """Every name ``QuerySeqPytorchDataset.encode_query`` will accept for this run.
 
     Built by the same :func:`~every_query.data.ontology.extend_code_map` the dataset uses, so a
     spec that validates here is a spec the dataset can encode — and vice versa.  Note this is
@@ -1018,7 +1018,7 @@ def model_query_vocab(query_codes: Sequence[str], ontology_dir: str | Path | Non
 def validate_spec_codes(specs: list[SequenceSpec], vocab: Collection[str]) -> None:
     """Fail fast on spec codes outside the model's query vocabulary.
 
-    ``ConditionalQueryPytorchDataset.encode_query`` raises ``KeyError`` on an unknown code, which
+    ``QuerySeqPytorchDataset.encode_query`` raises ``KeyError`` on an unknown code, which
     surfaces deep inside ``collate`` partway through an inference run — long after the minutes of
     labeling and model loading this check precedes.  Hand-written designed specs are exactly where
     a typo'd or wrong-vocabulary MEDS code enters.
@@ -1130,7 +1130,7 @@ def _ontology_fingerprint(ontology_dir: str | Path | None, query_codes: Sequence
       ``EQ_predict_multitask`` compares a checkpoint's ontology against), and
     - the **query universe**, which is where the ontology's ancestor nodes (and the leaf
       vocabulary) land after
-      :func:`~every_query.generate_tasks.sample_query_sequences.build_query_universe`; the
+      :func:`~every_query.generate_tasks.query_sequence_labeling.build_query_universe`; the
       universe is digested with its slot index, since order steers the draw.
 
     The two halves are joined by ``"|"``; :func:`split_ontology_fingerprint` takes them apart.

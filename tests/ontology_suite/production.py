@@ -11,7 +11,7 @@ from collections.abc import Sequence
 import polars as pl
 
 from every_query.data.ontology import build_event_to_query_nodes, build_ontology, expand_events_to_query_nodes
-from every_query.generate_tasks.sample_query_sequences import label_query_sequences
+from every_query.generate_tasks.query_sequence_labeling import label_query_sequences
 
 from .oracle import Event
 

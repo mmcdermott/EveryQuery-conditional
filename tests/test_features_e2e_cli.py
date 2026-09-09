@@ -1,7 +1,7 @@
 """End-to-end CLI smoke test with the ported features switched on.
 
 The per-feature suites test the mechanisms; this one tests that the *pipeline* survives them —
-that ``EQ_build_ontology`` → ``EQ_generate_query_sequences`` → ``EQ_train`` actually runs with
+that ``EQ_build_ontology`` → ``query_sequence_labeling`` → ``EQ_train`` actually runs with
 RoPE time positions, event bounds and ancestor queries enabled at once, through real
 subprocesses against the fixture cohort.
 
@@ -58,7 +58,11 @@ def featured_tasks_dir(eq_preprocessed_dataset: Path, ontology_dir: Path, tmp_pa
     for split in (train_split, tuning_split):
         run_and_check(
             [
-                "EQ_generate_query_sequences",
+                # A module invocation, not a console script: query_sequence_labeling is a library
+                # with no `[project.scripts]` entry, and its Hydra `main` is reached this way.
+                sys.executable,
+                "-m",
+                "every_query.generate_tasks.query_sequence_labeling",
                 f"data_dir={intermediate!s}",
                 f"out_dir={out_dir!s}",
                 f"query_codes={eq_preprocessed_dataset!s}",

@@ -27,7 +27,7 @@ from hydra.utils import instantiate
 from meds import held_out_split, tuning_split
 from omegaconf import DictConfig
 
-from every_query.data.seq_dataset import ANSWERS_COL, BOUND_EVENTS_COL, DURATIONS_COL, QUERIES_COL
+from every_query.data.query_seq_dataset import ANSWERS_COL, BOUND_EVENTS_COL, DURATIONS_COL, QUERIES_COL
 from every_query.model.conditional_lightning import ConditionalQueryLightningModule
 from every_query.predict.predict import _validate_tasks_dir
 from every_query.utils.model_loader import setup_model

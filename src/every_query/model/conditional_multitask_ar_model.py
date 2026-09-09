@@ -19,9 +19,8 @@ Ontology
 --------
 With ``ontology_dir`` set the model is sized to the ontology's extended vocabulary ``V_ext``
 (``train.py`` does this): the tied table gains one row per ancestor node, the input embedding is
-the ancestor-mixed :class:`~every_query.model.ontology_embedding.OntologyEmbedding` exactly as in
-the scalar :class:`~every_query.model.conditional_ar_model.ConditionalARModel`, and the readout
-projects onto the same **mixed** table.  The training labels stay leaf-only: a ``(B, K, V)``
+the ancestor-mixed :class:`~every_query.model.ontology_embedding.OntologyEmbedding`, and the
+readout projects onto the same **mixed** table.  The training labels stay leaf-only: a ``(B, K, V)``
 batch (``V`` = :attr:`base_vocab_size`, the cohort's width) is widened inside :meth:`forward` to
 ``(B, K, V_ext)`` by :func:`~every_query.data.ontology.derive_ancestor_targets`, since under the
 window rule an ancestor's bit is exactly the OR of its descendant leaves' bits.  Nothing wider than
@@ -35,7 +34,7 @@ import torch
 from transformers import LlamaConfig, LlamaModel
 from transformers.modeling_outputs import BaseModelOutput
 
-from every_query.model.conditional_model import (
+from every_query.model.answers import (
     N_ANSWER_CLASSES,
     _init_aux_embeddings,
     validate_rope_time_pair,

@@ -6,11 +6,11 @@ Covers, in order of pipeline position:
 2. ``ConditionalQueryModel`` — forward shape, loss masking, and *functional* information-flow
    tests: a query's prediction must be invariant to its own answer and to later queries, but
    sensitive to earlier answers and the patient context.
-3. ``ConditionalQueryPytorchDataset`` — label parquet loading, code encoding, and collation
+3. ``QuerySeqPytorchDataset`` — label parquet loading, code encoding, and collation
    (padding, binary answer classes, masks).
-4. ``sample_query_sequences`` — fully-random sequence sampling and binary observed-occurrence
+4. ``query_sequence_labeling`` — fully-random sequence sampling and binary observed-occurrence
    labeling on a hand-built events frame.
-5. ``sample_query_sequences`` Stages 1'/3' — the 5-stage pipeline's sequence-specific stages:
+5. ``query_sequence_labeling`` Stages 1'/3' — the 5-stage pipeline's sequence-specific stages:
    distribution parity with the training sampler, and per-shard index resolution.
 """
 
@@ -26,27 +26,27 @@ import torch
 import yaml
 from meds import held_out_split, tuning_split
 
-from every_query.data.seq_dataset import (
+from every_query.data.query_seq_dataset import (
     ANSWERS_COL,
     EOS_CODE,
     EVENT_BOUND_DURATION_SENTINEL,
-    ConditionalQueryBatch,
+    QuerySeqBatch,
 )
 from every_query.generate_tasks import sample_evaluation_query_sequences
-from every_query.generate_tasks.sample_evaluation_query_sequences import (
-    SequenceSpec,
-    build_dense_sequence_index_df,
-    read_sequence_specs,
-    sample_sequence_specs,
-    validate_spec_codes,
-)
-from every_query.generate_tasks.sample_query_sequences import (
+from every_query.generate_tasks.query_sequence_labeling import (
     CTX_ID_COL,
     POSITION_COL,
     QuerySequenceDistribution,
     build_sequence_index,
     label_binary_occurrence,
     resolve_prediction_times,
+)
+from every_query.generate_tasks.sample_evaluation_query_sequences import (
+    SequenceSpec,
+    build_dense_sequence_index_df,
+    read_sequence_specs,
+    sample_sequence_specs,
+    validate_spec_codes,
 )
 from every_query.generate_tasks.sample_tasks import (
     QueryDistribution,
@@ -141,8 +141,8 @@ def make_batch(
     q_codes: list[list[int]] | None = None,
     q_durations: list[list[float]] | None = None,
     q_mask: list[list[bool]] | None = None,
-) -> ConditionalQueryBatch:
-    """Build a small ConditionalQueryBatch with sensible defaults (2 samples x 3 queries)."""
+) -> QuerySeqBatch:
+    """Build a small QuerySeqBatch with sensible defaults (2 samples x 3 queries)."""
     B, L = len(q_answers), len(q_answers[0])
     if patient_codes is None:
         patient_codes = [[3, 4, 5, 6]] * B
@@ -153,7 +153,7 @@ def make_batch(
     if q_mask is None:
         q_mask = [[True] * L] * B
     S = len(patient_codes[0])
-    return ConditionalQueryBatch(
+    return QuerySeqBatch(
         code=torch.tensor(patient_codes),
         numeric_value=torch.zeros(B, S),
         numeric_value_mask=torch.zeros(B, S, dtype=torch.bool),
@@ -329,7 +329,7 @@ def test_seq_dataset_getitem_carries_sequences(seq_dataset):
 
 def test_seq_collate_shapes_and_padding(seq_dataset, seq_sample_batch):
     batch = seq_sample_batch
-    assert isinstance(batch, ConditionalQueryBatch)
+    assert isinstance(batch, QuerySeqBatch)
     B = batch.batch_size
     L = batch.n_queries
     assert batch.q_codes.shape == (B, L)
@@ -800,7 +800,7 @@ def test_resolve_prediction_times_raises_on_join_key_dtype_drift(tmp_path: Path)
 # Every method below is either overridden by the conditional module or inherited from
 # ``EveryQueryLightningModule``.  The inherited ones were written for the two-headed single-query
 # model and reach for ``outputs.occurs_loss`` / ``outputs.censor_loss`` / ``batch.occurs`` /
-# ``batch.censor``, none of which exist on ``ConditionalQueryOutput`` / ``ConditionalQueryBatch``.
+# ``batch.censor``, none of which exist on ``ConditionalQueryOutput`` / ``QuerySeqBatch``.
 # These tests run each hook against a real conditional batch so a re-introduced two-head assumption
 # fails here instead of at step 0 of a real training run.
 
@@ -990,7 +990,7 @@ def test_seq_dataset_rejects_labels_outside_vocab(tmp_path, tensorized_cohort_di
     from meds import train_split
     from meds_torchdata import MEDSTorchDataConfig
 
-    from every_query.data.seq_dataset import ConditionalQueryPytorchDataset
+    from every_query.data.query_seq_dataset import QuerySeqPytorchDataset
 
     labels = tmp_path / "labels"
     shutil.copytree(seq_task_labels_dir, labels)
@@ -1010,7 +1010,7 @@ def test_seq_dataset_rejects_labels_outside_vocab(tmp_path, tensorized_cohort_di
         batch_mode="SM",
     )
     with pytest.raises(ValueError, match="NOT//A//CODE"):
-        ConditionalQueryPytorchDataset(cfg, split=train_split)
+        QuerySeqPytorchDataset(cfg, split=train_split)
 
 
 def _adversarial_seq_label_frames() -> tuple[pl.DataFrame, pl.DataFrame, list[int]]:
@@ -1048,10 +1048,10 @@ def _adversarial_seq_label_frames() -> tuple[pl.DataFrame, pl.DataFrame, list[in
 
 def test_seq_label_extras_stay_aligned_with_the_upstream_rows() -> None:
     """Foreign subjects and a shuffled input order must not shift the hstacked query columns."""
-    from every_query.data.seq_dataset import ConditionalQueryPytorchDataset
+    from every_query.data.query_seq_dataset import QuerySeqPytorchDataset
 
     label_df, schema_df, surviving = _adversarial_seq_label_frames()
-    out = ConditionalQueryPytorchDataset.get_task_seq_bounds_and_labels(label_df, schema_df)
+    out = QuerySeqPytorchDataset.get_task_seq_bounds_and_labels(label_df, schema_df)
     assert out["queries"].to_list() == label_df["queries"][surviving].to_list()
     assert out["subject_id"].to_list() == label_df["subject_id"][surviving].to_list()
     assert out["prediction_time"].to_list() == label_df["prediction_time"][surviving].to_list()
@@ -1060,7 +1060,7 @@ def test_seq_label_extras_stay_aligned_with_the_upstream_rows() -> None:
 def test_seq_upstream_reordering_is_an_error_not_a_silent_misalignment(monkeypatch) -> None:
     from meds_torchdata import MEDSPytorchDataset
 
-    from every_query.data.seq_dataset import ConditionalQueryPytorchDataset
+    from every_query.data.query_seq_dataset import QuerySeqPytorchDataset
 
     label_df, schema_df, _ = _adversarial_seq_label_frames()
     real = MEDSPytorchDataset.get_task_seq_bounds_and_labels.__func__
@@ -1070,4 +1070,4 @@ def test_seq_upstream_reordering_is_an_error_not_a_silent_misalignment(monkeypat
 
     monkeypatch.setattr(MEDSPytorchDataset, "get_task_seq_bounds_and_labels", classmethod(reversed_upstream))
     with pytest.raises(RuntimeError, match=r"misaligned .* row\(s\) differ"):
-        ConditionalQueryPytorchDataset.get_task_seq_bounds_and_labels(label_df, schema_df)
+        QuerySeqPytorchDataset.get_task_seq_bounds_and_labels(label_df, schema_df)

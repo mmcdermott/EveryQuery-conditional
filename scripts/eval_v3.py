@@ -61,13 +61,13 @@ from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader
 
 from every_query.data.schema import QuerySeqSchema
-from every_query.data.seq_dataset import (
+from every_query.data.query_seq_dataset import (
     ANSWER_NO,
     ANSWER_YES,
     ANSWERS_COL,
     DURATIONS_COL,
     QUERIES_COL,
-    ConditionalQueryPytorchDataset,
+    QuerySeqPytorchDataset,
 )
 from every_query.model.conditional_lightning import ConditionalQueryLightningModule
 
@@ -138,7 +138,7 @@ def validate_supplied(df: pl.DataFrame, source: str) -> None:
 def preflight_vocab(df: pl.DataFrame, code_metadata_fp: Path) -> None:
     """Raise on any query code outside the model's vocabulary, before the model is loaded.
 
-    ``ConditionalQueryPytorchDataset.encode_query`` raises on OOV codes deliberately, but does so
+    ``QuerySeqPytorchDataset.encode_query`` raises on OOV codes deliberately, but does so
     inside ``collate`` — i.e. after model load, mid-run.  Checking here turns that into a fast,
     actionable failure listing the offending codes.
     """
@@ -374,7 +374,7 @@ def main():
     preflight_vocab(supplied, Path(cfg.code_metadata_fp))
     print(f"vocab pre-flight OK ({supplied[QUERIES_COL].explode().n_unique()} distinct query codes)")
 
-    ds = ConditionalQueryPytorchDataset(cfg, split=args.split)
+    ds = QuerySeqPytorchDataset(cfg, split=args.split)
     check_alignment(ds.schema_df, supplied, args.split)
     print(f"dataset: {len(ds)} sequences, alignment verified; device {DEVICE}")
 

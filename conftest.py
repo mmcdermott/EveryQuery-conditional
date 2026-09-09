@@ -394,7 +394,7 @@ def sample_batch(demo_dataset: EveryQueryPytorchDataset) -> EveryQueryBatch:
 def seq_task_labels_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """Hand-built ``QuerySeqSchema``-shaped query-sequence labels for train + tuning splits.
 
-    Layout matches ``sample_query_sequences.run`` output::
+    Layout matches ``query_sequence_labeling.run`` output::
 
         {seq_task_labels_dir}/{split}/{shard}.parquet
 
@@ -444,8 +444,8 @@ def seq_task_labels_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 @pytest.fixture(scope="session")
 def seq_dataset(tensorized_cohort_dir: Path, seq_task_labels_dir: Path):
-    """``ConditionalQueryPytorchDataset`` for the *train* split over the fixture cohort."""
-    from every_query.data.seq_dataset import ConditionalQueryPytorchDataset
+    """``QuerySeqPytorchDataset`` for the *train* split over the fixture cohort."""
+    from every_query.data.query_seq_dataset import QuerySeqPytorchDataset
 
     cfg = MEDSTorchDataConfig(
         tensorized_cohort_dir=str(tensorized_cohort_dir),
@@ -455,12 +455,12 @@ def seq_dataset(tensorized_cohort_dir: Path, seq_task_labels_dir: Path):
         static_inclusion_mode="omit",
         batch_mode="SM",
     )
-    return ConditionalQueryPytorchDataset(cfg, split=train_split)
+    return QuerySeqPytorchDataset(cfg, split=train_split)
 
 
 @pytest.fixture(scope="session")
 def seq_sample_batch(seq_dataset):
-    """A collated ``ConditionalQueryBatch`` covering both sequence lengths in the fixture."""
+    """A collated ``QuerySeqBatch`` covering both sequence lengths in the fixture."""
     return seq_dataset.collate([seq_dataset[i] for i in range(len(seq_dataset))])
 
 

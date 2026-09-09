@@ -27,7 +27,7 @@ import torch
 import yaml
 from omegaconf import OmegaConf
 
-from every_query.data.seq_dataset import ConditionalQueryBatch
+from every_query.data.query_seq_dataset import QuerySeqBatch
 from every_query.model.conditional_ar_model import (
     N_TOKEN_TYPES,
     TYPE_QUERY_ANSWER,
@@ -102,8 +102,8 @@ def make_batch(
     q_durations: list[list[float]] | None = None,
     q_mask: list[list[bool]] | None = None,
     **kwargs,
-) -> ConditionalQueryBatch:
-    """Build a small ConditionalQueryBatch with sensible defaults.
+) -> QuerySeqBatch:
+    """Build a small QuerySeqBatch with sensible defaults.
 
     The default two patient rows have *different real lengths* (4 and 2 tokens), so every test routinely
     exercises the re-packing that places each row's query stream immediately after its own last real event.
@@ -118,7 +118,7 @@ def make_batch(
     if q_mask is None:
         q_mask = [[True] * L] * B
     S = len(patient_codes[0])
-    return ConditionalQueryBatch(
+    return QuerySeqBatch(
         code=torch.tensor(patient_codes),
         numeric_value=torch.zeros(B, S),
         numeric_value_mask=torch.zeros(B, S, dtype=torch.bool),
@@ -717,7 +717,7 @@ def test_position_budget_covers_patient_and_query_tokens():
 
 
 def test_dataset_end_to_end_forward(seq_dataset, seq_sample_batch):
-    """A real collated ``ConditionalQueryBatch`` runs through an AR model sized to the cohort."""
+    """A real collated ``QuerySeqBatch`` runs through an AR model sized to the cohort."""
     torch.manual_seed(0)
     vocab = max(seq_dataset.code_to_index.values()) + 1
     model = ConditionalQueryARModel(

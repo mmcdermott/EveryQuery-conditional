@@ -49,9 +49,9 @@ from every_query.data.ontology import (
     build_event_to_query_nodes,
     build_ontology,
 )
+from every_query.generate_tasks import query_sequence_labeling as train_seq
 from every_query.generate_tasks import sample_evaluation_query_sequences as eval_seq
 from every_query.generate_tasks import sample_multitask_sequences as sms
-from every_query.generate_tasks import sample_query_sequences as train_seq
 from every_query.generate_tasks.sample_tasks import LABELED_DIRNAME
 
 

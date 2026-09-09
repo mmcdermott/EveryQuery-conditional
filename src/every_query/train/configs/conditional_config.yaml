@@ -4,7 +4,7 @@
 # `lightning_module.model._target_`.
 #
 # Differences vs. config.yaml (single-query EveryQuery):
-#   - datamodule.data_class points at ConditionalQueryPytorchDataset (query-sequence labels);
+#   - datamodule.data_class points at QuerySeqPytorchDataset (query-sequence labels);
 #   - lightning_module instantiates ConditionalQueryLightningModule /
 #     ConditionalQueryEncoderDecoderModel;
 #   - encoder is sized from config_overrides for a from-scratch EHR vocabulary (the
@@ -46,7 +46,7 @@ datamodule:
   # Stateful train loader: with max_epochs=1 a `do_resume` must pick up mid-epoch (see
   # every_query.data.datamodule.ResumableDatamodule).
   _target_: every_query.data.datamodule.ResumableDatamodule
-  data_class: every_query.data.seq_dataset.ConditionalQueryPytorchDataset
+  data_class: every_query.data.query_seq_dataset.QuerySeqPytorchDataset
   config:
     _target_: meds_torchdata.MEDSTorchDataConfig
     # Required Hydra args — no `.env`/env-var fallback (#235).  Pass shell-expanded vars:

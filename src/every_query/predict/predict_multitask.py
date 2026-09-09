@@ -84,7 +84,7 @@ from meds import held_out_split
 from omegaconf import DictConfig  # noqa: TC002 - Hydra resolves this at runtime
 
 from every_query.data.conditional_multitask_datamodule import EVAL_SPLITS, ConditionalMultitaskDataModule
-from every_query.data.seq_dataset import (
+from every_query.data.query_seq_dataset import (
     ANSWERS_COL,
     BOUND_EVENTS_COL,
     DURATIONS_COL,
