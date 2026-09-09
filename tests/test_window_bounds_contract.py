@@ -61,14 +61,13 @@ a query window:
 **A labeller missing from that list is exactly how this drifted the first time.**  Anything new
 that decides window membership belongs in it.
 
-Two sites outside ``src/`` also decide window membership inline rather than through a labeller:
-``scripts/eval_occurs_uncensored.py`` (``:82``, ``:98``) and ``scripts/eval_macro_position.py``
-(``:63``, ``:106``, ``:130``).  They are research drivers excluded from collection by
-``--ignore=scripts`` and are not importable without a live run directory, so they cannot be driven
-here -- but they produce the ground truth the conditional model is *scored* against, so a drift
-there corrupts reported numbers rather than training labels.  They are swept by hand and recorded
-here so the next reader knows they exist.  ``tests/test_cli_smoke.py::test_script_imports`` will
-catch a syntax error in them, nothing more.
+No site outside ``src/`` decides window membership any more.  Two once did -- the
+``scripts/eval_occurs_uncensored.py`` and ``scripts/eval_macro_position.py`` research drivers,
+which recomputed it inline rather than calling a labeller, and so could drift from this list
+without any test noticing.  Both were deleted with the rest of the conditional-seq analysis
+drivers.  The hazard is worth remembering rather than the files: a scorer that decides membership
+for itself corrupts *reported numbers* rather than training labels, which is the harder failure to
+see, so a new one belongs behind a labeller in this list -- not in ``scripts/``.
 
 Where the event-bound rule is pinned
 ------------------------------------

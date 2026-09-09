@@ -10,8 +10,8 @@ one artifact and evaluated on another, and the two are **independent roots** on 
     ``(B, K, V)`` dense targets per batch for the all-vocabulary loss.
 
 ``eval_tasks_dir`` - the QuerySeq EVALUATION grid
-    The ``eval/`` root written by ``EQ_generate_evaluation_query_sequences`` (the same grid
-    ``EQ_predict_sequences`` scores): ``QuerySeqSchema`` parquets whose rows are ordered scalar
+    The ``eval/`` root written by ``EQ_generate_evaluation_query_sequences``:
+    ``QuerySeqSchema`` parquets whose rows are ordered scalar
     queries with their answers.  Read by
     :class:`~every_query.data.multitask_eval_dataset.QuerySeqMultitaskEvalDataset`, which turns each
     row into ``n - 1`` teacher-forced conditioning pairs plus one scored final query.  No manifest, no

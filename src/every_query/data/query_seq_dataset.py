@@ -80,7 +80,8 @@ ALL_SEQ_LABEL_COLS = (*SEQ_LABEL_COLS, *OPTIONAL_SEQ_LABEL_COLS)
 
 # Duration written for an event-bounded query.  The window is defined by the boundary event, so
 # there is no horizon; a negative sentinel makes an accidental use as a horizon obvious rather
-# than plausible.  Downstream bucketing must special-case it (see evaluate_sequences).
+# than plausible.  Downstream bucketing must special-case it (see evaluate_multitask, which keys
+# on the whole window spec rather than on the duration alone).
 EVENT_BOUND_DURATION_SENTINEL = -1.0
 
 # Vocabulary index meaning "this query has no boundary event".  Shares PAD_INDEX = 0, which is
@@ -287,7 +288,7 @@ class QuerySeqPytorchDataset(MEDSPytorchDataset):
             strip_delta_tokens: When True, drop ``TIMELINE//DELTA*`` tokens from the encoder
                 input at collate time and emit :attr:`QuerySeqBatch.time_pos_ids`
                 (elapsed integer hours per surviving token) for rotary position encoding.
-                Pair with ``ConditionalQueryModel(use_rope_time=True)``; see
+                Pair with a model built ``use_rope_time=True``; see
                 :mod:`every_query.data.rope_time`.
             ontology_dir: When set, ancestor node names from the ontology's ``ontology_vocab.parquet``
                 are added to the query vocabulary, so a query may name a whole class rather
@@ -295,9 +296,8 @@ class QuerySeqPytorchDataset(MEDSPytorchDataset):
                 the indices have to agree, or a query would address the wrong embedding row.
             allow_active_starts: Opt in to tensorizing the optional ``start_durations`` /
                 ``start_events`` label columns (issue #27) into
-                :attr:`QuerySeqBatch.q_start_durations` / ``q_start_codes``.  The
-                ordinary sequence models (``ConditionalQueryEncoderDecoderModel``,
-                ``ConditionalQueryARModel``) do not encode window starts, so with the default
+                :attr:`QuerySeqBatch.q_start_durations` / ``q_start_codes``.  A model that does
+                not encode window starts must never be handed them, so with the default
                 ``False`` a labels directory carrying any *active* start (a positive duration or
                 an event start) is rejected at init rather than silently scored as if every window
                 opened at the prediction time.  Absent or all-default (``0.0`` / null) starts are
@@ -465,12 +465,11 @@ class QuerySeqPytorchDataset(MEDSPytorchDataset):
         if n_active and not self.allow_active_starts:
             raise ValueError(
                 f"{n_active} query window(s) in the labels have an active start (a positive "
-                "start_duration or a start_event).  The ordinary sequence models "
-                "(ConditionalQueryEncoderDecoderModel / ConditionalQueryARModel) do not encode window "
-                "starts, so scoring these labels with EQ_predict_sequences would silently treat every "
-                "window as opening at the prediction time.  Score them with EQ_predict_multitask (its "
-                "adapter passes allow_active_starts=True), or regenerate the grid with prediction-time "
-                "starts."
+                "start_duration or a start_event).  A model that does not encode window starts "
+                "would silently treat every window as opening at the prediction time, so this "
+                "dataset refuses the grid instead.  Score it with EQ_predict_multitask (its "
+                "adapter passes allow_active_starts=True), or regenerate the grid with "
+                "prediction-time starts."
             )
         start_codes = np.fromiter(
             (NO_BOUND_INDEX if c is None else self.code_to_index[c] for c in s_events),

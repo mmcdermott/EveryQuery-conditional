@@ -19,9 +19,10 @@ Covers, in pipeline order:
    refusal.  ``use_rope_time=False`` is inert only on a batch that carries no times, which is
    the half of that claim kept below.
 
-Section 3 was originally written against ``ConditionalQueryModel``, the encoder-decoder
-conditional-sequence model, because that was the only model that consumed ``time_pos_ids`` when
-the feature landed.  ``ConditionalMultitaskARModel`` is the surviving consumer; the claims are
+Section 3 was originally written against the encoder-decoder conditional query-sequence model
+(since deleted with the rest of that pipeline), because it was the only model that consumed
+``time_pos_ids`` when the feature landed.  ``ConditionalMultitaskARModel`` is the surviving
+consumer; the claims are
 the same, the index arithmetic is its own (one causal stream of ``S`` patient tokens followed by
 ``3K-2`` query tokens, not an encoder feeding a cross-attending decoder).
 

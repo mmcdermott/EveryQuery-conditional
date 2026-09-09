@@ -13,8 +13,8 @@ Covered in pipeline order:
    only the patient stream.
 
 Section 4 (and the two ``wrap_tok_embeddings`` size checks in section 2) were originally written
-against ``ConditionalQueryModel``, the encoder-decoder conditional-sequence model, because that
-was the only model when the ontology landed.  They now run against
+against the encoder-decoder conditional query-sequence model (since deleted with the rest of that
+pipeline), because it was the only model when the ontology landed.  They now run against
 :class:`~every_query.model.conditional_multitask_ar_model.ConditionalMultitaskARModel`, the
 surviving consumer.  Sections 1-3 are about :mod:`every_query.data.ontology` and the query
 universe and are model-independent.

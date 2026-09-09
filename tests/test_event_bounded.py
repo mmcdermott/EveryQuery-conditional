@@ -15,9 +15,10 @@ fixed horizon.  Covered here, in pipeline order:
 4. Model — that the boundary reaches the window's end slot, that it is causally local, and that
    a bound-free batch is answered *identically* to a model without the feature.
 
-Section 4 was originally written against ``ConditionalQueryModel``, the encoder-decoder
-conditional-sequence model, because that was the only model when event bounds landed.  The
-surviving consumer is :class:`~every_query.model.conditional_multitask_ar_model.ConditionalMultitaskARModel`,
+Section 4 was originally written against the encoder-decoder conditional query-sequence model
+(since deleted with the rest of that pipeline), because it was the only model when event bounds
+landed.  The surviving consumer is
+:class:`~every_query.model.conditional_multitask_ar_model.ConditionalMultitaskARModel`,
 whose windows carry a *pair* of specs — the boundary owns the window's **end**, and the issue-#27
 start event owns its beginning — so "the duration slot" below is the end half of the window
 token, and "block-local" is the causal ``[..., W_i, C_i, A_i, W_{i+1}, ...]`` stream rather than

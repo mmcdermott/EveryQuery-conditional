@@ -7,7 +7,7 @@
 # `sample_evaluation_tasks`' sampler on its seed axes, so for one `(seed, split, K, min_context,
 # fraction)` both generators score the identical `(subject, time)` set — the flat grid and the
 # sequence grid are directly comparable.  This endpoint emits QuerySeqSchema rows
-# (queries/durations/answers list columns) for EQ_predict_sequences, where that one emits flat
+# (queries/durations/answers list columns) for EQ_predict_multitask, where that one emits flat
 # TaskQuerySchema rows for EQ_predict.
 #
 # All shards under `{data_dir}/data/{split}/*.parquet` are discovered and processed in one
@@ -20,12 +20,12 @@
 #   data_dir     MEDS dataset root (event shards under `{data_dir}/data/{split}/*.parquet`)
 #   out_dir      output root (layout below).  Give it a root distinct from
 #                `EQ_generate_evaluation_tasks`' — both write `eval/{split}/{shard}.parquet`, in
-#                incompatible schemas, and EQ_predict_sequences rglobs whatever it is pointed at.
+#                incompatible schemas, and EQ_predict_multitask rglobs whatever it is pointed at.
 #   query_codes  vocabulary: a metadata root dir (loads `{dir}/metadata/codes.parquet`), an
 #                explicit Hydra list, or a YAML/parquet path.  With `sequences_path` set it is
 #                used only to reject codes outside the model's vocabulary.
 #
-# Output layout (`{out_dir}/eval` is directly usable as `EQ_predict_sequences tasks_dir=...`):
+# Output layout (`{out_dir}/eval` is directly usable as `EQ_predict_multitask tasks_dir=...`):
 #   {out_dir}/eval/{split}/{shard}.parquet          labeled grid, one file per shard
 #   {out_dir}/eval_unique/{split}/{shard}.parquet   deduped (subject_id, prediction_time)
 # The only intermediate is the per-shard provenance sidecar at the sibling
@@ -171,8 +171,8 @@ eventbound_fraction: 0.5
 # none of the other draws.  Designed specs (`sequences_path`) set their starts explicitly and ignore
 # these knobs.
 #
-# NOTE: the ordinary sequence models (EQ_predict_sequences) accept only prediction-time starts —
-# their dataset rejects a grid with any active start.  Active starts are for EQ_predict_multitask.
+# NOTE: active starts are for EQ_predict_multitask alone — QuerySeqPytorchDataset rejects a grid
+# carrying any active start unless the caller opts in, which only that adapter does.
 #
 # Per sampled query one uniform u picks the start form (the multitask sampler's cumulative split):
 #   u < eventstart_fraction                                     => event-defined start

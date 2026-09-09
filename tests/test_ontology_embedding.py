@@ -6,9 +6,9 @@ and a randomly-initialised decoder compresses an 8e-05 encoder difference to ~1e
 So liveness is asserted with a margin, and against the embedding output rather than the logits.
 
 The model-level halves — the pre-hook in section 3, all of section 4, and the checkpoint /
-determinism tests in section 5 — were originally driven through ``ConditionalQueryModel``, the
-encoder-decoder conditional-sequence model, because that was the only model that installed the
-wrapper.  They now run against
+determinism tests in section 5 — were originally driven through the encoder-decoder conditional
+query-sequence model (since deleted with the rest of that pipeline), because it was the only
+model that installed the wrapper.  They now run against
 :class:`~every_query.model.conditional_multitask_ar_model.ConditionalMultitaskARModel`.
 ``OntologyEmbedding`` and ``wrap_tok_embeddings`` themselves are shared and unchanged, so every
 section-1/2 claim is model-independent and untouched.

@@ -12,28 +12,11 @@ shape, no Hydra entry points, no configs.
     PyTorch Lightning with `training_step` / `validation_step` / `predict_step`. Shared between
     training and inference — the same LightningModule's `predict_step` is what `predict/` will
     use at inference time.
-- **`conditional_model.py`** — `ConditionalQueryEncoderDecoderModel` (alias
-    `ConditionalQueryModel`): the conditional query-sequence architecture with a bidirectional
-    ModernBERT patient encoder, a cross-attending `nn.TransformerDecoder` over
-    `[code, duration, answer]` query blocks and the custom `build_block_causal_mask`. Also home
-    to the pieces both conditional architectures share (`ConditionalQueryOutput`, the token-type
-    constants, `masked_bce`).
 - **`answers.py`** — the architecture-independent pieces every query-answering model needs: the
     binary answer vocabulary (`ANSWER_NO` / `ANSWER_YES` / `N_ANSWER_CLASSES`),
     `validate_rope_time_pair` (keeps the model's `use_rope_time` and the batch's `time_pos_ids`
     from drifting apart) and `_init_aux_embeddings` (re-inits tables built outside the HF
     backbone to the backbone's scale).
-- **`conditional_ar_model.py`** — `ConditionalQueryARModel`: the decoder-only conditional
-    architecture. One Hugging Face `LlamaModel` (trained from scratch) jointly attends over
-    `[patient events, c₁, d₁, a₁, …]` under a plain token-level causal mask; predictions are
-    read from each block's duration token. Every query is asked *at* the prediction time, so
-    all query tokens share the final real patient event's clinical-time RoPE position; query
-    order is carried by learned block-position embeddings, roles by token-type embeddings, and
-    visibility by the causal mask (not RoPE). See `docs/CONDITIONAL_QUERIES.md` §1 for how the
-    two architectures' attention behaviors differ.
-- **`conditional_lightning.py`** — `ConditionalQueryLightningModule`. One Lightning wrapper for
-    both conditional architectures; checkpoints record which one they hold via the model's
-    `architecture` hparam (absent = encoder–decoder, so pre-rename checkpoints load unchanged).
 - **`conditional_multitask_ar_model.py`** — `ConditionalMultitaskARModel`: the decoder-only
     *all-vocabulary* architecture over ordered windows `[patient, W0, C0, A0, …, W(K-1)]`. Each
     window's hidden state is projected onto the tied input-embedding table (one logit per code,

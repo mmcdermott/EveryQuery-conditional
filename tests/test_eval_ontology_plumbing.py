@@ -805,7 +805,7 @@ def test_the_output_tree_holds_only_parquets_when_a_sidecar_is_written(
 ):
     """The provenance sidecar must land in the artifacts sibling, never in the output root.
 
-    ``EQ_predict_sequences`` consumes an eval grid by rglobbing its output directory, so invariant
+    ``EQ_predict_multitask`` consumes an eval grid by rglobbing its output directory, so invariant
     7 — the final-output tree holds nothing but the parquets — is load-bearing, not tidiness.  A
     sidecar written next to (or under) the parquet is a well-formed JSON file that the consumer
     would try to read as a task frame.

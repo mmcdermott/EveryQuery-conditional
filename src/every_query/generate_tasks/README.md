@@ -12,15 +12,16 @@ families of (scattered-for-training, dense-for-evaluation) pairs — one per mod
 - **`EQ_generate_evaluation_tasks`** — dense-grid shape: sampled prediction
     times × `(codes × durations)`, for feeding `EQ_predict` → `EQ_evaluate`.
 
-**Conditional query-sequence model** (this fork), producing `QuerySeqSchema` rows (aligned
+**Query sequences** (this fork), producing `QuerySeqSchema` rows (aligned
 `queries` / `durations` / `answers` list columns per context):
 
 - **`query_sequence_labeling`** (a library; no console script) — scattered shape: every context draws its own
-    independent sequence of `Uniform{min_queries..max_queries}` queries, for pretraining.
+    independent sequence of `Uniform{min_queries..max_queries}` queries. Its labellers are the
+    shared seam under the evaluation-grid generator and the multitask sampler.
 - **`EQ_generate_evaluation_query_sequences`** — dense-grid shape: the *same* `N` query
-    sequences labeled at `K` sampled prediction times per subject (or at a supplied cohort),
-    for feeding `EQ_predict_sequences` → `EQ_evaluate_sequences`. Also the **only** evaluation
-    grid for the multitask model (`EQ_predict_multitask`), optionally with explicit per-query
+    sequences labeled at `K` sampled prediction times per subject (or at a supplied cohort).
+    This is the **only** evaluation grid for the multitask model, feeding
+    `EQ_predict_multitask` → `EQ_evaluate_multitask`, optionally with explicit per-query
     window starts (issue #27).
 
 **All-vocabulary multitask model**, producing `MultitaskBoundarySchema` rows plus packed
@@ -118,13 +119,9 @@ EQ_process_data       EQ_generate_training_tasks           EQ_train       EQ_pre
                       EQ_generate_evaluation_tasks(split=tuning)
                         → EQ_sample_task_tracking_pairs ──►  (in-training tracking input)
 
-                      query_sequence_labeling              EQ_train       EQ_predict_sequences
-                      EQ_generate_evaluation_query_sequences ───────────►  (inference input)
-                                                                          EQ_evaluate_sequences
-
-                      EQ_generate_multitask_sequences      EQ_train       EQ_predict_multitask
+                      EQ_generate_multitask_sequences      EQ_train       EQ_predict_multitask  →  EQ_evaluate_multitask
                       EQ_generate_evaluation_query_sequences ───────────►  (inference input:
-                                                                           the same QuerySeq grid,
+                                                                           the QuerySeq grid,
                                                                            active starts allowed)
 ```
 
@@ -146,14 +143,13 @@ own), so the two trees never nest and cleanup is a single `rm -rf` of the artifa
 cohort under `eval_unique/`). The separate `eval/` subdirectory keeps the two row distributions
 from colliding in one directory. `EQ_generate_evaluation_query_sequences` writes the same layout
 under *its* `out_dir` — give it a distinct root, since the two `eval/` trees hold incompatible
-schemas and `EQ_predict_sequences` rglobs whatever it is pointed at.
+schemas and `EQ_predict_multitask` rglobs whatever it is pointed at.
 
 **Sequence outputs** follow the same two-root rule: `out_dir` holds final parquets only, with all
 intermediates in the sibling `{name}_artifacts` root. Both sequence endpoints write layouts
-directly usable as `EQ_predict_sequences tasks_dir=...` — MEDS-TorchData rglobs that directory, so
+directly usable as `EQ_predict_multitask tasks_dir=...` — MEDS-TorchData rglobs that directory, so
 point it at exactly the parquets you want scored. Note that adopting this layout **invalidates run
-directories produced by the fork**, and the vendored `scripts/` eval helpers still carry hardcoded
-paths from the old layout.
+directories produced by the fork**.
 
 ## Running it
 
@@ -217,13 +213,13 @@ small (2 rows per task) and fixed for the duration of a training run — point
 have `EQ_train` log a macro-averaged, per-task-sampled AUROC (`tuning/occurs_auroc_macro_sampled`)
 every validation pass, without paying the cost of scoring the full tuning split.
 
-### Conditional query sequences
+### Evaluation query sequences
 
 ```bash
 # Dense evaluation grid: N sequences drawn once from the training distribution x K=2 sampled
 # prediction times per subject of every shard of the split -- the same cohort knobs (and cohort)
 # as EQ_generate_evaluation_tasks.  One parquet per shard at {out_dir}/eval/{split}/{shard}.parquet,
-# directly usable as `EQ_predict_sequences tasks_dir=$EVAL_SEQ_TASKS_DIR/eval`.  The sampling
+# directly usable as `EQ_predict_multitask tasks_dir=$EVAL_SEQ_TASKS_DIR/eval`.  The sampling
 # defaults mirror `sample_query_sequences_config.yaml`; if the checkpoint was trained with
 # overrides, pass the same ones here (e.g. min_queries=5 max_queries=5 duration_max=365) — an
 # out-of-distribution horizon shows up as an unexplained metric shift, not as an error:
@@ -459,8 +455,8 @@ all-vocabulary `.labels.npy` evaluation targets, `eval_meta` sidecars and `eval_
 removed in #29). The training sampler above stays separate and all-vocabulary; evaluation is:
 
 ```
-EQ_generate_evaluation_query_sequences   ->   QuerySeqSchema eval grid   ->   EQ_predict_sequences
-                                                                          OR   EQ_predict_multitask
+EQ_generate_evaluation_query_sequences   ->   QuerySeqSchema eval grid   ->   EQ_predict_multitask
+                                                                          ->   EQ_evaluate_multitask
 ```
 
 `EQ_predict_multitask` reads the grid's `eval/` root directly — including the explicit window starts
@@ -468,8 +464,9 @@ EQ_generate_evaluation_query_sequences   ->   QuerySeqSchema eval grid   ->   EQ
 `queries[:-1]` / `answers[:-1]` onto the teacher-forced conditioning pairs and scores the row's final
 query at its last window, and writes one scalar prediction per grid row (`target_code = queries[-1]`,
 `label = answers[-1]`, `prob`). No packed labels, manifest or sidecar is read or written on this path.
-The ordinary sequence models (`EQ_predict_sequences`) score the same grid but accept only
-prediction-time starts.
+`EQ_evaluate_multitask` then groups those rows by the query *spec* and macro-averages AUROC over
+the cells. The single-query pipeline's `EQ_predict` reads `TaskQuerySchema` rows instead and does
+not consume this grid at all.
 
 ## Determinism & restartability
 

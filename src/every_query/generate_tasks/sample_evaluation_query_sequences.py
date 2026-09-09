@@ -11,7 +11,7 @@ Relationship to ``sample_evaluation_tasks``: **same knobs, same semantics, diffe
 That module cross-joins its cohort with a ``codes x durations`` grid and emits flat
 ``TaskQuerySchema`` rows for ``EQ_predict``; this one cross-joins the *same* cohort with ``N``
 ordered :class:`SequenceSpec` s and emits :class:`QuerySeqSchema` rows (``queries`` /
-``durations`` / ``answers`` list columns) for ``EQ_predict_sequences``.  Everything on the cohort
+``durations`` / ``answers`` list columns) for ``EQ_predict_multitask``.  Everything on the cohort
 side is imported from ``sample_evaluation_tasks`` and driven by its knobs and seed axes, so for
 the same ``(seed, split, prediction_times_per_subject, min_context_per_subject,
 subject_subsample_fraction)`` the two generators score the **identical** ``(subject, time)`` set
@@ -55,7 +55,7 @@ three inputs that determine its rows — the ontology, the specs and the cohort 
 into the same ``out_dir`` with a different ``sequences_path``/``num_evaluation_sequences``/``seed``/cohort
 therefore relabels rather than silently keeping the previous grid.
 
-``{out_dir}/eval`` is directly consumable as ``EQ_predict_sequences tasks_dir=...`` (MEDS-TorchData
+``{out_dir}/eval`` is directly consumable as ``EQ_predict_multitask tasks_dir=...`` (MEDS-TorchData
 rglobs it, so point it at ``eval/`` — never at ``out_dir`` itself, or the ``eval_unique/`` frames
 are read as labels).  Give this generator and ``EQ_generate_evaluation_tasks`` distinct ``out_dir``
 roots: both write ``eval/{split}/{shard}.parquet``, in incompatible schemas.
@@ -79,16 +79,17 @@ multitask model can be scored on this grid.  Designed specs set starts explicitl
 form, or the parquet ``start_duration_days`` / ``start_event`` columns); sampled specs draw them from
 the ``eventstart_fraction`` / ``prediction_time_start_fraction`` / ``start_duration_*`` /
 ``start_event_codes`` knobs on three seed axes of their own.  With the default knobs every window
-opens at the prediction time and the output carries no start columns, exactly as before.  The
-ordinary sequence models do not encode starts: ``EQ_predict_sequences`` rejects a grid with any
-active start, and only ``EQ_predict_multitask`` consumes one.
+opens at the prediction time and the output carries no start columns, exactly as before.  Active
+starts are opt-in on the reader side too: ``QuerySeqPytorchDataset`` refuses to tensorize them
+unless asked, so only ``EQ_predict_multitask`` consumes a grid that carries them.
 
 Answers follow the module-wide sequence contract: binary, never null; an unobservable occurrence
 (record ends before the window does) is ``False``, and censoring is carried by an explicit
 ``TIMELINE//END`` query rather than a null answer.  Unlike ``sample_evaluation_tasks`` there is
 therefore no censored-row filter here.  If you need censored windows *excluded* from metrics rather
-than counted as negatives, that filtering belongs downstream (see
-``scripts/eval_occurs_uncensored.py``).
+than counted as negatives, that filtering belongs downstream of ``EQ_predict_multitask``, on the
+prediction rows: pair each row with its ``TIMELINE//END`` query at the same window and drop the
+rows that one answers ``True``.  Nothing in this tree does it for you.
 """
 
 import dataclasses
@@ -1082,8 +1083,8 @@ def assert_subjects_in_split(data_dir: Path, split: str, shards: list[str], subj
     """Fail fast if any supplied-cohort subject has no shard in ``split``.
 
     Silent here would mean all-``False`` answers now and a silent row-drop in
-    ``EQ_predict_sequences`` later (its schema_df semi-join drops subjects absent from the split
-    without erroring).  Only the ``subject_id`` column is scanned, so this is cheap even on a real
+    ``EQ_predict_multitask`` later (the dataset's schema_df semi-join drops subjects absent from the
+    split without erroring).  Only the ``subject_id`` column is scanned, so this is cheap even on a real
     split, and it runs before any shard is labeled rather than after the last one.
     """
     sid = TaskQuerySchema.subject_id_name
@@ -1234,7 +1235,7 @@ def _provenance_path(out_dir: Path, fp: Path) -> Path:
 
     Mirrors :func:`~every_query.generate_tasks.sample_tasks.labeled_fingerprint_path`: provenance
     lives in the ``{name}_artifacts`` sibling, never in the final-output root, so the output tree
-    keeps holding nothing but the parquets ``EQ_predict_sequences`` rglobs (invariant 7).  The
+    keeps holding nothing but the parquets ``EQ_predict_multitask`` rglobs (invariant 7).  The
     output's path *below* ``out_dir`` is kept as the sidecar's own, so every shard of every split
     gets its own and none can collide.
 

@@ -14,8 +14,9 @@ The interactions that could plausibly break are checked individually below:
 - ``TIMELINE//END`` must survive the delta strip, because it is this model's entire censoring
   mechanism.
 
-Originally written against ``ConditionalQueryModel``, the encoder-decoder conditional-sequence
-model, which was the only model carrying all three flags when they landed.  It now drives
+Originally written against the encoder-decoder conditional query-sequence model (since deleted
+with the rest of that pipeline), the only model carrying all three flags when they landed.  It
+now drives
 :class:`~every_query.model.conditional_multitask_ar_model.ConditionalMultitaskARModel`.  The
 composition claim is if anything sharper there: that model has *four* code slots reading the
 shared table (patient stream, window start event, window boundary event, conditioning code), and
