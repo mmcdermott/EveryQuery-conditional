@@ -34,7 +34,10 @@ A single Hugging Face `LlamaModel` (from a configurable `LlamaConfig`, trained f
 ```
 
 — patient events, then `TOKENS_PER_WINDOW · K − 2` query tokens. `W_i` describes window `i`, `C_i`
-names a code observed in that window and `A_i` supplies its teacher-forced answer. There is no
+names a code *asked about* for that window — drawn uniformly from the sampler's configured
+conditioning pool, independently of the labels — and `A_i` supplies its teacher-forced answer,
+looked up afterwards, which is `NO` for most codes, since most codes are rare. `C_i` is a question, not an assertion: if it named a code known to be present, `A_i`
+would be constant and the conditioning would carry no information. There is no
 trailing `(C, A)` pair after the last window: an answer exists to condition *later* windows, and
 there are none.
 
@@ -318,8 +321,11 @@ macro over 64. The two are otherwise indistinguishable, and the difference is no
 were precise. The only knob is `n_resamples` (default 1000), which trades runtime for interval
 resolution; it is not a way to switch the intervals off. The convention — percentile method, 1000
 resamples, 95%, `rng=np.random.default_rng(0)`, `_ci_lo` / `_ci_hi` suffixes, the task count logged
-beside the estimate — matches the training-time AUROC callback, so the two sets of intervals mean
-the same thing.
+beside the estimate — is taken verbatim from `upstream/task-auroc-ci`, which adds exactly these
+intervals to `task_auroc_callback.py`. **That branch has not landed on `upstream/main`**, so the
+callback in this tree computes no bootstrap at all: it logs the point estimates
+`tuning/occurs_auroc_macro_sampled` and its `_n_tasks`, and nothing else. Adopting the convention
+now means the two sets of intervals will mean the same thing once it does land.
 
 **The resampling unit is the subject, not the row.** `prediction_times_per_subject` defaults to `1`,
 so rows and subjects coincide at the defaults — but raise that knob and a subject contributes
@@ -348,7 +354,8 @@ absent.
 **Quote `_nested` as the headline uncertainty.** It is the only one of the three that resamples both
 axes. `_tasks` treats each cell's AUROC as exact and sees only between-task spread; `_subjects`
 conditions on the fixed `N` specs and sees only patient noise. `_tasks` is kept anyway, because it is
-what the training-time callback computes, so the training logs are directly comparable.
+the interval `upstream/task-auroc-ci` adds to the training-time callback — so once that branch lands,
+the training logs become directly comparable to this column.
 
 A resample can land single-class, where AUROC is undefined; those cell-replicates are `nan` and the
 bounds are read with `np.nanpercentile`. The count is reported per cell as

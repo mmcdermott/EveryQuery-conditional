@@ -242,8 +242,11 @@ EQ_train --config-name=conditional_multitask_ar_config \
 	lightning_module.model.ontology_dir="$ONTOLOGY_DIR" # omit for leaf codes only
 ```
 
-Each launch lands in `{output_dir}/<date>/<time>/` with `checkpoints/`, `loggers/csv/metrics.csv`
-and `resolved_config.yaml` — that run dir is what `EQ_predict_multitask` consumes. Vocabulary size
+Each launch lands in `{output_dir}/<date>/<time>/` with `checkpoints/`, `resolved_config.yaml` and
+the logger's output under `loggers/` — that run dir is what `EQ_predict_multitask` consumes. The
+shipped config logs to Weights & Biases, so either set `WANDB_ENTITY` (or pass
+`trainer.logger.entity=…`), or run without it: `trainer.logger=false` for no logging, or swap in a
+`CSVLogger` as `src/every_query/train/README.md` describes. Vocabulary size
 and max positions are sized from the cohort (or from the ontology's extended vocabulary)
 automatically, and both widths are recorded in the checkpoint.
 
@@ -258,7 +261,7 @@ Common overrides (full list:
 | `lightning_module.model.max_windows`                        | 5 (must be ≥ the labels' `num_bounds`)                          |
 | `lightning_module.model.use_rope_time`                      | true — elapsed hours as rotary positions, delta tokens stripped |
 | `lightning_module.model.config_overrides.num_hidden_layers` | 12 (hidden 384, 6 heads, intermediate 1536)                     |
-| `lightning_module.optimizer.lr` / `warmup_ratio`            | 2e-4 / 0.05                                                     |
+| `lightning_module.optimizer.lr` / `lightning_module.warmup_ratio` | 2e-4 / 0.05                                               |
 | `trainer.max_epochs` / `trainer.precision`                  | 1 / `bf16-mixed`                                                |
 | `do_resume=true`                                            | resume the run in `output_dir` (mid-epoch, stateful loader)     |
 | `seed`                                                      | 140799                                                          |
@@ -318,7 +321,8 @@ specs step 4 resolved, each populated by the whole cohort. It writes two tables:
 **Quote `_nested` as the headline uncertainty.** It is the only one of the three that resamples both
 axes — patients *and* task specs. `_subjects` holds the `N` specs fixed and sees patient noise
 alone; `_tasks` treats each cell's AUROC as exact and sees between-task spread alone (it is kept
-because it is what the training-time AUROC callback computes, so the two numbers are comparable).
+because it is the form `upstream/task-auroc-ci` adds to the training-time callback — that branch has
+not landed, so the callback in this tree still logs a point estimate only).
 
 `n_tasks_null` is reported next to `macro_auroc` for a reason: AUROC is undefined on a single-class
 cell, so a macro over 12 of 64 cells must not be readable as a macro over 64. The only knob is
