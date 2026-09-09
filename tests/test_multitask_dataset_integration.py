@@ -696,3 +696,316 @@ def test_upstream_reordering_is_an_error_not_a_silent_misalignment(monkeypatch) 
     monkeypatch.setattr(MEDSPytorchDataset, "get_task_seq_bounds_and_labels", classmethod(reversed_upstream))
     with pytest.raises(RuntimeError, match=r"misaligned .* row\(s\) differ"):
         MultitaskBoundaryPytorchDataset.get_task_seq_bounds_and_labels(label_df, schema_df)
+
+
+# --- PRs C+D: an ancestor-bearing labels directory through the dataset ---------------------------------
+
+
+@pytest.fixture(scope="module")
+def cohort_ontology_dir(tensorized_cohort_dir: Path, tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The three ``EQ_build_ontology`` artifacts for the fixture cohort's own ``codes.parquet``.
+
+    Built from *this* cohort, so its leaf token ids are the cohort's ``code/vocab_index`` and the
+    ancestors it mints sit in ``[V, V_ext)``.
+    """
+    from tests.multitask.conftest import write_cohort_ontology
+
+    return write_cohort_ontology(tensorized_cohort_dir, tmp_path_factory.mktemp("cohort_ontology"))
+
+
+def _ancestor_names(ontology_dir: Path, vocab_size: int) -> list[str]:
+    """Every ontology node name whose token id is an ancestor id (``>= V``)."""
+    from every_query.data.ontology import load_nodes
+
+    nodes = load_nodes(ontology_dir)
+    return [
+        str(n)
+        for n, i in zip(nodes["node_name"].to_list(), nodes["token_id"].to_list(), strict=True)
+        if int(i) >= vocab_size
+    ]
+
+
+def _alternating_condition_codes(ancestors: list[str], leaves: list[str], n: int, kc: int) -> list[list[str]]:
+    """``(n, kc)`` conditioning codes alternating ancestor / leaf, so both paths are always present."""
+    return [
+        [
+            ancestors[(i + j) % len(ancestors)] if (i + j) % 2 == 0 else leaves[(i * kc + j) % len(leaves)]
+            for j in range(kc)
+        ]
+        for i in range(n)
+    ]
+
+
+@pytest.fixture(scope="module")
+def ancestor_labels_dir(
+    tensorized_cohort_dir: Path, cohort_ontology_dir: Path, tmp_path_factory: pytest.TempPathFactory
+) -> Path:
+    """A sibling of ``multitask_labels_dir`` sampled in ``"boundaries+conditions"`` ontology mode.
+
+    Same cohort, same kernel, same writer; the only difference is that the *event* half of every window
+    - start events, bound events and every other conditioning code - names an ontology ancestor in
+    ``[V, V_ext)``, while the packed target bits stay leaf-only ``V`` wide.  The events themselves are
+    leaf-coded: the ancestors resolve through the closure expansion inside ``label_multitask_index``.
+    """
+    onto = str(cohort_ontology_dir)
+    vocab = sms.build_target_vocabulary(tensorized_cohort_dir, onto, "boundaries+conditions")
+    ancestors = list(vocab.ancestor_names)
+    assert ancestors, "the fixture cohort's hierarchical code names must mint ancestor nodes"
+    assert vocab.boundary_size > vocab.size
+    leaves = [c for c in vocab.boundary_candidates() if c not in set(ancestors)]
+    rng = np.random.default_rng(11)
+
+    rows = []
+    for subj in _SUBJECTS:
+        pt = _naive(_PRED_TIMES[subj])
+        for d in range(0, 60, 2):
+            rows.append(
+                {
+                    "subject_id": subj,
+                    "time": pt + timedelta(days=d),
+                    "code": leaves[int(rng.integers(0, len(leaves)))],
+                }
+            )
+    events = pl.DataFrame(rows).with_columns(
+        pl.col("time").cast(pl.Datetime("us")), pl.col("subject_id").cast(pl.Int64)
+    )
+
+    dist = sms.BoundaryDistribution(
+        K,
+        1.0,
+        30.0,
+        "log-uniform",
+        0.7,  # eventbound_fraction: most window ends are ancestor-named events
+        tuple(ancestors),  # boundary pool: ancestors only, so an ancestor bound code is certain
+        tuple(vocab.condition_candidates()),
+        eventstart_fraction=0.4,
+        prediction_time_start_fraction=0.3,
+        start_min_duration=1.0,
+        start_max_duration=20.0,
+        start_event_codes=tuple(ancestors),
+    )
+    root = tmp_path_factory.mktemp("ancestor_labels")
+    split_dir = root / train_split
+    manifest = sms.write_manifest(split_dir, sms.build_manifest(dist, vocab))
+    assert manifest["ontology_mode"] == "boundaries+conditions"
+    assert manifest["boundary_vocab_size"] == vocab.boundary_size > manifest["vocab_size"]
+
+    shards = {"0": _SUBJECTS[:2], "1": _SUBJECTS[2:]}
+    for shard, subjects in shards.items():
+        contexts = [(s, _naive(_PRED_TIMES[s])) for s in subjects for _ in range(3)]
+        sample = dist.sample(len(contexts), *[np.random.default_rng(200 + i + int(shard)) for i in range(7)])
+        index = pl.DataFrame(
+            {
+                "subject_id": pl.Series([c[0] for c in contexts], dtype=pl.Int64),
+                "prediction_time": pl.Series([c[1] for c in contexts], dtype=pl.Datetime("us")),
+                "start_durations": pl.Series(sample.start_durations.tolist(), dtype=pl.List(pl.Float32)),
+                "start_events": pl.Series(sample.start_events.tolist(), dtype=pl.List(pl.Utf8)),
+                "durations": pl.Series(sample.durations.tolist(), dtype=pl.List(pl.Float32)),
+                "bound_events": pl.Series(sample.bound_events.tolist(), dtype=pl.List(pl.Utf8)),
+                # Deterministic rather than drawn, so every shard carries both kinds of condition.
+                "condition_codes": pl.Series(
+                    _alternating_condition_codes(ancestors, leaves, len(contexts), K - 1),
+                    dtype=pl.List(pl.Utf8),
+                ),
+            }
+        )
+        tmp = sms._unique_tmp_path(sms.labels_path(split_dir, shard))
+        mm = np.lib.format.open_memmap(
+            tmp, mode="w+", dtype=np.uint8, shape=(index.height, K, vocab.packed_width)
+        )
+        metadata, _, _ = sms.label_multitask_index(
+            index, events, vocab, K, chunk_rows=2, out=mm, ontology_dir=onto
+        )
+        mm.flush()
+        del mm
+        sms.write_labeled_shard(metadata, split_dir, shard, labels_tmp=tmp)
+        # The fixture is only worth anything if the ancestors really reached the written metadata.
+        anc = set(ancestors)
+        written = pl.read_parquet(split_dir / f"{shard}.parquet")
+        assert anc & set(written["bound_events"].explode().drop_nulls().to_list()), shard
+        assert anc & set(written["start_events"].explode().drop_nulls().to_list()), shard
+        assert anc & set(written["condition_codes"].explode().to_list()), shard
+    return root
+
+
+def test_ancestor_bound_and_start_codes_load_into_the_extended_range(
+    tensorized_cohort_dir: Path, ancestor_labels_dir: Path, cohort_ontology_dir: Path
+) -> None:
+    """Ancestor event names resolve into ``[V, V_ext)`` while the target bits stay ``V`` wide.
+
+    Before PR C the sampler rejected any ``ontology_dir`` outright and the dataset had no such
+    argument; this pins the widened *event* vocabulary and the untouched *target* vocabulary as two
+    separate numbers on one loaded dataset.
+    """
+    from every_query.data.ontology import extended_vocab_size
+
+    ds = _dataset(tensorized_cohort_dir, ancestor_labels_dir, ontology_dir=cohort_ontology_dir)
+    vocab = sms.build_target_vocabulary(tensorized_cohort_dir)
+    assert ds.vocab_size == vocab.size, "targets stay leaf-only in every ontology mode"
+    assert ds.boundary_vocab_size == extended_vocab_size(cohort_ontology_dir) > ds.vocab_size
+    assert ds.ontology_mode == "boundaries+conditions"
+    for what, codes in (
+        ("boundary", ds._q_bound_codes),
+        ("start-event", ds._q_start_codes),
+        ("condition", ds._condition_codes),
+    ):
+        assert int(codes.max()) >= ds.vocab_size, f"no ancestor {what} code reached the dataset"
+        assert int(codes.max()) < ds.boundary_vocab_size, f"{what} code past V_ext"
+    # ...and every ancestor name the dataset can resolve was numbered by this ontology.
+    ancestors = _ancestor_names(cohort_ontology_dir, ds.vocab_size)
+    assert ancestors and all(ds.code_to_index[a] >= ds.vocab_size for a in ancestors)
+
+
+def test_ancestor_bearing_labels_without_an_ontology_fail_at_init(
+    tensorized_cohort_dir: Path, ancestor_labels_dir: Path
+) -> None:
+    """Ancestor-bearing labels with no ``ontology_dir`` are a sentence at init, not a CUDA assert.
+
+    Nothing but the manifest's ``ontology_mode`` knows those names were ever meant to be resolvable,
+    so the guard has to fire before the first unresolvable code turns into a device-side lookup.
+    """
+    with pytest.raises(ValueError, match="ontology_mode"):
+        _dataset(tensorized_cohort_dir, ancestor_labels_dir)
+
+
+def test_a_leaf_only_labels_dir_still_loads_with_an_ontology(
+    tensorized_cohort_dir: Path, multitask_labels_dir: Path, cohort_ontology_dir: Path
+) -> None:
+    """The ontology check is deliberately ONE-SIDED: leaf labels plus an ontology is the normal setup.
+
+    Deriving ancestor *targets* inside the model needs an ontology on the datamodule while the sampler
+    ran leaf-only, so a ``"none"`` manifest must keep loading when one is passed, with the leaf event
+    width untouched.  If this ever raises, the check went biconditional and every derived-targets
+    training run is broken.
+    """
+    ds = _dataset(tensorized_cohort_dir, multitask_labels_dir, ontology_dir=cohort_ontology_dir)
+    assert ds.ontology_mode == "none"
+    assert ds.boundary_vocab_size == ds.vocab_size, "a leaf run's event vocabulary is the leaf width"
+    assert ds._closure is None, "no ancestor conditioning code exists, so no closure is needed"
+    batch = ds.collate([ds[i] for i in range(len(ds))])
+    assert batch.targets.shape[-1] == ds.vocab_size
+    assert int(batch.condition_codes.max()) < ds.vocab_size
+
+
+def test_a_foreign_ontology_is_refused_by_the_dataset(
+    tensorized_cohort_dir: Path, ancestor_labels_dir: Path, tmp_path: Path
+) -> None:
+    """A same-width ontology of the same codes at two permuted indices is refused by identity.
+
+    Every width check passes - same ``V``, same ``V_ext`` - and every ancestor name still resolves, to a
+    node standing for a different set of descendants.  Only the cohort-identity check can see it.
+    """
+    from every_query.data.ontology import extended_vocab_size
+    from tests.multitask.conftest import write_cohort_ontology
+
+    permuted = write_cohort_ontology(tensorized_cohort_dir, tmp_path / "permuted", swap=("HR", "TEMP"))
+    manifest = json.loads((ancestor_labels_dir / train_split / MANIFEST_NAME).read_text())
+    assert extended_vocab_size(permuted) == manifest["boundary_vocab_size"], "widths cannot see it"
+    with pytest.raises(ValueError, match=r"different codes\.parquet"):
+        _dataset(tensorized_cohort_dir, ancestor_labels_dir, ontology_dir=permuted)
+
+
+def test_ancestor_condition_answers_agree_in_collate(
+    tensorized_cohort_dir: Path, ancestor_labels_dir: Path, cohort_ontology_dir: Path
+) -> None:
+    """PR D: ``collate`` re-derives an ancestor's answer as the OR over its closure descendants.
+
+    An ancestor conditioning code has no target column to gather from, so the stored-answer check has
+    to widen the leaf targets through ``derive_ancestor_targets`` first.  Agreement here is the
+    sampler's ``next_occurrence_after`` resolution and the model's closure OR meeting on one number.
+    """
+    from every_query.data.ontology import derive_ancestor_targets
+
+    ds = _dataset(tensorized_cohort_dir, ancestor_labels_dir, ontology_dir=cohort_ontology_dir)
+    assert ds._closure is not None, "a conditioning ontology mode must load the closure"
+    perm = np.random.default_rng(7).permutation(len(ds)).tolist()
+    batch = ds.collate([ds[i] for i in perm])  # the derived check runs inside here
+    assert batch.targets.shape == (len(perm), K, ds.vocab_size), "targets stay leaf-only"
+    assert int(batch.condition_codes.max()) >= ds.vocab_size, "the derived path was never exercised"
+    assert int(batch.condition_codes.min()) > 0
+
+    # The same widening, spelled out independently of collate's internals.
+    wide = derive_ancestor_targets(batch.targets[:, : K - 1], ds._closure)
+    expect = wide.gather(2, batch.condition_codes.unsqueeze(-1)).squeeze(-1)
+    assert torch.equal(expect, batch.condition_answers)
+    # A leaf slot still reads straight off its leaf column, so both branches are live in one batch.
+    leaf = batch.condition_codes < ds.vocab_size
+    assert leaf.any() and (~leaf).any()
+    ancestor_answers = batch.condition_answers[~leaf]
+    assert ancestor_answers.any() and not ancestor_answers.all(), (
+        "the ancestor answers are constant, so agreement here would say nothing"
+    )
+    clamped = batch.condition_codes.clamp(max=ds.vocab_size - 1).unsqueeze(-1)
+    direct = batch.targets[:, : K - 1].gather(2, clamped).squeeze(-1)
+    assert torch.equal(direct[leaf], batch.condition_answers[leaf])
+
+
+def test_corrupted_ancestor_condition_answers_fail_in_collate(
+    tensorized_cohort_dir: Path, ancestor_labels_dir: Path, cohort_ontology_dir: Path, tmp_path: Path
+) -> None:
+    """Flipping only the *ancestor* slots' stored answers must be caught, so the derived check is real.
+
+    The leaf slots are left alone: nothing but the closure-derived column can notice this corruption,
+    which is what separates a working check from one that is vacuously true because every ancestor
+    answer happened to already agree.
+    """
+    v = sms.build_target_vocabulary(tensorized_cohort_dir).size
+    ancestors = set(_ancestor_names(cohort_ontology_dir, v))
+    touched: list[bool] = []
+
+    def flip(df: pl.DataFrame) -> pl.DataFrame:
+        out = []
+        for codes, answers in zip(
+            df["condition_codes"].to_list(), df["condition_answers"].to_list(), strict=True
+        ):
+            row = []
+            for c, a in zip(codes, answers, strict=True):
+                row.append((not a) if c in ancestors else a)
+                touched.append(c in ancestors)
+            out.append(row)
+        return df.with_columns(pl.Series("condition_answers", out, dtype=pl.List(pl.Boolean)))
+
+    bad = _tampered(ancestor_labels_dir, tmp_path, flip)
+    assert any(touched), "shard 0 carries no ancestor conditioning code; the tamper would be a no-op"
+    ds = _dataset(tensorized_cohort_dir, bad, ontology_dir=cohort_ontology_dir)
+    bad_rows = [i for i in range(len(ds)) if ds[i]["_source_shard"].endswith("/0")]
+    assert bad_rows, "no row of the tampered shard survived the join"
+    with pytest.raises(ValueError, match="condition_answers disagree with the packed targets"):
+        ds.collate([ds[i] for i in bad_rows])
+
+
+def test_a_bound_code_past_the_boundary_vocabulary_is_rejected(
+    tensorized_cohort_dir: Path, multitask_labels_dir: Path, cohort_ontology_dir: Path, tmp_path: Path
+) -> None:
+    """A manifest whose ``boundary_vocab_size`` is narrower than the codes in its own labels is refused.
+
+    ``boundary_vocab_size`` is the width a model's event-embedding table is built to, so an id past it
+    is an out-of-range lookup - a device-side assert with no attribution on CUDA.  Driven from the leaf
+    fixture because in an ontology mode the same tamper is caught one step earlier, by the ontology's
+    own width; the second half pins that ordering.
+    """
+    import shutil
+
+    from every_query.data.ontology import closure_fingerprint, extended_vocab_size
+
+    bad = tmp_path / "narrow_labels"
+    shutil.copytree(multitask_labels_dir, bad)
+    fp = bad / train_split / MANIFEST_NAME
+    manifest = json.loads(fp.read_text())
+    assert manifest["ontology_mode"] == "none"
+    manifest["boundary_vocab_size"] = 3  # narrower than any real boundary code in these labels
+    fp.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match=r"code index \d+ .* outside the boundary vocabulary of size 3"):
+        _dataset(tensorized_cohort_dir, bad, ontology_dir=cohort_ontology_dir)
+
+    onto_bad = tmp_path / "narrow_ancestor_labels"
+    shutil.copytree(multitask_labels_dir, onto_bad)
+    fp = onto_bad / train_split / MANIFEST_NAME
+    manifest = json.loads(fp.read_text())
+    manifest["ontology_mode"] = "boundaries"
+    # The genuine closure digest, so the *identity* check passes and only the width disagrees.
+    manifest["ontology_fingerprint"] = closure_fingerprint(cohort_ontology_dir)
+    manifest["boundary_vocab_size"] = extended_vocab_size(cohort_ontology_dir) - 1
+    fp.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="could not embed"):
+        _dataset(tensorized_cohort_dir, onto_bad, ontology_dir=cohort_ontology_dir)

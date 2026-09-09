@@ -36,6 +36,9 @@ Issue #22 adds ``K-1`` **conditioning** code/answer pairs per context for teache
 decoder-only model: Stage 1M draws ``condition_codes`` iid uniform over all non-PAD base codes from a
 dedicated RNG stream (never perturbing the boundary streams), Stage 3M carries them through the index,
 and Stage 4M materializes ``condition_answers[i, j] = target[i, j, vocab_index(condition_codes[i, j])]``.
+In a conditioning ontology mode the pool is the ontology's non-PAD *nodes* instead (the manifest's
+``condition_policy`` says which), and an ancestor's answer is the OR of that bit over its closure
+descendants - resolved from the expanded interval table, since no ancestor has a stored column.
 
 Output, per event shard of the split::
 
@@ -54,11 +57,23 @@ under the window rule an ancestor's bit is the OR of its descendant leaves' bits
 :class:`~every_query.model.conditional_multitask_ar_model.ConditionalMultitaskARModel` derives them
 per batch from these leaf sidecars and the ontology's closure
 (:func:`~every_query.data.ontology.derive_ancestor_targets`); storing them would only add ~50% to
-every ``.labels.npy`` for no information.  What the sampler does *not* yet do is let an ancestor act
-as an **event** - an ancestor-valued ``start_event`` / ``bound_event`` ("until the next occurrence
-of any ``LAB//X//*``") - or as a conditioning code, so a non-null ``ontology_dir`` is still a hard
-error here.  The three seams :func:`build_target_vocabulary`, :func:`prepare_events_for_labeling`
-and :func:`resolve_event_boundaries` are where that plugs in.
+every ``.labels.npy`` for no information.
+
+**Ancestors as events**: what an ontology *does* change here is the other half of a window - an
+ancestor-valued ``start_event`` / ``bound_event`` ("until the next occurrence of any ``LAB//X//*``")
+and an ancestor-valued conditioning code.  Set ``ontology_dir`` and, optionally, ``ontology_mode``
+(``boundaries`` | ``conditions`` | ``boundaries+conditions``, the default) to enable them.  The
+three seams do it: :func:`build_target_vocabulary` widens the *event* names to the ontology's nodes
+at their ``[V, V_ext)`` token ids, :func:`prepare_events_for_labeling` explodes the stream through
+the closure so an ancestor has ordinary intervals, and :func:`resolve_event_boundaries` then needs
+no ancestor-specific code at all.
+
+The bits never move: the labeling interval table is rebuilt from the ``code_index < V`` rows of the
+expanded stream - which the self-pairs in the closure make identical to the unexpanded stream - so
+``vocab_size``, ``packed_width_bytes``, ``vocab_fingerprint`` and every label bit are the same in
+every mode.  The manifest records ``ontology_mode``, ``ontology_fingerprint`` (the closure digest)
+and ``boundary_vocab_size`` (``V_ext``) so a reader can tell which event vocabulary the windows were
+drawn against.
 """
 
 from __future__ import annotations
@@ -94,6 +109,7 @@ from every_query.generate_tasks.interval_table import (
     IntervalTable,
     build_interval_table,
     iter_packed_label_chunks,
+    next_occurrence_after,
     resolve_end_times,
     resolve_start_times,
 )
@@ -119,7 +135,7 @@ from every_query.utils.digest import vocab_fingerprint
 from every_query.utils.seeds import derive_seed
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Collection, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +146,18 @@ FORMAT_VERSION = 3
 MANIFEST_NAME = "_multitask_manifest.json"
 LABELS_SUFFIX = ".labels.npy"
 ONTOLOGY_MODE_NONE = "none"
+# An ancestor node may act as an *event* (a start / bound code, "until the next occurrence of any
+# ``LAB//X//*``") and/or as a conditioning code.  Targets are never affected: the bits stay leaf-only
+# in every mode, so ``vocab_size`` / ``packed_width_bytes`` / ``vocab_fingerprint`` are mode-invariant.
+ONTOLOGY_MODE_BOUNDARIES = "boundaries"
+ONTOLOGY_MODE_CONDITIONS = "conditions"
+ONTOLOGY_MODE_BOTH = "boundaries+conditions"
+ONTOLOGY_MODES = (
+    ONTOLOGY_MODE_NONE,
+    ONTOLOGY_MODE_BOUNDARIES,
+    ONTOLOGY_MODE_CONDITIONS,
+    ONTOLOGY_MODE_BOTH,
+)
 BITORDER = "little"
 WINDOW_SEMANTICS = "open_open"
 # Issue #24 window semantics, recorded in the manifest and folded into the config fingerprint.
@@ -141,6 +169,23 @@ DATETIME_UNIT = "us"
 # Issue #22: K-1 conditioning codes per context, iid uniform with replacement over all non-PAD base
 # codes, from a dedicated RNG stream; answer j is the target bit of that code at boundary j.
 CONDITION_POLICY = "uniform_base_vocab_no_pad"
+# ...and, when the mode lets an ancestor be a conditioning code, the pool is the ontology's whole
+# non-PAD node set instead.  The manifest records which, because it is the record of what a stored
+# ``condition_answers`` bit means: for an ancestor the answer is the OR over its closure descendants.
+CONDITION_POLICY_QUERY_NODES = "uniform_query_node_no_pad"
+
+
+def condition_policy(mode: str) -> str:
+    """The manifest's ``condition_policy`` for an ontology mode.
+
+    Examples:
+        >>> condition_policy("none"), condition_policy("boundaries")
+        ('uniform_base_vocab_no_pad', 'uniform_base_vocab_no_pad')
+        >>> condition_policy("conditions"), condition_policy("boundaries+conditions")
+        ('uniform_query_node_no_pad', 'uniform_query_node_no_pad')
+    """
+    return CONDITION_POLICY_QUERY_NODES if ontology_conditions_enabled(mode) else CONDITION_POLICY
+
 
 CTX_ID_COL = "_ctx_id"
 START_DURATIONS_COL = "start_durations"
@@ -156,17 +201,48 @@ START_COLUMNS = [START_DURATIONS_COL, START_EVENTS_COL]
 INDEX_COLUMNS = [CTX_ID_COL, SID, PT, *START_COLUMNS, DURATIONS_COL, BOUND_EVENTS_COL, CONDITION_CODES_COL]
 METADATA_COLUMNS = [SID, PT, *START_COLUMNS, DURATIONS_COL, BOUND_EVENTS_COL, CONDITION_CODES_COL]
 
-ONTOLOGY_NOT_SUPPORTED = (
-    "The multitask sampler labels observable leaf codes only; ancestor targets are derived from "
-    "these leaf labels inside the model (set lightning_module.model.ontology_dir at training time, "
-    "not here). Ancestor-valued start / bound events and conditioning codes are not supported yet."
-)
+
+def resolve_ontology_mode(ontology_dir: object, mode: object = None) -> str:
+    """The manifest's ``ontology_mode`` for a config's ``(ontology_dir, ontology_mode)`` pair.
+
+    Without an ontology the only legal mode is ``"none"``.  With one, ``None`` means "use the whole
+    feature" (:data:`ONTOLOGY_MODE_BOTH`); an explicit mode narrows it, and ``"none"`` is how a run
+    keeps an ontology on disk while sampling exactly the leaf-only draws it sampled before.
+
+    Examples:
+        >>> resolve_ontology_mode(None)
+        'none'
+        >>> resolve_ontology_mode("/onto")
+        'boundaries+conditions'
+        >>> resolve_ontology_mode("/onto", "boundaries")
+        'boundaries'
+        >>> resolve_ontology_mode(None, "boundaries")
+        Traceback (most recent call last):
+            ...
+        ValueError: ontology_mode='boundaries' needs an ontology_dir; got None
+        >>> resolve_ontology_mode("/onto", "targets")
+        Traceback (most recent call last):
+            ...
+        ValueError: ontology_mode must be one of ('none', 'boundaries', 'conditions', 'boundaries+conditions'), got 'targets'
+    """  # noqa: E501 — the doctest's error message is the value being pinned
+    mode = None if mode is None else str(mode)
+    if mode is not None and mode not in ONTOLOGY_MODES:
+        raise ValueError(f"ontology_mode must be one of {ONTOLOGY_MODES}, got {mode!r}")
+    if ontology_dir is None or not str(ontology_dir).strip():
+        if mode not in (None, ONTOLOGY_MODE_NONE):
+            raise ValueError(f"ontology_mode={mode!r} needs an ontology_dir; got None")
+        return ONTOLOGY_MODE_NONE
+    return ONTOLOGY_MODE_BOTH if mode is None else mode
 
 
-def reject_ontology(ontology_dir: object) -> None:
-    """Hard-fail on any non-null ``ontology_dir`` (the sampler is leaf-only; see the module docstring)."""
-    if ontology_dir is not None:
-        raise NotImplementedError(ONTOLOGY_NOT_SUPPORTED)
+def ontology_boundaries_enabled(mode: str) -> bool:
+    """Whether ``mode`` lets an ancestor node act as a start / bound event."""
+    return mode in (ONTOLOGY_MODE_BOUNDARIES, ONTOLOGY_MODE_BOTH)
+
+
+def ontology_conditions_enabled(mode: str) -> bool:
+    """Whether ``mode`` lets an ancestor node be drawn as a conditioning code."""
+    return mode in (ONTOLOGY_MODE_CONDITIONS, ONTOLOGY_MODE_BOTH)
 
 
 # ---------------------------------------------------------------------------
@@ -178,11 +254,20 @@ def reject_ontology(ontology_dir: object) -> None:
 class TargetVocabulary:
     """The cohort's base vocabulary, bit-aligned to its unchanged ``code/vocab_index``.
 
+    The ontology fields are the *event* half of the vocabulary and never touch the bits: an ancestor
+    node can be drawn as a start / bound event or as a conditioning code, but it is never a target
+    column, so ``size``, ``packed_width`` and ``fingerprint`` are identical with and without one.
+
     Attributes:
         codes: Codes sorted by vocabulary index.
         indices: ``int64`` vocabulary index per code (same order).  Unique, ``>= 0``.
         size: ``V = max(index) + 1`` - the bit width of every packed boundary row.
         fingerprint: Deterministic digest of the ordered ``(index, code)`` mapping.
+        ontology_mode: One of :data:`ONTOLOGY_MODES`; ``"none"`` when no ontology is attached.
+        ancestor_names: Non-observed ontology node names, ordered by token id (empty without one).
+        ancestor_indices: Their ``[V, V_ext)`` token ids, same order.
+        ontology_fingerprint: :func:`~every_query.data.ontology.closure_fingerprint` of the closure
+            that resolved the ancestor events, or ``None``.
 
     Examples:
         >>> v = TargetVocabulary.from_pairs(["B", "A", "PAD"], [2, 1, 0])
@@ -192,16 +277,72 @@ class TargetVocabulary:
         ['A', 'B']
         >>> v.fingerprint == TargetVocabulary.from_pairs(["A", "B", "PAD"], [1, 2, 0]).fingerprint
         True
+
+        Without an ontology the extended width collapses onto the leaf width and both candidate
+        pools are the same leaf pool:
+
+        >>> v.boundary_size, v.condition_candidates()
+        (3, ['A', 'B'])
+
+        Attaching a two-node ontology widens the *event* vocabulary only:
+
+        >>> w = v.with_ontology("boundaries", ("A//ANY", "ROOT"), (3, 4), "deadbeef")
+        >>> w.size, w.packed_width, w.fingerprint == v.fingerprint
+        (3, 1, True)
+        >>> w.boundary_size, w.boundary_candidates()
+        (5, ['A', 'B', 'A//ANY', 'ROOT'])
+        >>> w.condition_candidates()          # "boundaries" mode leaves conditioning codes leaf-only
+        ['A', 'B']
+        >>> sorted(w.boundary_code_to_index().items())
+        [('A', 1), ('A//ANY', 3), ('B', 2), ('PAD', 0), ('ROOT', 4)]
     """
 
     codes: tuple[str, ...]
     indices: np.ndarray
     size: int
     fingerprint: str
+    ontology_mode: str = ONTOLOGY_MODE_NONE
+    ancestor_names: tuple[str, ...] = ()
+    ancestor_indices: tuple[int, ...] = ()
+    ontology_fingerprint: str | None = None
     packed_width: int = field(init=False)
+    boundary_size: int = field(init=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "packed_width", (self.size + 7) // 8)
+        if self.ontology_mode not in ONTOLOGY_MODES:
+            raise ValueError(f"ontology_mode must be one of {ONTOLOGY_MODES}, got {self.ontology_mode!r}")
+        if len(self.ancestor_names) != len(self.ancestor_indices):
+            raise ValueError("ancestor_names and ancestor_indices must have the same length")
+        if self.ancestor_indices and min(self.ancestor_indices) < self.size:
+            raise ValueError(
+                f"ancestor token ids must all be >= the cohort width V={self.size}; got "
+                f"{min(self.ancestor_indices)}"
+            )
+        v_ext = max(self.ancestor_indices) + 1 if self.ancestor_indices else self.size
+        object.__setattr__(self, "boundary_size", v_ext)
+
+    def with_ontology(
+        self,
+        mode: str,
+        ancestor_names: Sequence[str],
+        ancestor_indices: Sequence[int],
+        ontology_fingerprint: str | None,
+    ) -> TargetVocabulary:
+        """A copy carrying the ontology's ancestor nodes as extra *event* names.
+
+        Bits are untouched.
+        """
+        return TargetVocabulary(
+            codes=self.codes,
+            indices=self.indices,
+            size=self.size,
+            fingerprint=self.fingerprint,
+            ontology_mode=mode,
+            ancestor_names=tuple(str(n) for n in ancestor_names),
+            ancestor_indices=tuple(int(i) for i in ancestor_indices),
+            ontology_fingerprint=ontology_fingerprint,
+        )
 
     @classmethod
     def from_pairs(cls, codes: Sequence[str], indices: Sequence[int]) -> TargetVocabulary:
@@ -228,9 +369,34 @@ class TargetVocabulary:
     def code_to_index(self) -> dict[str, int]:
         return dict(zip(self.codes, self.indices.tolist(), strict=True))
 
-    def boundary_candidates(self) -> list[str]:
-        """Codes usable as event boundaries: every base code except PAD / index zero."""
+    def boundary_code_to_index(self) -> dict[str, int]:
+        """``code_to_index`` plus every ancestor node name, whatever the mode.
+
+        The *resolution* map, not the draw pool: a supplied index may name an ancestor even in a mode
+        that never draws one, and it must still encode.  Leaf names win over same-named nodes, the
+        ``setdefault`` semantics of :func:`~every_query.data.ontology.extend_code_map`.
+        """
+        extended = self.code_to_index()
+        for name, idx in zip(self.ancestor_names, self.ancestor_indices, strict=True):
+            extended.setdefault(name, int(idx))
+        return extended
+
+    def _leaf_candidates(self) -> list[str]:
         return [c for c, i in zip(self.codes, self.indices.tolist(), strict=True) if i != 0]
+
+    def boundary_candidates(self) -> list[str]:
+        """Names drawable as event boundaries / starts: every non-PAD base code, ancestors if enabled."""
+        base = self._leaf_candidates()
+        if ontology_boundaries_enabled(self.ontology_mode):
+            return base + list(self.ancestor_names)
+        return base
+
+    def condition_candidates(self) -> list[str]:
+        """Names drawable as conditioning codes: every non-PAD base code, ancestors if enabled."""
+        base = self._leaf_candidates()
+        if ontology_conditions_enabled(self.ontology_mode):
+            return base + list(self.ancestor_names)
+        return base
 
 
 def _codes_parquet_path(source: object) -> Path:
@@ -245,14 +411,23 @@ def _codes_parquet_path(source: object) -> Path:
     return p
 
 
-def build_target_vocabulary(source: object, ontology_dir: object = None) -> TargetVocabulary:
+def build_target_vocabulary(
+    source: object, ontology_dir: object = None, ontology_mode: object = None
+) -> TargetVocabulary:
     """Extension seam 1: the vocabulary whose codes are targets (and boundary candidates).
 
-    MVP: the base cohort vocabulary from ``codes.parquet`` (``code`` + ``code/vocab_index``), every
-    code an ontology leaf.  Codes absent from a given split are neither removed nor renumbered; their
-    bits simply stay false for that split.  A non-null ``ontology_dir`` raises.
+    The **target** half is always the base cohort vocabulary from ``codes.parquet`` (``code`` +
+    ``code/vocab_index``): every bit is an observable leaf, and codes absent from a given split are
+    neither removed nor renumbered - their bits simply stay false for that split.  Ancestor targets
+    are derived from these leaf bits inside the model, never stored.
+
+    With an ``ontology_dir`` the **event** half widens: the ontology's non-observed nodes are added
+    at their ``[V, V_ext)`` token ids so an ancestor can bound (or start, or condition) a window.
+    The ontology is checked against this cohort by identity - not merely by width - so a same-width
+    ontology of another cohort, or of these codes at permuted indices, is refused rather than paired
+    with the wrong closure.
     """
-    reject_ontology(ontology_dir)
+    mode = resolve_ontology_mode(ontology_dir, ontology_mode)
     if isinstance(source, list | tuple | ListConfig):
         raise ValueError(
             "query_codes must be a metadata root dir or a codes.parquet path; the multitask sampler "
@@ -266,26 +441,56 @@ def build_target_vocabulary(source: object, ontology_dir: object = None) -> Targ
     )
     if df.height == 0:
         raise ValueError(f"{fp} holds no indexed codes")
-    return TargetVocabulary.from_pairs(df["code"].to_list(), df["code/vocab_index"].to_list())
+    vocab = TargetVocabulary.from_pairs(df["code"].to_list(), df["code/vocab_index"].to_list())
+    if mode == ONTOLOGY_MODE_NONE:
+        return vocab
+    return attach_ontology(vocab, str(ontology_dir), mode)
+
+
+def attach_ontology(vocab: TargetVocabulary, ontology_dir: str | Path, mode: str) -> TargetVocabulary:
+    """Widen ``vocab``'s *event* names with an ontology's ancestor nodes, checking cohort identity.
+
+    Kept out of :func:`build_target_vocabulary` so a caller that already holds a vocabulary (the
+    Stage 4M workers, which reconstruct it from the same ``codes.parquet``) attaches the same
+    ancestors without re-reading the cohort.
+    """
+    from every_query.data.ontology import check_ontology_cohort, closure_fingerprint, load_nodes
+
+    check_ontology_cohort(ontology_dir, code_to_index=vocab.code_to_index())
+    nodes = load_nodes(ontology_dir).filter(~pl.col("is_observed_code")).sort("token_id")
+    return vocab.with_ontology(
+        mode,
+        nodes["node_name"].to_list(),
+        nodes["token_id"].to_list(),
+        closure_fingerprint(ontology_dir),
+    )
 
 
 def read_boundary_codes(
-    spec: object, vocab: TargetVocabulary, exclude_prefixes: Sequence[str] = ()
+    spec: object,
+    vocab: TargetVocabulary,
+    exclude_prefixes: Sequence[str] = (),
+    ontology_dir: str | Path | None = None,
 ) -> list[str]:
     """Resolve the boundary-code pool: ``None`` => all base codes (index >= 1); else a list / YAML path.
 
     Every listed code must be in the vocabulary and must not be PAD; unknown codes are hard errors.
     Order-preserving dedup.  ``exclude_prefixes`` drops codes by name prefix *after* resolution, so an
-    explicit pool and the all-vocabulary default are filtered the same way.
+    explicit pool and the all-vocabulary default are filtered the same way - and with an
+    ``ontology_dir`` it also drops any node sitting above an excluded leaf
+    (:func:`nodes_over_excluded_leaves`), which a name-prefix test alone cannot reach.
     """
-    return _read_code_pool(spec, vocab, "boundary", exclude_prefixes)
+    return _read_code_pool(spec, vocab, "boundary", exclude_prefixes, ontology_dir)
 
 
 def read_start_event_codes(
-    spec: object, vocab: TargetVocabulary, exclude_prefixes: Sequence[str] = ()
+    spec: object,
+    vocab: TargetVocabulary,
+    exclude_prefixes: Sequence[str] = (),
+    ontology_dir: str | Path | None = None,
 ) -> list[str]:
     """Resolve the start-event pool (issue #24) with exactly the :func:`read_boundary_codes` rules."""
-    return _read_code_pool(spec, vocab, "start_event", exclude_prefixes)
+    return _read_code_pool(spec, vocab, "start_event", exclude_prefixes, ontology_dir)
 
 
 def read_exclude_prefixes(spec: object) -> tuple[str, ...]:
@@ -307,10 +512,17 @@ def read_exclude_prefixes(spec: object) -> tuple[str, ...]:
 
 
 def _read_code_pool(
-    spec: object, vocab: TargetVocabulary, what: str, exclude_prefixes: Sequence[str] = ()
+    spec: object,
+    vocab: TargetVocabulary,
+    what: str,
+    exclude_prefixes: Sequence[str] = (),
+    ontology_dir: str | Path | None = None,
 ) -> list[str]:
+    over_excluded: Collection[str] = ()
+    if ontology_dir is not None and exclude_prefixes:
+        over_excluded = nodes_over_excluded_leaves(ontology_dir, exclude_prefixes)
     if spec is None:
-        return _apply_prefix_exclusions(vocab.boundary_candidates(), exclude_prefixes, what)
+        return _apply_prefix_exclusions(vocab.boundary_candidates(), exclude_prefixes, what, over_excluded)
     if isinstance(spec, list | tuple | ListConfig):
         raw = list(spec)
     else:
@@ -321,39 +533,124 @@ def _read_code_pool(
     codes = [c for c in raw if not (c in seen or seen.add(c))]
     if not codes:
         raise ValueError(f"{what}_codes resolved to an empty list")
-    c2i = vocab.code_to_index()
+    # The extended map, so an explicit pool can name ancestor nodes ("bound on exactly these three
+    # subtrees") - the most obvious use of the feature.  Under no ontology it is the base map.
+    c2i = vocab.boundary_code_to_index()
     unknown = [c for c in codes if c not in c2i]
     if unknown:
         raise ValueError(f"{len(unknown)} {what} code(s) are not in the base vocabulary: {unknown[:10]}")
     pad = [c for c in codes if c2i[c] == 0]
     if pad:
         raise ValueError(f"{what} code(s) at vocab index 0 (PAD) are not allowed: {pad}")
-    return _apply_prefix_exclusions(codes, exclude_prefixes, what)
+    return _apply_prefix_exclusions(codes, exclude_prefixes, what, over_excluded)
 
 
-def _apply_prefix_exclusions(codes: list[str], exclude_prefixes: Sequence[str], what: str) -> list[str]:
-    """Drop every code whose name starts with one of ``exclude_prefixes``.
+def nodes_over_excluded_leaves(ontology_dir: str | Path, exclude_prefixes: Sequence[str]) -> set[str]:
+    """Ontology nodes that cover at least one leaf whose name matches ``exclude_prefixes``.
+
+    A name-prefix filter cannot reach these on its own: an ancestor's name is a *shorter* string than
+    the leaves under it, so ``TIMELINE`` never starts with ``TIMELINE//DELTA``.  Yet drawing
+    ``TIMELINE`` as a boundary means "the next occurrence of any ``TIMELINE//*`` event", delta tokens
+    included - exactly what the exclusion exists to prevent.  The closure is the only thing that
+    knows, so it decides.
+
+    Conservative on purpose: one excluded descendant removes the node.  A node that covers both
+    excluded and wanted leaves cannot express "any of these except those", so keeping it would
+    silently reintroduce the excluded events.
+    """
+    from every_query.data.ontology import load_event_to_query_nodes
+
+    prefixes = tuple(exclude_prefixes)
+    if not prefixes:
+        return set()
+    closure = load_event_to_query_nodes(ontology_dir)
+    matched = pl.col("event_code").str.starts_with(prefixes[0])
+    for p in prefixes[1:]:
+        matched = matched | pl.col("event_code").str.starts_with(p)
+    return set(closure.filter(matched)["query_node"].to_list())
+
+
+def _apply_prefix_exclusions(
+    codes: list[str],
+    exclude_prefixes: Sequence[str],
+    what: str,
+    also_exclude: Collection[str] = (),
+) -> list[str]:
+    """Drop every code whose name starts with one of ``exclude_prefixes``, plus ``also_exclude``.
+
+    ``also_exclude`` carries the ontology nodes :func:`nodes_over_excluded_leaves` found sitting above
+    an excluded leaf; without it a prefix exclusion would drop a subtree's leaves and leave a node
+    that draws them all back in.
 
     Examples:
         >>> _apply_prefix_exclusions(["A", "T//1", "T//2"], ("T//",), "boundary")
         ['A']
         >>> _apply_prefix_exclusions(["A", "B"], (), "boundary")
         ['A', 'B']
+        >>> _apply_prefix_exclusions(["A", "T"], ("T//",), "boundary", also_exclude={"T"})
+        ['A']
         >>> _apply_prefix_exclusions(["T//1"], ("T//",), "boundary")
         Traceback (most recent call last):
             ...
         ValueError: excluding prefixes ('T//',) empties the boundary pool
     """
-    if not exclude_prefixes:
+    if not exclude_prefixes and not also_exclude:
         return codes
     prefixes = tuple(exclude_prefixes)
-    kept = [c for c in codes if not c.startswith(prefixes)]
+    drop = set(also_exclude)
+    kept = [c for c in codes if c not in drop and not (prefixes and c.startswith(prefixes))]
     if not kept:
         raise ValueError(f"excluding prefixes {prefixes} empties the {what} pool")
     return kept
 
 
-def build_code_weights(source: object, codes: Sequence[str], column: str, power: float) -> tuple[float, ...]:
+def _ancestor_code_weights(
+    stat: dict[str, object], ontology_dir: str | Path, column: str
+) -> dict[str, float]:
+    """``node -> aggregated descendant statistic`` for every ontology node ``codes.parquet`` lacks.
+
+    How the descendants combine depends on what the statistic counts, and getting this wrong is not a
+    rounding error:
+
+    - a **count of occurrences** adds up.  An ancestor occurs whenever any descendant does, so its
+      occurrence count is the sum over the closure - the same table that decides its labels - up to
+      several descendants sharing a timestamp.
+    - a **count of subjects** does not.  A subject carrying two descendant codes would be counted
+      twice, so a wide subtree's "n_subjects" can exceed the cohort's subject count by the mean
+      number of distinct descendant codes per subject.  The maximum is used instead: a true lower
+      bound on "how many subjects have any descendant", and never absurd.  It under-weights a node
+      whose descendants reach disjoint subjects, which is the safe direction.
+
+    Only names absent from ``stat`` are added, so every leaf keeps the exact statistic
+    ``codes.parquet`` gives it and a weighted leaf-only pool draws identically with and without an
+    ontology.
+    """
+    from every_query.data.ontology import load_event_to_query_nodes
+
+    closure = load_event_to_query_nodes(ontology_dir)
+    leaf_stat = pl.DataFrame(
+        {
+            "event_code": list(stat.keys()),
+            "_stat": [0.0 if v is None else float(v) for v in stat.values()],
+        },
+        schema={"event_code": pl.Utf8, "_stat": pl.Float64},
+    )
+    combine = pl.col("_stat").max() if "subject" in column else pl.col("_stat").sum()
+    agg = closure.join(leaf_stat, on="event_code", how="inner").group_by("query_node").agg(combine)
+    return {
+        n: float(s)
+        for n, s in zip(agg["query_node"].to_list(), agg["_stat"].to_list(), strict=True)
+        if n not in stat
+    }
+
+
+def build_code_weights(
+    source: object,
+    codes: Sequence[str],
+    column: str,
+    power: float,
+    ontology_dir: str | Path | None = None,
+) -> tuple[float, ...]:
     """Sampling weights for ``codes``, proportional to ``codes.parquet[column] ** power``.
 
     The column is a per-code prevalence statistic of the *cohort* (``code/n_occurrences`` or
@@ -361,12 +658,20 @@ def build_code_weights(source: object, codes: Sequence[str], column: str, power:
     square-root damped, ``0.0`` uniform.  Codes with a null or zero statistic get the smallest
     positive weight in the pool rather than zero, so no pool member becomes undrawable.  Returns
     weights normalized to sum to 1, aligned to ``codes`` positionally.
+
+    An ancestor node has no row in ``codes.parquet``; given an ``ontology_dir`` it inherits an
+    aggregate of its descendants' statistic - the **sum** for an occurrence count, the **max** for a
+    subject count, where the max is a lower-bound proxy rather than the true union
+    (:func:`_ancestor_code_weights` explains why the two columns cannot combine the same way).  That
+    is what makes a weighted draw over an ancestor-bearing pool prefer the ancestors that recur.
     """
     if power < 0:
         raise ValueError(f"code_weight_power must be >= 0 (got {power})")
     fp = _codes_parquet_path(source)
     df = pl.read_parquet(fp, columns=["code", column])
-    stat = dict(zip(df["code"].to_list(), df[column].to_list(), strict=True))
+    stat: dict[str, object] = dict(zip(df["code"].to_list(), df[column].to_list(), strict=True))
+    if ontology_dir is not None:
+        stat.update(_ancestor_code_weights(stat, ontology_dir, column))
     missing = [c for c in codes if c not in stat]
     if missing:
         raise ValueError(f"{len(missing)} weighted code(s) are absent from {fp}: {missing[:10]}")
@@ -391,9 +696,13 @@ def resolve_boundary_pools(
     Returns ``(boundary_codes, boundary_weights, start_event_codes, start_event_weights)``; the
     weight tuples are empty when weighting is off.
     """
+    # Keyed on "is an ontology attached", NOT on "does this mode draw ancestors": an *explicit* pool
+    # may name ancestor nodes in any attached mode (that is what ``boundary_code_to_index`` is for),
+    # and such a pool needs both the closure-aware exclusion and the ancestor statistics.
+    onto = None if vocab.ontology_mode == ONTOLOGY_MODE_NONE else cfg.get("ontology_dir")
     exclude = read_exclude_prefixes(cfg.get("exclude_boundary_prefixes"))
-    boundary_codes = read_boundary_codes(cfg.get("boundary_codes"), vocab, exclude)
-    start_event_codes = read_start_event_codes(cfg.get("start_event_codes"), vocab, exclude)
+    boundary_codes = read_boundary_codes(cfg.get("boundary_codes"), vocab, exclude, onto)
+    start_event_codes = read_start_event_codes(cfg.get("start_event_codes"), vocab, exclude, onto)
 
     weighting = cfg.get("code_weighting")
     if weighting is None or str(weighting).lower() in ("", "null", "none", "uniform"):
@@ -405,9 +714,9 @@ def resolve_boundary_pools(
     source = cfg.get("query_codes")
     return (
         boundary_codes,
-        build_code_weights(source, boundary_codes, column, power),
+        build_code_weights(source, boundary_codes, column, power, onto),
         start_event_codes,
-        build_code_weights(source, start_event_codes, column, power),
+        build_code_weights(source, start_event_codes, column, power, onto),
     )
 
 
@@ -852,7 +1161,7 @@ def config_fingerprint(dist: BoundaryDistribution, vocab: TargetVocabulary) -> s
             "start_event_codes": _sha256_json(list(dist.start_event_codes)),
             "start_event_weights": _sha256_json([round(w, 12) for w in dist.start_event_weights]),
             "condition_codes": _sha256_json(list(dist.condition_codes)),
-            "condition_policy": CONDITION_POLICY,
+            "condition_policy": condition_policy(vocab.ontology_mode),
             "vocab_fingerprint": vocab.fingerprint,
             "vocab_size": vocab.size,
             "window": WINDOW_SEMANTICS,
@@ -863,7 +1172,17 @@ def config_fingerprint(dist: BoundaryDistribution, vocab: TargetVocabulary) -> s
             "missing_event_boundary": MISSING_EVENT_BOUNDARY,
             "missing_event_end": MISSING_EVENT_BOUNDARY,
             "datetime_unit": DATETIME_UNIT,
-            "ontology_mode": ONTOLOGY_MODE_NONE,
+            "ontology_mode": vocab.ontology_mode,
+            # Ontology keys enter the digest only when there IS one, so a leaf-only run fingerprints
+            # exactly as it did before this feature and its existing labels stay reusable.
+            **(
+                {}
+                if vocab.ontology_mode == ONTOLOGY_MODE_NONE
+                else {
+                    "ontology_fingerprint": vocab.ontology_fingerprint,
+                    "boundary_vocab_size": vocab.boundary_size,
+                }
+            ),
         }
     )
 
@@ -885,8 +1204,13 @@ def build_manifest(dist: BoundaryDistribution, vocab: TargetVocabulary) -> dict:
         "datetime_unit": DATETIME_UNIT,
         "event_bound_duration_sentinel": EVENT_BOUND_DURATION_SENTINEL,
         "vocab_fingerprint": vocab.fingerprint,
-        "ontology_mode": ONTOLOGY_MODE_NONE,
-        "condition_policy": CONDITION_POLICY,
+        # Leaf-only bits in every mode: vocab_size / packed_width_bytes / vocab_fingerprint above are
+        # ontology-invariant.  These three describe the *event* vocabulary the windows were drawn and
+        # resolved against, which is what a reader needs to accept an ancestor start / bound code.
+        "ontology_mode": vocab.ontology_mode,
+        "ontology_fingerprint": vocab.ontology_fingerprint,
+        "boundary_vocab_size": vocab.boundary_size,
+        "condition_policy": condition_policy(vocab.ontology_mode),
         "num_condition_codes": dist.num_bounds - 1,
         "n_boundary_codes": len(dist.boundary_codes),
         "n_start_event_codes": len(dist.start_event_codes),
@@ -928,12 +1252,36 @@ def validate_manifest(manifest: dict) -> dict:
         raise ValueError(f"unsupported manifest format_version {manifest['format_version']!r}")
     if manifest["bitorder"] != BITORDER:
         raise ValueError(f"manifest bitorder must be {BITORDER!r}, got {manifest['bitorder']!r}")
-    if manifest["ontology_mode"] != ONTOLOGY_MODE_NONE:
-        raise ValueError(
-            f"manifest ontology_mode must be {ONTOLOGY_MODE_NONE!r}, got {manifest['ontology_mode']!r}"
-        )
+    mode = manifest["ontology_mode"]
+    if mode not in ONTOLOGY_MODES:
+        raise ValueError(f"manifest ontology_mode must be one of {ONTOLOGY_MODES}, got {mode!r}")
     if manifest["packed_width_bytes"] != (int(manifest["vocab_size"]) + 7) // 8:
         raise ValueError("manifest packed_width_bytes disagrees with vocab_size")
+    # Pre-ontology manifests carry neither key; a mode that uses ancestors must carry both, and the
+    # extended width can only ever be at or above the leaf width (the bits never move).
+    boundary_size = int(manifest.get("boundary_vocab_size") or manifest["vocab_size"])
+    if boundary_size < int(manifest["vocab_size"]):
+        raise ValueError(
+            f"manifest boundary_vocab_size {boundary_size} is narrower than vocab_size "
+            f"{manifest['vocab_size']}"
+        )
+    if mode == ONTOLOGY_MODE_NONE:
+        if boundary_size != int(manifest["vocab_size"]):
+            raise ValueError(
+                f"manifest ontology_mode is {ONTOLOGY_MODE_NONE!r} but boundary_vocab_size "
+                f"{boundary_size} exceeds vocab_size {manifest['vocab_size']}"
+            )
+        if manifest.get("ontology_fingerprint") is not None:
+            raise ValueError(
+                f"manifest ontology_mode is {ONTOLOGY_MODE_NONE!r} but it records an ontology_fingerprint"
+            )
+    else:
+        # Both keys, so the writer and ``every_query.data.multitask_dataset.read_manifest`` agree on
+        # what an ancestor-bearing manifest must carry: the width bounds the ids, the digest says
+        # which closure gives them meaning.
+        absent = [k for k in ("ontology_fingerprint", "boundary_vocab_size") if not manifest.get(k)]
+        if absent:
+            raise ValueError(f"manifest ontology_mode is {mode!r} but it records no {' or '.join(absent)}")
     if int(manifest["num_bounds"]) < 1:
         raise ValueError("manifest num_bounds must be >= 1")
     return manifest
@@ -962,10 +1310,24 @@ def read_manifest(split_dir: Path) -> dict:
 def prepare_events_for_labeling(events_df: pl.DataFrame, ontology_dir: object = None) -> pl.DataFrame:
     """Extension seam 2: the event stream the interval table is built from.
 
-    MVP: the original stream, unexpanded (no closure expansion).  A non-null ``ontology_dir`` raises.
+    Without an ontology, the original stream, unexpanded.  With one,
+    :func:`~every_query.data.ontology.expand_events_to_query_nodes` repeats each event under every
+    node of its closure - the scalar QuerySeq sampler's own explosion, so an ancestor node becomes an
+    ordinary code with ordinary intervals and "the next occurrence of any ``LAB//X//*``" is just a
+    boundary lookup.
+
+    The closure keeps each leaf paired with *itself*, so the ``code_index < V`` rows of the expanded
+    stream are exactly the unexpanded stream: the leaf interval table built from them - the only one
+    that ever labels a bit - is unchanged.  Given the same resolved windows, labeling therefore
+    writes byte-identical bits.  That is a statement about *this* seam only: a boundaries mode still
+    changes which windows get drawn, and so what the bits contain.  What the expansion cannot touch
+    is the target vocabulary, the packed width, or what any one bit means.
     """
-    reject_ontology(ontology_dir)
-    return events_df
+    if ontology_dir is None:
+        return events_df
+    from every_query.data.ontology import expand_events_to_query_nodes, load_event_to_query_nodes
+
+    return expand_events_to_query_nodes(events_df, load_event_to_query_nodes(ontology_dir))
 
 
 def resolve_event_boundaries(
@@ -980,11 +1342,15 @@ def resolve_event_boundaries(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Extension seam 3: the ``(N, K)`` ``(start_times, end_times)`` matrices, start resolved first.
 
-    MVP: leaf-code event starts / bounds via
+    Leaf-code event starts / bounds via
     :func:`~every_query.generate_tasks.interval_table.resolve_start_times` and
-    :func:`~every_query.generate_tasks.interval_table.resolve_end_times`.
+    :func:`~every_query.generate_tasks.interval_table.resolve_end_times`.  Ancestor-valued starts and
+    bounds need no code here at all: ``table`` is built over the closure-expanded stream (seam 2), so
+    an ancestor id in ``[V, V_ext)`` is an ordinary code with ordinary intervals and "the first
+    occurrence after ``t``" resolves through the same searchsorted.  ``ontology_dir`` is accepted for
+    signature compatibility and is unused.
     """
-    reject_ontology(ontology_dir)
+    del ontology_dir  # the expansion happened in seam 2; resolution is code-agnostic
     start_times = resolve_start_times(table, subject_ids, prediction_times, start_durations, start_code_index)
     end_times = resolve_end_times(table, subject_ids, start_times, durations, bound_code_index)
     return start_times, end_times
@@ -1033,14 +1399,68 @@ def validate_index(index_df: pl.DataFrame, num_bounds: int) -> None:
     _check_slot_pair(index_df, START_DURATIONS_COL, START_EVENTS_COL, "start")
 
 
+def _all_codes_unknown_msg(n_unknown: int) -> str:
+    """A shard where *nothing* matched is not a sparse shard, it is the wrong input.
+
+    String codes that are not in ``codes.parquet`` - most likely the string-coded
+    ``tokenized_events`` instead of the vocab-indexed intermediate ``data_dir``.  Every label would
+    silently be false.
+    """
+    return (
+        f"all {n_unknown} timed event(s) of this shard carry codes outside the target vocabulary; "
+        "no label could ever be true. Check that data_dir is the preprocessing *intermediate* "
+        "dir (vocab-indexed codes, matching query_codes/codes.parquet) rather than the "
+        "string-coded tokenized_events."
+    )
+
+
+def restrict_to_labelable_events(
+    events_df: pl.DataFrame, vocab: TargetVocabulary
+) -> tuple[pl.DataFrame, int]:
+    """Drop what the cohort vocabulary cannot label, *before* the closure expansion.
+
+    On the leaf-only path this filtering happens after encoding and nothing else can go wrong.  Under
+    an ontology the expansion runs first, and two kinds of event would otherwise mint ancestor rows
+    that no leaf bit backs:
+
+    - **a code absent from ``codes.parquet``.**
+      :func:`~every_query.data.ontology.expand_events_to_query_nodes` passes an unknown code through
+      unexploded, and if that string happens to *be* an ontology node's name the extended map then
+      resolves it to that node - a phantom occurrence of an ancestor none of whose descendants
+      occurred.  Its window would close, and its conditioning answer would be true while every
+      descendant leaf bit is false: exactly the disagreement ``derive_ancestor_targets`` reports,
+      which is what the dataset's ``collate`` check raises on.
+    - **a code at vocabulary index 0.**  Its own bit is false by construction, so the ancestors above
+      it must not be true either.
+
+    Returns the filtered frame and the number of *timed* rows dropped as unknown, which the caller
+    folds into the same statistic :func:`_encode_events` reports on the leaf-only path.
+    """
+    c2i = vocab.code_to_index()
+    code = pl.col(DataSchema.code_name).cast(pl.Utf8)
+    timed = pl.col(DataSchema.time_name).is_not_null()
+    n_unknown = int(events_df.filter(timed & ~code.is_in(list(c2i.keys()))).height)
+    kept = events_df.filter(code.is_in([c for c, i in c2i.items() if i > 0]))
+    if kept.filter(timed).height == 0 and n_unknown > 0:
+        raise ValueError(_all_codes_unknown_msg(n_unknown))
+    return kept, n_unknown
+
+
 def _encode_events(
     events_df: pl.DataFrame, vocab: TargetVocabulary
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     """``(subject_id, time_us, code_index)`` of the non-null-time, in-vocabulary events + drop count.
 
     Index 0 (PAD) is excluded before the table is built, so target bit 0 is false by construction.
+    Under an ontology the stream is closure-expanded (seam 2) and the ancestor node names resolve
+    through :meth:`TargetVocabulary.boundary_code_to_index`, so the returned indices span
+    ``[1, V_ext)``; the caller splits them at ``V`` into the leaf table that labels and the extended
+    table that only resolves boundaries.
     """
-    codes_df = pl.DataFrame({"code": list(vocab.codes), "_code_index": vocab.indices})
+    ext = vocab.boundary_code_to_index()
+    codes_df = pl.DataFrame(
+        {"code": list(ext.keys()), "_code_index": np.fromiter(ext.values(), dtype=np.int64, count=len(ext))}
+    )
     ev = (
         events_df.select(SID, DataSchema.time_name, DataSchema.code_name)
         .filter(pl.col(DataSchema.time_name).is_not_null())
@@ -1050,15 +1470,7 @@ def _encode_events(
     n_unknown = int(ev["_code_index"].null_count())
     ev = ev.filter(pl.col("_code_index") > 0)  # drops unknown (null) and PAD (0)
     if ev.height == 0 and n_unknown > 0:
-        # A shard where *nothing* matched is not a sparse shard, it is the wrong input: string codes
-        # that are not in codes.parquet, most likely the string-coded ``tokenized_events`` instead
-        # of the vocab-indexed intermediate ``data_dir``.  Every label would silently be false.
-        raise ValueError(
-            f"all {n_unknown} timed event(s) of this shard carry codes outside the target vocabulary; "
-            "no label could ever be true. Check that data_dir is the preprocessing *intermediate* "
-            "dir (vocab-indexed codes, matching query_codes/codes.parquet) rather than the "
-            "string-coded tokenized_events."
-        )
+        raise ValueError(_all_codes_unknown_msg(n_unknown))
     sid = ev[SID].to_numpy().astype(np.int64)
     t = ev[DataSchema.time_name].cast(pl.Datetime("us")).cast(pl.Int64).to_numpy().astype(np.int64)
     ci = ev["_code_index"].to_numpy().astype(np.int64)
@@ -1066,8 +1478,13 @@ def _encode_events(
 
 
 def _map_codes(codes: pl.Series, vocab: TargetVocabulary, what: str) -> np.ndarray:
-    """Flat code series -> ``int64`` vocab indices (``-1`` for nulls); unknown / PAD codes are hard errors."""
-    c2i = vocab.code_to_index()
+    """Flat code series -> ``int64`` vocab indices (``-1`` for nulls); unknown / PAD codes are hard errors.
+
+    Resolved through :meth:`TargetVocabulary.boundary_code_to_index`, which is the base map when no
+    ontology is attached and the base map plus the ancestor nodes when one is: a *supplied* index may
+    name an ancestor in any mode, and it must encode even in a mode that would never draw one.
+    """
+    c2i = vocab.boundary_code_to_index()
     distinct = codes.drop_nulls().unique().to_list()
     unknown = sorted(c for c in distinct if c not in c2i)
     if unknown:
@@ -1118,6 +1535,11 @@ class LabelStats:
     n_events: int = 0
     n_unknown_code_events: int = 0
     n_intervals: int = 0
+    # Ontology-only (zero without one): the closure-expanded event count and the extended interval
+    # table's size, the two numbers that say what the ancestor boundaries cost in RAM this shard.
+    n_query_node_events: int = 0
+    n_event_table_intervals: int = 0
+    n_ancestor_condition_slots: int = 0
     n_contexts: int = 0
     vocab_size: int = 0
     packed_width: int = 0
@@ -1216,7 +1638,12 @@ def label_multitask_index(
         >>> np.unpackbits(packed, axis=-1, count=vocab.size, bitorder="little").tolist()
         [[[0, 0, 1, 0], [0, 0, 1, 0]]]
     """
-    reject_ontology(ontology_dir)
+    if (ontology_dir is None) != (vocab.ontology_mode == ONTOLOGY_MODE_NONE):
+        raise ValueError(
+            f"ontology_dir={ontology_dir!r} disagrees with the vocabulary's ontology_mode="
+            f"{vocab.ontology_mode!r}; build the vocabulary with build_target_vocabulary(..., "
+            "ontology_dir) and pass the same directory here."
+        )
     validate_index(index_df, num_bounds)
     stats = LabelStats(vocab_size=vocab.size, packed_width=vocab.packed_width, num_bounds=num_bounds)
 
@@ -1225,11 +1652,35 @@ def label_multitask_index(
     stats.n_contexts = n
 
     t0 = time.perf_counter()
+    n_unlabelable = 0
+    if ontology_dir is not None:
+        events_df, n_unlabelable = restrict_to_labelable_events(events_df, vocab)
     events_df = prepare_events_for_labeling(events_df, ontology_dir)
     ev_sid, ev_t, ev_ci, n_unknown = _encode_events(events_df, vocab)
-    stats.n_events = int(ev_sid.size)
-    stats.n_unknown_code_events = n_unknown
-    table = build_interval_table(ev_sid, ev_t, ev_ci, vocab_size=vocab.size)
+    stats.n_unknown_code_events = n_unknown + n_unlabelable
+    # Two tables under an ontology, one without.  ``table`` is leaf-only and is the ONLY one that ever
+    # labels a bit, so the packed output cannot depend on the expansion; ``event_table`` spans
+    # [0, V_ext) and exists purely so an ancestor id resolves as a start / bound / conditioning event.
+    #
+    # Two tables rather than one masked table: the labeling kernel has no notion of a code ceiling -
+    # ``dense[rows, :, codes] = ...`` would IndexError on the first ancestor interval that contains a
+    # lookup time - so a single V_ext table would need a change inside ``interval_table.py``, whose
+    # other caller builds its own code universe.  The cost is the leaf table's extra rows (~32 B
+    # each) beside the expanded ones; the labeling scratch and the packed output are leaf-wide either
+    # way.  What the split buys is that byte-identity is *structural*: the closure pairs every leaf
+    # with itself, so the ``code_index < V`` rows are exactly the unexpanded stream.
+    if vocab.boundary_size == vocab.size:
+        table = event_table = build_interval_table(ev_sid, ev_t, ev_ci, vocab_size=vocab.size)
+        stats.n_events = int(ev_sid.size)
+    else:
+        leaf = ev_ci < vocab.size
+        table = build_interval_table(ev_sid[leaf], ev_t[leaf], ev_ci[leaf], vocab_size=vocab.size)
+        event_table = build_interval_table(ev_sid, ev_t, ev_ci, vocab_size=vocab.boundary_size)
+        stats.n_events = int(leaf.sum())
+        stats.n_query_node_events = int(ev_sid.size)
+        stats.n_event_table_intervals = event_table.n_rows
+        del leaf
+    del ev_sid, ev_t, ev_ci
     stats.n_intervals = table.n_rows
     stats.build_seconds = time.perf_counter() - t0
 
@@ -1241,7 +1692,7 @@ def label_multitask_index(
 
     t1 = time.perf_counter()
     start_times, end_times = resolve_event_boundaries(
-        table,
+        event_table,
         subject_ids,
         prediction_times,
         start_durations,
@@ -1263,6 +1714,29 @@ def label_multitask_index(
     if window_times_out is not None:
         window_times_out["start_times"] = start_times.copy()
         window_times_out["end_times"] = end_times.copy()
+
+    # Conditioning answers for ANCESTOR codes (PR D).  A leaf answer is read straight off the packed
+    # row in the chunk loop below, but an ancestor has no packed column, so its answer is resolved
+    # here from the expanded table while the window matrices are still alive: the bit is "some
+    # occurrence of the node falls strictly inside (start, end)", i.e. the first occurrence strictly
+    # after the start is strictly before the end.  On the expanded stream that is the same OR over
+    # descendant leaves the model's ``derive_ancestor_targets`` computes - one searchsorted per slot
+    # instead of a V_ext-wide dense chunk.
+    kc = num_bounds - 1
+    ancestor_answers: np.ndarray | None = None
+    is_ancestor_condition = condition_index >= vocab.size
+    if kc and is_ancestor_condition.any():
+        stats.n_ancestor_condition_slots = int(is_ancestor_condition.sum())
+        rows = np.nonzero(is_ancestor_condition)[0]
+        first = next_occurrence_after(
+            event_table,
+            subject_ids[rows],
+            start_times[:, :kc][is_ancestor_condition],
+            condition_index[is_ancestor_condition],
+        )
+        ancestor_answers = np.zeros((n, kc), dtype=bool)
+        ancestor_answers[is_ancestor_condition] = first < end_times[:, :kc][is_ancestor_condition]
+        del rows, first
     del start_durations, start_code_index, durations, bound_code_index, resolved, is_event, is_event_start
 
     shape = (n, num_bounds, vocab.packed_width)
@@ -1275,7 +1749,6 @@ def label_multitask_index(
     # by (subject_id, resolved_start); the stable lexsort keeps (ctx_row, k) order among ties.  Only
     # the sorted copies survive: int32 context row + int32 window position per flattened row (a uint8
     # position would silently wrap at num_bounds >= 256 and scatter a window's bits onto another slot).
-    kc = num_bounds - 1
     subj_flat = np.repeat(subject_ids, num_bounds)
     order = np.lexsort((start_times.ravel(), subj_flat))
     ctx_sorted = (order // num_bounds).astype(np.int32)
@@ -1300,11 +1773,19 @@ def label_multitask_index(
         empty_windows += int((counts == 0).sum())
         # answers[i, j] = targets[i, j, condition_index[i, j]] for j < K-1, read straight off the packed
         # bytes PER flattened row: after the start-sort a context's K windows may straddle chunks.
+        # Ancestor slots have no packed column (their byte offset would run past packed_width); they
+        # were resolved from the expanded table above and are written in after the loop.
         sel = np.flatnonzero(ks < kc)
         if sel.size:
             r, j = rows[sel], ks[sel]
+            if ancestor_answers is not None:
+                keep = ~is_ancestor_condition[r, j]
+                sel, r, j = sel[keep], r[keep], j[keep]
+        if sel.size:
             ci = condition_index[r, j]
             answers[r, j] = (packed[sel, ci >> 3] >> (ci & 7)) & 1
+    if ancestor_answers is not None:
+        answers[is_ancestor_condition] = ancestor_answers[is_ancestor_condition]
     stats.label_seconds = time.perf_counter() - t2
     stats.contexts_per_second = n / stats.label_seconds if stats.label_seconds > 0 else float("inf")
     n_windows = n * num_bounds
@@ -1359,15 +1840,18 @@ def output_is_reusable(
         recorded = json.loads(sidecar_fp.read_text())
     except (OSError, json.JSONDecodeError):
         return False
-    if manifest.get("ontology_mode") != ONTOLOGY_MODE_NONE:
-        return False
     if recorded.get("index_fingerprint") != index_fingerprint:
         return False
     if recorded.get("vocab_fingerprint") != manifest["vocab_fingerprint"]:
         return False
     if recorded.get("config_fingerprint") != manifest["config_fingerprint"]:
         return False
-    if recorded.get("ontology_mode") != ONTOLOGY_MODE_NONE:
+    # The mode and the closure both decide what the windows were, so both gate reuse.  ``config_
+    # fingerprint`` already covers them for a run whose manifest was written by this code, but a
+    # sidecar left by an earlier run carries neither key and must not be mistaken for a match.
+    if recorded.get("ontology_mode") != manifest["ontology_mode"]:
+        return False
+    if recorded.get("ontology_fingerprint") != manifest.get("ontology_fingerprint"):
         return False
     shape = _packed_shape(final_labels)
     if shape is None:
@@ -1407,11 +1891,17 @@ def label_one_multitask_shard(
     manifest: dict,
     overwrite: bool = False,
     chunk_rows: int = 2000,
+    ontology_dir: str | None = None,
 ) -> tuple[str, str, dict]:
     """Stage 4M worker: label one index partition; write ``{shard}.labels.npy`` + ``{shard}.parquet``.
 
     Module-level so it pickles under ``spawn``.  Reads the manifest the driver already wrote (it never
     writes one).  Returns ``(shard, status, stats)`` with status ``"skipped"`` or ``"labeled"``.
+
+    ``ontology_dir`` must agree with the manifest's ``ontology_mode``: the worker rebuilds the
+    vocabulary from ``codes_source`` and re-attaches the ontology itself (nothing ontology-shaped
+    crosses the process boundary), then checks the closure it loaded against the fingerprint the
+    driver recorded, so a worker pointed at a different ontology fails instead of mislabeling.
     """
     validate_manifest(manifest)
     num_bounds = int(manifest["num_bounds"])
@@ -1428,12 +1918,29 @@ def label_one_multitask_shard(
         return shard, "skipped", {}
 
     _clean_stale_multitask_temps(out_dir, shard)
-    vocab = build_target_vocabulary(codes_source)
+    mode = str(manifest["ontology_mode"])
+    if (ontology_dir is None) != (mode == ONTOLOGY_MODE_NONE):
+        raise ValueError(
+            f"shard {shard}: ontology_dir={ontology_dir!r} disagrees with the manifest's "
+            f"ontology_mode={mode!r}"
+        )
+    vocab = build_target_vocabulary(codes_source, ontology_dir, None if ontology_dir is None else mode)
     if vocab.fingerprint != manifest["vocab_fingerprint"] or vocab.size != int(manifest["vocab_size"]):
         raise ValueError(
             f"shard {shard}: the vocabulary at {codes_source} (size {vocab.size}, {vocab.fingerprint[:12]}) "
             f"does not match the manifest (size {manifest['vocab_size']}, "
             f"{manifest['vocab_fingerprint'][:12]})"
+        )
+    if vocab.ontology_fingerprint != manifest.get("ontology_fingerprint"):
+        raise ValueError(
+            f"shard {shard}: the ontology at {ontology_dir} has closure "
+            f"{(vocab.ontology_fingerprint or '-')[:12]} but the manifest was written against "
+            f"{(manifest.get('ontology_fingerprint') or '-')[:12]}"
+        )
+    if vocab.boundary_size != int(manifest.get("boundary_vocab_size") or manifest["vocab_size"]):
+        raise ValueError(
+            f"shard {shard}: the ontology at {ontology_dir} is {vocab.boundary_size} wide but the "
+            f"manifest records boundary_vocab_size {manifest.get('boundary_vocab_size')}"
         )
 
     events_df = _read_event_shard(data_dir / f"{shard}.parquet")
@@ -1455,7 +1962,13 @@ def label_one_multitask_shard(
             mm = np.lib.format.open_memmap(labels_tmp, mode="w+", dtype=np.uint8, shape=shape)
             try:
                 metadata, _, stats = label_multitask_index(
-                    index_df, events_df, vocab, num_bounds, chunk_rows=chunk_rows, out=mm
+                    index_df,
+                    events_df,
+                    vocab,
+                    num_bounds,
+                    chunk_rows=chunk_rows,
+                    out=mm,
+                    ontology_dir=ontology_dir,
                 )
                 mm.flush()
             finally:
@@ -1470,7 +1983,8 @@ def label_one_multitask_shard(
             "index_fingerprint": current_fingerprint,
             "vocab_fingerprint": vocab.fingerprint,
             "config_fingerprint": manifest["config_fingerprint"],
-            "ontology_mode": ONTOLOGY_MODE_NONE,
+            "ontology_mode": vocab.ontology_mode,
+            "ontology_fingerprint": vocab.ontology_fingerprint,
             "n_rows": index_df.height,
             "stats": stats.as_dict(),
         },
@@ -1536,6 +2050,7 @@ def _label_multitask_shards(
     overwrite: bool,
     n_workers: int,
     chunk_rows: int,
+    ontology_dir: str | None = None,
 ) -> dict[str, str]:
     """Fan one worker per shard through a ``spawn`` pool (fork would inherit polars' locked threads)."""
     mp_context = multiprocessing.get_context("spawn")
@@ -1553,6 +2068,7 @@ def _label_multitask_shards(
                 manifest,
                 overwrite,
                 chunk_rows,
+                ontology_dir,
             ): s
             for s in shards
         }
@@ -1601,6 +2117,9 @@ def label_multitask_shards(
 
     n_workers = resolve_workers(cfg.get("max_workers"))
     chunk_rows = int(cfg.get("label_chunk_rows", 2000))
+    # Taken from the manifest, not the config: the manifest is what the workers validate against, and
+    # a resumed run must label with the ontology its existing sidecars were written under.
+    ontology_dir = None if manifest["ontology_mode"] == ONTOLOGY_MODE_NONE else str(cfg.ontology_dir)
     logger.info(
         "Stage 4M: labeling %s shard(s) across %s worker(s), chunk_rows=%s (scratch ~%.0f MiB/worker).",
         f"{len(shards):,}",
@@ -1619,6 +2138,7 @@ def label_multitask_shards(
         bool(cfg.overwrite),
         n_workers,
         chunk_rows,
+        ontology_dir,
     )
     n_skipped = sum(s == "skipped" for s in statuses.values())
     written = _validate_context_count(out_dir, total_contexts, manifest)
@@ -1640,21 +2160,22 @@ def label_multitask_shards(
 
 def run(cfg: DictConfig) -> None:
     """Execute Stages 0-4M for a fully-resolved config (no Hydra side effects)."""
-    # Leaf-only MVP: fail before any Stage 0 work.
-    reject_ontology(cfg.get("ontology_dir"))
+    # Fail on a malformed ontology_mode / a mode without an ontology before any Stage 0 work.
+    ontology_mode = resolve_ontology_mode(cfg.get("ontology_dir"), cfg.get("ontology_mode"))
+    ontology_dir = None if ontology_mode == ONTOLOGY_MODE_NONE else str(cfg.get("ontology_dir"))
 
     path_to_data = _require_path_arg(cfg.get("data_dir"), "data_dir")
     out_root = _require_path_arg(cfg.get("out_dir"), "out_dir")
     artifacts_dir = default_artifacts_dir(out_root)
 
-    vocab = build_target_vocabulary(cfg.get("query_codes"))
+    vocab = build_target_vocabulary(cfg.get("query_codes"), ontology_dir, ontology_mode)
     boundary_codes, boundary_weights, start_event_codes, start_event_weights = resolve_boundary_pools(
         cfg, vocab
     )
     dist = BoundaryDistribution.from_config(
         cfg,
         boundary_codes,
-        vocab.boundary_candidates(),
+        vocab.condition_candidates(),
         start_event_codes,
         boundary_weights,
         start_event_weights,

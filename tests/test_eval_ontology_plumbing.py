@@ -50,6 +50,7 @@ from every_query.data.ontology import (
     build_ontology,
 )
 from every_query.generate_tasks import sample_evaluation_query_sequences as eval_seq
+from every_query.generate_tasks import sample_multitask_sequences as sms
 from every_query.generate_tasks import sample_query_sequences as train_seq
 from every_query.generate_tasks.sample_tasks import LABELED_DIRNAME
 
@@ -493,7 +494,9 @@ def test_eval_and_training_paths_agree_on_the_same_ancestor_query(
         k: v for k, v in _answers_by_context_and_query(train_df).items() if k[2] == ANCESTOR_ONLY_NODE
     }
     key = (1, datetime(2020, 6, 6), ANCESTOR_ONLY_NODE)
-    assert key in train_answers, "the one context whose answer is True was not sampled; raise num_training_sequence_examples"
+    assert key in train_answers, (
+        "the one context whose answer is True was not sampled; raise num_training_sequence_examples"
+    )
 
     # Take the horizon the training path actually emitted (post float32 round-trip) so the eval
     # spec cannot differ from it by an epsilon at the window boundary.
@@ -980,14 +983,37 @@ def test_eval_ontology_config_keys_match_training_and_are_actually_consumed(
     *typo'd* key (asserted below), so the failure mode was never an unknown key being swallowed —
     it was a **known, documented** key that no line of code read.  Only watching the values arrive
     at ``build_query_universe`` and ``run_worker`` tells those two apart.
+
+    The multitask sampler ships the same pair of knobs (``ontology_dir`` plus its own
+    ``ontology_mode``) out of the same configs directory, and is exposed to exactly the same defect:
+    a documented default that nothing reads leaves an ontology run silently leaf-only.  So its two
+    defaults are pinned here too, against the functions that consume them — the event-side closure
+    expansion and the mode resolution — rather than against a shape.
     """
     configs = Path(eval_seq.CONFIGS)
     eval_cfg = yaml.safe_load((configs / "sample_evaluation_query_sequences_config.yaml").read_text())
     train_cfg = yaml.safe_load((configs / "sample_query_sequences_config.yaml").read_text())
+    multitask_cfg = yaml.safe_load((configs / "sample_multitask_sequences_config.yaml").read_text())
 
     assert eval_cfg["ontology_dir"] == train_cfg["ontology_dir"], "ontology_dir default differs"
     assert eval_cfg["ontology_dir"] is None
     assert inspect.signature(eval_seq.run_worker).parameters["ontology_dir"].default is None
+
+    # The multitask sampler: off by default on both keys, and both keys read by the code.
+    assert multitask_cfg["ontology_dir"] is None, "the multitask sampler's ontology_dir default drifted"
+    assert multitask_cfg["ontology_mode"] is None, (
+        "ontology_mode must default to null — the mode is derived from whether an ontology_dir was "
+        "given, so a hardcoded default would silently override half of the pair"
+    )
+    assert inspect.signature(sms.prepare_events_for_labeling).parameters["ontology_dir"].default is None
+    assert callable(getattr(sms, "resolve_ontology_mode", None)), (
+        "sample_multitask_sequences must resolve the (ontology_dir, ontology_mode) pair itself; "
+        "without it the config's ontology_mode reaches no code at all"
+    )
+    assert sms.resolve_ontology_mode(None, None) == "none", "the shipped defaults must mean no ontology"
+    assert sms.resolve_ontology_mode(str(ontology_dir), None) == "boundaries+conditions", (
+        "a configured ontology_dir with the default null mode must turn both ancestor halves on"
+    )
 
     # A typo'd key is already an error in this repo's plain-YAML Hydra setup — there is no schema
     # to add, and appending one with `+` is the documented escape hatch.

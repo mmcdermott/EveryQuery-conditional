@@ -87,16 +87,18 @@ class ConditionalMultitaskDataModule(ResumableDatamodule):
         persistent_workers: As in the upstream ``Datamodule``.
         prefetch_factor: As in the upstream ``Datamodule``.
         dataset_kwargs: Forwarded to the two training datasets, as in
-            :class:`~every_query.data.datamodule.ResumableDatamodule`, except for ``ontology_dir``
-            (below), which is taken out first.  Of its keys only ``strip_delta_tokens`` and
-            ``expected_vocab_size`` reach the evaluation adapter (the rest - manifest checks - have
-            no meaning for a grid).  ``expected_vocab_size`` is the **cohort's** width ``V``: the
-            training sidecars are leaf-only whether or not an ontology is in use.  Its
-            ``ontology_dir`` key is the checkpoint's ``model.ontology_dir`` (interpolated from it in
-            the shipped configs); the training datasets never see it - their manifest and packed
-            labels are leaf-only, and the model widens targets to ``V_ext`` itself - so it reaches
-            only the evaluation adapter, where it makes ancestor query / start / bound names
-            resolvable and raises the adapter's width check from ``V`` to the ontology's ``V_ext``.
+            :class:`~every_query.data.datamodule.ResumableDatamodule`.  Of its keys only
+            ``strip_delta_tokens`` and ``expected_vocab_size`` reach the evaluation adapter (the
+            rest - manifest checks - have no meaning for a grid).  ``expected_vocab_size`` is the
+            **cohort's** width ``V``: the training sidecars are leaf-only whether or not an ontology
+            is in use, because the model widens targets to ``V_ext`` itself.  Its ``ontology_dir``
+            key is the checkpoint's ``model.ontology_dir`` (interpolated from it in the shipped
+            configs); it is lifted into :attr:`ontology_dir` for the evaluation adapter - where it
+            makes ancestor query / start / bound names resolvable and raises the adapter's width
+            check from ``V`` to the ontology's ``V_ext`` - **and** forwarded to the training
+            datasets, which need it when the sampler drew ancestor-valued start / bound /
+            conditioning codes (``ontology_mode`` other than ``"none"`` in their manifest).  Against
+            a leaf-only labels directory the training datasets simply do not use it.
         eval_tasks_dir: Optional QuerySeq evaluation-grid ``eval/`` root
             (``EQ_generate_evaluation_query_sequences``).  Only ``trainer.test`` / ``trainer.predict``
             / ``EQ_predict_multitask`` need it; ``None`` is fine for ``fit``.
@@ -111,7 +113,7 @@ class ConditionalMultitaskDataModule(ResumableDatamodule):
         test_dataset / predict_dataset: ``QuerySeqMultitaskEvalDataset`` over :attr:`eval_config`.
         eval_config: ``config`` with only ``task_labels_dir`` replaced by ``eval_tasks_dir``.
         ontology_dir: The ontology the evaluation adapter resolves names through; ``None`` without one.
-        dataset_kwargs: The training datasets' keyword arguments (``ontology_dir`` removed).
+        dataset_kwargs: The training datasets' keyword arguments (``ontology_dir`` included).
 
     Examples:
         Everything about the grid is lazy, so a datamodule without one is fully usable for ``fit``
@@ -162,16 +164,19 @@ class ConditionalMultitaskDataModule(ResumableDatamodule):
             ...
         ValueError: predict_split must be one of ['held_out', 'tuning'], got 'train'; ...
 
-        ``ontology_dir`` is lifted out of ``dataset_kwargs``: the training datasets keep the leaf
-        width, the ontology is remembered for the evaluation adapter and recorded in the
-        hyperparameters beside the rest:
+        ``ontology_dir`` is remembered separately for the evaluation adapter and recorded in the
+        hyperparameters, and still reaches the training datasets, which need it to read a labels
+        directory whose start / bound / conditioning codes name ontology nodes.  ``expected_vocab_size``
+        stays the cohort's leaf ``V`` either way - the target bits never widen:
 
         >>> D = ConditionalMultitaskDataModule(
         ...     cfg, dataset_kwargs={"expected_vocab_size": 7, "ontology_dir": "/onto"}, max_windows=5)
-        >>> D.dataset_kwargs, D.ontology_dir
-        ({'expected_vocab_size': 7}, PosixPath('/onto'))
-        >>> D.hparams["dataset_kwargs"], D.hparams["ontology_dir"]
-        ({'expected_vocab_size': 7}, '/onto')
+        >>> D.ontology_dir
+        PosixPath('/onto')
+        >>> D.dataset_kwargs == {"expected_vocab_size": 7, "ontology_dir": "/onto"}
+        True
+        >>> D.hparams["ontology_dir"]
+        '/onto'
         >>> tmp.cleanup(); grid.cleanup()
     """
 
@@ -194,11 +199,16 @@ class ConditionalMultitaskDataModule(ResumableDatamodule):
                 "grid is an evaluation artifact scored in row order, so a shuffled split has no meaning."
             )
         # ``ontology_dir`` rides in ``dataset_kwargs`` so the shipped configs can interpolate it from
-        # ``lightning_module.model.ontology_dir`` the way the scalar datamodule's does, but the
-        # training datasets are leaf-only and do not take it: lift it out before the parent forwards
-        # the rest verbatim.
+        # ``lightning_module.model.ontology_dir`` the way the scalar datamodule's does.  It is lifted
+        # out (so :attr:`dataset_kwargs` and the hyperparameters keep recording it separately, and
+        # the evaluation adapter can be given it explicitly) and then put back, because the training
+        # datasets now need it too: their *targets* are still leaf-only, but a labels directory
+        # sampled with ancestor-valued start / bound / conditioning codes can only be read through
+        # the ontology that numbered them.  Against a leaf-only labels directory it is simply unused.
         training_kwargs = dict(dataset_kwargs or {})
         ontology_dir = training_kwargs.pop("ontology_dir", None)
+        if ontology_dir is not None:
+            training_kwargs["ontology_dir"] = ontology_dir
         super().__init__(
             config,
             data_class=MultitaskBoundaryPytorchDataset,

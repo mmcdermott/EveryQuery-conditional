@@ -154,6 +154,7 @@ def base_cfg(cohort: Path, out_dir: Path, **overrides) -> dict:
         "max_workers": 2,
         "label_chunk_rows": 7,
         "ontology_dir": None,
+        "ontology_mode": None,
         "overwrite": False,
     }
     cfg.update(overrides)
@@ -191,12 +192,36 @@ def make_index(
     return pl.DataFrame(cols)
 
 
-def condition_answers_oracle(meta: pl.DataFrame, dense: np.ndarray, vocab) -> np.ndarray:
-    """``(N, K-1)`` bool: ``dense[i, j, index(condition_codes[i, j])]``, computed slot by slot."""
-    c2i = vocab.code_to_index()
+def condition_answers_oracle(
+    meta: pl.DataFrame, dense: np.ndarray, vocab, ontology_dir: Path | None = None
+) -> np.ndarray:
+    """``(N, K-1)`` bool: ``dense[i, j, index(condition_codes[i, j])]``, computed slot by slot.
+
+    ``dense`` is the ``(N, K, V)`` *leaf* target block.  An ontology-node conditioning code has no
+    column there, so with an ``ontology_dir`` its answer is computed the way the contract defines it:
+    the OR over the node's closure descendants, read straight off ``event_to_query_nodes.parquet``.
+    Independent of the sampler's interval-lookup implementation, which is the point.
+    """
+    c2i = vocab.boundary_code_to_index() if ontology_dir is not None else vocab.code_to_index()
+    leaves: dict[str, list[int]] = {}
+    if ontology_dir is not None:
+        from every_query.data.ontology import load_event_to_query_nodes
+
+        base = vocab.code_to_index()
+        closure = load_event_to_query_nodes(ontology_dir)
+        for leaf, node in zip(closure["event_code"].to_list(), closure["query_node"].to_list(), strict=True):
+            if leaf in base:
+                leaves.setdefault(node, []).append(base[leaf])
+
+    def answer(i: int, j: int, code: str) -> bool:
+        idx = c2i[code]
+        if idx < dense.shape[2]:
+            return bool(dense[i, j, idx])
+        return bool(dense[i, j, leaves[code]].any())
+
     rows = meta["condition_codes"].to_list()
     return np.array(
-        [[bool(dense[i, j, c2i[c]]) for j, c in enumerate(row)] for i, row in enumerate(rows)], dtype=bool
+        [[answer(i, j, c) for j, c in enumerate(row)] for i, row in enumerate(rows)], dtype=bool
     ).reshape(meta.height, -1)
 
 

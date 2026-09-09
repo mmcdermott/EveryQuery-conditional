@@ -223,20 +223,26 @@ class MultitaskBoundarySchema(LabelSchema):
             ``prediction_time + start_duration``; an event-defined start holds
             ``EVENT_BOUND_DURATION_SENTINEL`` (``-1.0``).
         start_events: ``K`` start codes aligned with ``start_durations``: null for a duration-defined
-            start, a base-vocabulary code for an event-defined one (the window opens at its first
-            occurrence strictly after ``prediction_time``; if there is none the window is empty).
-            Exactly one representation is active per slot.  Parquets written before #24 lack both
-            start columns and are read as ``[0.0] * K`` / ``[null] * K``.
+            start, an event code for an event-defined one (the window opens at its first occurrence
+            strictly after ``prediction_time``; if there is none the window is empty).  Normally a
+            base code; an ontology node name in a boundaries ontology mode, where "its occurrence"
+            means an occurrence of any descendant leaf.  Exactly one representation is active per
+            slot.  Parquets written before #24 lack both start columns and are read as ``[0.0] * K``
+            / ``[null] * K``.
         durations: ``K`` horizons in days after the **resolved start** (``float32``).  A
             duration-bounded slot holds ``>= 0``; an event-bounded slot holds
             ``EVENT_BOUND_DURATION_SENTINEL`` (``-1.0``).
         bound_events: ``K`` boundary codes aligned with ``durations``: null for a duration-bounded
-            slot, a base-vocabulary code for an event-bounded one (the first occurrence strictly after
-            the resolved start).  Exactly one representation is active per slot.
-        condition_codes: ``K-1`` conditioning codes (non-PAD base vocabulary, never null); code ``j``
-            is the query whose answer at boundary ``j`` is teacher-forced into later boundaries.
+            slot, an event code for an event-bounded one (the first occurrence strictly after the
+            resolved start).  Exactly one representation is active per slot.  Normally a base
+            code; an ontology node name when the sampler ran in a boundaries ontology mode, in
+            which case "occurrence" means an occurrence of any descendant leaf.
+        condition_codes: ``K-1`` conditioning codes (non-PAD, never null); code ``j`` is the query
+            whose answer at boundary ``j`` is teacher-forced into later boundaries.  Base codes,
+            or ontology node names in a conditioning ontology mode.
         condition_answers: ``K-1`` booleans; ``answers[j]`` is the all-vocabulary target bit of
-            ``condition_codes[j]`` at boundary ``j`` (open-window semantics).
+            ``condition_codes[j]`` at boundary ``j`` (open-window semantics) - for an ontology node,
+            the OR of that bit over the node's closure descendants.
 
     Examples:
         >>> from datetime import datetime

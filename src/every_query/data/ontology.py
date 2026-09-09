@@ -470,7 +470,10 @@ def expand_events_to_query_nodes(
         ['A', 'A//B', 'UNKNOWN']
     """
     known = set(event_to_query_nodes_df["event_code"].to_list())
-    present = set(events_df["code"].to_list())
+    # ``.unique()`` before ``.to_list()``: the set is over distinct codes either way, but the naive
+    # form materialises one Python string per *event*, which on a full shard is gigabytes of
+    # transient objects in every Stage 4M worker before a single interval table exists.
+    present = set(events_df["code"].unique().to_list())
     missing = present - known
     if missing:
         logger.warning(
