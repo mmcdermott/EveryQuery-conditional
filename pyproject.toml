@@ -104,6 +104,10 @@ EQ_predict_sequences = "every_query.predict.predict_sequences:main"
 # row, target-only (#28); no packed labels, manifest or sidecar are read.
 EQ_predict_multitask = "every_query.predict.predict_multitask:main"
 EQ_evaluate_sequences = "every_query.evaluate.evaluate_sequences:main"
+# Metrics over that same grid: groups the EQ_predict_multitask rows by the query *spec* (the five
+# window list columns), scores each cell's final-query probability against its final-query answer,
+# and macro-averages over cells, with subject-cluster bootstrap CIs per cell and on the macro.
+EQ_evaluate_multitask = "every_query.evaluate.evaluate_multitask:main"
 
 [tool.coverage.run]
 # Measure coverage for EQ_* CLIs launched via subprocess in tests/test_cli_smoke.py.
