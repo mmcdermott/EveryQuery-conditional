@@ -117,7 +117,7 @@ num_evaluation_sequences: 64
 # bounds below, widening/narrowing these does not move the grid off-distribution as long as
 # they stay within `[training min_queries, training max_queries]`.
 min_queries: 1
-max_queries: 1
+max_queries: 3
 
 # Duration bounds in days.  Each query's horizon is drawn log-uniformly over the continuous
 # [min, max] interval and kept as a **float** (no day-rounding) — so it skews short: over
@@ -179,8 +179,8 @@ eventbound_fraction: 0.5
 #   u < eventstart_fraction + prediction_time_start_fraction    => the prediction time itself
 #   otherwise                                                   => a positive start delay
 # Both fractions must be in [0, 1] and sum to at most 1.
-eventstart_fraction: 0.0
-prediction_time_start_fraction: 1.0
+eventstart_fraction: 0.2
+prediction_time_start_fraction: 0.4
 
 # Start-delay draw for the "positive delay" form, in days after the prediction time.
 start_duration_min: 1

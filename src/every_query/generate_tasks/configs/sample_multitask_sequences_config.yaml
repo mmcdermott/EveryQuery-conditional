@@ -42,7 +42,7 @@ split: train
 seed: 1
 
 # Sampling budget: total contexts drawn across the whole split (one context = one output row).
-num_training_examples: 10000000
+num_training_examples: 5000000
 # Boundaries per context.  Fixed, not sampled: every row has exactly this many slots.
 num_bounds: 5
 
