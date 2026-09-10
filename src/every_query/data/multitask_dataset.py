@@ -20,11 +20,20 @@ The parquet and the ``.npy`` are row-aligned; that alignment **is** the contract
    checks every stored answer against the unpacked target bit.  It never samples either;
 7. loads the sampler-materialized window starts (issue #24: ``start_durations`` / ``start_events``),
    reading parquets written before #24 - which lack both columns - as prediction-time starts
-   (``[0.0] * K`` / ``[null] * K``), and maps start codes through the same base vocabulary as the
-   targets.  No start is ever sampled here.
+   (``[0.0] * K`` / ``[null] * K``), and maps start codes through the same vocabulary as the boundary
+   and conditioning codes.  No start is ever sampled here.
+
+Targets are always the cohort's leaf codes, ``V`` wide.  *Event* names - starts, bounds, conditioning
+codes - may reach ``[V, V_ext)`` when the sampler ran with an ontology (the manifest's
+``ontology_mode`` is not ``"none"``); pass that ``ontology_dir`` and they resolve through
+``extend_code_map``, bounded by the manifest's ``boundary_vocab_size``.  An ancestor conditioning
+code's stored answer is the OR over its closure descendants - the value ``derive_ancestor_targets``
+would put in that column - and ``collate`` re-derives exactly the ancestor slots a batch names to
+check it, rather than widening the whole block to ``V_ext`` to read back a handful of bits.
 
 It fails loudly at init when the cohort's ``codes.parquet`` (or an explicit ``expected_vocab_size`` /
-``expected_vocab_fingerprint``) disagrees with the manifest.
+``expected_vocab_fingerprint``) disagrees with the manifest, and when the ontology it is given is not
+the one the labels were sampled against.
 """
 
 import json
@@ -41,7 +50,7 @@ from meds_torchdata import MEDSPytorchDataset
 from meds_torchdata.config import MEDSTorchDataConfig
 from meds_torchdata.types import MEDSTorchBatch
 
-from every_query.data.seq_dataset import EVENT_BOUND_DURATION_SENTINEL, NO_BOUND_INDEX
+from every_query.data.query_seq_dataset import EVENT_BOUND_DURATION_SENTINEL, NO_BOUND_INDEX
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +73,9 @@ _INTERNAL_COLS = (SOURCE_SHARD_COL, SOURCE_ROW_COL)
 MANIFEST_NAME = "_multitask_manifest.json"
 LABELS_SUFFIX = ".labels.npy"
 BITORDER = "little"
+# The sampler's ``ontology_mode`` value that means "no ancestor ever acted as an event".  Declared
+# here rather than imported so reading a labels directory never pulls in the generator package.
+ONTOLOGY_MODE_NONE = "none"
 
 
 @dataclass
@@ -77,21 +89,27 @@ class MultitaskBoundaryBatch(MEDSTorchBatch):
             written before issue #24); ``None`` only on a hand-built batch, which the model reads as
             zero-duration starts.
         q_start_codes: ``(B, K)`` int64 - vocabulary index of the start event; ``NO_BOUND_INDEX`` (0)
-            for duration / prediction-time starts, never PAD when active.  Filled together with
+            for duration / prediction-time starts, never PAD when active; an ontology node in
+            ``[V, V_ext)`` under a boundaries ontology mode.  Filled together with
             ``q_start_durations``: exactly one of the two being ``None`` is an error.
         q_durations: ``(B, K)`` float - horizon in days after the **resolved start**;
             ``EVENT_BOUND_DURATION_SENTINEL`` at event-bounded slots.
         q_bound_codes: ``(B, K)`` long - boundary vocabulary index; ``NO_BOUND_INDEX`` (0) for a
-            duration-bounded slot.
+            duration-bounded slot.  May be an ontology node in ``[V, V_ext)`` when the labels were
+            sampled in a boundaries ontology mode, where it means "the next occurrence of any
+            descendant leaf".
         q_mask: ``(B, K)`` bool - True at real slots (all True: ``K`` is fixed; kept for the model
             contract).
         targets: ``(B, K, V)`` bool - ``targets[b, k, v]`` is "code ``v`` occurs strictly inside the
             open window ``(resolved_start, resolved_end)`` of window ``k``".  Bit ``0`` (PAD) is
             always False and must be masked from the loss.
         condition_codes: ``(B, K-1)`` long - vocabulary index of the sampler-drawn conditioning code
-            for boundaries ``0..K-2`` (never PAD).
+            for boundaries ``0..K-2`` (never PAD).  May be an ontology node in ``[V, V_ext)`` when
+            the labels were sampled in a conditioning ontology mode.
         condition_answers: ``(B, K-1)`` bool - ``targets[b, j, condition_codes[b, j]]``, materialized
-            by the sampler and verified in ``collate``.
+            by the sampler and verified in ``collate``.  For an ancestor code there is no such
+            column and the answer is the OR over its closure descendants instead - the value
+            ``derive_ancestor_targets`` puts in that column.
 
     Examples:
         >>> batch = MultitaskBoundaryBatch(
@@ -156,7 +174,7 @@ class MultitaskBoundaryBatch(MEDSTorchBatch):
     q_start_durations: torch.FloatTensor | None = None
     q_start_codes: torch.LongTensor | None = None
     # Per-patient-token elapsed hours for rotary time encoding; ``None`` unless the dataset strips
-    # delta tokens (mirrors ``ConditionalQueryBatch.time_pos_ids``).
+    # delta tokens (mirrors ``QuerySeqBatch.time_pos_ids``).
     time_pos_ids: torch.LongTensor | None = None
 
     LABEL_TENSOR_NAMES: ClassVar[tuple[str]] = (
@@ -234,6 +252,18 @@ def read_manifest(split_dir: Path) -> dict:
             raise ValueError(f"multitask manifest {fp} is missing {key!r}")
     if manifest["bitorder"] != BITORDER:
         raise ValueError(f"multitask manifest bitorder must be {BITORDER!r}, got {manifest['bitorder']!r}")
+    # ``boundary_vocab_size`` is not in the required set: manifests written before ancestor-valued
+    # boundaries existed carry neither it nor ``ontology_fingerprint``, and must keep loading.  A
+    # manifest that *claims* an ontology mode without it is corrupt, though - the width is the only
+    # thing that says how far an ancestor start / bound / condition code may reach.
+    if manifest["ontology_mode"] != ONTOLOGY_MODE_NONE:
+        missing = [k for k in ("boundary_vocab_size", "ontology_fingerprint") if not manifest.get(k)]
+        if missing:
+            raise ValueError(
+                f"multitask manifest {fp} has ontology_mode {manifest['ontology_mode']!r} but no "
+                f"{' or '.join(missing)}; regenerate the labels with the current "
+                "EQ_generate_multitask_sequences."
+            )
     # Format 2 (issue #20/#22: every window opens at the prediction time, no start columns) and
     # format 3 (issue #24: explicit starts) are both readable; a missing key means legacy format 2.
     version = manifest.get("format_version", 2)
@@ -254,6 +284,39 @@ def _vocab_fingerprint_from_codes_parquet(fp: Path) -> tuple[int, str]:
     return vocab.size, vocab.fingerprint
 
 
+def _check_rows_aligned(base: pl.DataFrame, surviving: pl.DataFrame) -> None:
+    """Require ``base`` and ``surviving`` to agree row-for-row on subject_id and prediction_time.
+
+    Examples:
+        >>> from datetime import datetime
+        >>> t = [datetime(2020, 1, 1), datetime(2020, 1, 2)]
+        >>> a = pl.DataFrame({"subject_id": [1, 2], "prediction_time": t})
+        >>> _check_rows_aligned(a, a.with_columns(pl.lit(0).alias("x")))
+        >>> _check_rows_aligned(a, a.reverse())
+        Traceback (most recent call last):
+            ...
+        RuntimeError: label rows are misaligned with the sequence bounds: 2 of 2 row(s) differ ...
+        >>> _check_rows_aligned(a, a.head(1))
+        Traceback (most recent call last):
+            ...
+        RuntimeError: label rows are misaligned with the sequence bounds: 2 vs 1 row(s)...
+    """
+    sid, pt = DataSchema.subject_id_name, LabelSchema.prediction_time_name
+    if base.height != surviving.height:
+        raise RuntimeError(
+            f"label rows are misaligned with the sequence bounds: {base.height} vs {surviving.height} "
+            "row(s); the upstream join dropped or duplicated rows."
+        )
+    mismatch = (base[sid] != surviving[sid]) | (base[pt] != surviving[pt])
+    n_bad = int(mismatch.sum())
+    if n_bad:
+        raise RuntimeError(
+            f"label rows are misaligned with the sequence bounds: {n_bad} of {base.height} row(s) differ "
+            f"in subject_id/prediction_time (first at row {int(mismatch.arg_max())}); the upstream join "
+            "no longer preserves label order."
+        )
+
+
 class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
     """MEDS dataset over multitask-boundary metadata parquets + packed ``.labels.npy`` sidecars."""
 
@@ -272,8 +335,35 @@ class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
         if not extras:
             return base
         sid = DataSchema.subject_id_name
-        surviving = label_df.join(schema_df.lazy().select(sid).unique().collect(), on=sid, how="semi")
+        # ``maintain_order="left"`` pins the semi join to ``label_df`` order (polars' default is
+        # unspecified); the check below turns a future ordering drift into an error rather than
+        # silently pairing one context's targets with another's patient window.
+        surviving = label_df.join(
+            schema_df.lazy().select(sid).unique().collect(), on=sid, how="semi", maintain_order="left"
+        )
+        _check_rows_aligned(base, surviving)
         return base.hstack(surviving.select(extras))
+
+    def _check_code_width(self, codes: np.ndarray, what: str) -> None:
+        """Refuse an index past the event vocabulary the labels were built with.
+
+        Membership in ``code_to_index`` is not enough: it says a name is known, not that its id fits
+        the table a model will embed it from.  Mirrors
+        :meth:`~every_query.data.multitask_eval_dataset.QuerySeqMultitaskEvalDataset._check_codes`.
+
+        Defence in depth rather than the front line.  When a real ontology is attached the width
+        equality above it (``extended_vocab_size == boundary_vocab_size``) has already run, and
+        ``extend_code_map`` cannot mint an id at or past ``extended_vocab_size``, so this can only
+        fire on a manifest whose ``boundary_vocab_size`` disagrees with the labels it describes - a
+        hand-edited one, or one written by a future sampler - and on the ``"none"``-mode path, where
+        the ontology branch is skipped entirely and this is the only width check there is.
+        """
+        if codes.size and int(codes.max()) >= self.boundary_vocab_size:
+            raise ValueError(
+                f"{what} code index {int(codes.max())} in the labels at {self._split_dir} is outside "
+                f"the boundary vocabulary of size {self.boundary_vocab_size} recorded in the "
+                "manifest. Regenerate the labels against this cohort and ontology."
+            )
 
     def __init__(
         self,
@@ -284,6 +374,7 @@ class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
         expected_vocab_fingerprint: str | None = None,
         check_cohort_vocabulary: bool = True,
         strip_delta_tokens: bool = False,
+        ontology_dir: str | Path | None = None,
     ):
         """Build the dataset.
 
@@ -296,7 +387,12 @@ class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
                 equal the manifest's.
             check_cohort_vocabulary: Also recompute the fingerprint from the cohort's
                 ``codes.parquet`` (``cfg.code_metadata_fp``) and require it to match the manifest.
-            strip_delta_tokens: As in :class:`~every_query.data.seq_dataset.ConditionalQueryPytorchDataset`.
+            strip_delta_tokens: As in :class:`~every_query.data.query_seq_dataset.QuerySeqPytorchDataset`.
+            ontology_dir: The ``EQ_build_ontology`` directory whose node names the labels' ancestor
+                start / bound / conditioning codes resolve through.  **Required** when the manifest's
+                ``ontology_mode`` is not ``"none"``; harmless (and unused for the labels) otherwise,
+                which is the ordinary derived-ancestor-targets setup - an ontology on the model with
+                a leaf-only sampler run.
         """
         self._split_dir = Path(cfg.task_labels_dir) / split if cfg.task_labels_dir is not None else None
         if self._split_dir is None:
@@ -306,6 +402,21 @@ class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
         self.vocab_size = int(self.manifest["vocab_size"])
         self.packed_width = int(self.manifest["packed_width_bytes"])
         self.vocab_fingerprint = str(self.manifest["vocab_fingerprint"])
+        # The *event* vocabulary the windows were drawn against.  Equal to ``vocab_size`` unless an
+        # ancestor node acted as a start / bound / conditioning code; the target bits are leaf-only
+        # in every mode, so ``vocab_size`` / ``packed_width`` below are untouched by it.
+        self.ontology_mode = str(self.manifest["ontology_mode"])
+        self.boundary_vocab_size = int(self.manifest.get("boundary_vocab_size") or self.vocab_size)
+        # One-sided on purpose: labels that name ancestors cannot be read without the ontology that
+        # numbered them, but an ontology *without* ancestor-bearing labels is the normal
+        # derived-targets configuration (leaf sampler, ancestor targets derived inside the model).
+        if self.ontology_mode != ONTOLOGY_MODE_NONE and ontology_dir is None:
+            raise ValueError(
+                f"the multitask manifest at {self._split_dir} has ontology_mode "
+                f"{self.ontology_mode!r}, so its start / bound / conditioning codes may name ontology "
+                "nodes, but no ontology_dir was given; pass the directory the labels were sampled "
+                "with."
+            )
         if expected_vocab_size is not None and expected_vocab_size != self.vocab_size:
             raise ValueError(
                 f"vocab_size mismatch: the model expects {expected_vocab_size} but the multitask manifest at "
@@ -349,6 +460,64 @@ class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
             c: int(i)
             for c, i in zip(code_meta["code"].to_list(), code_meta["code/vocab_index"].to_list(), strict=True)
         }
+        self._closure = None
+        self._descendant_leaves: torch.Tensor | None = None
+        self._descendant_offsets: torch.Tensor | None = None
+        if ontology_dir is not None and self.ontology_mode != ONTOLOGY_MODE_NONE:
+            from every_query.data.ontology import (
+                check_ontology_cohort,
+                closure_fingerprint,
+                extend_code_map,
+                extended_vocab_size,
+                load_closure_index,
+            )
+
+            # Identity, not width: a same-width ontology of another cohort - or of these codes at
+            # permuted indices - would pair every ancestor name with the wrong descendants.  Checked
+            # against the *base* map, before the extension adds the nodes being vouched for.
+            check_ontology_cohort(ontology_dir, code_to_index=self.code_to_index)
+            # ``read_manifest`` has already refused an ancestor mode without one, so this is never
+            # skipped for a manifest that claims to use ancestors.
+            recorded = self.manifest.get("ontology_fingerprint")
+            actual = closure_fingerprint(ontology_dir)
+            if recorded and actual != recorded:
+                raise ValueError(
+                    f"the ontology at {ontology_dir} has closure {actual[:12]}... but these labels "
+                    f"were sampled against {recorded[:12]}...; the same ancestor name would stand "
+                    "for a different set of descendants."
+                )
+            # The model's embedding table is sized from this same ontology, so its width is the one
+            # number that says an ancestor id in the labels is embeddable.  Comparing it here turns
+            # an out-of-range lookup - a device-side assert with no attribution on CUDA - into a
+            # sentence, and catches an ontology grown or pruned since the labels were sampled.
+            v_ext = extended_vocab_size(ontology_dir)
+            if v_ext != self.boundary_vocab_size:
+                raise ValueError(
+                    f"the ontology at {ontology_dir} is {v_ext} wide but the labels at "
+                    f"{self._split_dir} were sampled against a boundary vocabulary of "
+                    f"{self.boundary_vocab_size}; a model sized from this ontology could not embed "
+                    "their ancestor codes."
+                )
+            self.code_to_index = extend_code_map(self.code_to_index, ontology_dir)
+            # Loaded for every ontology mode, not just the conditioning ones: ``collate`` needs it to
+            # re-derive an ancestor conditioning answer as the OR over its descendant leaves, and a
+            # *supplied* index may carry an ancestor conditioning code even in a mode whose draw pool
+            # would never produce one.  Without it that gather would run off the leaf block.
+            self._closure = load_closure_index(
+                ontology_dir,
+                base_vocab_size=self.vocab_size,
+                vocab_fingerprint=self.vocab_fingerprint,
+            )
+            # The closure as a CSR-style ancestor -> descendant-leaf index, so ``collate`` can OR the
+            # handful of ancestor columns a batch actually names instead of materialising the whole
+            # (B, K-1, V_ext) block to read back B*(K-1) bits.  Two int64 vectors; pickles to the
+            # dataloader workers with the rest of the dataset.
+            anc = self._closure.ancestor_ids - self.vocab_size
+            order = torch.argsort(anc, stable=True)
+            self._descendant_leaves = self._closure.leaf_ids[order]
+            self._descendant_offsets = torch.searchsorted(
+                anc[order], torch.arange(self._closure.n_ancestors + 1)
+            )
 
         n = self.schema_df.height
         durations = self.schema_df[DURATIONS_COL]
@@ -380,6 +549,7 @@ class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
                 f"{unknown[:10]}. Regenerate the labels against this cohort's codes.parquet."
             )
         self._q_bound_codes = mapped.to_numpy().astype(np.int64).reshape(n, self.num_bounds)
+        self._check_code_width(self._q_bound_codes, "boundary")
         sentinel_ok = (self._q_bound_codes != NO_BOUND_INDEX) == (
             self._q_durations == EVENT_BOUND_DURATION_SENTINEL
         )
@@ -419,6 +589,7 @@ class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
             .astype(np.int64)
             .reshape(n, self.num_bounds)
         )
+        self._check_code_width(self._q_start_codes, "start-event")
         by_event = self._q_start_codes != NO_BOUND_INDEX
         start_ok = np.where(
             by_event,
@@ -449,6 +620,7 @@ class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
                     f"vocabulary: {bad[:10]}. Regenerate the labels against this cohort's codes.parquet."
                 )
             self._condition_codes = cond_mapped.to_numpy().astype(np.int64).reshape(n, kc)
+            self._check_code_width(self._condition_codes, "condition")
             flat_ans = cond_answers.explode()
             if flat_ans.null_count():
                 raise ValueError("condition_answers must not contain nulls")
@@ -587,15 +759,47 @@ class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
         dense = np.unpackbits(packed, axis=-1, count=self.vocab_size, bitorder=BITORDER)
         return torch.from_numpy(dense.astype(bool, copy=False))
 
+    def _ancestor_answers(
+        self,
+        leaf_targets: torch.Tensor,
+        condition_codes: torch.LongTensor,
+        ancestor: torch.Tensor,
+        expect: torch.BoolTensor,
+    ) -> torch.BoolTensor:
+        """Fill ``expect`` at the ancestor slots with the OR over each code's descendant leaves.
+
+        Deliberately not ``derive_ancestor_targets``: that is the right shape for the model, which
+        needs every ``V_ext`` column for its loss, but here at most ``B * (K-1)`` bits are wanted and
+        widening the whole block to read them costs a transient ``(B, K-1, V_ext)`` allocation per
+        batch, in a dataloader worker, on CPU.  One pass per *distinct* ancestor code in the batch -
+        typically a handful - reads the same bits from the leaf block directly.
+        """
+        if self._closure is None:
+            raise ValueError(
+                "the labels name ontology nodes as conditioning codes but this dataset has no "
+                "closure; construct it with the ontology_dir the labels were sampled with."
+            )
+        expect = expect.clone()
+        for code in torch.unique(condition_codes[ancestor]).tolist():
+            slot = int(code) - self.vocab_size
+            lo, hi = int(self._descendant_offsets[slot]), int(self._descendant_offsets[slot + 1])
+            here = ancestor & (condition_codes == code)
+            if lo == hi:  # a node with no descendant leaf can never be true
+                expect[here] = False
+                continue
+            b, j = here.nonzero(as_tuple=True)
+            expect[here] = leaf_targets[b, j][:, self._descendant_leaves[lo:hi]].any(dim=-1)
+        return expect
+
     def collate(self, batch: list[dict]) -> MultitaskBoundaryBatch:
         out = dict(super().collate(batch).items())
         out.pop("boolean_value", None)
 
         time_pos_ids = None
         if self.strip_delta_tokens:
-            from every_query.data.seq_dataset import ConditionalQueryPytorchDataset
+            from every_query.data.query_seq_dataset import QuerySeqPytorchDataset
 
-            time_pos_ids = ConditionalQueryPytorchDataset._apply_rope_time(self, out)
+            time_pos_ids = QuerySeqPytorchDataset._apply_rope_time(self, out)
 
         B = len(batch)
         # Start tensors are always emitted (zeros / NO_BOUND_INDEX for legacy files), exactly float32 / int64.
@@ -612,10 +816,17 @@ class MultitaskBoundaryPytorchDataset(MEDSPytorchDataset):
         )
         condition_answers = torch.from_numpy(np.stack([item["condition_answers"] for item in batch]))
 
-        # The stored answer must be the target bit of its code at its boundary (the sampler's contract).
+        # The stored answer must be the target bit of its code at its boundary (the sampler's
+        # contract).  For an ancestor code there is no such column - ``targets`` is leaf-only - and
+        # the contract is instead the OR over the code's closure descendants, the same value the
+        # model's ``derive_ancestor_targets`` puts in that column.
         kc = self.num_bounds - 1
         if kc:
-            expect = targets[:, :kc].gather(2, condition_codes.unsqueeze(-1)).squeeze(-1)
+            leaf = torch.clamp(condition_codes, max=self.vocab_size - 1)
+            expect = targets[:, :kc].gather(2, leaf.unsqueeze(-1)).squeeze(-1)
+            ancestor = condition_codes >= self.vocab_size
+            if bool(ancestor.any()):
+                expect = self._ancestor_answers(targets[:, :kc], condition_codes, ancestor, expect)
             if not torch.equal(expect, condition_answers):
                 bad = (expect != condition_answers).nonzero()[:5].tolist()
                 raise ValueError(

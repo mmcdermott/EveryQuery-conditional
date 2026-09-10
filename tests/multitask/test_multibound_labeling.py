@@ -6,21 +6,72 @@ inputs.
 """
 
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import numpy as np
 import polars as pl
 import pytest
 
 from every_query.generate_tasks import sample_multitask_sequences as sms
+from every_query.generate_tasks.interval_table import INF
 from every_query.generate_tasks.sample_multitask_sequences import (
     TargetVocabulary,
     label_multitask_index,
     validate_index,
 )
 from tests.multitask.conftest import CODES, condition_answers_oracle, make_events, make_index, scalar_oracle
+from tests.ontology_suite.golden import DECLARED_PARENTS, EVENTS, LEAVES, ONTOLOGY
+from tests.ontology_suite.golden import T0 as GOLDEN_T0
+from tests.ontology_suite.oracle import label_event_bounded
+from tests.ontology_suite.production import events_to_frame
 
 T0 = datetime(2024, 1, 1)
 VOCAB = TargetVocabulary.from_pairs(["A", "B", "DISCHARGE", "TIMELINE//END"], [1, 2, 3, 4])
+
+
+def _write_ontology(root: Path, codes: list[str], parents: dict[str, list[str]] | None = None) -> Path:
+    """The three ``EQ_build_ontology`` artifacts for ``codes`` at leaf ids ``1..len(codes)``.
+
+    Replicated from ``tests/test_multitask_ontology_targets.py`` rather than imported, so the two
+    files never have to be edited together.
+    """
+    from every_query.data.ontology import (
+        EMBEDDING_MIX_FILE,
+        EVENT_TO_QUERY_NODES_FILE,
+        ONTOLOGY_VOCAB_FILE,
+        build_event_to_query_nodes,
+        build_ontology,
+    )
+    from tests.ontology_suite.production import codes_frame
+
+    nodes, mix = build_ontology(codes_frame(codes, parents or {}))
+    root.mkdir(parents=True, exist_ok=True)
+    nodes.write_parquet(root / ONTOLOGY_VOCAB_FILE)
+    mix.write_parquet(root / EMBEDDING_MIX_FILE)
+    build_event_to_query_nodes(nodes, mix).write_parquet(root / EVENT_TO_QUERY_NODES_FILE)
+    return root
+
+
+def _ancestor_names(onto: Path) -> list[str]:
+    from every_query.data.ontology import load_nodes
+
+    return load_nodes(onto).filter(~pl.col("is_observed_code"))["node_name"].to_list()
+
+
+def _golden_vocab(tmp_path: Path, mode: str) -> tuple[Path, TargetVocabulary, TargetVocabulary]:
+    """``(ontology_dir, leaf-only vocabulary, the same vocabulary widened by the ontology)``.
+
+    The golden cohort's leaves at ids ``1..len(LEAVES)``, which is exactly what
+    :func:`_write_ontology` numbers them as, so the cohort-identity check inside
+    :func:`~every_query.generate_tasks.sample_multitask_sequences.attach_ontology` passes.
+    """
+    onto = _write_ontology(tmp_path / "onto", LEAVES, DECLARED_PARENTS)
+    leaf_vocab = TargetVocabulary.from_pairs(LEAVES, list(range(1, len(LEAVES) + 1)))
+    return onto, leaf_vocab, sms.attach_ontology(leaf_vocab, onto, mode)
+
+
+def _golden_dense(packed: np.ndarray, vocab: TargetVocabulary) -> np.ndarray:
+    return np.unpackbits(packed, axis=-1, count=vocab.size, bitorder="little").astype(bool)
 
 
 def _events(rows: list[tuple[int, datetime | None, str]]) -> pl.DataFrame:
@@ -150,6 +201,15 @@ def test_pad_bit_stays_false_and_unknown_event_codes_are_ignored() -> None:
     assert vocab.boundary_candidates() == ["A"]
 
 
+def test_all_unknown_event_codes_is_a_hard_error() -> None:
+    """A shard where *every* event is out-of-vocabulary is the wrong input (string-coded events),
+    not a sparse shard: it must raise instead of labeling everything false."""
+    vocab = TargetVocabulary.from_pairs(["PAD", "A"], [0, 1])
+    ev = _events([(1, T0 + timedelta(days=1), "ZZZ"), (1, T0 + timedelta(days=2), "YYY")])
+    with pytest.raises(ValueError, match="outside the target vocabulary"):
+        label_multitask_index(make_index([(1, T0)], [[(5.0, None)]]), ev, vocab, 1)
+
+
 def test_unknown_boundary_code_is_a_hard_error() -> None:
     ev = _events([(1, T0 + timedelta(days=1), "A")])
     with pytest.raises(ValueError, match="not in the base vocabulary"):
@@ -174,14 +234,34 @@ def test_validate_index_rejects_wrong_arity_and_mixed_representation() -> None:
         validate_index(make_index([(1, T0)], [[(1.0, None)]]).drop("durations"), 1)
 
 
-def test_ontology_dir_raises() -> None:
+def test_ontology_dir_and_vocab_mode_must_agree(tmp_path: Path) -> None:
+    """An ``ontology_dir`` is no longer refused outright - it must *agree* with the vocabulary it is
+    labeling against, in both directions, because a leaf-only vocabulary cannot encode an ancestor and
+    an ontology-bearing one was drawn against an event universe the caller must supply.
+
+    Also pins the seam-2 contract: without a directory the event stream is returned untouched (the
+    identity that keeps leaf labeling byte-identical), and with one it is closure-expanded.
+    """
     ev = _events([(1, T0 + timedelta(days=1), "A")])
-    with pytest.raises(NotImplementedError, match="observable leaf codes only"):
+    with pytest.raises(ValueError, match="disagrees with the vocabulary's ontology_mode"):
         label_multitask_index(make_index([(1, T0)], [[(1.0, None)]]), ev, VOCAB, 1, ontology_dir="x")
-    with pytest.raises(NotImplementedError):
-        sms.prepare_events_for_labeling(ev, ontology_dir="x")
-    with pytest.raises(NotImplementedError):
-        sms.build_target_vocabulary("anything", ontology_dir="x")
+
+    codes = ["A//1", "A//2", "TIMELINE//END"]
+    onto = _write_ontology(tmp_path / "onto", codes)
+    vocab = sms.attach_ontology(TargetVocabulary.from_pairs(codes, [1, 2, 3]), onto, "boundaries")
+    assert vocab.ontology_mode == "boundaries", "attach_ontology carries the mode onto the vocabulary"
+    assert vocab.boundary_size > vocab.size, "the ancestors widen the *event* vocabulary only"
+    ev2 = _events([(1, T0 + timedelta(days=1), "A//1")])
+    idx = make_index([(1, T0)], [[(5.0, None)]])
+    with pytest.raises(ValueError, match="disagrees with the vocabulary's ontology_mode"):
+        label_multitask_index(idx, ev2, vocab, 1, ontology_dir=None)
+    _, packed, _ = label_multitask_index(idx, ev2, vocab, 1, ontology_dir=str(onto))
+    assert packed.any(), "with the matching directory the same index labels normally"
+
+    assert sms.prepare_events_for_labeling(ev2, None) is ev2, "no ontology: the very same frame back"
+    expanded = sms.prepare_events_for_labeling(ev2, str(onto))
+    assert expanded.height > ev2.height, "the closure repeats each event under its ancestors"
+    assert set(expanded["code"].to_list()) == {"A//1", "A"}, "the ancestor node name is carried as a code"
 
 
 def test_vocab_size_not_divisible_by_eight_and_absent_codes_keep_bits_false() -> None:
@@ -709,3 +789,185 @@ def test_many_windows_do_not_wrap_the_window_position_index() -> None:
     x = VOCAB24.code_to_index()["X"]
     expected = [any(0.1 * j < day < 0.1 * j + 0.95 for day in range(1, 40)) for j in range(k)]
     assert d[0, :, x].tolist() == expected
+
+
+# --- ancestors as window furniture (PRs C + D) -----------------------------------------------------
+#
+# Targets stay leaf-only in every mode; what an ontology changes here is the other half of a window.
+# The golden cohort (``tests/ontology_suite``) is used throughout, so every expectation comes from the
+# independently written oracle rather than from a second run of the code under test.
+
+#: Pure ancestor nodes of the golden DAG, each with at least one descendant event in the fixture.
+_GOLDEN_ANCESTOR_BOUNDS = ["READMISSION", "DX", "LAB", "TIMELINE"]
+_GOLDEN_SUBJECTS = [1, 2, 3, 4, 5]
+
+
+def test_ancestor_bound_event_matches_the_scalar_oracle(tmp_path: Path) -> None:
+    """An ancestor-valued ``bound_event`` closes the window at the first occurrence of *any* descendant.
+
+    Every leaf target of every golden subject is compared against ``oracle.label_event_bounded``, which
+    resolves the same boundary by walking the DAG.  The failure this guards is silent: an ancestor id
+    that never reaches the interval table resolves to ``INF``, which merely leaves the window open, so
+    the run is also pinned to be genuinely bounded rather than degenerating to "ever again".
+    """
+    onto, _, vocab = _golden_vocab(tmp_path, "boundaries")
+    assert set(_GOLDEN_ANCESTOR_BOUNDS) <= set(_ancestor_names(onto)), (
+        "the fixture boundaries must be pure ancestor nodes, not leaves"
+    )
+    events = events_to_frame(EVENTS)
+    k = len(_GOLDEN_ANCESTOR_BOUNDS)
+    idx = make_index(
+        [(s, GOLDEN_T0) for s in _GOLDEN_SUBJECTS],
+        [[(-1.0, b) for b in _GOLDEN_ANCESTOR_BOUNDS]] * len(_GOLDEN_SUBJECTS),
+        fill_condition="LAB//GLU",
+    )
+    times: dict[str, np.ndarray] = {}
+    meta, packed, _ = label_multitask_index(
+        idx, events, vocab, k, ontology_dir=str(onto), window_times_out=times
+    )
+    dense = _golden_dense(packed, vocab)
+    c2i = vocab.code_to_index()
+    for row, subject in enumerate(meta["subject_id"].to_list()):
+        for j, boundary in enumerate(_GOLDEN_ANCESTOR_BOUNDS):
+            for leaf in LEAVES:
+                got = bool(dense[row, j, c2i[leaf]])
+                want = label_event_bounded(EVENTS, subject, ONTOLOGY, GOLDEN_T0, leaf, boundary)
+                assert got == want, f"subject {subject}, boundary {boundary!r}, leaf {leaf!r}"
+
+    # The ancestor boundary really bounded something: an id that never reached the table would have
+    # resolved to INF everywhere, leaving every window open to the end of the record.
+    assert dense.any(), "every label false would pass the comparison only if the oracle agreed by luck"
+    assert (times["end_times"] != INF).any(), "at least one ancestor boundary must actually occur"
+    unbounded = make_index(
+        [(s, GOLDEN_T0) for s in _GOLDEN_SUBJECTS],
+        [[(3650.0, None)] * k] * len(_GOLDEN_SUBJECTS),
+        fill_condition="LAB//GLU",
+    )
+    _, packed_open, _ = label_multitask_index(unbounded, events, vocab, k, ontology_dir=str(onto))
+    assert not np.array_equal(packed, packed_open), (
+        "an ancestor boundary resolving to INF would reproduce the unbounded ten-year window exactly"
+    )
+
+
+def test_ancestor_start_event_opens_the_window_at_the_first_descendant(tmp_path: Path) -> None:
+    """An ancestor-valued ``start_event`` opens the window at the first descendant occurrence - the same
+    window the responsible leaf would have opened.
+
+    Subject 5's only READMISSION descendant is ``READMISSION//CHILD_B`` on 03-05, so the ancestor start
+    and that leaf start must resolve to the identical instant.  ``next_occurrence_after`` returns ``INF``
+    without error for a code wider than the table's ``code_bits``, and an unresolved start yields an
+    all-false window, so the resolved times themselves are asserted, not just the bits.
+    """
+    onto, _, vocab = _golden_vocab(tmp_path, "boundaries")
+    events = events_to_frame(EVENTS)
+    ancestor_times: dict[str, np.ndarray] = {}
+    leaf_times: dict[str, np.ndarray] = {}
+    _, packed_a, _ = label_multitask_index(
+        make_index([(5, GOLDEN_T0)], [[(10.0, None)]], starts=[[(-1.0, "READMISSION")]]),
+        events,
+        vocab,
+        1,
+        ontology_dir=str(onto),
+        window_times_out=ancestor_times,
+    )
+    _, packed_l, _ = label_multitask_index(
+        make_index([(5, GOLDEN_T0)], [[(10.0, None)]], starts=[[(-1.0, "READMISSION//CHILD_B")]]),
+        events,
+        vocab,
+        1,
+        ontology_dir=str(onto),
+        window_times_out=leaf_times,
+    )
+    opened = int(ancestor_times["start_times"][0, 0])
+    assert opened != INF, "the ancestor start must resolve; INF is next_occurrence_after's silent failure"
+    expected_us = int((datetime(2024, 3, 5) - datetime(1970, 1, 1)).total_seconds() * 1_000_000)
+    assert opened == expected_us, "the window opens at CHILD_B on 03-05, the first descendant"
+    assert opened == int(leaf_times["start_times"][0, 0])
+    assert np.array_equal(packed_a, packed_l), "ancestor start == its responsible leaf start, bit for bit"
+
+    labels = {c: bool(_golden_dense(packed_a, vocab)[0, 0, i]) for c, i in vocab.code_to_index().items()}
+    assert labels["DISCHARGE"] is True, "03-09 is strictly inside (03-05, 03-15)"
+    assert labels["ADMISSION"] is False, "03-02 is before the resolved start"
+    assert labels["READMISSION//CHILD_B"] is False, "the start instant itself is excluded"
+    assert labels["TIMELINE//END"] is False, "03-28 is past the 10-day horizon"
+
+
+_COND_WINDOWS = [(7.0, None), (30.0, None), (-1.0, "DISCHARGE")]
+
+
+def test_ancestor_condition_answer_is_the_or_over_its_descendants(tmp_path: Path) -> None:
+    """An ancestor conditioning code's answer is the OR over its closure descendants (PR D).
+
+    The ancestor has no packed column, so the pre-PR-D path - reading bit ``index >> 3`` off the packed
+    row - would land on a padding bit that is always 0.  The all-False result that would produce is
+    refused explicitly, and a leaf conditioning code is checked alongside to show the ordinary
+    packed-bit path is untouched.
+    """
+    onto, _, vocab = _golden_vocab(tmp_path, "conditions")
+    events = events_to_frame(EVENTS)
+    assert "READMISSION" in _ancestor_names(onto), "the fixture conditioning code must be an ancestor"
+    k = len(_COND_WINDOWS)
+    contexts = [(s, GOLDEN_T0) for s in _GOLDEN_SUBJECTS]
+    windows = [_COND_WINDOWS] * len(_GOLDEN_SUBJECTS)
+
+    meta, packed, stats = label_multitask_index(
+        make_index(contexts, windows, fill_condition="READMISSION"),
+        events,
+        vocab,
+        k,
+        ontology_dir=str(onto),
+    )
+    dense = _golden_dense(packed, vocab)
+    answers = np.array(meta["condition_answers"].to_list(), dtype=bool)
+    assert answers.shape == (len(_GOLDEN_SUBJECTS), k - 1)
+    assert np.array_equal(answers, condition_answers_oracle(meta, dense, vocab, ontology_dir=onto))
+    assert answers.any() and not answers.all(), (
+        "a padding-bit read would make every ancestor answer False; a constant-True bug would make "
+        "them all True"
+    )
+    assert stats.n_ancestor_condition_slots == len(_GOLDEN_SUBJECTS) * (k - 1)
+
+    leaf_meta, leaf_packed, leaf_stats = label_multitask_index(
+        make_index(contexts, windows, fill_condition="LAB//GLU"),
+        events,
+        vocab,
+        k,
+        ontology_dir=str(onto),
+    )
+    leaf_answers = np.array(leaf_meta["condition_answers"].to_list(), dtype=bool)
+    leaf_dense = _golden_dense(leaf_packed, vocab)
+    assert np.array_equal(leaf_answers, condition_answers_oracle(leaf_meta, leaf_dense, vocab))
+    assert leaf_stats.n_ancestor_condition_slots == 0
+    assert np.array_equal(leaf_packed, packed), "the conditioning code never moves a target bit"
+
+
+def test_leaf_bits_are_identical_with_and_without_the_ontology(tmp_path: Path) -> None:
+    """The byte-identity invariant the whole design rests on: with leaf-only starts, bounds and
+    conditioning codes, attaching an ontology changes nothing about the packed leaf targets.
+
+    The closure pairs every leaf with itself, so the ``code_index < V`` rows of the expanded stream are
+    exactly the unexpanded stream - and the leaf interval table built from them is the only one that
+    ever sets a bit.  If the expansion leaked into labeling, an ancestor's occurrences would start
+    setting descendant bits and this array comparison would fail.
+    """
+    onto, leaf_vocab, vocab = _golden_vocab(tmp_path, "boundaries+conditions")
+    events = events_to_frame(EVENTS)
+    windows = [(7.0, None), (40.0, None), (-1.0, "DISCHARGE"), (-1.0, "ADMISSION")]
+    starts = [(0.0, None), (2.0, None), (-1.0, "ADMISSION"), (0.0, None)]
+    conditions = ["LAB//GLU", "DX//CARDIO//MI", "TIMELINE//END"]
+    n = len(_GOLDEN_SUBJECTS)
+    idx = make_index(
+        [(s, GOLDEN_T0) for s in _GOLDEN_SUBJECTS],
+        [windows] * n,
+        [conditions] * n,
+        starts=[starts] * n,
+    )
+    meta_leaf, packed_leaf, stats_leaf = label_multitask_index(idx, events, leaf_vocab, len(windows))
+    meta_onto, packed_onto, stats_onto = label_multitask_index(
+        idx, events, vocab, len(windows), ontology_dir=str(onto)
+    )
+    assert np.array_equal(packed_leaf, packed_onto), "the ontology must not touch a single leaf bit"
+    assert meta_leaf.equals(meta_onto), "metadata, conditioning answers included, is unchanged"
+    assert packed_leaf.any(), "an all-zero comparison would be vacuous"
+    assert stats_onto.n_query_node_events > stats_leaf.n_events, "the stream really was expanded"
+    assert stats_onto.n_events == stats_leaf.n_events, "but the leaf table saw exactly the same events"
