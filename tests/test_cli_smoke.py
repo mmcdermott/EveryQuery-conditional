@@ -6,8 +6,9 @@ A successful exit proves the ``[project.scripts]`` entry resolved, the package c
 resolved via ``importlib.resources.files()``, and module-level imports don't blow up in a fresh
 interpreter.
 
-``test_script_imports`` covers the un-installed research drivers under ``scripts/``, which
-``--ignore=scripts`` keeps out of collection entirely.
+``test_script_imports`` covers the un-installed drivers under ``scripts/``.  CI runs ``pytest``
+over the rootdir, where ``--doctest-modules`` imports them anyway, but a ``pytest tests/`` run
+never reaches the directory — this keeps them covered either way.
 
 Child-process coverage is picked up automatically via
 ``[tool.coverage.run] patch = ["subprocess"]`` in ``pyproject.toml`` — no
@@ -48,14 +49,11 @@ _ENTRYPOINTS: list[str] = sorted(_project_scripts())
 _DELETED_ENTRYPOINT = "EQ_generate_evaluation_multitask_sequences"
 _DELETED_MODULE = "sample_evaluation_multitask_sequences"
 
-# Third-party modules a ``scripts/`` driver needs that this project does not depend on.  The script
-# raises an informative ``ModuleNotFoundError`` naming the install command; skipping is honest here
-# because a missing optional dep is not API drift, which is what this test exists to catch.
-_OPTIONAL_SCRIPT_DEPS: dict[str, str] = {
-    "build_report.py": "reportlab",
-    "build_report_v2.py": "reportlab",
-    "build_report_final.py": "reportlab",
-}
+# Third-party modules a ``scripts/`` driver needs that this project does not depend on.  Empty
+# today — the report builders that needed ``reportlab`` are gone — but kept as the seam: a missing
+# optional dep is not API drift, which is what this test exists to catch, so such a driver should
+# skip rather than fail.
+_OPTIONAL_SCRIPT_DEPS: dict[str, str] = {}
 
 
 @pytest.fixture(scope="module")
@@ -123,18 +121,18 @@ def test_entrypoint_help(script, cli_env):
 def test_script_imports(script_path: Path):
     """Every ``scripts/*.py`` driver still imports against the current library API.
 
-    ``pyproject.toml`` sets ``--ignore=scripts``, so ``--doctest-modules`` never imports these.
-    That exclusion is deliberate — they are one-off research drivers with heavy imports and
-    ``argparse`` mains, not a doctest surface — but it is also what let several of them sit broken
-    behind stale ``every_query`` imports across a whole sampler refactor, invisible to CI.  This is
-    the cheap replacement: import only.  No cohort, no checkpoint, no ``main()``.
+    ``pyproject.toml`` used to set ``--ignore=scripts``, which is what let several of these sit
+    broken behind stale ``every_query`` imports across a whole sampler refactor, invisible to CI.
+    The exclusion is gone, so a rootdir run now imports them under ``--doctest-modules`` too — but
+    a ``pytest tests/`` run does not reach ``scripts/``, and this is what covers that case.
+    Import only: no cohort, no checkpoint, no ``main()``.
     """
     optional = _OPTIONAL_SCRIPT_DEPS.get(script_path.name)
     if optional is not None:
         pytest.importorskip(optional, reason=f"{script_path.name} needs the optional {optional!r} dep")
 
-    # Several drivers import their siblings (``from eval_v2 import ...``), which resolves only with
-    # scripts/ on the path — exactly how they run (``python scripts/eval_position_effect.py``).
+    # A driver may import a sibling, which resolves only with scripts/ on the path — exactly how
+    # they run (``python scripts/bench_multitask_dataset.py``).
     sys.path.insert(0, str(_SCRIPTS_DIR))
     try:
         spec = importlib.util.spec_from_file_location(f"_scripts_smoke_{script_path.stem}", script_path)

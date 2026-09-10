@@ -13,7 +13,7 @@ Covered, in pipeline order:
    a start-knob change relabels rather than serving a stale shard.
 
 Parity reasoning, stated once (the issue asks for it here): the query / duration / end draw of the
-eval grid is parity-anchored to ``sample_query_sequences.py`` and must not move; only the start
+eval grid is parity-anchored to ``query_sequence_labeling.py`` and must not move; only the start
 component mirrors ``sample_multitask_sequences.py``'s ``BoundaryDistribution``.  The tests therefore
 pin *both* halves — the legacy draw byte-for-byte, and the start draw's independence from it —
 without claiming the whole sequence equals a multitask draw.
@@ -31,9 +31,14 @@ import pytest
 import yaml
 from hydra import compose, initialize_config_dir
 
+from every_query.data.query_seq_dataset import EVENT_BOUND_DURATION_SENTINEL as SENTINEL
 from every_query.data.schema import QuerySeqSchema
-from every_query.data.seq_dataset import EVENT_BOUND_DURATION_SENTINEL as SENTINEL
 from every_query.generate_tasks import sample_evaluation_query_sequences as eval_seq
+from every_query.generate_tasks.query_sequence_labeling import (
+    BOUND_COL,
+    START_DURATION_COL,
+    START_EVENT_COL,
+)
 from every_query.generate_tasks.sample_evaluation_query_sequences import (
     SequenceSpec,
     _sample_starts,
@@ -42,11 +47,6 @@ from every_query.generate_tasks.sample_evaluation_query_sequences import (
     read_sequence_specs,
     sample_sequence_specs,
     validate_spec_codes,
-)
-from every_query.generate_tasks.sample_query_sequences import (
-    BOUND_COL,
-    START_DURATION_COL,
-    START_EVENT_COL,
 )
 
 SPLIT = "held_out"

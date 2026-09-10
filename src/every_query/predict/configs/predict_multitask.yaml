@@ -1,11 +1,11 @@
 # EQ_predict_multitask — inference over a QuerySeqSchema evaluation grid with the multitask model.
 #
-# Reads the `eval/` root written by EQ_generate_evaluation_query_sequences (the same grid
-# EQ_predict_sequences scores), runs the trained ConditionalMultitaskAR model over it, and writes
+# Reads the `eval/` root written by EQ_generate_evaluation_query_sequences, runs the trained
+# ConditionalMultitaskAR model over it, and writes
 # ONE scalar prediction per grid row: the probability that the row's final query occurs in its
 # window, conditioned on the patient and on the earlier queries with their true answers
 # (queries[:-1] / answers[:-1] are teacher-forced conditioning pairs; queries[-1] is scored).
-# Unlike EQ_predict_sequences this path consumes the grid's explicit window starts
+# This is the only path that consumes the grid's explicit window starts
 # (start_durations / start_events), which only the multitask model encodes.  See
 # src/every_query/predict/predict_multitask.py for the row mapping and the output columns.
 #
@@ -55,8 +55,8 @@ num_workers: null
 
 # Lightning precision string for the inference Trainer.  bf16-mixed is the precision every shipped
 # training config records, so scoring runs under the same autocast the checkpoint was trained
-# with, and it is what EQ_predict / EQ_predict_sequences inherit from the run's trainer config, so
-# both model families score a grid under the same numerics (a run trained under another precision
+# with, and it is what EQ_predict inherits from the run's trainer config, so both pipelines score
+# under the same numerics (a run trained under another precision
 # needs the matching value here).  Pass 32-true for full-precision probabilities (they differ from
 # bf16-mixed at the ~1e-2 level; the pre-#30 manual loop was fp32).
 precision: bf16-mixed

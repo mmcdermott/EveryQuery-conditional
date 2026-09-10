@@ -49,13 +49,14 @@ from meds_torchdata.config import MEDSTorchDataConfig
 from meds_torchdata.types import MEDSTorchBatch
 
 from every_query.data import rope_time
-from every_query.model.conditional_model import ANSWER_NO, ANSWER_YES
+from every_query.model.answers import ANSWER_NO, ANSWER_YES
 
 logger = logging.getLogger(__name__)
 
 # End-of-timeline code: a real MEDS vocabulary code emitted once per subject at the record's last
 # timestamp.  A query ``(EOS_CODE, d)`` therefore answers "does the record end within d?" — the
-# mechanism by which the conditional model handles censoring (see conditional_model docstring).
+# mechanism by which these models handle censoring: there is no separate "censored" answer class,
+# so censoring is expressed as an ordinary query (see :mod:`every_query.model.answers`).
 EOS_CODE = "TIMELINE//END"
 
 QUERIES_COL = "queries"
@@ -79,7 +80,8 @@ ALL_SEQ_LABEL_COLS = (*SEQ_LABEL_COLS, *OPTIONAL_SEQ_LABEL_COLS)
 
 # Duration written for an event-bounded query.  The window is defined by the boundary event, so
 # there is no horizon; a negative sentinel makes an accidental use as a horizon obvious rather
-# than plausible.  Downstream bucketing must special-case it (see evaluate_sequences).
+# than plausible.  Downstream bucketing must special-case it (see evaluate_multitask, which keys
+# on the whole window spec rather than on the duration alone).
 EVENT_BOUND_DURATION_SENTINEL = -1.0
 
 # Vocabulary index meaning "this query has no boundary event".  Shares PAD_INDEX = 0, which is
@@ -88,11 +90,11 @@ NO_BOUND_INDEX = 0
 
 
 @dataclass
-class ConditionalQueryBatch(MEDSTorchBatch):
+class QuerySeqBatch(MEDSTorchBatch):
     """MEDS batch extended with per-sample query-sequence tensors.
 
     Examples:
-        >>> batch = ConditionalQueryBatch(
+        >>> batch = QuerySeqBatch(
         ...     code=torch.tensor([[1, 2, 3], [4, 5, 0]]),
         ...     numeric_value=torch.zeros(2, 3),
         ...     numeric_value_mask=torch.zeros(2, 3, dtype=torch.bool),
@@ -109,7 +111,7 @@ class ConditionalQueryBatch(MEDSTorchBatch):
 
         Mismatched query-tensor shapes raise:
 
-        >>> ConditionalQueryBatch(
+        >>> QuerySeqBatch(
         ...     code=torch.tensor([[1, 2], [3, 4]]),
         ...     numeric_value=torch.zeros(2, 2),
         ...     numeric_value_mask=torch.zeros(2, 2, dtype=torch.bool),
@@ -244,7 +246,7 @@ _PER_TOKEN_FIELDS = (
 )
 
 
-class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
+class QuerySeqPytorchDataset(MEDSPytorchDataset):
     """MEDS dataset over query-sequence label parquets (see module docstring for tensor shapes)."""
 
     @classmethod
@@ -284,9 +286,9 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
             cfg: Upstream MEDS torchdata config.
             split: MEDS split name.
             strip_delta_tokens: When True, drop ``TIMELINE//DELTA*`` tokens from the encoder
-                input at collate time and emit :attr:`ConditionalQueryBatch.time_pos_ids`
+                input at collate time and emit :attr:`QuerySeqBatch.time_pos_ids`
                 (elapsed integer hours per surviving token) for rotary position encoding.
-                Pair with ``ConditionalQueryModel(use_rope_time=True)``; see
+                Pair with a model built ``use_rope_time=True``; see
                 :mod:`every_query.data.rope_time`.
             ontology_dir: When set, ancestor node names from the ontology's ``ontology_vocab.parquet``
                 are added to the query vocabulary, so a query may name a whole class rather
@@ -294,9 +296,8 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
                 the indices have to agree, or a query would address the wrong embedding row.
             allow_active_starts: Opt in to tensorizing the optional ``start_durations`` /
                 ``start_events`` label columns (issue #27) into
-                :attr:`ConditionalQueryBatch.q_start_durations` / ``q_start_codes``.  The
-                ordinary sequence models (``ConditionalQueryEncoderDecoderModel``,
-                ``ConditionalQueryARModel``) do not encode window starts, so with the default
+                :attr:`QuerySeqBatch.q_start_durations` / ``q_start_codes``.  A model that does
+                not encode window starts must never be handed them, so with the default
                 ``False`` a labels directory carrying any *active* start (a positive duration or
                 an event start) is rejected at init rather than silently scored as if every window
                 opened at the prediction time.  Absent or all-default (``0.0`` / null) starts are
@@ -308,9 +309,9 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
         missing = [c for c in SEQ_LABEL_COLS if c not in schema_cols]
         if missing:
             raise ValueError(
-                f"ConditionalQueryPytorchDataset requires query-sequence label columns "
+                f"QuerySeqPytorchDataset requires query-sequence label columns "
                 f"{list(SEQ_LABEL_COLS)}; missing {missing}.  Generate labels with "
-                f"EQ_generate_query_sequences."
+                f"EQ_generate_evaluation_query_sequences."
             )
 
         self.queries = self.schema_df[QUERIES_COL]
@@ -464,12 +465,11 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
         if n_active and not self.allow_active_starts:
             raise ValueError(
                 f"{n_active} query window(s) in the labels have an active start (a positive "
-                "start_duration or a start_event).  The ordinary sequence models "
-                "(ConditionalQueryEncoderDecoderModel / ConditionalQueryARModel) do not encode window "
-                "starts, so scoring these labels with EQ_predict_sequences would silently treat every "
-                "window as opening at the prediction time.  Score them with EQ_predict_multitask (its "
-                "adapter passes allow_active_starts=True), or regenerate the grid with prediction-time "
-                "starts."
+                "start_duration or a start_event).  A model that does not encode window starts "
+                "would silently treat every window as opening at the prediction time, so this "
+                "dataset refuses the grid instead.  Score it with EQ_predict_multitask (its "
+                "adapter passes allow_active_starts=True), or regenerate the grid with "
+                "prediction-time starts."
             )
         start_codes = np.fromiter(
             (NO_BOUND_INDEX if c is None else self.code_to_index[c] for c in s_events),
@@ -540,7 +540,7 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
 
         code = out["code"]
         _, n_old = code.shape
-        pad = ConditionalQueryBatch.PAD_INDEX
+        pad = QuerySeqBatch.PAD_INDEX
 
         zeros = torch.zeros_like(code, dtype=torch.float)
         new_code, new_nv, new_nvm, new_tdd, time_pos = rope_time.strip_delta_tokens(
@@ -574,7 +574,7 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
 
         return time_pos
 
-    def collate(self, batch: list[dict]) -> ConditionalQueryBatch:
+    def collate(self, batch: list[dict]) -> QuerySeqBatch:
         out = dict(super().collate(batch).items())
         # The base batch type doesn't know about the seq label columns; drop anything
         # super() didn't consume and rebuild the query tensors below.
@@ -615,7 +615,7 @@ class ConditionalQueryPytorchDataset(MEDSPytorchDataset):
                 q_start_durations[i, :n] = torch.as_tensor(item["start_durations"], dtype=torch.float)
                 q_start_codes[i, :n] = torch.as_tensor(item["start_codes"], dtype=torch.long)
 
-        return ConditionalQueryBatch(
+        return QuerySeqBatch(
             **out,
             q_codes=q_codes,
             q_durations=q_durations,

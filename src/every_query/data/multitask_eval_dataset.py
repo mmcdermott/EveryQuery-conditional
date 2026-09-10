@@ -42,7 +42,7 @@ inputs, and the last one is the scalar label.  Nothing here reads or writes a ``
 multitask manifest, ``eval_meta`` or ``eval_tasks.parquet``.
 
 The dataset is the explicit opt-in path for active window starts: it builds the underlying
-:class:`~every_query.data.seq_dataset.ConditionalQueryPytorchDataset` with
+:class:`~every_query.data.query_seq_dataset.QuerySeqPytorchDataset` with
 ``allow_active_starts=True``, which the ordinary sequence models' path never does.
 """
 
@@ -60,10 +60,10 @@ from meds_torchdata import MEDSPytorchDataset
 from meds_torchdata.config import MEDSTorchDataConfig
 from meds_torchdata.types import MEDSTorchBatch
 
-from every_query.data.seq_dataset import (
+from every_query.data.query_seq_dataset import (
     ALL_SEQ_LABEL_COLS,
     NO_BOUND_INDEX,
-    ConditionalQueryPytorchDataset,
+    QuerySeqPytorchDataset,
 )
 
 logger = logging.getLogger(__name__)
@@ -192,10 +192,10 @@ class MultitaskEvalBatch(MEDSTorchBatch):
             raise ValueError("n_queries must equal q_mask.sum(1)")
 
 
-class QuerySeqMultitaskEvalDataset(ConditionalQueryPytorchDataset):
+class QuerySeqMultitaskEvalDataset(QuerySeqPytorchDataset):
     """``QuerySeqSchema`` evaluation grid tensorized for ``ConditionalMultitaskARModel`` scoring.
 
-    A :class:`~every_query.data.seq_dataset.ConditionalQueryPytorchDataset` built with
+    A :class:`~every_query.data.query_seq_dataset.QuerySeqPytorchDataset` built with
     ``allow_active_starts=True`` (the only caller that does), whose :meth:`collate` emits a
     :class:`MultitaskEvalBatch` per the mapping in the module docstring.  On top of the parent's
     checks it requires:

@@ -15,7 +15,7 @@ for some occurrence ``t_v`` of code ``v``.  Issue #24 gives every window an expl
 The start is resolved first and the end relative to it; an unresolved event start never opens the
 window (every target false, the end is ``+inf`` too, never ``pt``), and an unresolved event end runs to
 the end of the record.  The window is open at both ends, exactly as the scalar
-:func:`~every_query.generate_tasks.sample_query_sequences.label_with_event_bounds` path defines the
+:func:`~every_query.generate_tasks.query_sequence_labeling.label_with_event_bounds` path defines the
 ``(prediction_time, boundary)`` window; that function is the correctness oracle the tests compare
 against (fed the resolved start as its prediction time).
 
@@ -102,8 +102,8 @@ import polars as pl
 from meds import DataSchema
 from omegaconf import DictConfig, ListConfig
 
+from every_query.data.query_seq_dataset import EVENT_BOUND_DURATION_SENTINEL
 from every_query.data.schema import MultitaskBoundarySchema, TaskQuerySchema
-from every_query.data.seq_dataset import EVENT_BOUND_DURATION_SENTINEL
 from every_query.generate_tasks.interval_table import (
     INF,
     IntervalTable,
@@ -113,7 +113,7 @@ from every_query.generate_tasks.interval_table import (
     resolve_end_times,
     resolve_start_times,
 )
-from every_query.generate_tasks.sample_query_sequences import resolve_prediction_times
+from every_query.generate_tasks.query_sequence_labeling import resolve_prediction_times
 from every_query.generate_tasks.sample_tasks import (
     INDEX_DIRNAME,
     LABELED_DIRNAME,

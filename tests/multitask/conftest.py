@@ -274,7 +274,7 @@ def resolved_start_scalar_oracle(
 def _scalar_oracle_rows(
     index_df: pl.DataFrame, events_df: pl.DataFrame, codes: list[str], num_bounds: int, pts: list
 ) -> np.ndarray:
-    from every_query.generate_tasks.sample_query_sequences import label_with_event_bounds
+    from every_query.generate_tasks.query_sequence_labeling import label_with_event_bounds
 
     recs = []
     for i, r in enumerate(index_df.iter_rows(named=True)):

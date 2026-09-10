@@ -42,35 +42,32 @@ def int_prod(x: int, y: int) -> int:
 def required_position_embeddings(model_cfg: DictConfig, max_seq_len: int) -> int:
     """The ``max_position_embeddings`` a model config needs for a ``max_seq_len`` data window.
 
-    The decoder-only :class:`~every_query.model.conditional_ar_model.ConditionalQueryARModel`
-    runs patient history and query stream through **one** backbone, so its position budget must
-    cover both: ``max_seq_len`` patient tokens plus three tokens (code, duration, answer) per
-    query block up to ``max_queries``.  Every other model only ever feeds the backbone the
-    patient window plus the two tokens the single-query model splices in (query + duration),
-    which also safely covers the encoder-decoder conditional model (its encoder sees the
-    patient window alone).
+    The decoder-only
+    :class:`~every_query.model.conditional_multitask_ar_model.ConditionalMultitaskARModel` runs
+    patient history and window stream through **one** backbone, so its position budget must
+    cover both: ``max_seq_len`` patient tokens plus three tokens per window block up to
+    ``max_windows``.  Every other model only ever feeds the backbone the patient window plus the
+    two tokens the single-query model splices in (query + duration), which is the fallback below.
 
     Examples:
-        >>> ar = OmegaConf.create(
-        ...     {"_target_": "every_query.model.conditional_ar_model.ConditionalQueryARModel",
-        ...      "max_queries": 8}
+        >>> multitask = OmegaConf.create(
+        ...     {"_target_":
+        ...      "every_query.model.conditional_multitask_ar_model.ConditionalMultitaskARModel",
+        ...      "max_windows": 8}
         ... )
-        >>> required_position_embeddings(ar, 256)
+        >>> required_position_embeddings(multitask, 256)
         280
-        >>> encdec = OmegaConf.create(
-        ...     {"_target_": "every_query.model.conditional_model.ConditionalQueryEncoderDecoderModel"}
-        ... )
-        >>> required_position_embeddings(encdec, 256)
+
+        Anything else gets the patient window plus the single-query model's two spliced tokens:
+
+        >>> single = OmegaConf.create({"_target_": "every_query.model.EveryQueryModel"})
+        >>> required_position_embeddings(single, 256)
         258
     """
     target = str(model_cfg.get("_target_", ""))
     target_name = target.rsplit(".", 1)[-1]
     if target_name == "ConditionalMultitaskARModel":
         return max_seq_len + 3 * int(model_cfg.max_windows)
-    if target_name == "ConditionalQueryARModel":
-        from every_query.model.conditional_model import TOKENS_PER_QUERY
-
-        return max_seq_len + TOKENS_PER_QUERY * int(model_cfg.max_queries)
     return max_seq_len + 2
 
 

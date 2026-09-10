@@ -1,0 +1,24 @@
+# EQ_evaluate_multitask — per-task-spec metrics over an EQ_predict_multitask output parquet.
+
+defaults:
+  - _self_
+
+# Required: the one-row-per-grid-row predictions parquet written by EQ_predict_multitask.
+predictions_parquet: ???
+
+# Required: output stem; tables land at <stem>.by_task.parquet and <stem>.summary.parquet.
+metrics_stem: ???
+
+# Bootstrap replicates behind every interval this CLI emits — the per-cell subject-cluster
+# intervals on by_task and all three macro intervals on the summary.  The intervals themselves are
+# not optional; this knob only trades runtime for interval resolution.
+n_resamples: 1000
+
+# Seed for the subject and task resampling streams, so a fixed predictions parquet gives fixed
+# intervals.  Matches the upstream/task-auroc-ci convention (np.random.default_rng(0)).
+bootstrap_seed: 0
+
+hydra:
+  output_subdir: null
+  job:
+    chdir: false

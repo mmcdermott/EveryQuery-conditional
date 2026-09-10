@@ -12,15 +12,16 @@ families of (scattered-for-training, dense-for-evaluation) pairs — one per mod
 - **`EQ_generate_evaluation_tasks`** — dense-grid shape: sampled prediction
     times × `(codes × durations)`, for feeding `EQ_predict` → `EQ_evaluate`.
 
-**Conditional query-sequence model** (this fork), producing `QuerySeqSchema` rows (aligned
+**Query sequences** (this fork), producing `QuerySeqSchema` rows (aligned
 `queries` / `durations` / `answers` list columns per context):
 
-- **`EQ_generate_query_sequences`** — scattered shape: every context draws its own
-    independent sequence of `Uniform{min_queries..max_queries}` queries, for pretraining.
+- **`query_sequence_labeling`** (a library; no console script) — scattered shape: every context draws its own
+    independent sequence of `Uniform{min_queries..max_queries}` queries. Its labellers are the
+    shared seam under the evaluation-grid generator and the multitask sampler.
 - **`EQ_generate_evaluation_query_sequences`** — dense-grid shape: the *same* `N` query
-    sequences labeled at `K` sampled prediction times per subject (or at a supplied cohort),
-    for feeding `EQ_predict_sequences` → `EQ_evaluate_sequences`. Also the **only** evaluation
-    grid for the multitask model (`EQ_predict_multitask`), optionally with explicit per-query
+    sequences labeled at `K` sampled prediction times per subject (or at a supplied cohort).
+    This is the **only** evaluation grid for the multitask model, feeding
+    `EQ_predict_multitask` → `EQ_evaluate_multitask`, optionally with explicit per-query
     window starts (issue #27).
 
 **All-vocabulary multitask model**, producing `MultitaskBoundarySchema` rows plus packed
@@ -66,12 +67,14 @@ families of (scattered-for-training, dense-for-evaluation) pairs — one per mod
     the optional in-training `TaskAurocTrackingCallback` — see
     `trainer.callbacks.task_auroc_tracking` in `train/configs/config.yaml`.
 
-- **`sample_query_sequences.py`** — scattered conditional-sequence generator. Per context,
+- **`query_sequence_labeling.py`** — scattered conditional-sequence generator. Per context,
     draws `Uniform{min_queries..max_queries}` iid `(code, duration)` queries in random order
     (the end-of-timeline code `TIMELINE//END` is an ordinary code, not a privileged censor
     slot) and labels each with a binary observed-occurrence answer — there is no censoring
-    null, because censoring is expressed by the `TIMELINE//END` query itself. Registered as
-    `EQ_generate_query_sequences`.
+    null, because censoring is expressed by the `TIMELINE//END` query itself. A library rather
+    than a CLI: no `[project.scripts]` entry, reachable as
+    `python -m every_query.generate_tasks.query_sequence_labeling`. Its labellers are the shared
+    window-semantics seam under both the evaluation-grid and the multitask samplers.
 
 - **`sample_evaluation_query_sequences.py`** — dense-grid conditional-sequence generator:
     `sample_evaluation_tasks` with `SequenceSpec`s in place of `(code, duration)` grid cells.
@@ -86,7 +89,7 @@ families of (scattered-for-training, dense-for-evaluation) pairs — one per mod
     (`num_evaluation_sequences=64`, 50% event-bounded by default, every window opening at the
     prediction time unless the `eventstart_fraction` / `prediction_time_start_fraction` start knobs
     say otherwise) and shared by every shard. Reuses `sample_evaluation_tasks`'s cohort sampler and
-    `sample_query_sequences`'s `label_query_sequences` labeler (which routes a grid with explicit
+    `query_sequence_labeling`'s `label_query_sequences` labeler (which routes a grid with explicit
     starts through `interval_table.py`, the multitask sampler's window resolver); only the grid
     build is its own. Registered as `EQ_generate_evaluation_query_sequences`.
 
@@ -116,13 +119,9 @@ EQ_process_data       EQ_generate_training_tasks           EQ_train       EQ_pre
                       EQ_generate_evaluation_tasks(split=tuning)
                         → EQ_sample_task_tracking_pairs ──►  (in-training tracking input)
 
-                      EQ_generate_query_sequences          EQ_train       EQ_predict_sequences
-                      EQ_generate_evaluation_query_sequences ───────────►  (inference input)
-                                                                          EQ_evaluate_sequences
-
-                      EQ_generate_multitask_sequences      EQ_train       EQ_predict_multitask
+                      EQ_generate_multitask_sequences      EQ_train       EQ_predict_multitask  →  EQ_evaluate_multitask
                       EQ_generate_evaluation_query_sequences ───────────►  (inference input:
-                                                                           the same QuerySeq grid,
+                                                                           the QuerySeq grid,
                                                                            active starts allowed)
 ```
 
@@ -144,14 +143,13 @@ own), so the two trees never nest and cleanup is a single `rm -rf` of the artifa
 cohort under `eval_unique/`). The separate `eval/` subdirectory keeps the two row distributions
 from colliding in one directory. `EQ_generate_evaluation_query_sequences` writes the same layout
 under *its* `out_dir` — give it a distinct root, since the two `eval/` trees hold incompatible
-schemas and `EQ_predict_sequences` rglobs whatever it is pointed at.
+schemas and `EQ_predict_multitask` rglobs whatever it is pointed at.
 
 **Sequence outputs** follow the same two-root rule: `out_dir` holds final parquets only, with all
 intermediates in the sibling `{name}_artifacts` root. Both sequence endpoints write layouts
-directly usable as `EQ_predict_sequences tasks_dir=...` — MEDS-TorchData rglobs that directory, so
+directly usable as `EQ_predict_multitask tasks_dir=...` — MEDS-TorchData rglobs that directory, so
 point it at exactly the parquets you want scored. Note that adopting this layout **invalidates run
-directories produced by the fork**, and the vendored `scripts/` eval helpers still carry hardcoded
-paths from the old layout.
+directories produced by the fork**.
 
 ## Running it
 
@@ -215,13 +213,13 @@ small (2 rows per task) and fixed for the duration of a training run — point
 have `EQ_train` log a macro-averaged, per-task-sampled AUROC (`tuning/occurs_auroc_macro_sampled`)
 every validation pass, without paying the cost of scoring the full tuning split.
 
-### Conditional query sequences
+### Evaluation query sequences
 
 ```bash
 # Dense evaluation grid: N sequences drawn once from the training distribution x K=2 sampled
 # prediction times per subject of every shard of the split -- the same cohort knobs (and cohort)
 # as EQ_generate_evaluation_tasks.  One parquet per shard at {out_dir}/eval/{split}/{shard}.parquet,
-# directly usable as `EQ_predict_sequences tasks_dir=$EVAL_SEQ_TASKS_DIR/eval`.  The sampling
+# directly usable as `EQ_predict_multitask tasks_dir=$EVAL_SEQ_TASKS_DIR/eval`.  The sampling
 # defaults mirror `sample_query_sequences_config.yaml`; if the checkpoint was trained with
 # overrides, pass the same ones here (e.g. min_queries=5 max_queries=5 duration_max=365) — an
 # out-of-distribution horizon shows up as an unexplained metric shift, not as an error:
@@ -238,8 +236,9 @@ EQ_generate_evaluation_query_sequences \
 	split=held_out contexts_path=cohort.parquet sequences_path=tasks.yaml
 ```
 
-`EQ_generate_query_sequences` takes the same three path args and only ever samples its contexts;
-to label a supplied cohort use `EQ_generate_evaluation_query_sequences contexts_path=...`.
+`query_sequence_labeling` (via `python -m`) takes the same three path args and only ever samples
+its contexts; to label a supplied cohort use
+`EQ_generate_evaluation_query_sequences contexts_path=...`.
 
 #### Window starts (issue #27)
 
@@ -284,10 +283,10 @@ at the prediction time and reproduce the pre-#27 grid — same specs, no start c
 Output rows carry `start_durations` (`0.0` = prediction time, `> 0` = delay in days, `-1.0` = event
 start) and `start_events` (the start code, or null) only when some spec has an active start.
 
-**The ordinary sequence models accept only prediction-time starts**: `ConditionalQueryPytorchDataset`
+**The ordinary sequence models accept only prediction-time starts**: `QuerySeqPytorchDataset`
 loads a grid with absent or all-default start columns, and refuses one with any positive-delay or
 event start unless built with `allow_active_starts=True` — which only the multitask prediction
-adapter does. `EQ_generate_query_sequences` never samples a start.
+adapter does. `query_sequence_labeling` never samples a start.
 
 ### Multitask boundary labels — every code at every window
 
@@ -456,8 +455,8 @@ all-vocabulary `.labels.npy` evaluation targets, `eval_meta` sidecars and `eval_
 removed in #29). The training sampler above stays separate and all-vocabulary; evaluation is:
 
 ```
-EQ_generate_evaluation_query_sequences   ->   QuerySeqSchema eval grid   ->   EQ_predict_sequences
-                                                                          OR   EQ_predict_multitask
+EQ_generate_evaluation_query_sequences   ->   QuerySeqSchema eval grid   ->   EQ_predict_multitask
+                                                                          ->   EQ_evaluate_multitask
 ```
 
 `EQ_predict_multitask` reads the grid's `eval/` root directly — including the explicit window starts
@@ -465,8 +464,9 @@ EQ_generate_evaluation_query_sequences   ->   QuerySeqSchema eval grid   ->   EQ
 `queries[:-1]` / `answers[:-1]` onto the teacher-forced conditioning pairs and scores the row's final
 query at its last window, and writes one scalar prediction per grid row (`target_code = queries[-1]`,
 `label = answers[-1]`, `prob`). No packed labels, manifest or sidecar is read or written on this path.
-The ordinary sequence models (`EQ_predict_sequences`) score the same grid but accept only
-prediction-time starts.
+`EQ_evaluate_multitask` then groups those rows by the query *spec* and macro-averages AUROC over
+the cells. The single-query pipeline's `EQ_predict` reads `TaskQuerySchema` rows instead and does
+not consume this grid at all.
 
 ## Determinism & restartability
 
@@ -486,7 +486,7 @@ alone — deliberately independent of the cohort, so the same `(seed, split)` yi
 sequences for any cohort you point it at, and two cohorts' metrics are comparable query-for-query.
 Its cohort draw uses `sample_evaluation_tasks`'s axes, `(seed, "prediction_times", split, shard)`
 and `(seed, "subject_subsample", split, shard)`, so it also lands on the flat generator's cohort.
-`sample_query_sequences` still uses the fork's per-shard seed axes; folding it onto upstream's
+`query_sequence_labeling` still uses the fork's per-shard seed axes; folding it onto upstream's
 `derive_seed(seed, "queries")` / `derive_seed(seed, "contexts")` convention is part of the Phase 2
 rewrite.
 

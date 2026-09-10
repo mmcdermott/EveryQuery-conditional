@@ -5,8 +5,8 @@ The evaluation flow is::
     EQ_generate_evaluation_query_sequences -> QuerySeqSchema eval grid -> EQ_predict_multitask
 
 Takes a trained :class:`~every_query.model.conditional_multitask_ar_model.ConditionalMultitaskARModel`
-run directory and the ``eval/`` root written by ``EQ_generate_evaluation_query_sequences`` (the same
-grid ``EQ_predict_sequences`` consumes, plus the explicit window starts only this model can read),
+run directory and the ``eval/`` root written by ``EQ_generate_evaluation_query_sequences``
+(including the explicit window starts only this model can read),
 and writes **one scalar prediction per grid row**: the probability that the row's *final* query
 occurs in its window, conditioned on the patient and on the earlier queries with their true answers.
 
@@ -84,7 +84,7 @@ from meds import held_out_split
 from omegaconf import DictConfig  # noqa: TC002 - Hydra resolves this at runtime
 
 from every_query.data.conditional_multitask_datamodule import EVAL_SPLITS, ConditionalMultitaskDataModule
-from every_query.data.seq_dataset import (
+from every_query.data.query_seq_dataset import (
     ANSWERS_COL,
     BOUND_EVENTS_COL,
     DURATIONS_COL,
@@ -493,9 +493,9 @@ def build_predict_trainer(
 
     ``precision`` is a Lightning precision string and defaults to ``bf16-mixed``, the production
     training precision, so the backbone pass runs under the same autocast the checkpoint was trained
-    with - and under the same numerics as ``EQ_predict`` / ``EQ_predict_sequences``, which predict
-    through the trainer of the run's ``resolved_config.yaml`` and so inherit the ``bf16-mixed`` every
-    shipped training config records; a multitask-vs-conditional comparison on one grid is therefore
+    with - and under the same numerics as ``EQ_predict``, which predicts
+    through the trainer of the run's ``resolved_config.yaml`` and so inherits the ``bf16-mixed`` every
+    shipped training config records; a cross-run comparison is therefore
     like for like (a run trained under another precision would need the matching override here).
     (The pre-#30 manual loop ran the model in fp32; ``bf16-mixed`` is a deliberate change.)  Pass
     ``32-true`` for full-precision scoring (e.g. to compare against a hand-computed

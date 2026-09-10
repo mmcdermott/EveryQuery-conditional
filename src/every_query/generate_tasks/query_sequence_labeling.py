@@ -1,4 +1,26 @@
-"""Sampling-first query-*sequence* label generator for conditional pre-training.
+"""Query-*sequence* window labelling, and the sampling pipeline built on top of it.
+
+**This module is a library, not a CLI.**  It has no ``[project.scripts]`` entry point; the name
+says what the rest of the repo imports it for.  Its labellers are the one place the
+``(start, end]`` window semantics are implemented, and three surviving callers depend on them:
+
+- :mod:`~every_query.generate_tasks.sample_evaluation_query_sequences` (the evaluation-grid
+  generator) routes every grid through :func:`label_query_sequences` and draws its query universe
+  and ontology expansion from here;
+- :mod:`~every_query.generate_tasks.sample_multitask_sequences` takes
+  :func:`resolve_prediction_times` from here, and its ``(N, K, V)`` interval-table labeller is
+  differentially tested against :func:`label_with_event_bounds` as the scalar oracle;
+- :mod:`every_query.data.ontology`'s production probe and the window-bounds contract test pin the
+  labellers directly.
+
+The Hydra ``run``/``main`` tail below is kept for one further reason: it is the *training-pipeline
+arm* of the sampler differential in ``tests/sampler/test_sequence_orchestration.py``, which runs
+one designed spec table through both the dense evaluation entry point and
+:func:`label_one_sequence_shard` and asserts they label DAG boundaries and ancestor targets
+identically.  The multitask sampler cannot stand in for that arm — it accepts no supplied window
+table and its targets are leaf-only by design — so deleting the tail would delete one side of a
+differential rather than move it.  Its config, ``configs/sample_query_sequences_config.yaml``, is
+kept with it, and stays key-identical to the evaluation config (a test asserts it).
 
 Sibling of :mod:`~every_query.generate_tasks.sample_tasks`, running the *same* 5-stage pipeline but
 emitting, per sampled patient context, an ordered *sequence* of queries rather than one scattered
@@ -61,8 +83,8 @@ import polars as pl
 from meds import DataSchema
 from omegaconf import DictConfig
 
+from every_query.data.query_seq_dataset import EOS_CODE, EVENT_BOUND_DURATION_SENTINEL
 from every_query.data.schema import QuerySeqSchema, TaskQuerySchema
-from every_query.data.seq_dataset import EOS_CODE, EVENT_BOUND_DURATION_SENTINEL
 from every_query.generate_tasks.sample_tasks import (
     INDEX_DIRNAME,
     LABELED_DIRNAME,
@@ -1384,7 +1406,11 @@ CONFIGS = str(files("every_query") / "generate_tasks" / "configs")
 
 @hydra.main(version_base=None, config_path=CONFIGS, config_name="sample_query_sequences_config")
 def main(cfg: DictConfig) -> None:
-    """Hydra entry point (``EQ_generate_query_sequences``): the sampled 5-stage pipeline via :func:`run`.
+    """Hydra entry point for the sampled 5-stage pipeline via :func:`run`.
+
+    There is no console script; reach it as ``python -m
+    every_query.generate_tasks.query_sequence_labeling``.  It survives because it is one arm of the
+    two-pipeline sampler differential (see this module's docstring).
 
     Path roots are required args with no ``.env``/env-var fallback (removed upstream in #235):
     ``data_dir``, ``out_dir``, and ``query_codes`` are mandatory, resolved through the same

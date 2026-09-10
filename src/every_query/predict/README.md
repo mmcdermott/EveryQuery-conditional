@@ -13,8 +13,7 @@ probabilities.
 ├── __init__.py
 ├── configs
 │   ├── predict.yaml
-│   ├── predict_multitask.yaml
-│   └── predict_sequences.yaml
+│   └── predict_multitask.yaml
 ├── external_tasks
 │   ├── README.md
 │   ├── __init__.py
@@ -27,7 +26,6 @@ probabilities.
 │   └── process_composite.py
 ├── predict.py
 ├── predict_multitask.py
-├── predict_sequences.py
 └── schema.py
 
 ```
@@ -35,11 +33,7 @@ probabilities.
 Key files:
 
 - `predict.py` — `EQ_predict` (inference-only Hydra main).
-- `predict_sequences.py` — `EQ_predict_sequences`: the conditional counterpart. Consumes
-    `QuerySeqSchema` parquets plus a `ConditionalQueryLightningModule` checkpoint and runs
-    teacher-forced inference, emitting one flat row per query *position*
-    (`subject_id`, `prediction_time`, `position`, `query`, `duration_days`, `answer`, `answer_prob`).
-- `predict_multitask.py` — `EQ_predict_multitask`: scores the *same*
+- `predict_multitask.py` — `EQ_predict_multitask`: scores the
     `EQ_generate_evaluation_query_sequences` grid with a `ConditionalMultitaskLightningModule`
     checkpoint. Per grid row, `queries[:-1]` / `answers[:-1]` are the teacher-forced conditioning
     pairs and the final query is scored target-only at its last window (no all-vocabulary logits,
@@ -58,9 +52,8 @@ Key files:
     --ntasks>1` launch is refused so rows stay aligned with the grid, and the collated labels and
     scored codes are re-checked row by row against the grid before writing).
 - `schema.py` — `PredictionSchema` (`TaskQuerySchema` + `censor_prob` + `occurs_prob`).
-- `configs/predict_sequences.yaml` — same required trio as `predict.yaml`
-    (`model_run_dir`, `tasks_dir`, `output_parquet`), pointed at a conditional training run.
-- `configs/predict_multitask.yaml` — the same trio for a multitask run; `tasks_dir` is the
+- `configs/predict_multitask.yaml` — the same required trio as `predict.yaml`
+    (`model_run_dir`, `tasks_dir`, `output_parquet`) for a multitask run; `tasks_dir` is the
     QuerySeq grid's `eval/` root. Optional: `ckpt_name`, `split`, `overwrite`, `batch_size`,
     `num_workers`, `device` (`null` | `cpu` | `cuda` | `cuda:N` | `mps`, always one device),
     `precision` (`bf16-mixed`, the training / sibling-CLI precision; `32-true` for fp32),
