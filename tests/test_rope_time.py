@@ -4,25 +4,35 @@ Covers, in pipeline order:
 
 1. :mod:`every_query.data.rope_time` — strip semantics, elapsed-time preservation, row
    isolation, and agreement between the keep mask and the strip.
-2. :class:`~every_query.data.seq_dataset.ConditionalQueryPytorchDataset` — that
+2. :class:`~every_query.data.query_seq_dataset.QuerySeqPytorchDataset` — that
    ``strip_delta_tokens=True`` removes the delta tokens from the collated encoder input,
    emits aligned ``time_pos_ids``, and leaves the query tensors untouched.
-3. :class:`~every_query.model.conditional_model.ConditionalQueryModel` — that
-   ``use_rope_time`` actually reaches ModernBERT's rotary machinery *through the real
-   ``forward`` path* (the encoder output moves when only the times move), and that **both**
-   half-configurations are refused rather than silently falling back to token-index
-   positions: a RoPE model handed a batch with no times, and a non-RoPE model handed a
-   batch that carries them.  The second direction was written down here as a *desirable*
+3. :class:`~every_query.model.conditional_multitask_ar_model.ConditionalMultitaskARModel` — that
+   ``use_rope_time`` actually reaches the backbone's rotary machinery *through the real
+   ``forward`` path* (the window hidden states move when only the times move), that the query
+   tokens are pinned to the last patient event's clinical hour rather than advancing time, and
+   that **both** half-configurations are refused rather than silently falling back to
+   token-index positions: a RoPE model handed a batch with no times, and a non-RoPE model handed
+   a batch that carries them.  The second direction was written down here as a *desirable*
    property once ("a non-RoPE model answers a timed batch identically") — that configuration
-   leaves the encoder with zero elapsed-time information, so the correct behaviour is a
+   leaves the backbone with zero elapsed-time information, so the correct behaviour is a
    refusal.  ``use_rope_time=False`` is inert only on a batch that carries no times, which is
    the half of that claim kept below.
 
-Measurement level, throughout section 3: assertions about whether times *reached* the encoder
-read ``last_hidden_state`` and use the ``LIVE`` margin.  A randomly-initialised decoder and
-answer head squash the encoder difference to ~1e-07 at ``answer_logits``, i.e. into float32
-rounding noise, so a bare ``torch.equal`` inequality there is satisfied by one ULP and passes
-just as happily when RoPE is dead.
+Section 3 was originally written against the encoder-decoder conditional query-sequence model
+(since deleted with the rest of that pipeline), because it was the only model that consumed
+``time_pos_ids`` when the feature landed.  ``ConditionalMultitaskARModel`` is the surviving
+consumer; the claims are
+the same, the index arithmetic is its own (one causal stream of ``S`` patient tokens followed by
+``3K-2`` query tokens, not an encoder feeding a cross-attending decoder).
+
+Measurement level, throughout section 3: assertions about whether times *reached* the backbone
+read ``window_hidden_states`` and use the ``LIVE`` margin.  That is the tensor the tied readout
+reads, so it is where the effect lives and it does not depend on the readout's initialisation —
+the same reasoning that made the encoder-decoder version measure ``last_hidden_state`` rather
+than ``answer_logits``, where a randomly-initialised head squashed the difference to ~1e-07,
+i.e. into float32 rounding noise, and a bare ``torch.equal`` inequality was satisfied by one ULP
+and passed just as happily when RoPE was dead.
 """
 
 import pytest
@@ -30,6 +40,7 @@ import torch
 from meds import train_split
 from meds_torchdata import MEDSTorchDataConfig
 
+from every_query.data.query_seq_dataset import QuerySeqBatch, QuerySeqPytorchDataset
 from every_query.data.rope_time import (
     DELTA_TOKEN_PREFIX,
     build_keep_mask,
@@ -37,55 +48,21 @@ from every_query.data.rope_time import (
     delta_vocab_ids,
     strip_delta_tokens,
 )
-from every_query.data.seq_dataset import ConditionalQueryBatch, ConditionalQueryPytorchDataset
-from every_query.model.conditional_model import ANSWER_NO, ANSWER_YES, ConditionalQueryModel
+from every_query.model.answers import validate_rope_time_pair
+from every_query.model.conditional_multitask_ar_model import TOKENS_PER_WINDOW
 
-# Imported rather than re-declared so the margin that separates "RoPE is live" from float32
+# The multitask model's own construction idiom, reused rather than re-invented.
+from tests.test_conditional_multitask_ar_model import make_batch, tiny_model
+
+# Imported rather than redeclared so the margin that separates "RoPE is live" from float32
 # rounding cannot drift between the three files that measure it.
 from tests.test_feature_liveness import LIVE
 
 DELTA_ID = 90
 
-
-def _rope_batch(time_pos_ids=None, patient_codes=None):
-    """A 1x4-token, 1x2-query batch, optionally carrying rotary time positions."""
-    if patient_codes is None:
-        patient_codes = [[3, 4, 5, 6]]
-    B, S = len(patient_codes), len(patient_codes[0])
-    return ConditionalQueryBatch(
-        code=torch.tensor(patient_codes),
-        numeric_value=torch.zeros(B, S),
-        numeric_value_mask=torch.zeros(B, S, dtype=torch.bool),
-        time_delta_days=torch.zeros(B, S),
-        q_codes=torch.tensor([[7, 8]] * B),
-        q_durations=torch.tensor([[30.0, 7.0]] * B),
-        q_answers=torch.tensor([[ANSWER_YES, ANSWER_NO]] * B),
-        q_mask=torch.tensor([[True, True]] * B),
-        time_pos_ids=None if time_pos_ids is None else torch.tensor(time_pos_ids),
-    )
-
-
-def _tiny_model(**kwargs) -> ConditionalQueryModel:
-    model = ConditionalQueryModel(
-        model_name="answerdotai/ModernBERT-base",
-        num_hidden_layers=2,
-        config_overrides={
-            "hidden_size": 32,
-            "num_attention_heads": 2,
-            "intermediate_size": 64,
-            "vocab_size": 16,
-            "max_position_embeddings": 64,
-            "pad_token_id": 0,
-        },
-        decoder_layers=1,
-        decoder_heads=2,
-        decoder_ffn_mult=2,
-        max_queries=8,
-        mlp_dropout=0.0,
-        **kwargs,
-    )
-    model.eval()
-    return model
+# ``make_batch``'s patient stream: row 0 has four real tokens, row 1 has two and two PADs.
+NEAR_TIMES = torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]])
+FAR_TIMES = torch.tensor([[0, 240, 1000, 5000], [0, 5, 9, 30]])
 
 
 # ── 1. strip semantics ──────────────────────────────────────────────────
@@ -227,7 +204,7 @@ def test_dataset_without_strip_emits_no_time_pos_ids(seq_sample_batch):
 
 def test_dataset_strip_emits_aligned_time_pos_ids(tensorized_cohort_dir, seq_task_labels_dir):
     """With stripping on, ``time_pos_ids`` aligns to ``code`` and no delta token survives."""
-    ds = ConditionalQueryPytorchDataset(
+    ds = QuerySeqPytorchDataset(
         _seq_cfg(tensorized_cohort_dir, seq_task_labels_dir),
         split=train_split,
         strip_delta_tokens=True,
@@ -238,7 +215,7 @@ def test_dataset_strip_emits_aligned_time_pos_ids(tensorized_cohort_dir, seq_tas
     assert batch.time_pos_ids.shape == batch.code.shape
     assert not torch.isin(batch.code, ds.delta_ids).any(), "no delta token may survive the strip"
     # Elapsed time never runs backwards within a row.
-    real = batch.code != ConditionalQueryBatch.PAD_INDEX
+    real = batch.code != QuerySeqBatch.PAD_INDEX
     for i in range(batch.code.shape[0]):
         row = batch.time_pos_ids[i][real[i]]
         assert (row.diff() >= 0).all() if row.numel() > 1 else True
@@ -253,13 +230,13 @@ def test_dataset_strip_compacts_the_real_collated_stream(tensorized_cohort_dir, 
     aligned, and the surviving tokens keep their order.
     """
     cfg = _seq_cfg(tensorized_cohort_dir, seq_task_labels_dir)
-    plain = ConditionalQueryPytorchDataset(cfg, split=train_split)
+    plain = QuerySeqPytorchDataset(cfg, split=train_split)
     before = plain.collate([plain[i] for i in range(len(plain))])
 
-    real = before.code[before.code != ConditionalQueryBatch.PAD_INDEX]
+    real = before.code[before.code != QuerySeqBatch.PAD_INDEX]
     victim = int(real.mode().values.item())  # the most common real token
 
-    ds = ConditionalQueryPytorchDataset(cfg, split=train_split, strip_delta_tokens=True)
+    ds = QuerySeqPytorchDataset(cfg, split=train_split, strip_delta_tokens=True)
     ds.delta_ids = torch.tensor([victim])
     after = ds.collate([ds[i] for i in range(len(ds))])
 
@@ -270,8 +247,8 @@ def test_dataset_strip_compacts_the_real_collated_stream(tensorized_cohort_dir, 
     assert after.numeric_value_mask.shape == after.code.shape
 
     for i in range(before.code.shape[0]):
-        kept = [int(c) for c in before.code[i] if int(c) not in (victim, ConditionalQueryBatch.PAD_INDEX)]
-        got = [int(c) for c in after.code[i] if int(c) != ConditionalQueryBatch.PAD_INDEX]
+        kept = [int(c) for c in before.code[i] if int(c) not in (victim, QuerySeqBatch.PAD_INDEX)]
+        got = [int(c) for c in after.code[i] if int(c) != QuerySeqBatch.PAD_INDEX]
         assert got == kept, "surviving tokens must keep their original order"
 
 
@@ -280,7 +257,7 @@ def test_strip_emits_times_even_when_the_cohort_has_no_delta_tokens(
 ):
     """``time_pos_ids`` means "the strip was requested", not "delta tokens were deleted".
 
-    ``ConditionalQueryPytorchDataset`` handles the empty-``delta_ids`` cohort explicitly — it
+    ``QuerySeqPytorchDataset`` handles the empty-``delta_ids`` cohort explicitly — it
     warns and carries on, emitting ``time_pos_ids`` while deleting nothing — so the presence of
     the field is not by itself proof that ``batch.code`` was rewritten.  Pinned here because
     ``_encoder_position_kwargs``'s docstring reasons about what that presence implies, and
@@ -290,8 +267,8 @@ def test_strip_emits_times_even_when_the_cohort_has_no_delta_tokens(
     the mismatch reported, not smoothed over.
     """
     cfg = _seq_cfg(tensorized_cohort_dir, seq_task_labels_dir)
-    plain = ConditionalQueryPytorchDataset(cfg, split=train_split)
-    ds = ConditionalQueryPytorchDataset(cfg, split=train_split, strip_delta_tokens=True)
+    plain = QuerySeqPytorchDataset(cfg, split=train_split)
+    ds = QuerySeqPytorchDataset(cfg, split=train_split, strip_delta_tokens=True)
     assert ds.delta_ids.numel() == 0, "this fixture cohort must have no TIMELINE//DELTA* codes"
 
     before = plain.collate([plain[i] for i in range(len(plain))])
@@ -299,23 +276,63 @@ def test_strip_emits_times_even_when_the_cohort_has_no_delta_tokens(
 
     assert after.time_pos_ids is not None, "the positions are emitted even with nothing to strip"
     assert after.time_pos_ids.shape == after.code.shape
-    pad = ConditionalQueryBatch.PAD_INDEX
+    pad = QuerySeqBatch.PAD_INDEX
     for i in range(before.code.shape[0]):
         kept = [int(c) for c in before.code[i] if int(c) != pad]
         got = [int(c) for c in after.code[i] if int(c) != pad]
         assert got == kept, "no delta ids means no token may be removed from the stream"
 
     # The guard is still right in this case — the user asked for the strip, and a
-    # use_rope_time=False model would drop the hours it produced on the floor.
+    # use_rope_time=False model would drop the hours it produced on the floor.  Asserted on the
+    # shared validator both conditional architectures call, so it holds whichever model consumes
+    # this batch.
     with pytest.raises(ValueError, match="strip_delta_tokens"):
-        _tiny_model(use_rope_time=False)._encoder_position_kwargs(after)
+        validate_rope_time_pair(False, after.time_pos_ids)
+
+
+def test_dataset_strip_never_touches_the_static_table(tensorized_cohort_dir, seq_task_labels_dir):
+    """``static_code`` & friends are a separate table, not per-token fields of the dynamic stream.
+
+    The old width heuristic compacted *any* ``(B, n_old)`` tensor with the dynamic keep mask, so
+    with ``static_inclusion_mode=include`` the static table was corrupted whenever it happened to
+    be exactly as wide as the padded dynamic stream.  Pick ``max_seq_len`` so that it is.
+    """
+
+    def cfg(max_seq_len: int) -> MEDSTorchDataConfig:
+        return MEDSTorchDataConfig(
+            tensorized_cohort_dir=str(tensorized_cohort_dir),
+            task_labels_dir=str(seq_task_labels_dir),
+            max_seq_len=max_seq_len,
+            seq_sampling_strategy="to_end",
+            static_inclusion_mode="include",
+            batch_mode="SM",
+        )
+
+    plain = before = None
+    for max_seq_len in range(1, 9):
+        plain = QuerySeqPytorchDataset(cfg(max_seq_len), split=train_split)
+        before = plain.collate([plain[i] for i in range(len(plain))])
+        if before.code.shape[1] == before.static_code.shape[1]:
+            break
+    assert before.code.shape[1] == before.static_code.shape[1], "fixture never lines the widths up"
+
+    real = before.code[before.code != QuerySeqBatch.PAD_INDEX]
+    victim = int(real.mode().values.item())
+    ds = QuerySeqPytorchDataset(cfg(plain.config.max_seq_len), split=train_split, strip_delta_tokens=True)
+    ds.delta_ids = torch.tensor([victim])
+    after = ds.collate([ds[i] for i in range(len(ds))])
+
+    assert after.code.shape[1] < before.code.shape[1], "the dynamic stream must actually get shorter"
+    assert torch.equal(after.static_code, before.static_code)
+    assert torch.equal(after.static_numeric_value, before.static_numeric_value)
+    assert torch.equal(after.static_numeric_value_mask, before.static_numeric_value_mask)
 
 
 def test_dataset_strip_leaves_query_tensors_untouched(tensorized_cohort_dir, seq_task_labels_dir):
     """Stripping touches the encoder stream only; the decoder's query blocks are unaffected."""
     cfg = _seq_cfg(tensorized_cohort_dir, seq_task_labels_dir)
-    plain = ConditionalQueryPytorchDataset(cfg, split=train_split)
-    stripped = ConditionalQueryPytorchDataset(cfg, split=train_split, strip_delta_tokens=True)
+    plain = QuerySeqPytorchDataset(cfg, split=train_split)
+    stripped = QuerySeqPytorchDataset(cfg, split=train_split, strip_delta_tokens=True)
 
     a = plain.collate([plain[i] for i in range(len(plain))])
     b = stripped.collate([stripped[i] for i in range(len(stripped))])
@@ -329,24 +346,20 @@ def test_dataset_strip_leaves_query_tensors_untouched(tensorized_cohort_dir, seq
 # ── 3. model wiring ─────────────────────────────────────────────────────
 
 
-def _encode(model, batch) -> torch.Tensor:
-    """The encoder memory the decoder cross-attends to — where RoPE actually acts."""
+def _hidden(model, batch) -> torch.Tensor:
+    """The window hidden states the tied readout projects — where RoPE actually acts."""
     with torch.no_grad():
-        return model.HF_model(
-            input_ids=batch.code,
-            attention_mask=batch.code != ConditionalQueryBatch.PAD_INDEX,
-            **model._encoder_position_kwargs(batch),
-        ).last_hidden_state
+        return model.window_hidden_states(batch)
 
 
-def _record_encoder_calls(model) -> list[tuple[dict, torch.Tensor]]:
-    """Record ``(kwargs, last_hidden_state)`` for every encoder call ``forward`` itself makes.
+def _record_backbone_calls(model) -> list[tuple[dict, torch.Tensor]]:
+    """Record ``(kwargs, last_hidden_state)`` for every backbone call ``forward`` itself makes.
 
-    Every other measurement in this file calls ``model.HF_model(...)`` with position kwargs the
-    test assembled, which proves the *seam* works and says nothing about whether ``forward``
-    uses it.  A ``forward`` that computed the kwargs and then dropped them — the guards firing,
+    Every other measurement in this file reaches the backbone through ``window_hidden_states``,
+    which proves the *seam* works and says nothing about whether the training ``forward`` uses
+    it.  A ``forward`` that computed the positions and then dropped them — the guards firing,
     the seam correct, RoPE stone dead in the only path training and evaluation take — would be
-    invisible to all of them.  Hooking the encoder is what closes that.
+    invisible to all of them.  Hooking the backbone is what closes that.
     """
     calls: list[tuple[dict, torch.Tensor]] = []
 
@@ -358,58 +371,73 @@ def _record_encoder_calls(model) -> list[tuple[dict, torch.Tensor]]:
 
 
 def test_rope_time_reaches_rotary():
-    """Same tokens, different elapsed times must give a different encoder representation.
+    """Same tokens, different elapsed times must give a different representation.
 
-    Asserted on the encoder output rather than on ``answer_logits``: the randomly-initialised
-    decoder and answer head attenuate the difference to ~1e-7, which would make a logit-level
-    assertion a test of initialisation luck rather than of the wiring.  The margin is ``LIVE``
-    rather than a bare inequality for the same reason — the real effect here is ~1e-4.
+    Asserted on the window hidden states rather than on the logits: that is the tensor the tied
+    readout reads, so the claim does not depend on the readout's initialisation.  The margin is
+    ``LIVE`` rather than a bare inequality because a bitwise difference is satisfied by one ULP
+    of float32 rounding.
     """
-    model = _tiny_model(use_rope_time=True)
-    near = _encode(model, _rope_batch(time_pos_ids=[[0, 1, 2, 3]]))
-    far = _encode(model, _rope_batch(time_pos_ids=[[0, 240, 1000, 5000]]))
+    model = tiny_model(use_rope_time=True)
+    near = _hidden(model, make_batch(time_pos_ids=NEAR_TIMES))
+    far = _hidden(model, make_batch(time_pos_ids=FAR_TIMES))
     assert (near - far).abs().max().item() > LIVE, (
-        "time_pos_ids must change the encoder geometry when use_rope_time=True"
+        "time_pos_ids must change the backbone geometry when use_rope_time=True"
     )
 
 
 def test_rope_time_is_the_only_thing_that_moved():
-    """Holding times fixed reproduces the encoder output exactly — the change is time, not noise."""
-    model = _tiny_model(use_rope_time=True)
-    once = _encode(model, _rope_batch(time_pos_ids=[[0, 24, 48, 72]]))
-    twice = _encode(model, _rope_batch(time_pos_ids=[[0, 24, 48, 72]]))
+    """Holding times fixed reproduces the hidden states exactly — the change is time, not noise."""
+    model = tiny_model(use_rope_time=True)
+    once = _hidden(model, make_batch(time_pos_ids=NEAR_TIMES))
+    twice = _hidden(model, make_batch(time_pos_ids=NEAR_TIMES))
     assert torch.equal(once, twice)
 
 
-def test_forward_hands_the_times_to_the_encoder():
-    """The real ``forward`` path — not a hand-assembled encoder call — must use the positions.
+def test_forward_hands_the_times_to_the_backbone():
+    """The real ``forward`` path — not a hand-assembled call — must use the positions.
 
     Replaces an assertion that read ``assert not torch.equal(near.answer_logits,
     far.answer_logits)`` after two ``model(batch)`` calls.  That was the repo's only defence
     against ``forward`` ignoring the position kwargs, and it was a one-ULP defence: an untrained
     head compresses this difference to ~1e-07, so *any* two non-identical float paths satisfy
     it.  Here the batches go through ``model(batch)`` exactly as training does, and the claim is
-    measured where the effect lives — at the tensor the decoder cross-attends to.
+    measured where the effect lives.
+
+    The positions themselves are checked semantically rather than against
+    ``model._position_ids``, which would only compare the method with itself: the patient prefix
+    carries the batch's own elapsed hours, and every query token sits at the last *real* patient
+    event's hour, because a query about the future must not advance clinical time.
     """
-    model = _tiny_model(use_rope_time=True)
-    calls = _record_encoder_calls(model)
-    near_batch = _rope_batch(time_pos_ids=[[0, 1, 2, 3]])
-    far_batch = _rope_batch(time_pos_ids=[[0, 240, 1000, 5000]])
+    model = tiny_model(use_rope_time=True)
+    calls = _record_backbone_calls(model)
+    near_batch = make_batch(time_pos_ids=NEAR_TIMES)
+    far_batch = make_batch(time_pos_ids=FAR_TIMES)
+    n_query_tokens = TOKENS_PER_WINDOW * near_batch.q_durations.shape[1] - 2
 
     with torch.no_grad():
         model(near_batch)
         model(far_batch)
 
-    assert len(calls) == 2, "forward must call the encoder exactly once per batch"
+    assert len(calls) == 2, "forward must call the backbone exactly once per batch"
     for (kwargs, _), batch in zip(calls, [near_batch, far_batch], strict=True):
-        assert "position_ids" in kwargs, (
-            "forward computed the rotary positions and did not pass them to the encoder"
+        position_ids = kwargs.get("position_ids")
+        assert position_ids is not None, (
+            "forward computed the rotary positions and did not pass them to the backbone"
         )
-        assert torch.equal(kwargs["position_ids"], batch.time_pos_ids)
+        n_patient = (batch.code != batch.PAD_INDEX).sum(dim=1)
+        for row, n in enumerate(n_patient.tolist()):
+            assert position_ids[row, :n].tolist() == batch.time_pos_ids[row, :n].tolist(), (
+                "the patient prefix must carry the batch's own elapsed hours"
+            )
+            last_hour = int(batch.time_pos_ids[row, n - 1])
+            assert position_ids[row, n : n + n_query_tokens].tolist() == [last_hour] * n_query_tokens, (
+                "a query token must sit at the last patient event's hour, not advance past it"
+            )
 
     (_, near), (_, far) = calls
     assert (near - far).abs().max().item() > LIVE, (
-        "the encoder forward actually ran must move when only the elapsed times move"
+        "the backbone forward actually ran must move when only the elapsed times move"
     )
 
 
@@ -418,39 +446,38 @@ def test_non_rope_model_refuses_a_batch_carrying_times():
 
     This test used to assert the opposite — that such a batch is "answered identically" by a
     non-RoPE model — which wrote the defect down as intended behaviour.  ``time_pos_ids`` is
-    emitted only by the strip path, so answering that batch normally means answering with an
-    encoder that has *no* elapsed-time signal at all: the delta tokens gone from ``code`` and
+    emitted only by the strip path, so answering that batch normally means answering with a
+    backbone that has *no* elapsed-time signal at all: the delta tokens gone from ``code`` and
     the hours that replaced them discarded, while training, validating and checkpointing with
     entirely normal-looking numbers.  See ``test_rope_strip_guard.py`` for the measurement
     proving that blindness.
     """
-    model = _tiny_model(use_rope_time=False)
+    model = tiny_model(use_rope_time=False)
     with pytest.raises(ValueError, match="time_pos_ids"):
-        model(_rope_batch(time_pos_ids=[[0, 240, 1000, 5000]]))
+        model(make_batch(time_pos_ids=FAR_TIMES))
 
 
 def test_non_rope_model_without_times_is_unperturbed():
     """The half of the old claim that survives: no times, no RoPE, no change and no refusal.
 
-    The guard must be narrow.  A refusal that fired on every ``use_rope_time=False`` batch, or
-    a fallback that started handing the encoder positions of its own, would both be caught
-    here: the encoder output must be bit-identical to a plain call passing no position kwargs
-    at all, and the model must still answer.
+    The guard must be narrow.  A refusal that fired on every ``use_rope_time=False`` batch, or a
+    fallback that started handing the backbone positions of its own, would both be caught here:
+    the backbone must receive ``position_ids=None``, exactly as it did before the feature
+    existed, and the model must still answer.
     """
-    model = _tiny_model(use_rope_time=False)
-    batch = _rope_batch()
+    model = tiny_model(use_rope_time=False)
+    batch = make_batch()
     assert batch.time_pos_ids is None
 
-    assert model._encoder_position_kwargs(batch) == {}
+    calls = _record_backbone_calls(model)
     with torch.no_grad():
         loss, out = model(batch)
-        plain = model.HF_model(
-            input_ids=batch.code, attention_mask=batch.code != ConditionalQueryBatch.PAD_INDEX
-        ).last_hidden_state
-    assert torch.equal(_encode(model, batch), plain), (
-        "a non-RoPE model must reach the encoder exactly as it did before the feature existed"
+
+    assert len(calls) == 1
+    assert calls[0][0].get("position_ids", "absent") is None, (
+        "a non-RoPE model must reach the backbone exactly as it did before the feature existed"
     )
-    assert loss.isfinite() and out.answer_logits.isfinite().all()
+    assert loss.isfinite() and out.logits.isfinite().all()
 
 
 def test_rope_model_refuses_a_batch_without_times():
@@ -459,20 +486,26 @@ def test_rope_model_refuses_a_batch_without_times():
     Falling back is indistinguishable from working: the upstream experiment scored an entire
     eval grid against a model that never received its time positions before noticing.
     """
-    model = _tiny_model(use_rope_time=True)
+    model = tiny_model(use_rope_time=True)
     with pytest.raises(ValueError, match="time_pos_ids"):
-        model(_rope_batch())
+        model(make_batch())
 
 
 def test_rope_positions_beyond_max_position_embeddings_are_finite():
-    """Hour-scale positions exceed max_position_embeddings; rotary computes them on the fly."""
-    model = _tiny_model(use_rope_time=True)
+    """Hour-scale positions exceed max_position_embeddings; rotary computes them on the fly.
+
+    The *count* of positions is still budgeted (``max_seq_len + 3 * max_windows``); it is only
+    their magnitude that is unbounded, which is the distinction this pins.
+    """
+    model = tiny_model(use_rope_time=True)
+    batch = make_batch(time_pos_ids=torch.tensor([[0, 20_000, 60_000, 90_000], [0, 40_000, 0, 0]]))
+    assert int(batch.time_pos_ids.max()) > model.max_seq_len
     with torch.no_grad():
-        loss, out = model(_rope_batch(time_pos_ids=[[0, 20_000, 60_000, 90_000]]))
-    assert loss.isfinite() and out.answer_logits.isfinite().all()
+        loss, out = model(batch)
+    assert loss.isfinite() and out.logits.isfinite().all()
 
 
 def test_use_rope_time_is_recorded_in_hparams():
     """Checkpoints must round-trip the flag, or a reloaded model silently changes semantics."""
-    assert _tiny_model(use_rope_time=True).hparams["use_rope_time"] is True
-    assert _tiny_model().hparams["use_rope_time"] is False
+    assert tiny_model(use_rope_time=True).hparams["use_rope_time"] is True
+    assert tiny_model().hparams["use_rope_time"] is False

@@ -4,9 +4,11 @@ The MEICAR-style token stream interleaves quantized ``TIMELINE//DELTA//*`` token
 clinical events, so elapsed time is recoverable only by summing those categorical tokens.  This
 module supports the alternative time representation: drop the delta tokens from the encoder input
 entirely and expose each remaining token's **elapsed time** (hours since the row's first kept
-token) as ``time_pos_ids``, which :class:`~every_query.model.conditional_model.ConditionalQueryModel`
-feeds to ModernBERT's rotary position machinery.  Attention then sees *continuous relative time*
-rather than token distance plus quantized delta tokens.
+token) as ``time_pos_ids``, which
+:class:`~every_query.model.conditional_multitask_ar_model.ConditionalMultitaskARModel` feeds to its
+backbone's rotary position machinery.  Attention then sees *continuous relative time* rather than
+token distance plus quantized delta tokens.  The two halves are kept in step by
+:func:`~every_query.model.answers.validate_rope_time_pair`.
 
 Mechanics:
 

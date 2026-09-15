@@ -20,20 +20,38 @@ hydra:
           - output_dir
           - datamodule.config.tensorized_cohort_dir
           - datamodule.config.task_labels_dir
+          - datamodule.eval_tasks_dir
 
 datamodule:
-  _target_: every_query.data.datamodule.ResumableDatamodule
-  data_class: every_query.data.multitask_dataset.MultitaskBoundaryPytorchDataset
+  _target_: every_query.data.conditional_multitask_datamodule.ConditionalMultitaskDataModule
   config:
     _target_: meds_torchdata.MEDSTorchDataConfig
     tensorized_cohort_dir: ???
+    # TRAINING multitask labels: the out_dir of EQ_generate_multitask_sequences (per split, the
+    # metadata parquets + packed .labels.npy sidecars + _multitask_manifest.json).  Read by the fit
+    # loop only (train / tuning); it is NOT the evaluation grid (see eval_tasks_dir below).
     task_labels_dir: ???
     static_inclusion_mode: omit
     seq_sampling_strategy: to_end
     max_seq_len: 256
   dataset_kwargs:
     strip_delta_tokens: ${lightning_module.model.use_rope_time}
+    # The COHORT's vocabulary width V, which the leaf-only training sidecars are checked against.
+    # train.py overwrites this with the cohort's V after sizing the model, so with an ontology the
+    # model's config_overrides.vocab_size (V_ext) and this number differ and both are recorded.
     expected_vocab_size: ${lightning_module.model.config_overrides.vocab_size}
+    # Set once on the model; the evaluation adapter resolves ancestor query / start / bound names
+    # through it.  The training datasets also receive it: their target bits are leaf-only either
+    # way, but a labels dir sampled with `ontology_mode` other than "none" carries ancestor-valued
+    # start / bound / conditioning codes that only resolve through the ontology that numbered them.
+    ontology_dir: ${lightning_module.model.ontology_dir}
+  # Optional QuerySeq evaluation-grid `eval/` root (EQ_generate_evaluation_query_sequences), an
+  # artifact independent of task_labels_dir.  Only trainer.test / trainer.predict /
+  # EQ_predict_multitask read it; fit never does, so null is fine for training.
+  eval_tasks_dir: null
+  # The model's window budget, forwarded to the evaluation adapter so an over-long grid row fails
+  # when the dataset is built rather than inside a forward pass.
+  max_windows: ${lightning_module.model.max_windows}
   batch_size: 96
   num_workers: 8
   pin_memory: true
@@ -45,7 +63,18 @@ lightning_module:
     precision: ${trainer.precision}
     max_windows: 5
     use_rope_time: true
+    # Optional EQ_build_ontology output.  When set, train.py sizes config_overrides.vocab_size to
+    # the ontology's V_ext, the input/readout table is ancestor-mixed, and the leaf-only training
+    # targets are widened to V_ext inside the model's forward (ancestor bit = OR of its leaves).
+    # The training sampler needs no ontology for ancestor *targets*; it takes the same directory
+    # only to let an ancestor bound / start / condition a window (see its `ontology_mode`).
+    # `datamodule.dataset_kwargs.ontology_dir` interpolates from here.
     ontology_dir: null
+    # Leave null: train.py fills in the cohort's vocabulary fingerprint (the multitask manifest's
+    # `vocab_fingerprint`, recomputed from metadata/codes.parquet).  Persisted in the checkpoint so an
+    # `ontology_dir` is re-verified against *this* cohort on every load and EQ_predict_multitask can
+    # refuse a same-width but different cohort.
+    cohort_vocab_fingerprint: null
     config_overrides:
       hidden_size: 384
       num_hidden_layers: 12

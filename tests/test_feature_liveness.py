@@ -4,148 +4,175 @@ A feature can be plumbed through collate, reach the forward pass, and then be mu
 zero -- passing every shape, dtype and "runs without error" assertion in the suite while
 contributing nothing to the output.  Nothing in ``test_event_bounded.py`` or
 ``test_feature_composition.py`` can detect that, because they assert the model *runs* with the
-new tensors, not that it *responds* to them.
+new tensors, not that it *responds* to them.  The same gap exists in
+``test_conditional_multitask_ar_model.py``: it pins the window token's *structure*
+(``test_window_specs_use_matching_rows_and_distinct_roles`` rebuilds the expected embedding out
+of the model's own parameters, which an all-zero marker satisfies exactly) and the RoPE
+*guards*, but nothing there measures magnitude.  That is what this file is for.
 
 Three probes here that a dead feature cannot pass:
 
 1. **Gradient** -- each new parameter receives a non-zero gradient from a batch exercising it.
 2. **Sensitivity** -- perturbing one new input field alone moves the output.
-3. **Atom invariance** -- an unbounded batch is bit-identical with and without the new tensors
-   attached.  The evaluation grid is entirely atomic single-code, time-bounded queries, so this
-   is the property every reported AUROC number rests on: if attaching the machinery perturbed
-   those queries, the scores would describe a different model than the one that was trained.
+3. **Atom invariance** -- an unbounded, prediction-time-started batch is bit-identical with and
+   without the new tensors attached.  The evaluation grid is entirely atomic single-code,
+   time-bounded queries, so this is the property every reported AUROC number rests on: if
+   attaching the machinery perturbed those queries, the scores would describe a different model
+   than the one that was trained.
 
-A note on measurement level, learned the hard way: a randomly-initialised decoder and output
-head compress an 8e-05 encoder-output difference down to ~1e-07 at the logits, which is the
-same magnitude as float32 rounding noise.  Assertions about the *encoder* therefore measure the
-encoder's output directly, and no assertion anywhere here uses bare ``torch.equal`` inequality
-to mean "responds to" -- a bitwise inequality is satisfied by one ULP of rounding, which is how
-a test can be green from the moment it is written while the feature it names does nothing.
+A note on measurement level, learned the hard way: on the encoder-decoder model these probes
+were originally written against, a randomly-initialised decoder and output head compressed an
+8e-05 encoder-output difference down to ~1e-07 at the logits, which is the same magnitude as
+float32 rounding noise.  ``ConditionalMultitaskARModel`` reads out through a tied linear
+projection rather than a decoder tower, so the attenuation is milder -- but the discipline is
+kept: RoPE is asserted on ``window_hidden_states`` (the tensor the readout actually reads), and
+no assertion anywhere here uses bare ``torch.equal`` inequality to mean "responds to".  A
+bitwise inequality is satisfied by one ULP of rounding, which is how a test can be green from
+the moment it is written while the feature it names does nothing.
 """
 
 import pytest
 import torch
 
-from every_query.data.seq_dataset import ConditionalQueryBatch
-from every_query.model.conditional_model import ConditionalQueryModel
+# The multitask model's own construction idiom, reused rather than re-invented so a change to
+# the batch contract shows up here too.
+from tests.test_conditional_multitask_ar_model import make_batch, tiny_model
 
-B, L, N = 2, 2, 6
 # Comfortably above float32 rounding on these tensors (~1e-7) and below any real effect (~1e-5).
 LIVE = 1e-6
 
 
-def _tiny(**kw) -> ConditionalQueryModel:
-    torch.manual_seed(0)
-    model = ConditionalQueryModel(
-        num_hidden_layers=2,
-        config_overrides={
-            "hidden_size": 32,
-            "num_attention_heads": 2,
-            "intermediate_size": 64,
-            "vocab_size": 16,
-            "max_position_embeddings": 64,
-            "pad_token_id": 0,
-        },
-        decoder_layers=1,
-        decoder_heads=2,
-        decoder_ffn_mult=2,
-        max_queries=8,
-        mlp_dropout=0.0,
-        **kw,
-    )
-    model.eval()
-    return model
+def _atomic(**over):
+    """``make_batch`` reduced to atomic windows: every window timed, opened at prediction time.
 
-
-def _batch(**over) -> ConditionalQueryBatch:
-    kw = {
-        "code": torch.tensor([[1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 0]]),
-        "numeric_value": torch.zeros(B, N),
-        "numeric_value_mask": torch.zeros(B, N, dtype=torch.bool),
-        "time_delta_days": torch.ones(B, N),
-        "q_codes": torch.tensor([[7, 8], [9, 7]]),
-        "q_durations": torch.tensor([[30.0, 7.0], [365.0, 14.0]]),
-        "q_answers": torch.tensor([[1, 0], [0, 1]]),
-        "q_mask": torch.ones(B, L, dtype=torch.bool),
-    }
-    kw.update(over)
-    return ConditionalQueryBatch(**kw)
-
-
-def _logits(model, **over):
-    logits, _ = model(_batch(**over))
-    return logits
+    This is the shape of the whole evaluation grid, and the batch the "attaching the machinery changes
+    nothing" claim below is about.
+    """
+    batch = make_batch(**over)
+    rows, windows = batch.q_durations.shape
+    batch.q_durations = torch.tensor([[7.0, 30.0, 4.0, 2.0, 1.0][:windows]] * rows)
+    batch.q_bound_codes = torch.zeros_like(batch.q_bound_codes)
+    if batch.q_start_codes is not None:
+        batch.q_start_durations = torch.zeros_like(batch.q_start_durations)
+        batch.q_start_codes = torch.zeros_like(batch.q_start_codes)
+    return batch
 
 
 # ── 1. gradient ────────────────────────────────────────────────────────────────────────
 
 
-def test_bound_marker_receives_gradient():
-    """The one parameter these three features add to the model must not be inert."""
-    model = _tiny()
-    model.train()
-    logits, _ = model(_batch(q_bound_codes=torch.tensor([[3, 0], [0, 5]])))
-    logits.sum().backward()
+def test_role_markers_receive_gradient():
+    """The parameters these features add to the model must not be inert.
 
-    grad = model.bound_marker.grad
-    total = 0.0 if grad is None else grad.abs().sum().item()
-    assert total > 0, "bound_marker received no gradient -- it is wired in but inert"
+    ``make_batch``'s default windows exercise both: window 1 ends at boundary code 10, window 2
+    opens at start event 9.  ``torch.where`` computes both branches of the start/end spec, so a
+    marker that never reached the *selected* branch would still leave the forward finite.
+    """
+    model = tiny_model()
+    model.train()
+    _, out = model(make_batch())
+    out.logits.sum().backward()
+
+    for name in ("bound_marker", "start_marker"):
+        grad = getattr(model, name).grad
+        total = 0.0 if grad is None else grad.abs().sum().item()
+        assert total > 0, f"{name} received no gradient -- it is wired in but inert"
 
 
 # ── 2. sensitivity ─────────────────────────────────────────────────────────────────────
 
 
 def test_bound_code_identity_changes_output():
-    model = _tiny()
-    ref = _logits(model, q_bound_codes=torch.tensor([[3, 0], [0, 5]]))
-    moved = _logits(model, q_bound_codes=torch.tensor([[4, 0], [0, 5]]))
-    assert (moved - ref).abs().max().item() > LIVE
-
-
-def test_bound_marker_separates_bounding_from_being_asked_about():
-    """The same code id must not embed identically as a boundary and as a query subject."""
-    model = _tiny()
-    ids = torch.tensor([[3, 0], [0, 5]])
+    model = tiny_model()
+    ref = make_batch()
+    moved = make_batch()
+    moved.q_bound_codes[:, 1] = 11  # was 10
     with torch.no_grad():
-        bounded = model._query_duration_embeds(_batch(q_bound_codes=ids))
+        _, a = model(ref)
+        _, b = model(moved)
+    assert (b.logits - a.logits).abs().max().item() > LIVE
+
+
+def test_start_code_identity_changes_output():
+    """The issue-#27 twin of the above: *when the window opens* is part of the question asked."""
+    model = tiny_model()
+    ref = make_batch()
+    moved = make_batch()
+    moved.q_start_codes[:, 2] = 8  # was 9
+    with torch.no_grad():
+        _, a = model(ref)
+        _, b = model(moved)
+    assert (b.logits - a.logits).abs().max().item() > LIVE
+
+
+def test_markers_separate_a_code_from_the_role_it_plays():
+    """The same code id must not embed identically as a boundary and as a query subject.
+
+    One role richer than the encoder-decoder original, because a multitask window has *two*
+    code-valued slots: a single shared (or zero) marker would collapse "ends at X" into "opens
+    at X" into "X itself".  ``test_window_specs_use_matching_rows_and_distinct_roles`` pins that
+    the markers are *added* on the right paths and are distinct objects; this pins that they are
+    distinct *values*, which an all-zero init would satisfy the first way and not the second.
+    """
+    model = tiny_model()
+    ids = torch.tensor([[10, 10]])
+    with torch.no_grad():
         plain = model.HF_model.get_input_embeddings()(ids)
-    assert (bounded[0, 0] - plain[0, 0]).abs().max().item() > LIVE
+        as_bound = plain + model.bound_marker
+        as_start = plain + model.start_marker
+    assert (as_bound - plain).abs().max().item() > LIVE, "bound_marker is inert: bounded-by-X == X"
+    assert (as_start - plain).abs().max().item() > LIVE, "start_marker is inert: opens-at-X == X"
+    assert (as_bound - as_start).abs().max().item() > LIVE, "the two roles share one marker"
 
 
 # ── 3. RoPE ────────────────────────────────────────────────────────────────────────────
 
 
-def test_time_positions_reach_the_encoder():
-    model = _tiny(use_rope_time=True)
-    even = _batch(time_pos_ids=torch.tensor([[0, 1, 2, 3, 4, 5]] * B))
-    uneven = _batch(time_pos_ids=torch.tensor([[0, 10, 40, 90, 160, 250], [0, 5, 9, 30, 44, 60]]))
-    mask = torch.ones(B, N, dtype=torch.long)
+def test_time_positions_reach_the_backbone():
+    """Same tokens, different elapsed times must give different window hidden states.
+
+    Measured at ``window_hidden_states`` -- the tensor the tied readout reads -- rather than at
+    the logits, for the same reason the encoder-decoder version measured the encoder output: it
+    is where the effect lives, and it does not depend on the readout's initialisation.
+    """
+    model = tiny_model(use_rope_time=True)
+    even = make_batch(time_pos_ids=torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]]))
+    uneven = make_batch(time_pos_ids=torch.tensor([[0, 240, 1000, 5000], [0, 5, 9, 30]]))
     with torch.no_grad():
-        # Directly at the encoder: the untrained decoder+head would compress this to ~1e-7.
-        h_even = model.HF_model(
-            input_ids=even.code, attention_mask=mask, **model._encoder_position_kwargs(even)
-        ).last_hidden_state
-        h_uneven = model.HF_model(
-            input_ids=uneven.code, attention_mask=mask, **model._encoder_position_kwargs(uneven)
-        ).last_hidden_state
+        h_even = model.window_hidden_states(even)
+        h_uneven = model.window_hidden_states(uneven)
     assert (h_even - h_uneven).abs().max().item() > LIVE
 
 
 def test_rope_without_time_positions_refuses_rather_than_falling_back():
-    model = _tiny(use_rope_time=True)
+    model = tiny_model(use_rope_time=True)
     with pytest.raises(ValueError, match="time_pos_ids"):
-        model(_batch())
+        model(make_batch())
 
 
 # ── 4. atom invariance ─────────────────────────────────────────────────────────────────
 
 
-def test_unbounded_batch_is_bit_identical_with_and_without_feature_tensors():
-    """The property every reported AUROC rests on -- the eval grid is entirely atomic queries."""
-    model = _tiny()
-    plain = _logits(model)
-    with_machinery = _logits(model, q_bound_codes=torch.zeros(B, L, dtype=torch.long))
-    assert torch.equal(plain, with_machinery), (
-        "attaching the feature tensors perturbs a purely unbounded batch; every eval_full score "
-        "would then describe a different model than the one trained"
+def test_atomic_batch_is_bit_identical_with_and_without_the_feature_machinery():
+    """The property every reported AUROC rests on -- the eval grid is entirely atomic queries.
+
+    ``q_bound_codes`` is a required field of ``MultitaskBoundaryBatch``, so "without the feature
+    tensors" means the two things that are genuinely optional or inert on an atomic window: the
+    issue-#27 start pair left off the batch entirely (the pre-#24 on-disk form), and the two role
+    markers, which an all-zero bound/start column must never reach.
+    """
+    model = tiny_model()
+    with torch.no_grad():
+        _, explicit = model(_atomic())
+        _, legacy = model(_atomic(starts=False))
+        assert torch.equal(explicit.logits, legacy.logits), (
+            "attaching all-zero start tensors perturbs a purely atomic batch"
+        )
+
+        model.bound_marker.add_(10.0)
+        model.start_marker.add_(10.0)
+        _, marked = model(_atomic())
+    assert torch.equal(explicit.logits, marked.logits), (
+        "the role markers reach a window that is neither event-bounded nor event-started; every "
+        "reported score would then describe a different model than the one that was trained"
     )

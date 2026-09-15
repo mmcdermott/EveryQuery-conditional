@@ -40,8 +40,8 @@ def setup_model(
             or the literal string ``"best"`` falls back to ``best_model.ckpt``.
         module_cls: LightningModule class whose ``load_from_checkpoint`` restores the model.
             Defaults to :class:`EveryQueryLightningModule`; pass
-            :class:`~every_query.model.conditional_lightning.ConditionalQueryLightningModule`
-            for conditional query-sequence runs.
+            :class:`~every_query.model.conditional_multitask_lightning.ConditionalMultitaskLightningModule`
+            for multitask runs.
 
     Returns:
         Tuple ``(train_cfg, lightning_module, trainer)``.  ``train_cfg`` is the OmegaConf

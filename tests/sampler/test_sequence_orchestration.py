@@ -21,13 +21,13 @@ from every_query.data.ontology import (
     build_event_to_query_nodes,
     build_ontology,
 )
+from every_query.data.query_seq_dataset import EOS_CODE
 from every_query.data.schema import QuerySeqSchema
-from every_query.data.seq_dataset import EOS_CODE
 from every_query.generate_tasks import (
-    sample_evaluation_query_sequences as eval_sqs,
+    query_sequence_labeling as sqs,
 )
 from every_query.generate_tasks import (
-    sample_query_sequences as sqs,
+    sample_evaluation_query_sequences as eval_sqs,
 )
 from every_query.generate_tasks.sample_tasks import INDEX_DIRNAME
 
@@ -616,7 +616,7 @@ def test_supplied_sequences_path_labels_complete_dense_grid(tmp_path: Path) -> N
 # ``_label_both_ways`` runs one designed spec table through
 #   * the dense evaluation entry point (``sample_evaluation_query_sequences.main`` with
 #     ``sequences_path`` + ``contexts_path``), and
-#   * the training Stage 4' worker (``sample_query_sequences.label_one_sequence_shard``) over a
+#   * the training Stage 4' worker (``query_sequence_labeling.label_one_sequence_shard``) over a
 #     Stage 3'-shaped index built from the same specs and contexts,
 # and asserts each against the same hand-derived truth table.  The two pipelines share
 # ``label_query_sequences`` but expand the ontology in different callers, so both are pinned.

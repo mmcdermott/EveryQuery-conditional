@@ -2,6 +2,7 @@
 
 import json
 import multiprocessing
+import shutil
 from datetime import datetime
 from pathlib import Path
 
@@ -30,6 +31,7 @@ from tests.multitask.conftest import (
     make_codes_parquet,
     make_index,
     scalar_oracle,
+    write_cohort_ontology,
 )
 
 
@@ -45,6 +47,38 @@ def _load_split(out_dir: Path, vocab: TargetVocabulary) -> dict[str, tuple[pl.Da
         packed = np.load(out_dir / "train" / f"{fp.stem}{LABELS_SUFFIX}", mmap_mode="r")
         res[fp.stem] = (pl.read_parquet(fp), np.asarray(packed))
     return res
+
+
+def _ancestor_names(ontology_dir: Path) -> list[str]:
+    """The ontology's non-observed node names, ordered by token id (``["C", "TIMELINE"]`` here)."""
+    from every_query.data.ontology import load_nodes
+
+    nodes = load_nodes(ontology_dir).filter(~pl.col("is_observed_code")).sort("token_id")
+    return nodes["node_name"].to_list()
+
+
+def _closure_fingerprint(ontology_dir: Path) -> str:
+    from every_query.data.ontology import closure_fingerprint
+
+    return closure_fingerprint(ontology_dir)
+
+
+def _closure_variant(src: Path, dst: Path, event_code: str, query_node: str) -> Path:
+    """A copy of ``src`` whose closure drops one ``(event_code, query_node)`` pair.
+
+    The nodes and the mix are copied byte for byte, so the cohort-identity check and every width check
+    still pass and ``V_ext`` is unchanged; only ``event_to_query_nodes.parquet`` - the table that
+    decides what an ancestor node means - differs, which is exactly what
+    :func:`~every_query.data.ontology.closure_fingerprint` digests.
+    """
+    from every_query.data.ontology import EVENT_TO_QUERY_NODES_FILE, load_event_to_query_nodes
+
+    shutil.copytree(src, dst)
+    closure = load_event_to_query_nodes(src)
+    kept = closure.filter(~((pl.col("event_code") == event_code) & (pl.col("query_node") == query_node)))
+    assert kept.height == closure.height - 1, f"({event_code}, {query_node}) is not in the closure"
+    kept.write_parquet(dst / EVENT_TO_QUERY_NODES_FILE)
+    return dst
 
 
 # --- Stage 1M -------------------------------------------------------------------------------------
@@ -164,6 +198,10 @@ def test_run_writes_layout_manifest_and_exact_count(synthetic_cohort: Path, tmp_
     assert manifest["datetime_unit"] == "us"
     assert manifest["vocab_fingerprint"] == vocab.fingerprint
     assert manifest["ontology_mode"] == "none"
+    # Leaf invariance: a run without an ontology records no closure and no widened event vocabulary.
+    assert manifest["ontology_fingerprint"] is None
+    assert manifest["boundary_vocab_size"] == manifest["vocab_size"]
+    assert manifest["condition_policy"] == "uniform_base_vocab_no_pad"
     assert manifest["format_version"] == 3
     assert manifest["num_condition_codes"] == K - 1
     # Issue #24 semantics keys (the legacy ``window`` / ``missing_event_boundary`` keys are retained).
@@ -246,15 +284,27 @@ def test_uses_spawn_pool(synthetic_cohort: Path, tmp_path: Path, monkeypatch) ->
     assert seen == ["spawn"]
 
 
-def test_ontology_dir_raises_before_stage0(synthetic_cohort: Path, tmp_path: Path) -> None:
+def test_an_ontology_mode_without_a_dir_raises_before_stage0(synthetic_cohort: Path, tmp_path: Path) -> None:
+    """The ``(ontology_dir, ontology_mode)`` pair is resolved before any Stage 0 work, so a mode that
+    has no closure to read - and an unknown mode name - fails with nothing written to disk."""
     out = tmp_path / "mt"
-    with pytest.raises(NotImplementedError, match="observable leaf codes only"):
-        _run(synthetic_cohort, out, ontology_dir=str(tmp_path / "onto"))
-    assert not out.exists()
-    assert not default_artifacts_dir(out).exists()
+    with pytest.raises(ValueError, match="needs an ontology_dir"):
+        _run(synthetic_cohort, out, ontology_mode="boundaries")
+    assert not out.exists(), "a rejected config must not create the output root"
+    assert not default_artifacts_dir(out).exists(), "a rejected config must not build Stage 0 artifacts"
+
+    onto = write_cohort_ontology(synthetic_cohort, tmp_path / "onto")
+    with pytest.raises(ValueError, match="ontology_mode must be one of"):
+        _run(synthetic_cohort, out, ontology_dir=str(onto), ontology_mode="targets")
+    assert not out.exists(), "an unknown ontology_mode must not create the output root"
+    assert not default_artifacts_dir(out).exists(), "an unknown ontology_mode must not build Stage 0"
 
 
-def test_events_are_not_closure_expanded(synthetic_cohort: Path, tmp_path: Path, monkeypatch) -> None:
+def test_events_are_not_closure_expanded_without_an_ontology(
+    synthetic_cohort: Path, tmp_path: Path, monkeypatch
+) -> None:
+    """Leaf-only runs never touch the closure: the event stream reaching the labeler is the very frame
+    that was read off disk, and ``expand_events_to_query_nodes`` is never called."""
     from every_query.data import ontology
 
     def boom(*args, **kwargs):  # pragma: no cover - the assertion is that this never runs
@@ -277,6 +327,42 @@ def test_events_are_not_closure_expanded(synthetic_cohort: Path, tmp_path: Path,
     assert seen and all(seen)
 
 
+def test_events_are_closure_expanded_with_an_ontology(
+    synthetic_cohort: Path, tmp_path: Path, monkeypatch
+) -> None:
+    """With an ontology the labeler sees a *different*, closure-expanded frame: every ancestor node name is an
+    ordinary code in it, which is what makes an ancestor boundary a plain lookup."""
+    onto = write_cohort_ontology(synthetic_cohort, tmp_path / "onto")
+    ancestors = set(_ancestor_names(onto))
+    assert ancestors == {"C", "TIMELINE"}, f"unexpected fixture ancestors {sorted(ancestors)}"
+    seen = []
+    real = sms.prepare_events_for_labeling
+
+    def spy(events_df, ontology_dir=None):
+        out = real(events_df, ontology_dir)
+        seen.append((out is events_df, set(out["code"].to_list())))
+        return out
+
+    monkeypatch.setattr(sms, "prepare_events_for_labeling", spy)
+    # Run the worker in-process so the monkeypatch is visible (a spawned worker would not see it).
+    cfg = OmegaConf.create(
+        base_cfg(
+            synthetic_cohort,
+            tmp_path / "mt",
+            num_training_examples=30,
+            ontology_dir=str(onto),
+            ontology_mode="boundaries",
+        )
+    )
+    monkeypatch.setattr(sms, "_label_multitask_shards", _inprocess_pool)
+    sms.run(cfg)
+    assert seen, "prepare_events_for_labeling was never called"
+    for is_identity, codes in seen:
+        assert not is_identity, "an ontology run must hand the labeler an expanded frame, not the original"
+        assert ancestors <= codes, f"the expanded stream is missing ancestor codes {ancestors - codes}"
+        assert set(CODES) <= codes, "the expanded stream must keep every leaf event (self-pairs)"
+
+
 def _inprocess_pool(
     shards,
     index_dir,
@@ -288,10 +374,20 @@ def _inprocess_pool(
     overwrite,
     n_workers,
     chunk_rows,
+    ontology_dir=None,
 ):
     return {
         s: label_one_multitask_shard(
-            s, index_dir, data_dir, out_dir, labeled_dir, codes_source, manifest, overwrite, chunk_rows
+            s,
+            index_dir,
+            data_dir,
+            out_dir,
+            labeled_dir,
+            codes_source,
+            manifest,
+            overwrite,
+            chunk_rows,
+            ontology_dir,
         )[1]
         for s in shards
     }
@@ -748,3 +844,331 @@ def test_start_config_change_invalidates_labels_but_not_end_draws(
     assert (meta["start_durations"].explode() == 0).all() and meta[
         "start_events"
     ].explode().null_count() == meta.height * K
+
+
+# --- ontology: boundaries + conditioning (PRs C and D) ----------------------------------------------
+
+
+def test_an_ontology_leaves_the_leaf_bits_byte_identical(synthetic_cohort: Path, tmp_path: Path) -> None:
+    """Attaching an ontology widens the *event* vocabulary and nothing else.
+
+    Both runs use the same seed and draw no event-defined window at all, so the two indices describe
+    the same windows; what the ontology changes is only which names *could* have been drawn and the
+    closure-expanded stream the labeler builds its tables from.  The stored bits must not move: the
+    leaf interval table is rebuilt from the ``code_index < V`` rows, which the closure's self-pairs
+    make identical to the unexpanded stream.
+    """
+    onto = write_cohort_ontology(synthetic_cohort, tmp_path / "onto")
+    no_events = {"eventbound_fraction": 0.0, "eventstart_fraction": 0.0}
+    _run(synthetic_cohort, tmp_path / "leaf", **no_events)
+    _run(
+        synthetic_cohort,
+        tmp_path / "onto_run",
+        ontology_dir=str(onto),
+        ontology_mode="boundaries",
+        **no_events,
+    )
+    vocab = build_target_vocabulary(synthetic_cohort)
+    leaf, with_onto = _load_split(tmp_path / "leaf", vocab), _load_split(tmp_path / "onto_run", vocab)
+    assert leaf.keys() == with_onto.keys()
+    for shard in leaf:
+        assert np.array_equal(leaf[shard][1], with_onto[shard][1]), f"shard {shard} labels moved"
+        assert leaf[shard][0].equals(with_onto[shard][0]), f"shard {shard} metadata moved"
+
+    a, b = read_manifest(tmp_path / "leaf" / "train"), read_manifest(tmp_path / "onto_run" / "train")
+    for key in ("vocab_size", "packed_width_bytes", "vocab_fingerprint", "num_bounds"):
+        assert a[key] == b[key], f"{key} is not ontology-invariant"
+    assert (a["ontology_mode"], b["ontology_mode"]) == ("none", "boundaries")
+    assert a["ontology_fingerprint"] is None
+    assert b["ontology_fingerprint"] == _closure_fingerprint(onto)
+    assert (a["boundary_vocab_size"], b["boundary_vocab_size"]) == (13, 15)
+    assert a["config_fingerprint"] != b["config_fingerprint"], (
+        "the ontology keys must enter the config fingerprint when there is an ontology"
+    )
+
+
+def test_a_changed_closure_relabels_and_an_unchanged_one_is_reused(
+    synthetic_cohort: Path, tmp_path: Path, monkeypatch
+) -> None:
+    """The closure gates reuse, because it decides what an ancestor window means.
+
+    The two ontologies here differ *only* in ``event_to_query_nodes.parquet``: the second drops the
+    pair ``(C//0 -> C)``, so the node ``C`` no longer covers ``C//0`` while the nodes, the mix, the
+    leaf indices and ``V_ext`` stay byte for byte the same.  Every width check and the cohort-identity
+    check accept it, so only the closure fingerprint can tell the two runs apart.
+    """
+    statuses = {}
+    real = sms._label_multitask_shards
+
+    def spy(*args, **kwargs):
+        statuses.update(real(*args, **kwargs))
+        return statuses
+
+    # The leaf-only reuse path still works (the regression guard for the rewritten reuse gate).
+    leaf_out = tmp_path / "leaf"
+    _run(synthetic_cohort, leaf_out, num_training_examples=30)
+    monkeypatch.setattr(sms, "_label_multitask_shards", spy)
+    _run(synthetic_cohort, leaf_out, num_training_examples=30)
+    assert set(statuses.values()) == {"skipped"}, "a leaf-only rerun must reuse every shard"
+
+    onto_a = write_cohort_ontology(synthetic_cohort, tmp_path / "onto_a")
+    out = tmp_path / "mt"
+    onto_cfg = {"ontology_dir": str(onto_a), "ontology_mode": "boundaries+conditions"}
+    statuses.clear()
+    _run(synthetic_cohort, out, num_training_examples=30, **onto_cfg)
+    assert set(statuses.values()) == {"labeled"}
+
+    # Same ontology, same closure: reused.
+    statuses.clear()
+    _run(synthetic_cohort, out, num_training_examples=30, **onto_cfg)
+    assert set(statuses.values()) == {"skipped"}, "an unchanged closure must not force a relabel"
+
+    # A different closure over the same cohort: relabeled.
+    onto_b = _closure_variant(onto_a, tmp_path / "onto_b", "C//0", "C")
+    assert _closure_fingerprint(onto_b) != _closure_fingerprint(onto_a)
+    statuses.clear()
+    _run(synthetic_cohort, out, num_training_examples=30, **{**onto_cfg, "ontology_dir": str(onto_b)})
+    assert set(statuses.values()) == {"labeled"}, "a changed closure must invalidate every shard"
+    assert read_manifest(out / "train")["ontology_fingerprint"] == _closure_fingerprint(onto_b)
+
+
+def test_a_permuted_ontology_is_refused_by_cohort_identity(synthetic_cohort: Path, tmp_path: Path) -> None:
+    """A same-width ontology of the same codes at permuted indices would pair every target column with the
+    wrong closure; the vocabulary refuses it by identity, which no width check could do."""
+    from every_query.data.ontology import extended_vocab_size
+
+    honest = write_cohort_ontology(synthetic_cohort, tmp_path / "honest")
+    permuted = write_cohort_ontology(synthetic_cohort, tmp_path / "permuted", swap=("C//0", "C//1"))
+    assert extended_vocab_size(permuted) == extended_vocab_size(honest), (
+        "the permuted ontology must be the same width, or the test proves nothing about identity"
+    )
+    with pytest.raises(ValueError, match=r"different codes\.parquet"):
+        build_target_vocabulary(synthetic_cohort, permuted, "boundaries")
+    # The honest ontology over the same cohort is accepted.
+    vocab = build_target_vocabulary(synthetic_cohort, honest, "boundaries")
+    assert vocab.boundary_size == extended_vocab_size(honest) and vocab.size == len(CODES) + 1
+
+
+def test_the_worker_refuses_a_different_ontology_than_the_manifest(
+    synthetic_cohort: Path, tmp_path: Path
+) -> None:
+    """Nothing ontology-shaped crosses the process boundary, so a Stage 4M worker re-attaches the ontology
+    itself and must fail rather than label a shard against a closure the driver never saw - including the case
+    of no ontology at all against an ontology manifest."""
+    onto_a = write_cohort_ontology(synthetic_cohort, tmp_path / "onto_a")
+    out = tmp_path / "mt"
+    _run(
+        synthetic_cohort,
+        out,
+        num_training_examples=30,
+        ontology_dir=str(onto_a),
+        ontology_mode="boundaries",
+    )
+    manifest = read_manifest(out / "train")
+    art = default_artifacts_dir(out) / "train"
+    onto_b = _closure_variant(onto_a, tmp_path / "onto_b", "C//0", "C")
+
+    def label(ontology_dir):
+        return label_one_multitask_shard(
+            "0",
+            art / INDEX_DIRNAME,
+            synthetic_cohort / "data" / "train",
+            out / "train",
+            art / LABELED_DIRNAME,
+            str(synthetic_cohort),
+            manifest,
+            True,
+            7,
+            ontology_dir,
+        )
+
+    with pytest.raises(ValueError, match="has closure"):
+        label(str(onto_b))
+    with pytest.raises(ValueError, match="disagrees with the manifest's ontology_mode"):
+        label(None)
+    # The ontology the manifest was written against still labels the shard.
+    assert label(str(onto_a))[1] == "labeled"
+
+
+def test_the_ontology_mode_decides_which_pools_carry_ancestors(
+    synthetic_cohort: Path, tmp_path: Path
+) -> None:
+    """``ontology_mode`` is the switch between the two halves of the feature (PRs C and D).
+
+    An ancestor node may be drawn as a start / bound event exactly in the boundaries modes and as a
+    conditioning code exactly in the conditions modes; the ``condition_policy`` the manifest publishes
+    follows the conditioning half alone.  The bit width never moves in any mode.
+    """
+    onto = write_cohort_ontology(synthetic_cohort, tmp_path / "onto")
+    ancestors = set(_ancestor_names(onto))
+    vocab = build_target_vocabulary(synthetic_cohort)
+    draws = {
+        "eventbound_fraction": 0.9,
+        "eventstart_fraction": 0.6,
+        "prediction_time_start_fraction": 0.2,
+    }
+    for mode in ("none", "boundaries", "conditions", "boundaries+conditions"):
+        out = tmp_path / f"mt_{mode.replace('+', '_')}"
+        _run(synthetic_cohort, out, ontology_dir=str(onto), ontology_mode=mode, **draws)
+        meta = pl.concat([m for m, _ in _load_split(out, vocab).values()])
+        bounds = set(meta["bound_events"].explode().drop_nulls().to_list())
+        starts = set(meta["start_events"].explode().drop_nulls().to_list())
+        conditions = set(meta["condition_codes"].explode().drop_nulls().to_list())
+        assert bounds and starts and conditions, f"{mode}: nothing was drawn"
+
+        wants_boundaries = mode in ("boundaries", "boundaries+conditions")
+        wants_conditions = mode in ("conditions", "boundaries+conditions")
+        assert bool(ancestors & bounds) == wants_boundaries, f"{mode}: bound_events {sorted(bounds)}"
+        assert bool(ancestors & starts) == wants_boundaries, f"{mode}: start_events {sorted(starts)}"
+        assert bool(ancestors & conditions) == wants_conditions, (
+            f"{mode}: condition_codes {sorted(conditions)}"
+        )
+
+        manifest = read_manifest(out / "train")
+        assert manifest["ontology_mode"] == mode
+        assert manifest["condition_policy"] == (
+            "uniform_query_node_no_pad" if wants_conditions else "uniform_base_vocab_no_pad"
+        ), f"{mode}: condition_policy"
+        assert manifest["vocab_size"] == vocab.size and manifest["packed_width_bytes"] == vocab.packed_width
+        assert manifest["boundary_vocab_size"] == (vocab.size if mode == "none" else vocab.size + 2)
+
+
+# --- PR C/D review fixes: pools, exclusions and weighting under an ontology ------------------------
+
+
+def _weighted_hierarchical_cohort(tmp_path: Path) -> Path:
+    """A metadata root with the prevalence columns *and* a two-level code hierarchy.
+
+    ``tests.multitask.conftest``'s cohort has the hierarchy but no statistics;
+    ``test_prevalence_weighting``'s has the statistics but flat codes.  The ancestor weighting needs
+    both.  Four ``C//*`` leaves at 10 occurrences each and one ``TIMELINE//END`` at 1, so a correct
+    closure sum gives ``C`` exactly 40.
+    """
+    root = tmp_path / "weighted_cohort"
+    (root / "metadata").mkdir(parents=True, exist_ok=True)
+    codes = [f"C//{i}" for i in range(4)] + ["TIMELINE//END"]
+    pl.DataFrame(
+        {
+            "code": codes,
+            "code/vocab_index": list(range(1, len(codes) + 1)),
+            "code/n_occurrences": [10, 10, 10, 10, 1],
+            "code/n_subjects": [7, 7, 7, 7, 1],
+        }
+    ).write_parquet(root / "metadata" / "codes.parquet")
+    return root
+
+
+def test_an_ancestor_over_an_excluded_leaf_is_excluded_too(synthetic_cohort: Path, tmp_path: Path) -> None:
+    """``exclude_boundary_prefixes`` follows the closure, not just the name.
+
+    An ancestor's name is a *shorter* string than the leaves under it, so ``C`` never starts with
+    ``C//``; a pure name filter drops the leaves and leaves the node that draws every one of them back
+    in.  That defeats the documented use of the knob - excluding ``TIMELINE//DELTA``, whose ancestor
+    ``TIMELINE`` means "the next delta token".
+    """
+    onto = write_cohort_ontology(synthetic_cohort, tmp_path / "onto")
+    vocab = build_target_vocabulary(synthetic_cohort, str(onto), "boundaries")
+    assert "C" in vocab.ancestor_names and "TIMELINE" in vocab.ancestor_names
+
+    # Without the closure the name filter keeps ``C`` while dropping every ``C//*`` leaf under it.
+    assert "C" in sms.read_boundary_codes(None, vocab, ("C//",)), (
+        "fixture no longer exercises the gap this test is about"
+    )
+
+    kept = sms.read_boundary_codes(None, vocab, ("C//",), str(onto))
+    assert "C" not in kept, "the node above the excluded subtree survived the exclusion"
+    assert not any(c.startswith("C//") for c in kept)
+    assert "TIMELINE" in kept and "TIMELINE//END" in kept, "an unrelated subtree must be untouched"
+
+    # An explicit pool is filtered by the same rule.
+    with pytest.raises(ValueError, match="empties the boundary pool"):
+        sms.read_boundary_codes(["C"], vocab, ("C//",), str(onto))
+
+
+def test_prevalence_weighting_takes_an_explicit_ancestor_pool_in_every_attached_mode(
+    synthetic_cohort: Path, tmp_path: Path
+) -> None:
+    """The weighting needs the ontology whenever one is attached, not only in a boundaries mode.
+
+    An explicit pool may name ontology nodes in any attached mode, and such a node has no
+    ``codes.parquet`` row - so gating the ontology on "does this mode draw ancestors" made a
+    documented configuration abort in Stage 0 with "weighted code(s) are absent from ...".
+    """
+    cohort = _weighted_hierarchical_cohort(tmp_path)
+    onto = write_cohort_ontology(cohort, tmp_path / "onto")
+    for mode in ("boundaries", "conditions", "boundaries+conditions"):
+        vocab = build_target_vocabulary(cohort, str(onto), mode)
+        cfg = OmegaConf.create(
+            {
+                "query_codes": str(cohort),
+                "ontology_dir": str(onto),
+                "boundary_codes": ["C"],
+                "start_event_codes": ["C", "TIMELINE//END"],
+                "exclude_boundary_prefixes": [],
+                "code_weighting": "prevalence",
+                "code_weight_column": "code/n_occurrences",
+                "code_weight_power": 1.0,
+            }
+        )
+        codes, weights, starts, start_weights = sms.resolve_boundary_pools(cfg, vocab)
+        assert codes == ["C"] and weights == (1.0,), f"{mode}: single-member pool must normalize to 1"
+        assert starts == ["C", "TIMELINE//END"], mode
+        # C covers 40 occurrences (4 leaves x 10), TIMELINE//END has 1.
+        assert abs(sum(start_weights) - 1.0) < 1e-9, mode
+        assert abs(start_weights[0] - 40 / 41) < 1e-9, f"{mode}: the ancestor must sum its leaves"
+
+
+def test_an_ancestor_subject_count_is_the_max_not_the_sum(synthetic_cohort: Path, tmp_path: Path) -> None:
+    """Summing ``code/n_subjects`` over descendants counts a subject once per code they carry.
+
+    A wide subtree could then claim more subjects than the cohort has.  Occurrence counts still sum -
+    those really do add up - so the aggregation depends on what the column counts.
+
+    The max is a sampling *proxy*, not the node's true subject count: descendants reaching disjoint
+    subjects make the truth larger than any one of them, and the per-code counts carry no overlap
+    information to recover it.  What is pinned here is the chosen proxy, not a bound on the truth.
+    """
+    onto = write_cohort_ontology(synthetic_cohort, tmp_path / "onto")
+    stat: dict[str, object] = dict.fromkeys(CODES, 10.0)
+    by_subjects = sms._ancestor_code_weights(stat, onto, "code/n_subjects")
+    by_occurrences = sms._ancestor_code_weights(stat, onto, "code/n_occurrences")
+    n_leaves_under_c = sum(1 for c in CODES if c.startswith("C//"))
+    assert n_leaves_under_c > 1
+    assert by_subjects["C"] == 10.0, "the proxy must equal the largest descendant's subject count"
+    assert by_occurrences["C"] == 10.0 * n_leaves_under_c
+
+
+def test_an_unknown_event_code_never_becomes_a_phantom_ancestor(tmp_path: Path) -> None:
+    """An out-of-vocabulary event code that happens to *be* an ontology node name is still unknown.
+
+    ``expand_events_to_query_nodes`` passes a code the closure does not know through unexploded, and
+    the extended map would then resolve that string to the node of the same name - an occurrence of
+    an ancestor none of whose descendants occurred.  The stored answer would be true while every
+    descendant leaf bit is false, which is precisely the disagreement ``derive_ancestor_targets``
+    reports and the dataset's ``collate`` check raises on.
+    """
+    cohort = tmp_path / "cohort"
+    make_codes_parquet(cohort, ["C//0", "C//1", "OTHER"], first_index=1)
+    onto = write_cohort_ontology(cohort, tmp_path / "onto")
+    vocab = build_target_vocabulary(cohort, str(onto), "conditions")
+    assert "C" in vocab.ancestor_names, "fixture must mint the ancestor whose name we impersonate"
+
+    # No C//* leaf ever occurs; a literal event coded "C" does, and "C" is not in codes.parquet.
+    events = pl.DataFrame(
+        {
+            "subject_id": [1, 1],
+            "time": [datetime(2024, 1, 5), datetime(2024, 1, 6)],
+            "code": ["C", "OTHER"],
+        }
+    ).with_columns(pl.col("time").cast(pl.Datetime("us")), pl.col("subject_id").cast(pl.Int64))
+    idx = make_index([(1, datetime(2024, 1, 1))], [[(30.0, None), (30.0, None)]], fill_condition="C")
+
+    meta, packed, stats = sms.label_multitask_index(idx, events, vocab, 2, ontology_dir=str(onto))
+    dense = np.unpackbits(packed, axis=-1, count=vocab.size, bitorder="little")
+    leaves_under_c = [i for c, i in vocab.code_to_index().items() if c.startswith("C//")]
+    assert not dense[0, :, leaves_under_c].any(), "no descendant leaf occurred, by construction"
+    assert meta["condition_answers"].to_list() == [[False]], (
+        "the ancestor's answer must be the OR over its descendants, not a phantom occurrence of "
+        "an event that merely shares its name"
+    )
+    assert stats.n_unknown_code_events == 1, "the dropped event must still be counted as unknown"
