@@ -301,9 +301,11 @@ down.
 
 The price is sparsity. A `K`-query spec splits into up to `2^(K-1)` cells skewed hard toward
 all-`False` (most codes are rare), and AUROC is undefined on a single-class cell, so expect many null
-`auroc` rows at `K > 1` and read `n_rows` / `n_positive` next to every cell. At the grid default
-`min_queries = max_queries = 1` every `prior_answers` is `[]` and the cells are exactly the specs.
-The score is `prob` and the class label is `label`, i.e. `answers[-1]`.
+`auroc` rows at `K > 1` and read `n_rows` / `n_positive` next to every cell. A one-query spec has
+`prior_answers = []` and stays one cell. The sampled grid draws `K` from `min_queries..max_queries`
+(1..3 by default), so it yields more cells than `num_evaluation_sequences` — and *which* cells exist
+depends on the cohort, since a conditioning nobody in the cohort has produces no row. The score is
+`prob` and the class label is `label`, i.e. `answers[-1]`.
 
 `duration_bucket` is emitted alongside each cell as a *descriptive* rollup axis, never as a grouping
 key — bucketing lumps distinct horizons, and at `K > 1` it would pool rows whose conditioning

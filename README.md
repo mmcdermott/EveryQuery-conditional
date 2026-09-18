@@ -310,9 +310,10 @@ Groups the prediction rows by the query **specification** — the five list colu
 `durations`, `start_durations`, `start_events`, `bound_events`, which recover exactly the `N` specs
 step 4 resolved — **plus `prior_answers`** (`answers[:-1]`, the teacher-forced answers the final
 query was conditioned on). A cell is thus one spec under one fixed conditioning, so its AUROC cannot
-be earned by echoing the conditioning answer. At the default one-query grid `prior_answers` is
-always `[]` and the cells are exactly the specs; at `K > 1` a spec splits into up to `2^(K-1)`
-cells, many of them small or single-class. It writes one table:
+be earned by echoing the conditioning answer. A one-query spec has `prior_answers = []` and stays
+one cell; at `K > 1` a spec splits into up to `2^(K-1)` cells, many of them small or single-class.
+The sampled grid draws `K` from `min_queries..max_queries` (1..3 by default), so expect more rows
+than `num_evaluation_sequences`, and a cohort-dependent number of them. It writes one table:
 
 - `metrics.by_task.parquet`, one row per cell: the spec and `prior_answers`, a descriptive
   `target_code` / `n_queries` / `duration_bucket`, `n_rows` / `n_positive` / `prevalence`,
