@@ -160,7 +160,7 @@ ______________________________________________________________________
 | `EQ_generate_evaluation_query_sequences`                 | Label the *same* `N` query specifications at every context of a cohort — the dense evaluation grid.                         |
 | `EQ_train --config-name=conditional_multitask_ar_config` | Train `ConditionalMultitaskARModel` via `ConditionalMultitaskLightningModule`.                                              |
 | `EQ_predict_multitask`                                   | Score each grid row's final query with the trained model: one scalar probability per row.                                   |
-| `EQ_evaluate_multitask`                                  | Group those rows by the query spec, score each cell, macro-average, and bootstrap.                                          |
+| `EQ_evaluate_multitask`                                  | Group those rows by task (query spec + prior answers); one AUROC and 95% row-bootstrap CI per task.                         |
 
 The evaluation half is one chain, and the grid in the middle is a single artifact:
 
@@ -282,13 +282,13 @@ pooling.
 ### The grouping key is the query specification plus the conditioning answers
 
 ```python
-SPEC_KEY = ["queries", "durations", "start_durations", "start_events", "bound_events"]
-TASK_KEY = [*SPEC_KEY, "prior_answers"]  # prior_answers = answers[:-1], derived by the evaluator
+TASK_KEY = ["queries", "durations", "start_durations", "start_events", "bound_events",
+            "prior_answers"]  # prior_answers = answers[:-1], derived by the evaluator
 ```
 
 `EQ_generate_evaluation_query_sequences` resolves `N` specifications once and labels **every one of
-them at every context**, so `SPEC_KEY` recovers exactly those `N` specs, each populated by the whole
-cohort. `prior_answers` — the teacher-forced answers the final query was conditioned on — then
+them at every context**, so the five list columns recover exactly those `N` specs, each populated by
+the whole cohort. `prior_answers` — the teacher-forced answers the final query was conditioned on — then
 splits each spec by *what the model was told*. A cell is one conditional question,
 `P(A_K | patient, Q_1..Q_K, A_1..A_{K-1} = a)` for one fixed `a`, and within it the only thing
 varying across rows is the patient, which is what a per-task metric needs.
@@ -300,12 +300,10 @@ while discriminating nothing within either group. That is the pooled-AUROC failu
 down.
 
 The price is sparsity. A `K`-query spec splits into up to `2^(K-1)` cells skewed hard toward
-all-`False` (most codes are rare), and AUROC is undefined on a single-class cell, so expect
-`n_tasks_null` to be large at `K > 1` and read `n_rows` / `n_positive` next to every cell. The macro
-weights every scored cell equally, so a rare conditioning with a handful of rows counts as much as
-the all-`False` cell holding most of the cohort. At the grid default `min_queries = max_queries = 1`
-every `prior_answers` is `[]` and the cells are exactly the specs. The score is `prob` and the class
-label is `label`, i.e. `answers[-1]`.
+all-`False` (most codes are rare), and AUROC is undefined on a single-class cell, so expect many null
+`auroc` rows at `K > 1` and read `n_rows` / `n_positive` next to every cell. At the grid default
+`min_queries = max_queries = 1` every `prior_answers` is `[]` and the cells are exactly the specs.
+The score is `prob` and the class label is `label`, i.e. `answers[-1]`.
 
 `duration_bucket` is emitted alongside each cell as a *descriptive* rollup axis, never as a grouping
 key — bucketing lumps distinct horizons, and at `K > 1` it would pool rows whose conditioning
@@ -313,67 +311,33 @@ contexts differ, which is the axis most worth separating. An event-bounded query
 `event-bound` bucket rather than falling through the horizon ladder, where the `-1.0` sentinel would
 file it under the shortest horizon.
 
-### Two tables
+### One table
 
 `<metrics_stem>.by_task.parquet` — one row per cell: the spec and `prior_answers`, `target_code`,
-`n_queries`, `duration_bucket`, `n_rows` / `n_positive` / `prevalence`, `n_subjects` (the subjects
-whose conditioning matches, not the whole cohort), `auroc` (null when the cell
-is single-class) and its 95% interval `auroc_ci_lo` / `auroc_ci_hi`.
+`n_queries`, `duration_bucket`, `n_rows` / `n_positive` / `prevalence`, `n_subjects`, `auroc` (null
+when the cell is single-class), its 95% interval `auroc_ci_lo` / `auroc_ci_hi`, and
+`n_degenerate_replicates`.
 
-`<metrics_stem>.summary.parquet` — exactly one row: `macro_auroc` (the mean over the scorable
-cells), three 95% intervals `macro_auroc_ci_{lo,hi}_tasks` / `_subjects` / `_nested`, and
-`n_tasks_scored`, `n_tasks_null`, `n_resamples`, `bootstrap_seed`.
-
-`n_tasks_null` sits next to the estimate so that a macro over 12 of 64 cells cannot be read as a
-macro over 64. The two are otherwise indistinguishable, and the difference is not small.
+That is the whole output: the per-task AUROC and its interval. There is no macro and no cross-task
+interval — a macro is `by_task["auroc"].mean()` if you want one, and how to weight and resample
+tasks is a decision for whoever reads the table, not the evaluator.
 
 ### The bootstrap
 
-**Always computed, never opt-in.** A point AUROC without an interval invites being quoted as if it
-were precise. The only knob is `n_resamples` (default 1000), which trades runtime for interval
-resolution; it is not a way to switch the intervals off. The convention — percentile method, 1000
-resamples, 95%, `rng=np.random.default_rng(0)`, `_ci_lo` / `_ci_hi` suffixes, the task count logged
-beside the estimate — is taken verbatim from `upstream/task-auroc-ci`, which adds exactly these
-intervals to `task_auroc_callback.py`. **That branch has not landed on `upstream/main`**, so the
-callback in this tree computes no bootstrap at all: it logs the point estimates
-`tuning/occurs_auroc_macro_sampled` and its `_n_tasks`, and nothing else. Adopting the convention
-now means the two sets of intervals will mean the same thing once it does land.
+Each task is bootstrapped on its own: draw the task's rows with replacement, recompute the AUROC,
+repeat `n_resamples` times (default 1000), and read `auroc_ci_lo` / `auroc_ci_hi` off the 2.5th and
+97.5th percentiles. `bootstrap_seed` (default 0) fixes the draws, and rows are put in a canonical
+order first, so a given predictions parquet always yields the same intervals however it was written.
 
-**The resampling unit is the subject, not the row.** `prediction_times_per_subject` defaults to `1`,
-so rows and subjects coincide at the defaults — but raise that knob and a subject contributes
-several correlated rows to the same cell. Resampling rows would then understate the spread and
-quietly narrow every interval.
+**The resampling unit is the row** — each `(subject_id, prediction_time)` is one prediction.
+`prediction_times_per_subject` defaults to `1`, so rows and subjects coincide at the defaults; raise
+that knob and a subject contributes several correlated rows to the same cell, which a row bootstrap
+treats as independent, so the interval is somewhat narrower than a subject-level one would be.
+`n_subjects` sits next to `n_rows` so that case is visible.
 
-**One pass produces every interval.** Per replicate a single subject index is drawn *once and shared
-across all cells*, and each cell's AUROC is recomputed over the rows of its drawn subjects. That one
-`n_cells × n_resamples` grid yields all four numbers:
-
-| interval                    | read off the grid as                                                | resampling axis        | the question it answers                                                      |
-| --------------------------- | ------------------------------------------------------------------- | ---------------------- | ---------------------------------------------------------------------------- |
-| `auroc_ci_*` (per cell `c`) | percentiles of `AUROC[c, :]`                                        | subjects               | would *this task's* AUROC hold on a different draw of patients?              |
-| `macro_auroc_ci_*_subjects` | percentiles of `mean_c AUROC[:, b]`                                 | subjects               | would the macro hold on a different cohort, holding the specs fixed?         |
-| `macro_auroc_ci_*_nested`   | resample cells within each `b`, take the mean; percentiles over `b` | subjects **and** tasks | would the macro hold on a different cohort *and* a different draw of specs?  |
-| `macro_auroc_ci_*_tasks`    | resample the *point* AUROCs with replacement, take the mean         | tasks                  | would the macro hold on a different draw of specs, holding the cohort fixed? |
-
-The sharing is what makes the macro rows valid: every cell is drawn from the same cohort, so the
-cells are correlated through their subjects. Redrawing per cell would destroy that correlation and
-narrow the macro intervals — and it would cost the per-cell rows nothing, since each cell's marginal
-distribution is still a subject bootstrap of that cell. A drawn subject whose conditioning answers
-put it in a sibling cell contributes no rows to this one, so a cell's subject count varies by
-replicate — correctly, since which subjects land in a cell is itself cohort noise. The evaluator
-asserts that the grid is dense **per spec** rather than trusting it: a partially-written grid would
-otherwise bias which subjects reach a spec's cells, quietly.
-
-**Quote `_nested` as the headline uncertainty.** It is the only one of the three that resamples both
-axes. `_tasks` treats each cell's AUROC as exact and sees only between-task spread; `_subjects`
-conditions on the fixed `N` specs and sees only patient noise. `_tasks` is kept anyway, because it is
-the interval `upstream/task-auroc-ci` adds to the training-time callback — so once that branch lands,
-the training logs become directly comparable to this column.
-
-A resample can land single-class, where AUROC is undefined; those cell-replicates are `nan` and the
-bounds are read with `np.nanpercentile`. The count is reported per cell as
-`n_degenerate_replicates`, so an interval resting on a handful of usable replicates is visible
-rather than silently wide.
+A resample can land single-class, where AUROC is undefined; those replicates are `nan` and the bounds
+are read with `np.nanpercentile`. The count is reported per cell as `n_degenerate_replicates`, so an
+interval resting on a handful of usable replicates is visible rather than silently wide.
 
 ______________________________________________________________________
 
@@ -381,8 +345,8 @@ ______________________________________________________________________
 
 No numbers yet. The earlier measurements in this document's predecessor were produced by the
 conditional query-sequence model that this repository no longer ships, and reporting them here would
-attribute another model's behaviour to this one. Multitask numbers — macro AUROC over the evaluation
-grid's task cells, with the intervals described in §4 — will be added once
+attribute another model's behaviour to this one. Multitask numbers — per-task AUROCs over the
+evaluation grid, with the intervals described in §4 — will be added once
 `EQ_predict_multitask` → `EQ_evaluate_multitask` has been run on a trained checkpoint.
 
 ______________________________________________________________________

@@ -10,10 +10,10 @@ Two halves:
   merge with a real horizon, the partition must round-trip against the grid it came from, and the
   result must not depend on input row order.  If a future polars breaks any of them the fallback is
   a derived ``pl.struct(TASK_KEY).hash()`` key.
-- **End-to-end metric behaviour** on small synthetic frames: a separable cell scores 1.0, a
-  single-class cell comes back null and is counted, the macro is the mean over the non-null cells,
-  and the three macro intervals bracket the point estimate with ``_nested`` no narrower than
-  ``_subjects``.
+- **End-to-end metric behaviour** on small synthetic frames: a separable task scores 1.0, a
+  single-class task comes back null with no interval, the conditioning answers split a spec into
+  tasks, and each task's row-bootstrap interval brackets its AUROC, is reproducible per seed, and
+  resamples rows rather than subjects.
 
 Every fixture here is synthetic — no cohort data is read.
 """
@@ -102,8 +102,7 @@ def _tuple_set(series: pl.Series) -> set[tuple]:
 
 
 def _cells(predictions: pl.DataFrame) -> pl.DataFrame:
-    by_task, _ = compute_multitask_metrics(predictions, n_resamples=_N_RESAMPLES)
-    return by_task
+    return compute_multitask_metrics(predictions, n_resamples=_N_RESAMPLES)
 
 
 # --- 1. no collision --------------------------------------------------------------------------
@@ -299,51 +298,30 @@ def test_a_model_that_only_echoes_its_conditioning_does_not_score() -> None:
     pooled = roc_auc_score(grid["label"].to_list(), grid["prob"].to_list())
     assert pooled == pytest.approx(0.75)
 
-    by_task, summary = compute_multitask_metrics(grid, n_resamples=_N_RESAMPLES)
+    by_task = _cells(grid)
 
     assert by_task["auroc"].to_list() == [0.5, 0.5]
-    assert summary["macro_auroc"][0] == pytest.approx(0.5)
-    # Sparse cells still bootstrap: a draw that misses a cell's subjects just contributes no rows.
     for row in by_task.iter_rows(named=True):
         assert row["auroc_ci_lo"] <= row["auroc"] <= row["auroc_ci_hi"]
-
-
-def test_grid_invariant_is_asserted_not_trusted() -> None:
-    """A spec missing a subject is a malformed grid and must fail loudly, not silently.
-
-    Every spec is labelled at every context, so a hole means a partially-written grid.  (A *cell* no longer
-    holds every subject — it is one conditioning's slice of a spec — so the check is per spec.)
-    """
-    grid = _grid([_spec(["A"], [30.0]), _spec(["B"], [30.0])], n_subjects=4)
-    # Drop one subject from one cell only.
-    holed = grid.filter(~((pl.col("queries").list.first() == "B") & (pl.col("subject_id") == 3)))
-
-    with pytest.raises(ValueError, match="not dense"):
-        compute_multitask_metrics(holed, n_resamples=_N_RESAMPLES)
 
 
 # --- 5. order independence --------------------------------------------------------------------
 
 
 def test_shuffling_input_rows_changes_nothing() -> None:
-    """Shuffled input yields identical cells and identical metrics.
+    """Shuffled input yields identical tasks, AUROCs *and* intervals.
 
-    Guards both the grouping (which uses ``maintain_order=True``) and the bootstrap, whose subject
-    slots are derived from the sorted subject array rather than from row order.
+    Guards the grouping and the bootstrap together: rows are put in a canonical order before any
+    resample index is drawn, so the intervals cannot depend on how the parquet happened to be
+    written.  Uses noisy scores — on a separable grid every interval is ``[1, 1]`` regardless.
     """
-    specs = [
-        _spec(["A"], [30.0]),
-        _spec(["A", "B"], [1.0, -1.0], bound_events=[None, "DISCHARGE"]),
-        _spec(["B"], [7.0], start_durations=[-1.0], start_events=["ADMISSION"]),
-    ]
-    grid = _grid(specs, n_subjects=8)
+    grid = _spread_grid()
 
-    by_task, summary = compute_multitask_metrics(grid, n_resamples=_N_RESAMPLES)
-    shuffled = grid.sample(fraction=1.0, shuffle=True, seed=17)
-    by_task_shuffled, summary_shuffled = compute_multitask_metrics(shuffled, n_resamples=_N_RESAMPLES)
+    by_task = _cells(grid)
+    by_task_shuffled = _cells(grid.sample(fraction=1.0, shuffle=True, seed=17))
 
+    assert by_task["auroc_ci_lo"].n_unique() > 1
     assert by_task.equals(by_task_shuffled)
-    assert summary.equals(summary_shuffled)
 
 
 # --- end-to-end metric behaviour --------------------------------------------------------------
@@ -365,7 +343,7 @@ def _separable_and_degenerate_grid() -> pl.DataFrame:
 
 def test_separable_cell_scores_one_and_inverted_cell_scores_zero() -> None:
     """A perfectly ordered cell is AUROC 1.0; a perfectly reversed one is 0.0."""
-    by_task, _ = compute_multitask_metrics(_separable_and_degenerate_grid(), n_resamples=_N_RESAMPLES)
+    by_task = _cells(_separable_and_degenerate_grid())
 
     aurocs = {
         tuple(d): a for d, a in zip(by_task["durations"].to_list(), by_task["auroc"].to_list(), strict=True)
@@ -374,54 +352,25 @@ def test_separable_cell_scores_one_and_inverted_cell_scores_zero() -> None:
     assert aurocs[(7.0,)] == 0.0
 
 
-def test_single_class_cell_is_null_and_counted() -> None:
-    """AUROC is undefined on a single-class cell: null in ``by_task``, counted in ``n_tasks_null``."""
-    by_task, summary = compute_multitask_metrics(_separable_and_degenerate_grid(), n_resamples=_N_RESAMPLES)
+def test_single_class_cell_is_null() -> None:
+    """AUROC is undefined on a single-class task: null, with no fabricated interval either."""
+    by_task = _cells(_separable_and_degenerate_grid())
 
     single = by_task.filter(pl.col("durations").list.first() == 1.0)
     assert single.height == 1
     assert single["auroc"].to_list() == [None]
-    # An unscorable cell gets no fabricated interval either.
     assert single["auroc_ci_lo"].to_list() == [None]
     assert single["auroc_ci_hi"].to_list() == [None]
-
-    row = summary.row(0, named=True)
-    assert row["n_tasks_scored"] == 2
-    assert row["n_tasks_null"] == 1
+    assert single["n_degenerate_replicates"].to_list() == [None]
+    assert by_task["auroc"].null_count() == 1
 
 
-def test_macro_is_the_mean_over_non_null_cells() -> None:
-    """The headline is the mean of the scored cells only — here ``mean(1.0, 0.0) == 0.5``."""
-    by_task, summary = compute_multitask_metrics(_separable_and_degenerate_grid(), n_resamples=_N_RESAMPLES)
+def test_empty_predictions_give_an_empty_table_with_the_full_schema() -> None:
+    """No rows in, no tasks out — but the same columns and dtypes a populated run writes."""
+    grid = _grid([_spec(["A"], [30.0])])
 
-    scored = [a for a in by_task["auroc"].to_list() if a is not None]
-    assert summary["macro_auroc"][0] == pytest.approx(sum(scored) / len(scored))
-    assert summary["macro_auroc"][0] == pytest.approx(0.5)
-
-
-def test_summary_has_exactly_one_row_and_records_its_bootstrap_settings() -> None:
-    """The summary is one row and carries the knobs its intervals were produced with."""
-    _, summary = compute_multitask_metrics(
-        _separable_and_degenerate_grid(), n_resamples=_N_RESAMPLES, bootstrap_seed=7
-    )
-
-    assert summary.height == 1
-    row = summary.row(0, named=True)
-    assert row["n_resamples"] == _N_RESAMPLES
-    assert row["bootstrap_seed"] == 7
-    assert set(summary.columns) == {
-        "macro_auroc",
-        "macro_auroc_ci_lo_tasks",
-        "macro_auroc_ci_hi_tasks",
-        "macro_auroc_ci_lo_subjects",
-        "macro_auroc_ci_hi_subjects",
-        "macro_auroc_ci_lo_nested",
-        "macro_auroc_ci_hi_nested",
-        "n_tasks_scored",
-        "n_tasks_null",
-        "n_resamples",
-        "bootstrap_seed",
-    }
+    assert _cells(grid.clear()).schema == _cells(grid).schema
+    assert _cells(grid.clear()).height == 0
 
 
 def _spread_grid(n_subjects: int = 40) -> pl.DataFrame:
@@ -429,7 +378,7 @@ def _spread_grid(n_subjects: int = 40) -> pl.DataFrame:
 
     Perfectly separable cells give degenerate intervals ``[1.0, 1.0]``, which cannot distinguish a wide
     interval from a narrow one.  Here each cell's scores are a noisy, cell-dependent function of the label, so
-    both axes of the bootstrap have something to vary.
+    the bootstrap has something to vary.
     """
     specs = [_spec(["A"], [float(d)]) for d in (2, 7, 30, 90, 180)]
     rows = []
@@ -449,78 +398,49 @@ def _spread_grid(n_subjects: int = 40) -> pl.DataFrame:
     return _frame(rows)
 
 
-def test_macro_intervals_bracket_the_point_estimate() -> None:
-    """All three macro intervals satisfy ``lo <= macro <= hi``."""
-    _, summary = compute_multitask_metrics(_spread_grid(), n_resamples=200)
-
-    row = summary.row(0, named=True)
-    macro = row["macro_auroc"]
-    for axis in ("tasks", "subjects", "nested"):
-        lo, hi = row[f"macro_auroc_ci_lo_{axis}"], row[f"macro_auroc_ci_hi_{axis}"]
-        assert lo is not None and hi is not None, axis
-        assert lo <= macro <= hi, (axis, lo, macro, hi)
-
-
-def test_nested_interval_is_no_narrower_than_the_subjects_interval() -> None:
-    """``_nested`` resamples subjects *and* tasks, so it cannot be tighter than ``_subjects``.
-
-    ``_subjects`` conditions on the fixed ``N`` specs and sees only patient noise; ``_nested`` adds
-    between-task spread on top of exactly the same AUROC grid.  A ``_nested`` interval narrower than
-    ``_subjects`` would mean the cell resampling was collapsing rather than adding variance — the
-    signature of redrawing the subject index per cell instead of sharing it.
-    """
-    _, summary = compute_multitask_metrics(_spread_grid(), n_resamples=200)
-
-    row = summary.row(0, named=True)
-    subjects_width = row["macro_auroc_ci_hi_subjects"] - row["macro_auroc_ci_lo_subjects"]
-    nested_width = row["macro_auroc_ci_hi_nested"] - row["macro_auroc_ci_lo_nested"]
-    assert nested_width >= subjects_width
-
-
-def test_per_cell_intervals_bracket_their_point_estimates() -> None:
-    """Every scored cell's subject bootstrap brackets that cell's own AUROC."""
-    by_task, _ = compute_multitask_metrics(_spread_grid(), n_resamples=200)
+def test_per_task_intervals_bracket_their_point_estimates() -> None:
+    """Every scored task's row bootstrap brackets that task's own AUROC, with real width."""
+    by_task = compute_multitask_metrics(_spread_grid(), n_resamples=200)
 
     for row in by_task.iter_rows(named=True):
         assert row["auroc"] is not None
-        assert row["auroc_ci_lo"] <= row["auroc"] <= row["auroc_ci_hi"]
-        # A cell with plenty of both classes should almost never resample single-class.
+        assert row["auroc_ci_lo"] < row["auroc"] < row["auroc_ci_hi"]
+        # A task with plenty of both classes should almost never resample single-class.
         assert row["n_degenerate_replicates"] == 0
 
 
 def test_bootstrap_is_reproducible_and_seed_dependent() -> None:
-    """A fixed seed gives fixed intervals; a different seed moves them."""
+    """A fixed seed gives fixed intervals; a different seed moves them but not the point AUROC."""
     grid = _spread_grid()
-    _, a = compute_multitask_metrics(grid, n_resamples=200, bootstrap_seed=0)
-    _, b = compute_multitask_metrics(grid, n_resamples=200, bootstrap_seed=0)
-    _, c = compute_multitask_metrics(grid, n_resamples=200, bootstrap_seed=1)
+    a = compute_multitask_metrics(grid, n_resamples=200, bootstrap_seed=0)
+    b = compute_multitask_metrics(grid, n_resamples=200, bootstrap_seed=0)
+    c = compute_multitask_metrics(grid, n_resamples=200, bootstrap_seed=1)
 
     assert a.equals(b)
-    assert a["macro_auroc"][0] == c["macro_auroc"][0]  # the point estimate does not depend on the seed
-    assert a["macro_auroc_ci_lo_subjects"][0] != c["macro_auroc_ci_lo_subjects"][0]
+    assert a["auroc"].to_list() == c["auroc"].to_list()
+    assert a["auroc_ci_lo"].to_list() != c["auroc_ci_lo"].to_list()
 
 
-def test_subject_is_the_resampling_unit_not_the_row() -> None:
-    """Duplicating every subject's rows must not shrink the interval the way row resampling would.
+def test_rows_are_the_resampling_unit() -> None:
+    """Each ``(subject_id, prediction_time)`` row is one prediction, resampled on its own.
 
-    With ``prediction_times_per_subject > 1`` a subject contributes several perfectly correlated
-    rows.  Resampling *rows* would treat those as independent and narrow the interval toward
-    ``1/sqrt(2)`` of its width; resampling *subjects* keeps them together, so the width is
-    essentially unchanged.
+    Duplicating every row (a second prediction time per subject with identical labels and scores)
+    leaves the point AUROC alone and doubles ``n_rows`` but not ``n_subjects``; the row bootstrap
+    sees twice the data and the interval narrows toward ``1/sqrt(2)`` of its width.  That is the
+    documented behaviour, pinned here so a change to subject-level resampling is a deliberate one.
     """
     grid = _spread_grid(n_subjects=40)
-    # A second prediction time per subject, carrying identical labels and scores.
-    doubled = pl.concat([grid, grid])
+    single = compute_multitask_metrics(grid, n_resamples=400)
+    double = compute_multitask_metrics(pl.concat([grid, grid]), n_resamples=400)
 
-    _, single = compute_multitask_metrics(grid, n_resamples=200)
-    _, double = compute_multitask_metrics(doubled, n_resamples=200)
+    assert double["auroc"].to_list() == pytest.approx(single["auroc"].to_list())
+    assert double["n_rows"].to_list() == [80] * 5
+    assert double["n_subjects"].to_list() == [40] * 5
 
-    def width(summary: pl.DataFrame) -> float:
-        row = summary.row(0, named=True)
-        return row["macro_auroc_ci_hi_subjects"] - row["macro_auroc_ci_lo_subjects"]
+    def mean_width(by_task: pl.DataFrame) -> float:
+        return (by_task["auroc_ci_hi"] - by_task["auroc_ci_lo"]).mean()
 
-    assert double["macro_auroc"][0] == pytest.approx(single["macro_auroc"][0])
-    assert width(double) == pytest.approx(width(single), rel=0.15)
+    assert mean_width(double) == pytest.approx(mean_width(single) / 2**0.5, rel=0.2)
 
 
 def test_missing_columns_fail_with_the_column_names() -> None:
