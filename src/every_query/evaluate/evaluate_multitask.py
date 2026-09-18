@@ -4,21 +4,26 @@ Consumes the one-row-per-grid-row parquet written by ``EQ_predict_multitask`` (`
 ``prediction_time``, the five window list columns, ``answers``, ``target_code``, ``label``,
 ``prob``) and emits two metric tables.
 
-**Grouping key — the query specification**, :data:`TASK_KEY`.  That *is* the task:
+**Grouping key — the query specification plus the conditioning answers**, :data:`TASK_KEY`.
 ``EQ_generate_evaluation_query_sequences`` resolves ``N`` ``SequenceSpec``s once and labels every
-one of them at every context, so grouping on the spec recovers exactly those ``N`` cells, each
-populated by the whole cohort.  Pooling instead would measure cross-query base-rate separation
-rather than within-task discrimination.
+one of them at every context; :data:`SPEC_KEY` recovers those ``N`` specs, and ``prior_answers``
+(``answers[:-1]``, the teacher-forced answers the final query was conditioned on) then splits each
+spec by *what the model was told*.  A cell is therefore one conditional question —
+``P(A_K | patient, Q_1..Q_K, A_1..A_{K-1} = a)`` for one fixed ``a`` — and its AUROC measures
+discrimination among the contexts that share that conditioning.  Pooling across ``a`` would let the
+conditioning answer itself separate the classes (a ``TIMELINE//END=YES`` prefix all but determines a
+later death label), which is base-rate separation, not within-task discrimination.  The class label
+is ``label`` (i.e. ``answers[-1]``, the final query's answer) and the score is ``prob``.
 
-``answers[:-1]`` is deliberately **not** in the key.  The conditioning answers vary per context, so
-adding them would split each spec cell into up to ``2 ** (K - 1)`` sub-buckets skewed hard toward
-all-``False`` (most codes are rare), and AUROC is undefined on a single-class cell, so most of the
-partition would come back null.  Prior answers are context, not identity: the class label is
-``label`` (i.e. ``answers[-1]``, the final query's answer) and the score is ``prob``.
+The price is sparsity: a ``K``-query spec splits into up to ``2 ** (K - 1)`` cells skewed hard
+toward all-``False`` (most codes are rare), and AUROC is undefined on a single-class cell, so expect
+``n_tasks_null`` to be large and read ``n_rows`` / ``n_positive`` next to every cell.  The grid is
+still dense **per spec** (asserted), but a cell holds only the subjects whose conditioning answers
+match, so ``n_subjects`` varies by cell.
 
 Outputs, both derived from one bootstrap pass (see :func:`compute_multitask_metrics`):
 
-- ``<metrics_stem>.by_task.parquet`` — one row per spec: the spec itself, descriptive
+- ``<metrics_stem>.by_task.parquet`` — one row per cell: the spec and ``prior_answers``, descriptive
   ``target_code`` / ``n_queries`` / ``duration_bucket``, counts, prevalence, the within-cell AUROC
   (null when single-class) and its 95% subject-cluster bootstrap interval.
 - ``<metrics_stem>.summary.parquet`` — one row: ``macro_auroc`` (the mean over non-null cells) and
@@ -45,6 +50,7 @@ from omegaconf import DictConfig
 from sklearn.metrics import roc_auc_score
 
 from every_query.data.query_seq_dataset import (
+    ANSWERS_COL,
     BOUND_EVENTS_COL,
     DURATIONS_COL,
     QUERIES_COL,
@@ -59,14 +65,21 @@ logging.basicConfig(level=logging.INFO)
 CONFIGS = str(files("every_query") / "evaluate" / "configs")
 
 #: The query specification — grouping on these five list columns recovers the evaluation grid's
-#: ``SequenceSpec``s exactly.  ``answers`` is excluded on purpose (see the module docstring).
-TASK_KEY = [QUERIES_COL, DURATIONS_COL, START_DURATIONS_COL, START_EVENTS_COL, BOUND_EVENTS_COL]
+#: ``SequenceSpec``s exactly.  The grid is dense at this level: every spec covers every subject.
+SPEC_KEY = [QUERIES_COL, DURATIONS_COL, START_DURATIONS_COL, START_EVENTS_COL, BOUND_EVENTS_COL]
+
+#: ``answers[:-1]`` — the teacher-forced answers the final query was conditioned on.  Derived by
+#: :func:`_with_prior_answers`, never read from the parquet.
+PRIOR_ANSWERS_COL = "prior_answers"
+
+#: One task cell: a spec under one fixed set of conditioning answers (see the module docstring).
+TASK_KEY = [*SPEC_KEY, PRIOR_ANSWERS_COL]
 
 SUBJECT_ID_COL = "subject_id"
 LABEL_COL = "label"
 PROB_COL = "prob"
 
-REQUIRED_COLUMNS = [*TASK_KEY, SUBJECT_ID_COL, LABEL_COL, PROB_COL]
+REQUIRED_COLUMNS = [*SPEC_KEY, ANSWERS_COL, SUBJECT_ID_COL, LABEL_COL, PROB_COL]
 
 # Match `upstream/task-auroc-ci`'s convention so the evaluator's intervals and the training-time
 # callback's intervals mean the same thing: percentile method, 1000 resamples, 95%, seed 0.
@@ -174,8 +187,9 @@ class _Cell:
 
     ``y`` / ``score`` are sorted by the cell's subject *slot* (the subject's index in the run-wide
     sorted subject array) and ``offsets`` is the resulting CSR-style row index, so the rows of
-    subject slot ``s`` are ``y[offsets[s]:offsets[s + 1]]``.  That is what lets one shared subject
-    draw be gathered into every cell in vectorised form.
+    subject slot ``s`` are ``y[offsets[s]:offsets[s + 1]]`` — empty for a subject whose conditioning
+    answers put it in a sibling cell.  That is what lets one shared subject draw be gathered into
+    every cell in vectorised form.
     """
 
     key: tuple
@@ -193,8 +207,9 @@ def _gather_rows(offsets: np.ndarray, draw: np.ndarray) -> np.ndarray:
     """Row indices for a subject draw: every row of every drawn subject, repeats included.
 
     ``draw`` holds subject slots sampled with replacement, so a subject drawn twice contributes its
-    rows twice — which is the point of a *cluster* bootstrap.  When each subject owns exactly one
-    row per cell (``prediction_times_per_subject=1``, the default) this collapses to ``offsets[draw]``.
+    rows twice — which is the point of a *cluster* bootstrap — and a drawn subject with no row in
+    this cell contributes nothing.  When each subject owns exactly one row in the cell this collapses
+    to ``offsets[draw]``.
 
     Examples:
         Three subjects with 1, 2 and 1 rows; drawing subject 1 twice takes both of its rows twice:
@@ -204,9 +219,14 @@ def _gather_rows(offsets: np.ndarray, draw: np.ndarray) -> np.ndarray:
         [0, 1, 2, 1, 2]
         >>> _gather_rows(np.array([0, 1, 2, 3]), np.array([2, 0])).tolist()
         [2, 0]
+
+        Subject 1 is absent from this cell and subject 2 has two rows — as many rows as subjects,
+        but not one row *per* subject, so the shortcut must not fire:
+
+        >>> _gather_rows(np.array([0, 1, 1, 3]), np.array([1, 2, 0])).tolist()
+        [1, 2, 0]
     """
-    n_subjects = offsets.size - 1
-    if int(offsets[-1]) == n_subjects:  # one row per subject — the common, fast case
+    if bool((np.diff(offsets) == 1).all()):  # exactly one row per subject — the fast case
         return offsets[draw]
     starts = offsets[draw]
     counts = offsets[draw + 1] - starts
@@ -233,26 +253,41 @@ def _validate_columns(predictions: pl.DataFrame) -> None:
         )
 
 
-def _build_cells(predictions: pl.DataFrame, subjects: np.ndarray) -> list[_Cell]:
-    """Partition predictions into task cells, asserting the dense-grid subject invariant.
+def _with_prior_answers(predictions: pl.DataFrame) -> pl.DataFrame:
+    """Append :data:`PRIOR_ANSWERS_COL` — ``answers`` minus its final (scored) entry.
 
-    Every cell must hold every subject: each spec is labelled at every context, so the grid is
-    dense by construction.  The macro intervals depend on it — one shared subject index is only
-    valid if it intersects every cell the same way — so a partially-written grid must fail loudly
-    here rather than produce quietly wrong intervals.
+    Examples:
+        >>> df = pl.DataFrame({"answers": [[True, False, True], [False]]})
+        >>> _with_prior_answers(df)["prior_answers"].to_list()
+        [[True, False], []]
     """
+    answers = pl.col(ANSWERS_COL)
+    return predictions.with_columns(answers.list.head(answers.list.len() - 1).alias(PRIOR_ANSWERS_COL))
+
+
+def _assert_dense_specs(predictions: pl.DataFrame, n_subjects: int) -> None:
+    """Every *spec* must cover every subject; a partially-written grid must fail loudly.
+
+    Each spec is labelled at every context, so the grid is dense by construction at the spec level (a cell,
+    being one slice of a spec by conditioning answers, legitimately is not).  A spec missing subjects would
+    bias which subjects reach its cells, and quietly so.
+    """
+    covered = predictions.group_by(SPEC_KEY).agg(pl.col(SUBJECT_ID_COL).n_unique().alias("n"))
+    holed = covered.filter(pl.col("n") < n_subjects)
+    if holed.height:
+        queries, n = holed[QUERIES_COL][0].to_list(), holed["n"][0]
+        raise ValueError(
+            f"the evaluation grid is not dense: {holed.height} spec(s) do not cover every subject, e.g. "
+            f"{queries!r} covers {n} of {n_subjects}. Every spec must be labelled at every context."
+        )
+
+
+def _build_cells(predictions: pl.DataFrame, subjects: np.ndarray) -> list[_Cell]:
+    """Partition predictions into task cells, each laid out against the run-wide subject index."""
     cells: list[_Cell] = []
     for key, group in predictions.group_by(TASK_KEY, maintain_order=True):
         slots = np.searchsorted(subjects, group[SUBJECT_ID_COL].to_numpy())
         counts = np.bincount(slots, minlength=subjects.size)
-        if not counts.all():
-            n_missing = int((counts == 0).sum())
-            raise ValueError(
-                f"the evaluation grid is not dense: task cell {key[0]!r} covers "
-                f"{subjects.size - n_missing} of {subjects.size} subject(s), missing {n_missing}. "
-                "Every spec must be labelled at every context; the macro bootstrap intervals assume "
-                "one shared subject index intersects every cell identically."
-            )
         order = np.argsort(slots, kind="stable")
         y = group[LABEL_COL].to_numpy().astype(bool)[order]
         score = group[PROB_COL].to_numpy().astype(np.float64)[order]
@@ -285,9 +320,11 @@ def _bootstrap_grid(
     """The ``(len(scored), n_resamples)`` AUROC grid every interval in this module is read off.
 
     Per replicate a single subject index is drawn **once and shared across all cells**, then each cell's AUROC
-    is recomputed over the rows of its drawn subjects.  Redrawing per cell would destroy the correlation the
-    dense grid induces between cells and would narrow every macro interval; it costs the per-cell rows
-    nothing, since each row of the grid is still an ordinary subject bootstrap of that cell.
+    is recomputed over the rows of its drawn subjects (none, for a drawn subject that sits in a sibling cell).
+    Redrawing per cell would destroy the correlation the shared cohort induces between cells and would narrow
+    every macro interval; it costs the per-cell rows nothing, since each row of the grid is still a subject
+    bootstrap of that cell — with the cell's own subject count varying by replicate, as it should, since which
+    subjects land in a cell is itself cohort noise.
     """
     grid = np.full((len(scored), n_resamples), np.nan)
     for b in range(n_resamples):
@@ -362,8 +399,8 @@ def compute_multitask_metrics(
             intervals.
 
     Returns:
-        ``by_task`` (one row per spec, sorted by the spec so the table does not depend on input row
-        order) and ``summary`` (exactly one row).
+        ``by_task`` (one row per cell, sorted by :data:`TASK_KEY` so the table does not depend on
+        input row order) and ``summary`` (exactly one row).
 
     Raises:
         ValueError: if a required column is missing, a label is null, ``n_resamples < 1``, or the
@@ -382,6 +419,7 @@ def compute_multitask_metrics(
         ...     "start_durations": [[0.0]] * 8,
         ...     "start_events": [[None]] * 8,
         ...     "bound_events": [[None]] * 8,
+        ...     "answers": [[a] for a in [True, True, False, False, True, True, True, True]],
         ...     "label": [True, True, False, False, True, True, True, True],
         ...     "prob": [0.9, 0.8, 0.2, 0.1, 0.7, 0.6, 0.5, 0.4],
         ... })
@@ -403,11 +441,13 @@ def compute_multitask_metrics(
     if n_resamples < 1:
         raise ValueError(f"n_resamples must be >= 1, got {n_resamples} — the intervals are not optional")
     _validate_columns(predictions)
+    predictions = _with_prior_answers(predictions)
 
     if predictions.is_empty():
         return _empty_outputs(predictions, n_resamples, bootstrap_seed)
 
     subjects = np.sort(predictions[SUBJECT_ID_COL].unique().to_numpy())
+    _assert_dense_specs(predictions, subjects.size)
     cells = _build_cells(predictions, subjects)
     scored = [i for i, c in enumerate(cells) if c.auroc is not None]
 

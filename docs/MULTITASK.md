@@ -279,22 +279,33 @@ differences between queries and systematically overstates per-query skill. Since
 That argument has a concrete home now: it is exactly why `EQ_evaluate_multitask` groups instead of
 pooling.
 
-### The grouping key is the query specification
+### The grouping key is the query specification plus the conditioning answers
 
 ```python
-TASK_KEY = ["queries", "durations", "start_durations", "start_events", "bound_events"]
+SPEC_KEY = ["queries", "durations", "start_durations", "start_events", "bound_events"]
+TASK_KEY = [*SPEC_KEY, "prior_answers"]  # prior_answers = answers[:-1], derived by the evaluator
 ```
 
-Those five list columns *are* the task. `EQ_generate_evaluation_query_sequences` resolves `N`
-specifications once and labels **every one of them at every context**, so grouping on the spec
-recovers exactly those `N` cells, each populated by the whole cohort — for a given spec, the only
-thing varying across its rows is the patient, which is what a per-task metric needs.
+`EQ_generate_evaluation_query_sequences` resolves `N` specifications once and labels **every one of
+them at every context**, so `SPEC_KEY` recovers exactly those `N` specs, each populated by the whole
+cohort. `prior_answers` — the teacher-forced answers the final query was conditioned on — then
+splits each spec by *what the model was told*. A cell is one conditional question,
+`P(A_K | patient, Q_1..Q_K, A_1..A_{K-1} = a)` for one fixed `a`, and within it the only thing
+varying across rows is the patient, which is what a per-task metric needs.
 
-`answers[:-1]` is deliberately **not** in the key. The conditioning answers vary per context, so
-adding them would split each cell into up to `2^(K-1)` sub-buckets skewed hard toward all-`False`
-(most codes are rare), and AUROC is undefined on a single-class cell, so most of the partition would
-come back null. Prior answers are context, not identity: the score is `prob` and the class label is
-`label`, i.e. `answers[-1]`.
+Without `prior_answers` in the key a spec's AUROC pools contexts that were told different things,
+and the conditioning answer can then separate the classes on its own: a `TIMELINE//END=YES` prefix
+all but determines a later death label, so a model that merely echoes its conditioning scores well
+while discriminating nothing within either group. That is the pooled-AUROC failure above, one level
+down.
+
+The price is sparsity. A `K`-query spec splits into up to `2^(K-1)` cells skewed hard toward
+all-`False` (most codes are rare), and AUROC is undefined on a single-class cell, so expect
+`n_tasks_null` to be large at `K > 1` and read `n_rows` / `n_positive` next to every cell. The macro
+weights every scored cell equally, so a rare conditioning with a handful of rows counts as much as
+the all-`False` cell holding most of the cohort. At the grid default `min_queries = max_queries = 1`
+every `prior_answers` is `[]` and the cells are exactly the specs. The score is `prob` and the class
+label is `label`, i.e. `answers[-1]`.
 
 `duration_bucket` is emitted alongside each cell as a *descriptive* rollup axis, never as a grouping
 key — bucketing lumps distinct horizons, and at `K > 1` it would pool rows whose conditioning
@@ -304,8 +315,9 @@ file it under the shortest horizon.
 
 ### Two tables
 
-`<metrics_stem>.by_task.parquet` — one row per spec: the spec itself, `target_code`, `n_queries`,
-`duration_bucket`, `n_rows` / `n_positive` / `prevalence`, `n_subjects`, `auroc` (null when the cell
+`<metrics_stem>.by_task.parquet` — one row per cell: the spec and `prior_answers`, `target_code`,
+`n_queries`, `duration_bucket`, `n_rows` / `n_positive` / `prevalence`, `n_subjects` (the subjects
+whose conditioning matches, not the whole cohort), `auroc` (null when the cell
 is single-class) and its 95% interval `auroc_ci_lo` / `auroc_ci_hi`.
 
 `<metrics_stem>.summary.parquet` — exactly one row: `macro_auroc` (the mean over the scorable
@@ -343,13 +355,14 @@ across all cells*, and each cell's AUROC is recomputed over the rows of its draw
 | `macro_auroc_ci_*_nested`   | resample cells within each `b`, take the mean; percentiles over `b` | subjects **and** tasks | would the macro hold on a different cohort *and* a different draw of specs?  |
 | `macro_auroc_ci_*_tasks`    | resample the *point* AUROCs with replacement, take the mean         | tasks                  | would the macro hold on a different draw of specs, holding the cohort fixed? |
 
-The sharing is what makes the macro rows valid: the grid is dense, so every cell holds the same
-subjects and the cells are correlated through them. Redrawing per cell would destroy that
-correlation and narrow the macro intervals — and it would cost the per-cell rows nothing, since each
-cell's marginal distribution is still an ordinary subject bootstrap of that cell. The evaluator
-asserts the density rather than trusting it: a partially-written grid would otherwise intersect
-different cells to different degrees and produce macro intervals that are quietly wrong rather than
-absent.
+The sharing is what makes the macro rows valid: every cell is drawn from the same cohort, so the
+cells are correlated through their subjects. Redrawing per cell would destroy that correlation and
+narrow the macro intervals — and it would cost the per-cell rows nothing, since each cell's marginal
+distribution is still a subject bootstrap of that cell. A drawn subject whose conditioning answers
+put it in a sibling cell contributes no rows to this one, so a cell's subject count varies by
+replicate — correctly, since which subjects land in a cell is itself cohort noise. The evaluator
+asserts that the grid is dense **per spec** rather than trusting it: a partially-written grid would
+otherwise bias which subjects reach a spec's cells, quietly.
 
 **Quote `_nested` as the headline uncertainty.** It is the only one of the three that resamples both
 axes. `_tasks` treats each cell's AUROC as exact and sees only between-task spread; `_subjects`

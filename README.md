@@ -307,11 +307,16 @@ EQ_evaluate_multitask \
 ```
 
 Groups the prediction rows by the query **specification** — the five list columns `queries`,
-`durations`, `start_durations`, `start_events`, `bound_events` — which recovers exactly the `N`
-specs step 4 resolved, each populated by the whole cohort. It writes two tables:
+`durations`, `start_durations`, `start_events`, `bound_events`, which recover exactly the `N` specs
+step 4 resolved — **plus `prior_answers`** (`answers[:-1]`, the teacher-forced answers the final
+query was conditioned on). A cell is thus one spec under one fixed conditioning, so its AUROC cannot
+be earned by echoing the conditioning answer. At the default one-query grid `prior_answers` is
+always `[]` and the cells are exactly the specs; at `K > 1` a spec splits into up to `2^(K-1)`
+cells, many of them small or single-class. It writes two tables:
 
-- `metrics.by_task.parquet`, one row per spec: the spec itself, a descriptive `target_code` /
-  `n_queries` / `duration_bucket`, `n_rows` / `n_positive` / `prevalence`, `n_subjects`, the
+- `metrics.by_task.parquet`, one row per cell: the spec and `prior_answers`, a descriptive
+  `target_code` / `n_queries` / `duration_bucket`, `n_rows` / `n_positive` / `prevalence`,
+  `n_subjects` (those whose conditioning matches), the
   within-cell `auroc` (null when the cell is single-class) and its 95% subject-cluster bootstrap
   interval `auroc_ci_lo` / `auroc_ci_hi`.
 - `metrics.summary.parquet`, exactly one row: `macro_auroc` — the mean over the scorable cells —

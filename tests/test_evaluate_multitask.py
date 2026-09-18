@@ -23,7 +23,11 @@ from __future__ import annotations
 import polars as pl
 import pytest
 
-from every_query.evaluate.evaluate_multitask import TASK_KEY, compute_multitask_metrics
+from every_query.evaluate.evaluate_multitask import (
+    TASK_KEY,
+    _with_prior_answers,
+    compute_multitask_metrics,
+)
 
 # Small enough to keep the suite fast, large enough that the percentile bounds are stable.
 _N_RESAMPLES = 64
@@ -35,9 +39,21 @@ _GRID_SCHEMA = {
     "start_durations": pl.List(pl.Float32),
     "start_events": pl.List(pl.Utf8),
     "bound_events": pl.List(pl.Utf8),
+    "answers": pl.List(pl.Boolean),
     "label": pl.Boolean,
     "prob": pl.Float32,
 }
+
+
+def _frame(rows: list[dict]) -> pl.DataFrame:
+    """Rows to a prediction frame; a row without ``answers`` gets all-``False`` prior answers.
+
+    All-``False`` priors keep every spec in one cell, so a test that is not about the conditioning
+    answers sees exactly the spec-level partition.
+    """
+    for row in rows:
+        row.setdefault("answers", [False] * (len(row["queries"]) - 1) + [row["label"]])
+    return pl.DataFrame(rows, schema=_GRID_SCHEMA)
 
 
 def _grid(specs: list[dict], n_subjects: int = 4) -> pl.DataFrame:
@@ -58,7 +74,7 @@ def _grid(specs: list[dict], n_subjects: int = 4) -> pl.DataFrame:
                     "prob": 0.9 - 0.1 * s,
                 }
             )
-    return pl.DataFrame(rows, schema=_GRID_SCHEMA)
+    return _frame(rows)
 
 
 def _spec(
@@ -235,15 +251,68 @@ def test_cells_round_trip_against_the_grid() -> None:
     assert by_task["n_rows"].to_list() == [n_subjects] * len(specs)
     assert by_task["n_subjects"].to_list() == [n_subjects] * len(specs)
     # The emitted keys are exactly the input's distinct specs, nothing invented or dropped.
-    assert by_task.select(TASK_KEY).sort(TASK_KEY).equals(grid.select(TASK_KEY).unique().sort(TASK_KEY))
+    expected = _with_prior_answers(grid).select(TASK_KEY).unique().sort(TASK_KEY)
+    assert by_task.select(TASK_KEY).sort(TASK_KEY).equals(expected)
+
+
+def _conditioned_grid(n_subjects: int = 40) -> pl.DataFrame:
+    """One two-query spec whose conditioning answer all but determines the label.
+
+    Even subjects were told ``Q1=YES`` and are mostly positive; odd subjects were told ``Q1=NO`` and
+    are mostly negative.  The score is a function of the conditioning answer alone, so it carries
+    **no** signal about the label within either group — a model leaning entirely on what it was told.
+    """
+    spec = _spec(["Q1", "Q2"], [1.0, 30.0])
+    rows = []
+    for s in range(n_subjects):
+        told_yes = s % 2 == 0
+        label = told_yes if s % 8 >= 2 else not told_yes  # a quarter of each group breaks the rule
+        prob = 0.7 if told_yes else 0.2
+        rows.append({"subject_id": s, **spec, "answers": [told_yes, label], "label": label, "prob": prob})
+    return _frame(rows)
+
+
+def test_prior_answers_split_a_spec_into_cells() -> None:
+    """One spec, two conditioning prefixes: two cells that partition the spec's rows and subjects."""
+    grid = _conditioned_grid()
+
+    by_task = _cells(grid)
+
+    assert by_task["prior_answers"].to_list() == [[False], [True]]
+    assert by_task["n_rows"].to_list() == [20, 20]
+    # A cell holds only the subjects whose conditioning matches — not the whole cohort.
+    assert by_task["n_subjects"].to_list() == [20, 20]
+    # The description is still the final query's.
+    assert by_task["target_code"].to_list() == ["Q2", "Q2"]
+    assert by_task["n_queries"].to_list() == [2, 2]
+
+
+def test_a_model_that_only_echoes_its_conditioning_does_not_score() -> None:
+    """The reason the key carries the prior answers.
+
+    Pooled over the spec, the conditioning answer separates the classes on its own (AUROC well above chance);
+    within one conditioning it carries no information, and the cells say so.
+    """
+    from sklearn.metrics import roc_auc_score
+
+    grid = _conditioned_grid()
+    pooled = roc_auc_score(grid["label"].to_list(), grid["prob"].to_list())
+    assert pooled == pytest.approx(0.75)
+
+    by_task, summary = compute_multitask_metrics(grid, n_resamples=_N_RESAMPLES)
+
+    assert by_task["auroc"].to_list() == [0.5, 0.5]
+    assert summary["macro_auroc"][0] == pytest.approx(0.5)
+    # Sparse cells still bootstrap: a draw that misses a cell's subjects just contributes no rows.
+    for row in by_task.iter_rows(named=True):
+        assert row["auroc_ci_lo"] <= row["auroc"] <= row["auroc_ci_hi"]
 
 
 def test_grid_invariant_is_asserted_not_trusted() -> None:
-    """A cell missing a subject is a malformed grid and must fail loudly, not silently.
+    """A spec missing a subject is a malformed grid and must fail loudly, not silently.
 
-    The macro intervals share one subject index across cells, which is only valid when every cell holds the
-    same subjects; a partially-written grid would otherwise intersect cells to different degrees and produce
-    quietly wrong intervals rather than absent ones.
+    Every spec is labelled at every context, so a hole means a partially-written grid.  (A *cell* no longer
+    holds every subject — it is one conditioning's slice of a spec — so the check is per spec.)
     """
     grid = _grid([_spec(["A"], [30.0]), _spec(["B"], [30.0])], n_subjects=4)
     # Drop one subject from one cell only.
@@ -291,7 +360,7 @@ def _separable_and_degenerate_grid() -> pl.DataFrame:
         rows.append({"subject_id": s, **separable, "label": positive, "prob": 0.9 if positive else 0.1})
         rows.append({"subject_id": s, **inverted, "label": positive, "prob": 0.1 if positive else 0.9})
         rows.append({"subject_id": s, **single_class, "label": True, "prob": 0.5 + 0.01 * s})
-    return pl.DataFrame(rows, schema=_GRID_SCHEMA)
+    return _frame(rows)
 
 
 def test_separable_cell_scores_one_and_inverted_cell_scores_zero() -> None:
@@ -377,7 +446,7 @@ def _spread_grid(n_subjects: int = 40) -> pl.DataFrame:
                     "prob": base + 0.9 * ((s * 7919 % 97) / 97.0 - 0.5),
                 }
             )
-    return pl.DataFrame(rows, schema=_GRID_SCHEMA)
+    return _frame(rows)
 
 
 def test_macro_intervals_bracket_the_point_estimate() -> None:
