@@ -160,8 +160,10 @@ class QuerySeqSchema(LabelSchema):
             ``true`` / ``false`` is fed to the model in place of ``answers[j]`` when query ``j``
             conditions a later one, null teacher-forces the labeled truth.  ``answers`` is never
             altered, so the scoring label stays the truth.  Null on every row's final query (the
-            scored one).  Absent from grids that force nothing; like active starts, consumed only by
-            the multitask predictor and rejected by ``QuerySeqPytorchDataset`` otherwise.
+            scored one).  ``EQ_generate_evaluation_query_sequences`` writes a forced row only where
+            the truth agrees with it, so in its grids the fed value is always the truth.  Absent
+            from grids that force nothing; like active starts, consumed only by the multitask
+            predictor and rejected by ``QuerySeqPytorchDataset`` otherwise.
 
     Examples:
         >>> from datetime import datetime

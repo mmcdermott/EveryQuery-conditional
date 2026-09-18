@@ -84,13 +84,15 @@ opens at the prediction time and the output carries no start columns, exactly as
 starts are opt-in on the reader side too: ``QuerySeqPytorchDataset`` refuses to tensorize them
 unless asked, so only ``EQ_predict_multitask`` consumes a grid that carries them.
 
-Forced answers.  A designed spec may dictate the answer fed to the model for an earlier query when
-it conditions a later one (``forced_answer``: "assume Q1 = YES, what is P(Q2)?").  It is an *input*
-only: it is tiled onto the labeled grid as the optional ``forced_answers`` list column
-(:func:`attach_forced_answers`) and never touches ``answers``, so the label a row is scored against
-is always the truth.  The final query of a sequence is the scored one and conditions nothing, so its
-forced answer must be null (:class:`SequenceSpec` rejects anything else).  Designed specs spell out
-every field of every entry — see :func:`read_sequence_specs`.
+Forced answers.  A designed spec may fix the answer an earlier query must have when it conditions a
+later one (``forced_answer``: "among contexts where Q1 = YES, what is P(Q2)?").  It selects the spec's
+cohort: it is tiled onto the labeled grid as the optional ``forced_answers`` list column
+(:func:`attach_forced_answers`), and :func:`drop_forced_mismatches` then drops every row whose labeled
+truth disagrees, so a forced spec is **not** dense — it holds only the contexts where its conditioning
+really happened, and the model is never told a counterfactual.  ``answers`` is never touched, so the
+label a row is scored against is always the truth.  The final query of a sequence is the scored one
+and conditions nothing, so its forced answer must be null (:class:`SequenceSpec` rejects anything
+else).  Designed specs spell out every field of every entry — see :func:`read_sequence_specs`.
 
 Answers follow the module-wide sequence contract: binary, never null; an unobservable occurrence
 (record ends before the window does) is ``False``, and censoring is carried by an explicit
@@ -117,7 +119,12 @@ import numpy as np
 import polars as pl
 from omegaconf import DictConfig
 
-from every_query.data.query_seq_dataset import EVENT_BOUND_DURATION_SENTINEL, FORCED_ANSWERS_COL, QUERIES_COL
+from every_query.data.query_seq_dataset import (
+    ANSWERS_COL,
+    EVENT_BOUND_DURATION_SENTINEL,
+    FORCED_ANSWERS_COL,
+    QUERIES_COL,
+)
 from every_query.data.schema import QuerySeqSchema, TaskQuerySchema
 from every_query.generate_tasks.query_sequence_labeling import (
     BOUND_COL,
@@ -1310,7 +1317,9 @@ def _specs_fingerprint(specs: list[SequenceSpec]) -> str:
             entry.append([[s.start_at(i)[0], s.start_at(i)[1]] for i in range(len(s))])
     if any(s.has_forced_answers for s in specs):
         for entry, s in zip(payload, specs, strict=True):
-            entry.append({"forced_answers": [s.forced_at(i) for i in range(len(s))]})
+            # "forced_cohort", not "forced_answers": renamed when a forced answer became a cohort
+            # filter, so a dense forced grid written before that reads as stale and is relabeled.
+            entry.append({"forced_cohort": [s.forced_at(i) for i in range(len(s))]})
     return f"{len(specs)}:{hashlib.sha256(json.dumps(payload).encode()).hexdigest()[:16]}"
 
 
@@ -1422,6 +1431,37 @@ def attach_forced_answers(labeled: pl.DataFrame, specs: list[SequenceSpec]) -> p
     per_spec = [[s.forced_at(p) for p in range(len(s))] for s in specs]
     tiled = pl.Series(FORCED_ANSWERS_COL, per_spec * (labeled.height // n), dtype=pl.List(pl.Boolean))
     return labeled.with_columns(tiled)
+
+
+def drop_forced_mismatches(labeled: pl.DataFrame) -> pl.DataFrame:
+    """Keep only the rows whose labeled truth agrees with every designed ``forced_answers`` entry.
+
+    A forced answer selects a spec's cohort: "P(death | record did not end)" is scored on the contexts
+    where the record really did not end, never on a counterfactual.  So what the model is told always
+    equals the truth, and a forced spec's rows are exactly the matching ``prior_answers`` cell of the
+    same spec left unforced.  Specs that force nothing — every sampled spec — keep every context.
+
+    Examples:
+        >>> labeled = pl.DataFrame({
+        ...     "queries": [["A", "B"]] * 3 + [["C"]],
+        ...     "answers": [[True, False], [False, True], [True, True], [False]],
+        ...     "forced_answers": [[True, None]] * 3 + [[None]],
+        ... })
+        >>> drop_forced_mismatches(labeled)["answers"].to_list()
+        [[True, False], [True, True], [False]]
+        >>> drop_forced_mismatches(labeled.drop("forced_answers")).height
+        4
+    """
+    if FORCED_ANSWERS_COL not in labeled.columns:
+        return labeled
+    forced, truth = pl.col(FORCED_ANSWERS_COL), pl.col(ANSWERS_COL)
+    rows = labeled.with_row_index("_row")
+    contradicted = (
+        rows.select("_row", FORCED_ANSWERS_COL, ANSWERS_COL)
+        .explode(FORCED_ANSWERS_COL, ANSWERS_COL)
+        .filter(forced.is_not_null() & (forced != truth))["_row"]
+    )
+    return rows.filter(~pl.col("_row").is_in(contradicted.implode())).drop("_row")
 
 
 def _write(labeled: pl.DataFrame, fp: Path, out_dir: Path, fingerprint: dict[str, str | None]) -> None:
@@ -1566,6 +1606,7 @@ def run_worker(
     # split even when a sparse shard yields no eligible prediction time.
     index_df = build_dense_sequence_index_df(shard_contexts, specs)
     labeled = attach_forced_answers(label_query_sequences(index_df, events_df), specs)
+    labeled = drop_forced_mismatches(labeled)
     _write(labeled, labels_fp, root, fingerprint)
 
     if unique_fp is not None:
