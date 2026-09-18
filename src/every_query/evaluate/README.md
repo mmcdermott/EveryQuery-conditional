@@ -35,14 +35,16 @@ One Hydra main. No model instantiation, no trainer loop, no multi-model orchestr
 `(query, duration_days)` pair, so `EQ_evaluate` cannot read it. `EQ_evaluate_multitask`
 groups those rows by the query **specification** — the five window list columns
 `(queries, durations, start_durations, start_events, bound_events)` — which is what
-`EQ_generate_evaluation_query_sequences` resolves once and labels at every context. Each
-group is therefore one task scored over the whole cohort, and the headline is a macro
-average over those cells rather than a pooled AUROC, which would measure cross-query
-base-rate separation instead.
+`EQ_generate_evaluation_query_sequences` resolves once and labels at every context — plus
+`prior_answers` (`answers[:-1]`), the teacher-forced answers the final query was conditioned
+on. Each group is therefore one spec under one fixed conditioning, scored over the subjects
+who share it, and the headline is a macro average over those cells rather than a pooled
+AUROC, which would measure cross-query (or cross-conditioning) base-rate separation instead.
+With one query per spec, `prior_answers` is always `[]` and the cells are exactly the specs.
 
 ```
 predict/ predictions.parquet  ──►  EQ_evaluate_multitask  ──►  <stem>.by_task.parquet
-(one row per grid row)                                          (one row per query spec)
+(one row per grid row)                                          (one row per spec x prior answers)
                                                             ──►  <stem>.summary.parquet
                                                                  (macro AUROC + 3 CI pairs)
 ```
