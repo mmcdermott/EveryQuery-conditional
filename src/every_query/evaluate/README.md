@@ -41,7 +41,10 @@ on. Each group is therefore one task — one spec under one fixed conditioning �
 `(subject_id, prediction_time)` row in it is one prediction. AUROC is computed within the
 task, never pooled across tasks, which would measure cross-query (or cross-conditioning)
 base-rate separation instead. With one query per spec, `prior_answers` is always `[]` and
-the tasks are exactly the specs.
+the tasks are exactly the specs. `forced_answers` is in the key too: a designed spec that forces
+an answer is written only at the contexts where that answer is true, so it holds the same rows as
+the matching `prior_answers` task of the unforced spec, and keying on it keeps the two from being
+pooled (and double-counted) when a grid carries both.
 
 ```
 predict/ predictions.parquet  ──►  EQ_evaluate_multitask  ──►  <stem>.by_task.parquet

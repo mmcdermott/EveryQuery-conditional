@@ -692,7 +692,12 @@ def test_designed_starts_are_labeled_per_the_rule(
     fp.write_text(yaml.safe_dump(specs))
     _run(data_dir, out_dir, codes_yaml, sequences_path=fp)
     df = pl.concat([_labels(out_dir, s) for s in SHARDS])
-    assert df.height == df.select("subject_id", "prediction_time").n_unique() * len(specs)
+    # A spec that forces nothing keeps every context; a forced spec keeps only the contexts whose
+    # truth agrees with it, and here that really does drop rows.
+    n_contexts = df.select("subject_id", "prediction_time").n_unique()
+    per_spec = dict(df.group_by(pl.col("queries").list.join("|")).len().rows())
+    assert per_spec["ICD//C03"] == per_spec["ICD//A01"] == n_contexts
+    assert df.height < n_contexts * len(specs)
 
     events = [tuple(r) for r in synthetic_events.select("subject_id", "time", "code").rows()]
     seen_forms: set[tuple] = set()
@@ -721,6 +726,12 @@ def test_designed_starts_are_labeled_per_the_rule(
     assert all(
         row["forced_answers"] == forced_by_queries[tuple(row["queries"])] for row in df.iter_rows(named=True)
     )
+    # ...and every surviving row's truth agrees with each answer its spec forces.
+    assert all(
+        forced is None or forced == answer
+        for row in df.iter_rows(named=True)
+        for forced, answer in zip(row["forced_answers"], row["answers"], strict=True)
+    )
     # The oracle is not vacuous: both answers occur across the grid.
     flat = df.explode("answers")
     assert flat["answers"].any() and not flat["answers"].all()
@@ -747,8 +758,8 @@ def test_yaml_null_start_keys_read_as_absent(tmp_path: Path):
 def test_flipping_a_forced_answer_relabels_and_an_unforced_file_writes_no_column(
     tmp_path: Path, data_dir: Path, codes_yaml: Path
 ):
-    """The labels are identical under either forced value, so only the fingerprint stands between a flipped
-    ``forced_answer`` and the stale shard written under the other one."""
+    """A forced answer keeps the contexts whose truth matches it, so the two values partition the unforced
+    grid; the fingerprint stands between a flipped ``forced_answer`` and the shard written under the other."""
     out_dir = tmp_path / "grid"
     fp = tmp_path / "specs.yaml"
     files = [out_dir / "eval" / SPLIT / f"{s}.parquet" for s in SHARDS]
@@ -767,9 +778,12 @@ def test_flipping_a_forced_answer_relabels_and_an_unforced_file_writes_no_column
     assert all(df["forced_answers"].to_list() == [[True, None]] * df.height for df in yes)
     no = run(False)
     assert all(df["forced_answers"].to_list() == [[False, None]] * df.height for df in no)
-    # Forcing changes what the model is told, never what happened.
+    # Forcing selects contexts, never rewrites what happened: YES and NO split the unforced rows.
+    first_answer = pl.col("answers").list.first()
     for a, b, c in zip(unforced, yes, no, strict=True):
-        assert a["answers"].to_list() == b["answers"].to_list() == c["answers"].to_list()
+        assert b["answers"].to_list() == a.filter(first_answer)["answers"].to_list()
+        assert c["answers"].to_list() == a.filter(~first_answer)["answers"].to_list()
+    assert sum(df.height for df in yes) and sum(df.height for df in no)
 
     # Same file again: current, so untouched.
     before = [f.stat().st_ino for f in files]

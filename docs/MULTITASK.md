@@ -110,10 +110,10 @@ Four mechanisms with disjoint jobs.
 
 The logits at `W_i` estimate `P(v occurs in window i | patient, W_0..W_i, (C, A)_0..(C, A)_{i-1})`
 for every `v`. Earlier answers are caller-supplied conditioning values, teacher-forced in training
-and — at evaluation — taken from the grid's own true answers, unless a designed spec dictates one
-(`forced_answer`, see `generate_tasks/README.md`): that value is then fed as `A_i` in place of the
-truth, which asks the counterfactual "given `C_i` had this answer". It is an input only — the label
-the final query is scored against is always the truth, and the final query itself can never be
+and — at evaluation — taken from the grid's own true answers, even where a designed spec fixes one
+(`forced_answer`, see `generate_tasks/README.md`): the grid keeps that spec only at the contexts
+whose truth agrees, so the fed `A_i` is still the truth and no counterfactual is ever asked. The
+label the final query is scored against is always the truth, and the final query itself can never be
 forced. Feeding the model's own predictions
 back in as later conditions is a separate sampling capability, deliberately not implemented.
 
@@ -287,12 +287,14 @@ pooling.
 
 ```python
 TASK_KEY = ["queries", "durations", "start_durations", "start_events", "bound_events",
-            "prior_answers"]  # prior_answers = answers[:-1], derived by the evaluator
+            "forced_answers",  # a designed spec's cohort selector; all-null when nothing is forced
+            "prior_answers"]   # prior_answers = answers[:-1], derived by the evaluator
 ```
 
 `EQ_generate_evaluation_query_sequences` resolves `N` specifications once and labels **every one of
 them at every context**, so the five list columns recover exactly those `N` specs, each populated by
-the whole cohort. `prior_answers` — the teacher-forced answers the final query was conditioned on — then
+the whole cohort (a designed spec with a `forced_answer` is the exception: it is written only where
+its conditioning really happened). `prior_answers` — the teacher-forced answers the final query was conditioned on — then
 splits each spec by *what the model was told*. A cell is one conditional question,
 `P(A_K | patient, Q_1..Q_K, A_1..A_{K-1} = a)` for one fixed `a`, and within it the only thing
 varying across rows is the patient, which is what a per-task metric needs.

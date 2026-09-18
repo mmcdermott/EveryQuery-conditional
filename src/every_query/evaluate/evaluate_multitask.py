@@ -16,10 +16,12 @@ A ``K``-query sequence splits into up to ``2 ** (K - 1)`` tasks skewed hard towa
 (most codes are rare), and AUROC is undefined on a single-class task, so expect null ``auroc`` rows
 and read ``n_rows`` / ``n_positive`` next to every estimate.
 
-``forced_answers`` is in the key too: a designed conditioning answer is part of the spec — constant
-across contexts — so "P(death | record did not end)" and "P(death | record ended)" are two tasks over
-the same five window columns, and each still holds the whole cohort.  A predictions parquet written
-before the column existed reads as all-null (nothing forced) and groups exactly as it did.
+``forced_answers`` is in the key too.  A designed conditioning answer selects a cohort —
+``EQ_generate_evaluation_query_sequences`` writes a forced spec only at the contexts whose truth
+agrees with it — so a forced task holds the same rows as the matching ``prior_answers`` task of the
+same spec left unforced.  Keying on it keeps the two apart when a grid carries both, instead of
+pooling them and counting those rows twice.  A predictions parquet written before the column existed
+reads as all-null (nothing forced) and groups exactly as it did.
 
 **The interval is a row bootstrap within the task**: draw the task's rows with replacement,
 recompute the AUROC, repeat ``n_resamples`` times, and take the 2.5th / 97.5th percentiles.  Rows

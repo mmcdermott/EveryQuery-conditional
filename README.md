@@ -234,9 +234,11 @@ never mean "the default I did not know about":
   resolved start.
 - `forced_answer`: `true` / `false` / `null`; **must be `null` on the final query of every sequence**.
 
-`forced_answer` dictates the answer the model is *told* an earlier query had ("assume the record
-did not end — now what is P(death)?"); `null` teacher-forces the labeled truth. It never touches the
-labels: `answers` stays the truth and the final query is scored against it. The `-1` sentinel may be
+`forced_answer` fixes the answer an earlier query must have ("among contexts where the record did
+not end — what is P(death)?"): the grid keeps that sequence only at the contexts whose labeled truth
+agrees, so the model is never told a counterfactual. `null` keeps every context and teacher-forces
+the truth. It never touches the labels: `answers` stays the truth and the final query is scored
+against it. The `-1` sentinel may be
 written in place of a `null` duration next to an event. A long-format parquet
 `(seq_id, position, query, start_event, start_duration_days, bound_event, duration_days, forced_answer)`
 works too, every column required.
@@ -319,7 +321,7 @@ target_code, label, prob
 
 `target_code` is `queries[-1]` and `label` is `answers[-1]`; the final query is never teacher-forced
 into its own prediction. `answers` is always the labeled truth; `forced_answers` records which
-conditioning answers a designed spec dictated instead (all-null otherwise), and
+conditioning answers a designed spec fixed its cohort to (all-null otherwise), and
 `EQ_evaluate_multitask` keys its task cells on it, so the forced-YES and forced-NO variants of one
 query spec are scored as two tasks. Options: `ckpt_name=` (checkpoint stem under `checkpoints/`, default best),
 `batch_size=`, `num_workers=`, `device=` (`cpu`, `cuda`, `cuda:N`, `mps`), `precision=` (default
@@ -342,7 +344,8 @@ Groups the prediction rows by the query **specification** — the five list colu
 `durations`, `start_durations`, `start_events`, `bound_events`, which recover exactly the `N` specs
 step 4 resolved — **plus `prior_answers`** (`answers[:-1]`, the teacher-forced answers the final
 query was conditioned on). A cell is thus one spec under one fixed conditioning, so its AUROC cannot
-be earned by echoing the conditioning answer. A one-query spec has `prior_answers = []` and stays
+be earned by echoing the conditioning answer. (`forced_answers` is in the key as well, so a designed
+forced spec and the matching cell of its unforced twin stay separate rather than pooling.) A one-query spec has `prior_answers = []` and stays
 one cell; at `K > 1` a spec splits into up to `2^(K-1)` cells, many of them small or single-class.
 The sampled grid draws `K` from `min_queries..max_queries` (1..3 by default), so expect more rows
 than `num_evaluation_sequences`, and a cohort-dependent number of them. It writes one table:

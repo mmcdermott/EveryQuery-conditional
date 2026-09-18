@@ -194,8 +194,8 @@ _GRID_SPECS = {
         entry("DISCHARGE", start_event="ADMISSION//PULMONARY", bound_event="TIMELINE//END"),
     ],
     "single": [entry("TIMELINE//END", 1)],
-    # One query spec under both designed conditioning answers: same windows, same labels, and the
-    # only thing that differs is the answer the model is told the first query had.
+    # One query spec under both designed conditioning answers: same windows, and each keeps only the
+    # contexts whose true first answer is the forced one, so together they partition the cohort.
     "forced_yes": [entry("TIMELINE//END", 30, forced_answer=True), entry("DISCHARGE", 30)],
     "forced_no": [entry("TIMELINE//END", 30, forced_answer=False), entry("DISCHARGE", 30)],
 }
@@ -262,7 +262,8 @@ def test_predict_multitask_scores_a_queryseq_grid_with_active_starts(
     grid = pl.concat(
         [pl.read_parquet(fp) for fp in sorted((grid_dir / "eval" / tuning_split).glob("*.parquet"))]
     )
-    assert grid.height == cohort.height * len(specs)
+    # ``forced_yes`` + ``forced_no`` partition the cohort, so they add one cohort's worth of rows.
+    assert grid.height == cohort.height * (len(specs) - 1)
     assert {"start_durations", "start_events"} <= set(grid.columns)
     for name in ("_multitask_manifest.json", "eval_meta", "eval_tasks.parquet"):
         assert not list(grid_dir.parent.rglob(name)), name
@@ -295,17 +296,14 @@ def test_predict_multitask_scores_a_queryseq_grid_with_active_starts(
         "label",
         "prob",
     ]
-    # A designed conditioning answer reaches the model and nothing else: the two variants share
-    # their labeled ``answers`` (the truth, never overwritten) and hence their labels, and differ in
-    # ``prob`` because the first query's answer was dictated rather than teacher-forced.
+    # A designed conditioning answer selects its cohort: the two variants split the contexts by the
+    # first query's true answer, so what the model is told is always what happened.
     by_forced = {
-        forced: preds.filter(pl.col("forced_answers").list.first() == forced).sort("subject_id")
-        for forced in (True, False)
+        forced: preds.filter(pl.col("forced_answers").list.first() == forced) for forced in (True, False)
     }
-    assert by_forced[True].height == by_forced[False].height == cohort.height
-    assert by_forced[True]["answers"].to_list() == by_forced[False]["answers"].to_list()
-    assert by_forced[True]["label"].to_list() == by_forced[False]["label"].to_list()
-    assert by_forced[True]["prob"].to_list() != by_forced[False]["prob"].to_list()
+    assert by_forced[True].height + by_forced[False].height == cohort.height
+    for forced, rows in by_forced.items():
+        assert rows["answers"].list.first().to_list() == [forced] * rows.height
     assert preds["prob"].is_between(0.0, 1.0).all()
     assert preds["target_code"].to_list() == [q[-1] for q in preds["queries"].to_list()]
     assert preds["label"].to_list() == [a[-1] for a in preds["answers"].to_list()]

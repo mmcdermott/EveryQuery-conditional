@@ -288,8 +288,10 @@ death_given_not_censored:              # opens 7d out; "assume the record does N
     forced_answer: null
 ```
 
-`forced_answer` (`true` / `false`) is the answer fed to the model for that query when it conditions
-a later one, in place of the labeled truth; `null` teacher-forces the truth. It is written to the grid
+`forced_answer` (`true` / `false`) fixes the answer that query must have when it conditions a later
+one: the sequence is written only at the contexts whose labeled truth agrees, so a forced sequence
+covers a sub-cohort (every other sequence still covers every context) and the model is never told a
+counterfactual. `null` keeps every context and teacher-forces the truth. It is written to the grid
 as a `forced_answers` list column (absent when no spec forces anything) and never alters `answers`,
 so the scoring label is always the truth. **The final query of a sequence must have
 `forced_answer: null`** — it is the scored query and its answer conditions nothing; the spec reader
