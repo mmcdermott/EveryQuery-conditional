@@ -1,8 +1,8 @@
 """Metrics for multitask conditional-query predictions — ``EQ_evaluate_multitask``.
 
 Consumes the one-row-per-grid-row parquet written by ``EQ_predict_multitask`` (``subject_id``,
-``prediction_time``, the five window list columns, ``answers``, ``target_code``, ``label``,
-``prob``) and emits two metric tables.
+``prediction_time``, the five window list columns, ``answers``, ``forced_answers``, ``target_code``,
+``label``, ``prob``) and emits two metric tables.
 
 **Grouping key — the query specification**, :data:`TASK_KEY`.  That *is* the task:
 ``EQ_generate_evaluation_query_sequences`` resolves ``N`` ``SequenceSpec``s once and labels every
@@ -15,6 +15,12 @@ adding them would split each spec cell into up to ``2 ** (K - 1)`` sub-buckets s
 all-``False`` (most codes are rare), and AUROC is undefined on a single-class cell, so most of the
 partition would come back null.  Prior answers are context, not identity: the class label is
 ``label`` (i.e. ``answers[-1]``, the final query's answer) and the score is ``prob``.
+
+``forced_answers`` **is** in the key, for the opposite reason: a designed conditioning answer is
+part of the spec — constant across contexts — so "P(death | record did not end)" and
+"P(death | record ended)" are two tasks over the same five window columns, and each still holds the
+whole cohort.  A predictions parquet written before the column existed reads as all-null (nothing
+forced) and groups exactly as it did.
 
 Outputs, both derived from one bootstrap pass (see :func:`compute_multitask_metrics`):
 
@@ -47,6 +53,7 @@ from sklearn.metrics import roc_auc_score
 from every_query.data.query_seq_dataset import (
     BOUND_EVENTS_COL,
     DURATIONS_COL,
+    FORCED_ANSWERS_COL,
     QUERIES_COL,
     START_DURATIONS_COL,
     START_EVENTS_COL,
@@ -58,15 +65,18 @@ logging.basicConfig(level=logging.INFO)
 
 CONFIGS = str(files("every_query") / "evaluate" / "configs")
 
-#: The query specification — grouping on these five list columns recovers the evaluation grid's
-#: ``SequenceSpec``s exactly.  ``answers`` is excluded on purpose (see the module docstring).
-TASK_KEY = [QUERIES_COL, DURATIONS_COL, START_DURATIONS_COL, START_EVENTS_COL, BOUND_EVENTS_COL]
+#: The five window list columns every predictions parquet must carry.
+WINDOW_KEY = [QUERIES_COL, DURATIONS_COL, START_DURATIONS_COL, START_EVENTS_COL, BOUND_EVENTS_COL]
+#: The query specification — grouping on these list columns recovers the evaluation grid's
+#: ``SequenceSpec``s exactly.  ``answers`` is excluded on purpose (see the module docstring);
+#: ``forced_answers`` is defaulted to all-null when absent, so it is not a *required* column.
+TASK_KEY = [*WINDOW_KEY, FORCED_ANSWERS_COL]
 
 SUBJECT_ID_COL = "subject_id"
 LABEL_COL = "label"
 PROB_COL = "prob"
 
-REQUIRED_COLUMNS = [*TASK_KEY, SUBJECT_ID_COL, LABEL_COL, PROB_COL]
+REQUIRED_COLUMNS = [*WINDOW_KEY, SUBJECT_ID_COL, LABEL_COL, PROB_COL]
 
 # Match `upstream/task-auroc-ci`'s convention so the evaluator's intervals and the training-time
 # callback's intervals mean the same thing: percentile method, 1000 resamples, 95%, seed 0.
@@ -403,6 +413,9 @@ def compute_multitask_metrics(
     if n_resamples < 1:
         raise ValueError(f"n_resamples must be >= 1, got {n_resamples} — the intervals are not optional")
     _validate_columns(predictions)
+    if FORCED_ANSWERS_COL not in predictions.columns:
+        nothing_forced = pl.col(QUERIES_COL).list.eval(pl.lit(None, dtype=pl.Boolean))
+        predictions = predictions.with_columns(nothing_forced.alias(FORCED_ANSWERS_COL))
 
     if predictions.is_empty():
         return _empty_outputs(predictions, n_resamples, bootstrap_seed)

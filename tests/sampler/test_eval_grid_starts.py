@@ -48,6 +48,7 @@ from every_query.generate_tasks.sample_evaluation_query_sequences import (
     sample_sequence_specs,
     validate_spec_codes,
 )
+from tests.designed_specs import entry
 
 SPLIT = "held_out"
 SHARDS = ["0", "1"]
@@ -136,34 +137,32 @@ def test_spec_name_sanitising_keeps_the_starts():
 # ---------------------------------------------------------------------------
 
 DESIGNED = {
-    "post_admission": [{"query": "LAB//X", "start_event": "HOSPITAL_ADMISSION", "duration_days": 30}],
-    "delayed": [{"query": "ICD//I10", "start_duration_days": 7, "duration_days": 30}],
+    "post_admission": [entry("LAB//X", 30, start_event="HOSPITAL_ADMISSION")],
+    "delayed": [entry("ICD//I10", 30, start_duration_days=7)],
     "between_events": [
-        {
-            "query": "PROCEDURE//X",
-            "start_event": "HOSPITAL_ADMISSION",
-            "duration_days": -1,
-            "bound_event": "HOSPITAL_DISCHARGE",
-        }
+        # The sentinels spelled out, the way a script-generated file would; ``null`` is equivalent.
+        entry("PROCEDURE//X", -1, start_event="HOSPITAL_ADMISSION", bound_event="HOSPITAL_DISCHARGE")
+        | {"start_duration_days": -1}
     ],
     "mixed": [
-        ["TIMELINE//END", 1],
-        ["SEPSIS", -1, "HOSPITAL_DISCHARGE"],
-        {"query": "LAB//X", "duration_days": 3},
+        entry("TIMELINE//END", 1, forced_answer=False),
+        entry("SEPSIS", bound_event="HOSPITAL_DISCHARGE"),
+        entry("LAB//X", 3),
     ],
 }
 
 
 def _expected_designed() -> dict[str, tuple]:
     return {
-        "post_admission": (("LAB//X",), (30.0,), (), (SENTINEL,), ("HOSPITAL_ADMISSION",)),
-        "delayed": (("ICD//I10",), (30.0,), (), (7.0,), (None,)),
+        "post_admission": (("LAB//X",), (30.0,), (), (SENTINEL,), ("HOSPITAL_ADMISSION",), ()),
+        "delayed": (("ICD//I10",), (30.0,), (), (7.0,), (None,), ()),
         "between_events": (
             ("PROCEDURE//X",),
             (-1.0,),
             ("HOSPITAL_DISCHARGE",),
             (SENTINEL,),
             ("HOSPITAL_ADMISSION",),
+            (),
         ),
         "mixed": (
             ("TIMELINE//END", "SEPSIS", "LAB//X"),
@@ -171,13 +170,17 @@ def _expected_designed() -> dict[str, tuple]:
             (None, "HOSPITAL_DISCHARGE", None),
             (),
             (),
+            (False, None, None),
         ),
     }
 
 
+def _view(s: SequenceSpec) -> tuple:
+    return (s.queries, s.durations, s.bounds, s.start_durations, s.start_events, s.forced_answers)
+
+
 def _check_designed(specs: list[SequenceSpec]) -> None:
-    got = {s.name: (s.queries, s.durations, s.bounds, s.start_durations, s.start_events) for s in specs}
-    assert got == _expected_designed()
+    assert {s.name: _view(s) for s in specs} == _expected_designed()
 
 
 def test_yaml_mapping_form(tmp_path: Path):
@@ -197,104 +200,129 @@ def test_bare_list_form(tmp_path: Path):
     fp.write_text(yaml.safe_dump(list(DESIGNED.values())))
     specs = read_sequence_specs(fp)
     assert [s.name for s in specs] == [f"seq_{i:04d}" for i in range(4)]
-    expected = list(_expected_designed().values())
-    assert [(s.queries, s.durations, s.bounds, s.start_durations, s.start_events) for s in specs] == expected
+    assert [_view(s) for s in specs] == list(_expected_designed().values())
 
 
-def test_long_format_parquet_with_start_columns(tmp_path: Path):
+def _long_format_rows() -> list[dict]:
+    """``DESIGNED`` as long-format rows, out of position order within ``mixed``."""
     rows = [
-        {
-            "seq_id": "post_admission",
-            "position": 0,
-            "query": "LAB//X",
-            "duration_days": 30.0,
-            "bound_event": None,
-            "start_duration_days": None,
-            "start_event": "HOSPITAL_ADMISSION",
-        },
-        {
-            "seq_id": "delayed",
-            "position": 0,
-            "query": "ICD//I10",
-            "duration_days": 30.0,
-            "bound_event": None,
-            "start_duration_days": 7.0,
-            "start_event": None,
-        },
-        {
-            "seq_id": "between_events",
-            "position": 0,
-            "query": "PROCEDURE//X",
-            "duration_days": -1.0,
-            "bound_event": "HOSPITAL_DISCHARGE",
-            "start_duration_days": -1.0,
-            "start_event": "HOSPITAL_ADMISSION",
-        },
-        {
-            "seq_id": "mixed",
-            "position": 1,
-            "query": "SEPSIS",
-            "duration_days": -1.0,
-            "bound_event": "HOSPITAL_DISCHARGE",
-            "start_duration_days": 0.0,
-            "start_event": None,
-        },
-        {
-            "seq_id": "mixed",
-            "position": 0,
-            "query": "TIMELINE//END",
-            "duration_days": 1.0,
-            "bound_event": None,
-            "start_duration_days": None,
-            "start_event": None,
-        },
-        {
-            "seq_id": "mixed",
-            "position": 2,
-            "query": "LAB//X",
-            "duration_days": 3.0,
-            "bound_event": None,
-            "start_duration_days": 0.0,
-            "start_event": None,
-        },
+        {"seq_id": name, "position": i, **e}
+        for name, entries in DESIGNED.items()
+        for i, e in enumerate(entries)
     ]
-    fp = tmp_path / "designed.parquet"
-    pl.DataFrame(rows).with_columns(pl.col("start_duration_days").cast(pl.Float64)).write_parquet(fp)
+    return rows[::-1]
+
+
+def _write_long_format(fp: Path, rows: list[dict]) -> Path:
+    pl.DataFrame(rows).with_columns(
+        pl.col("start_duration_days", "duration_days").cast(pl.Float64),
+        pl.col("forced_answer").cast(pl.Boolean),
+    ).write_parquet(fp)
+    return fp
+
+
+def test_long_format_parquet(tmp_path: Path):
+    fp = _write_long_format(tmp_path / "designed.parquet", _long_format_rows())
     _check_designed(read_sequence_specs(fp))
 
 
-def test_long_format_parquet_without_start_columns_is_unchanged(tmp_path: Path):
-    rows = [
-        {"seq_id": "a", "position": 0, "query": "X", "duration_days": 3.0},
-        {"seq_id": "a", "position": 1, "query": "Y", "duration_days": 5.0},
-    ]
+@pytest.mark.parametrize(
+    "column", ["duration_days", "bound_event", "start_duration_days", "start_event", "forced_answer"]
+)
+def test_long_format_parquet_must_carry_every_column(tmp_path: Path, column: str):
+    rows = [{k: v for k, v in r.items() if k != column} for r in _long_format_rows()]
     fp = tmp_path / "designed.parquet"
     pl.DataFrame(rows).write_parquet(fp)
-    (spec,) = read_sequence_specs(fp)
-    assert (spec.queries, spec.durations, spec.bounds, spec.start_durations, spec.start_events) == (
-        ("X", "Y"),
-        (3.0, 5.0),
-        (),
-        (),
-        (),
-    )
+    with pytest.raises(ValueError, match=rf"missing required column\(s\) \['{column}'\]"):
+        read_sequence_specs(fp)
+
+
+@pytest.mark.parametrize("key", sorted(eval_seq._MAPPING_ENTRY_KEYS))
+def test_every_key_of_a_designed_entry_is_required(tmp_path: Path, key: str):
+    """``null`` is a legal value; a key that is simply not there is not."""
+    fp = tmp_path / "sparse.yaml"
+    full = entry("A", 30)
+    fp.write_text(yaml.safe_dump({"s": [{k: v for k, v in full.items() if k != key}]}))
+    with pytest.raises(ValueError, match=rf"missing required key\(s\) \['{key}'\]"):
+        read_sequence_specs(fp)
+
+
+@pytest.mark.parametrize("shorthand", [["A", 30], ["A", -1, "B"], "A"])
+def test_the_list_shorthand_is_rejected(tmp_path: Path, shorthand):
+    fp = tmp_path / "shorthand.yaml"
+    fp.write_text(yaml.safe_dump({"s": [shorthand]}))
+    with pytest.raises(ValueError, match="entry 0 must be a mapping with all of"):
+        read_sequence_specs(fp)
 
 
 @pytest.mark.parametrize(
-    ("entry", "match"),
+    ("override", "match"),
     [
-        ({"query": "A", "duration_days": 3, "typo": 1}, "unknown key"),
-        ({"query": "A"}, "missing required key"),
-        ({"query": "A", "duration_days": 3, "start_event": "ADMIT", "start_duration_days": 7}, "sentinel"),
-        ({"query": "A", "duration_days": 3, "start_duration_days": -1}, "finite number >= 0"),
-        ({"query": "A", "duration_days": 30, "bound_event": "X"}, "sentinel"),
+        ({"typo": 1}, "unknown key"),
+        ({"start_event": "ADMIT", "start_duration_days": 7}, "sentinel"),
+        ({"start_duration_days": -1}, "finite number >= 0"),
+        ({"bound_event": "X"}, "sentinel"),
+        ({"duration_days": None}, "neither a duration_days nor a bound_event"),
     ],
 )
-def test_contradictory_mapping_entries_are_rejected(tmp_path: Path, entry, match):
+def test_contradictory_mapping_entries_are_rejected(tmp_path: Path, override, match):
     fp = tmp_path / "bad.yaml"
-    fp.write_text(yaml.safe_dump({"s": [entry]}))
+    fp.write_text(yaml.safe_dump({"s": [entry("A", 30) | override]}))
     with pytest.raises(ValueError, match=match):
         read_sequence_specs(fp)
+
+
+# ---------------------------------------------------------------------------
+# 2b. Forced answers
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("suffix", [".yaml", ".json", ".parquet"])
+@pytest.mark.parametrize(
+    "entries",
+    [
+        [entry("A", 1), entry("B", 30, forced_answer=True)],
+        [entry("A", 1, forced_answer=False), entry("B", 30, forced_answer=False)],
+        [entry("A", 1, forced_answer=True)],
+    ],
+    ids=["final-of-two", "every-position", "only-query"],
+)
+def test_the_final_query_may_never_be_forced(tmp_path: Path, suffix: str, entries: list[dict]):
+    """The final query is the scored one: its answer conditions nothing, so a value there is refused
+    in every supplied shape rather than silently ignored."""
+    fp = tmp_path / f"bad{suffix}"
+    if suffix == ".parquet":
+        _write_long_format(fp, [{"seq_id": "s", "position": i, **e} for i, e in enumerate(entries)])
+    elif suffix == ".json":
+        fp.write_text(json.dumps({"s": entries}))
+    else:
+        fp.write_text(yaml.safe_dump({"s": entries}))
+    with pytest.raises(ValueError, match=r"forces the answer of its final query .* must be null"):
+        read_sequence_specs(fp)
+
+
+@pytest.mark.parametrize("bad", [1, 0, "yes", "true"])
+def test_a_forced_answer_is_strictly_boolean(tmp_path: Path, bad):
+    fp = tmp_path / "bad.yaml"
+    fp.write_text(yaml.safe_dump({"s": [entry("A", 1) | {"forced_answer": bad}, entry("B", 30)]}))
+    with pytest.raises(TypeError, match="must be true, false or null"):
+        read_sequence_specs(fp)
+
+
+def test_a_file_that_forces_nothing_is_the_unforced_spec(tmp_path: Path):
+    """Spelling ``forced_answer: null`` everywhere — which the strict format requires — must not change the
+    fingerprint or put a ``forced_answers`` column in the grid."""
+    fp = tmp_path / "plain.yaml"
+    fp.write_text(yaml.safe_dump({"s": [entry("A", 1), entry("B", 30)]}))
+    (spec,) = read_sequence_specs(fp)
+    assert spec == SequenceSpec("s", ("A", "B"), (1.0, 30.0))
+    assert not spec.has_forced_answers
+
+
+def test_spec_name_sanitising_keeps_the_forced_answers():
+    spec = SequenceSpec("a/b", ("A", "B"), (1.0, 1.0), forced_answers=(True, None))
+    (safe,) = eval_seq._sanitise_names([spec])
+    assert safe.name == "a_b" and safe.forced_answers == (True, None)
 
 
 def test_unknown_start_codes_are_rejected_against_the_vocabulary():
@@ -538,21 +566,29 @@ def _labels(out_dir: Path, shard: str) -> pl.DataFrame:
     return pl.read_parquet(out_dir / "eval" / SPLIT / f"{shard}.parquet")
 
 
-def test_config_ships_the_start_keys_with_the_prediction_time_defaults():
+# The start knobs that open every sampled window at the prediction time — the pre-#27 grid.  The
+# shipped defaults draw active starts instead, so tests about that grid ask for it explicitly.
+PREDICTION_TIME_STARTS = {"eventstart_fraction": 0.0, "prediction_time_start_fraction": 1.0}
+
+
+def test_config_ships_the_start_keys():
     cfg = yaml.safe_load(
         (Path(eval_seq.CONFIGS) / "sample_evaluation_query_sequences_config.yaml").read_text()
     )
-    assert cfg["eventstart_fraction"] == 0.0
-    assert cfg["prediction_time_start_fraction"] == 1.0
+    assert cfg["eventstart_fraction"] == 0.2
+    assert cfg["prediction_time_start_fraction"] == 0.4
     assert cfg["start_duration_min"] == 1 and cfg["start_duration_max"] == 180
     assert cfg["start_duration_distribution"] == "log-uniform"
     assert cfg["start_event_codes"] is None
 
 
-def test_default_grid_carries_no_start_columns(tmp_path: Path, data_dir: Path, codes_yaml: Path):
-    """Schema-compatible with today: the default config writes exactly the pre-#27 columns."""
+def test_prediction_time_start_grid_carries_no_start_columns(
+    tmp_path: Path, data_dir: Path, codes_yaml: Path
+):
+    """Schema-compatible with pre-#27: with every window opening at the prediction time the grid carries
+    exactly the old columns — no start columns, and no ``forced_answers`` either."""
     out_dir = tmp_path / "grid"
-    _run(data_dir, out_dir, codes_yaml)
+    _run(data_dir, out_dir, codes_yaml, **PREDICTION_TIME_STARTS)
     for shard in SHARDS:
         df = _labels(out_dir, shard)
         assert df.columns == [
@@ -633,18 +669,19 @@ def test_designed_starts_are_labeled_per_the_rule(
 
     # synthetic_events: per subject, codes cycle A01, B02, C03, D04, E05 every 10 days.
     specs = {
+        # The forced answers ride along untouched by labeling: ``answers`` below is compared to
+        # the oracle at *every* position, forced or not, so a labeler that wrote the forced value
+        # into ``answers`` — and with it corrupted the truth — would fail here.
         "between": [
-            {"query": "ICD//C03", "start_event": "ICD//B02", "duration_days": -1, "bound_event": "ICD//C03"},
-            {"query": "MED//D04", "start_event": "ICD//B02", "duration_days": -1, "bound_event": "MED//E05"},
+            entry("ICD//C03", start_event="ICD//B02", bound_event="ICD//C03", forced_answer=True),
+            entry("MED//D04", start_event="ICD//B02", bound_event="MED//E05"),
         ],
-        "after_b": [{"query": "ICD//C03", "start_event": "ICD//B02", "duration_days": 15}],
+        "after_b": [entry("ICD//C03", 15, start_event="ICD//B02")],
         "delayed": [
-            {"query": "ICD//A01", "start_duration_days": 25, "duration_days": -1, "bound_event": "MED//E05"},
-            {"query": "ICD//B02", "start_duration_days": 25, "duration_days": 30},
+            entry("ICD//A01", start_duration_days=25, bound_event="MED//E05", forced_answer=False),
+            entry("ICD//B02", 30, start_duration_days=25),
         ],
-        "never": [
-            {"query": "ICD//A01", "start_event": "MED//E05", "duration_days": -1, "bound_event": "NOPE//X"}
-        ],
+        "never": [entry("ICD//A01", start_event="MED//E05", bound_event="NOPE//X")],
     }
     fp = tmp_path / "specs.yaml"
     fp.write_text(yaml.safe_dump(specs))
@@ -676,6 +713,14 @@ def test_designed_starts_are_labeled_per_the_rule(
             seen_forms.add((start_event is not None, bound is not None))
     # Every start/end form combination was actually exercised.
     assert seen_forms == {(True, True), (True, False), (False, True), (False, False)}
+    # Each row carries its own spec's forced answers, null-padded for the specs that force nothing.
+    forced_by_queries = {
+        tuple(e["query"] for e in entries): [e["forced_answer"] for e in entries]
+        for entries in specs.values()
+    }
+    assert all(
+        row["forced_answers"] == forced_by_queries[tuple(row["queries"])] for row in df.iter_rows(named=True)
+    )
     # The oracle is not vacuous: both answers occur across the grid.
     flat = df.explode("answers")
     assert flat["answers"].any() and not flat["answers"].all()
@@ -689,14 +734,47 @@ def test_yaml_null_start_keys_read_as_absent(tmp_path: Path):
         yaml.safe_dump(
             {
                 "s": [
-                    {"query": "A", "duration_days": 3, "start_duration_days": None, "start_event": "ADMIT"},
-                    {"query": "B", "duration_days": 3, "start_duration_days": None, "start_event": None},
+                    entry("A", 3, start_event="ADMIT"),
+                    entry("B", 3, start_duration_days=None),
                 ]
             }
         )
     )
     (spec,) = read_sequence_specs(fp)
     assert spec.start_durations == (SENTINEL, 0.0) and spec.start_events == ("ADMIT", None)
+
+
+def test_flipping_a_forced_answer_relabels_and_an_unforced_file_writes_no_column(
+    tmp_path: Path, data_dir: Path, codes_yaml: Path
+):
+    """The labels are identical under either forced value, so only the fingerprint stands between a flipped
+    ``forced_answer`` and the stale shard written under the other one."""
+    out_dir = tmp_path / "grid"
+    fp = tmp_path / "specs.yaml"
+    files = [out_dir / "eval" / SPLIT / f"{s}.parquet" for s in SHARDS]
+
+    def run(forced: bool | None) -> list[list]:
+        fp.write_text(
+            yaml.safe_dump({"s": [entry("ICD//A01", 30, forced_answer=forced), entry("ICD//B02", 30)]})
+        )
+        _run(data_dir, out_dir, codes_yaml, sequences_path=fp)
+        return [pl.read_parquet(f) for f in files]
+
+    unforced = run(None)
+    assert all("forced_answers" not in df.columns for df in unforced)
+
+    yes = run(True)
+    assert all(df["forced_answers"].to_list() == [[True, None]] * df.height for df in yes)
+    no = run(False)
+    assert all(df["forced_answers"].to_list() == [[False, None]] * df.height for df in no)
+    # Forcing changes what the model is told, never what happened.
+    for a, b, c in zip(unforced, yes, no, strict=True):
+        assert a["answers"].to_list() == b["answers"].to_list() == c["answers"].to_list()
+
+    # Same file again: current, so untouched.
+    before = [f.stat().st_ino for f in files]
+    run(False)
+    assert [f.stat().st_ino for f in files] == before
 
 
 def test_start_knob_change_relabels_instead_of_serving_stale_shards(

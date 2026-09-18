@@ -190,27 +190,56 @@ EQ_generate_evaluation_query_sequences \
 vocabulary:
 
 ```yaml
-# designed.yaml   name -> [entry, ...]
-mortality_30d_uncensored:
-  - [TIMELINE//END, 30]      # condition on "record continues past 30d"
-  - [MEDS_DEATH, 30]
-sepsis_before_discharge:
-  - [SEPSIS, -1, HOSPITAL_DISCHARGE//HOME]
-lab_in_the_month_after_admission:
-  - query: LAB//220645//ANY  # ancestor query (needs ontology_dir)
-    start_event: HOSPITAL_ADMISSION
+# designed.yaml   name -> [entry, ...]; every entry spells out all six keys (null is a legal value)
+mortality_30d_given_uncensored:
+  - query: TIMELINE//END
+    start_event: null
+    start_duration_days: 0          # opens at the prediction time ...
+    bound_event: null
+    duration_days: 30               # ... closes 30 days later
+    forced_answer: false            # tell the model "the record continues past 30d"
+  - query: MEDS_DEATH
+    start_event: null
+    start_duration_days: 0
+    bound_event: null
     duration_days: 30
+    forced_answer: null             # the final query is the scored one: always null
+sepsis_before_discharge:
+  - query: SEPSIS
+    start_event: null
+    start_duration_days: 0
+    bound_event: HOSPITAL_DISCHARGE//HOME
+    duration_days: null             # closes at the discharge, not after a horizon
+    forced_answer: null
+lab_in_the_month_after_admission:
+  - query: LAB//220645//ANY         # ancestor query (needs ontology_dir)
+    start_event: HOSPITAL_ADMISSION
+    start_duration_days: null
+    bound_event: null
+    duration_days: 30
+    forced_answer: null
 ```
 
 ```bash
 EQ_generate_evaluation_query_sequences ... sequences_path=designed.yaml
 ```
 
-An entry is `[code, duration_days]`, `[code, -1, bound_event]`, or the mapping form
-`{query, duration_days[, bound_event][, start_duration_days][, start_event]}` — the mapping is the
-readable one for a window that opens later than the prediction time. A long-format parquet
-`(seq_id, position, query, duration_days[, bound_event][, start_duration_days][, start_event])`
-works too.
+Every entry is a mapping with **all six keys** — a missing key is an error, so a designed file can
+never mean "the default I did not know about":
+
+- `query`: a vocabulary code (or, with `ontology_dir`, an ancestor node).
+- `start_event` / `start_duration_days`: a code + `null`, **or** `null` + days `>= 0` (`0` = the
+  prediction time).
+- `bound_event` / `duration_days`: a code + `null`, **or** `null` + days `> 0`, measured from the
+  resolved start.
+- `forced_answer`: `true` / `false` / `null`; **must be `null` on the final query of every sequence**.
+
+`forced_answer` dictates the answer the model is *told* an earlier query had ("assume the record
+did not end — now what is P(death)?"); `null` teacher-forces the labeled truth. It never touches the
+labels: `answers` stays the truth and the final query is scored against it. The `-1` sentinel may be
+written in place of a `null` duration next to an event. A long-format parquet
+`(seq_id, position, query, start_event, start_duration_days, bound_event, duration_days, forced_answer)`
+works too, every column required.
 
 | Knob                                                       | Default                  | Meaning                                                                                                                                                           |
 | ---------------------------------------------------------- | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -284,12 +313,15 @@ their true answers — and writes one row per grid row, in grid order:
 
 ```
 subject_id, prediction_time,
-queries, start_durations, start_events, durations, bound_events, answers,
+queries, start_durations, start_events, durations, bound_events, answers, forced_answers,
 target_code, label, prob
 ```
 
 `target_code` is `queries[-1]` and `label` is `answers[-1]`; the final query is never teacher-forced
-into its own prediction. Options: `ckpt_name=` (checkpoint stem under `checkpoints/`, default best),
+into its own prediction. `answers` is always the labeled truth; `forced_answers` records which
+conditioning answers a designed spec dictated instead (all-null otherwise), and
+`EQ_evaluate_multitask` keys its task cells on it, so the forced-YES and forced-NO variants of one
+query spec are scored as two tasks. Options: `ckpt_name=` (checkpoint stem under `checkpoints/`, default best),
 `batch_size=`, `num_workers=`, `device=` (`cpu`, `cuda`, `cuda:N`, `mps`), `precision=` (default
 `bf16-mixed`, matching every shipped training config), `enable_progress_bar=false` for log-file
 runs, `overwrite=true`. `split=train` is refused.

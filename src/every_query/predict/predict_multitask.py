@@ -8,7 +8,8 @@ Takes a trained :class:`~every_query.model.conditional_multitask_ar_model.Condit
 run directory and the ``eval/`` root written by ``EQ_generate_evaluation_query_sequences``
 (including the explicit window starts only this model can read),
 and writes **one scalar prediction per grid row**: the probability that the row's *final* query
-occurs in its window, conditioned on the patient and on the earlier queries with their true answers.
+occurs in its window, conditioned on the patient and on the earlier queries with their true answers
+(or, where the grid's designed spec dictates one, with that ``forced_answers`` value instead).
 
 Per real grid row the :class:`~every_query.data.multitask_eval_dataset.QuerySeqMultitaskEvalDataset`
 adapter maps::
@@ -18,7 +19,7 @@ adapter maps::
     q_start_durations  <- start_durations     (0.0 where absent)
     q_start_codes      <- start_events        (no-bound index where null / absent)
     condition_codes    <- queries[:-1]
-    condition_answers  <- answers[:-1]
+    condition_answers  <- answers[:-1]        (forced_answers[:-1] wherever it is non-null)
     scored_code        <- queries[-1]
     label              <- answers[-1]
 
@@ -54,12 +55,13 @@ against ``answers[-1]`` / ``queries[-1]`` read back from the grid itself.
 Output columns, one row per input sequence, in dataset (= dataloader = input) order::
 
     subject_id, prediction_time,
-    queries, start_durations, start_events, durations, bound_events, answers,
+    queries, start_durations, start_events, durations, bound_events, answers, forced_answers,
     target_code, label, prob
 
 The complete lists identify the conditional task (``target_code == queries[-1]``,
-``label == answers[-1]``).  ``start_durations`` / ``start_events`` / ``bound_events`` are always
-written, normalized to their defaults (``0.0`` / null / null) when the grid lacked the column.  The
+``label == answers[-1]``).  ``answers`` is always the labeled truth, never a forced value.
+``start_durations`` / ``start_events`` / ``bound_events`` / ``forced_answers`` are always written,
+normalized to their defaults (``0.0`` / null / null / null) when the grid lacked the column.  The
 old evaluation-only ``task_id``, ``task_group``, ``start_resolved``, ``end_resolved`` and
 ``window_days`` sidecar fields are intentionally not recreated.
 """
@@ -88,6 +90,7 @@ from every_query.data.query_seq_dataset import (
     ANSWERS_COL,
     BOUND_EVENTS_COL,
     DURATIONS_COL,
+    FORCED_ANSWERS_COL,
     QUERIES_COL,
     START_DURATIONS_COL,
     START_EVENTS_COL,
@@ -112,6 +115,7 @@ OUTPUT_COLUMNS = [
     DURATIONS_COL,
     BOUND_EVENTS_COL,
     ANSWERS_COL,
+    FORCED_ANSWERS_COL,
     "target_code",
     "label",
     "prob",
@@ -603,6 +607,11 @@ def predictions_to_df(
     start_durations = schema_df[START_DURATIONS_COL] if dataset.has_starts else default_list(0.0, pl.Float32)
     start_events = schema_df[START_EVENTS_COL] if dataset.has_starts else default_list(None, pl.Utf8)
     bound_events = schema_df[BOUND_EVENTS_COL] if dataset.has_bound_events else default_list(None, pl.Utf8)
+    # ``answers`` stays the labeled truth; this records which conditioning answers were dictated
+    # instead, which is what tells a forced-YES row from a forced-NO row of the same query spec.
+    forced_answers = (
+        schema_df[FORCED_ANSWERS_COL] if dataset.has_forced_answers else default_list(None, pl.Boolean)
+    )
 
     return pl.DataFrame(
         {
@@ -614,6 +623,7 @@ def predictions_to_df(
             DURATIONS_COL: durations.cast(pl.List(pl.Float32)),
             BOUND_EVENTS_COL: bound_events.cast(pl.List(pl.Utf8)).alias(BOUND_EVENTS_COL),
             ANSWERS_COL: answers,
+            FORCED_ANSWERS_COL: forced_answers.cast(pl.List(pl.Boolean)).alias(FORCED_ANSWERS_COL),
             "target_code": target_code,
             "label": label.cast(pl.Boolean),
             "prob": pl.Series(probs, dtype=pl.Float32),

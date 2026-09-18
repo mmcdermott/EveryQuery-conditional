@@ -1,10 +1,9 @@
 """End-to-end correctness tests for sampled and supplied query-sequence pipelines.
 
-Unlike the broader CLI smoke tests, these tests pin every value written against a tiny cohort whose
-labels can be worked out by hand.  The sampled tests use the real Stage 0 prediction-time map,
-Stage 1' query/bound sampling, Stage 2 context sampling, Stage 3' index partitioning, and Stage 4'
-process worker.  The supplied-sequence test also drives the dense evaluation entry point over a
-designed YAML file and supplied cohort.
+Unlike the broader CLI smoke tests, these tests pin every value written against a tiny cohort whose labels can
+be worked out by hand.  The sampled tests use the real Stage 0 prediction-time map, Stage 1' query/bound
+sampling, Stage 2 context sampling, Stage 3' index partitioning, and Stage 4' process worker.  The supplied-
+sequence test also drives the dense evaluation entry point over a designed YAML file and supplied cohort.
 """
 
 from datetime import datetime, timedelta
@@ -30,6 +29,7 @@ from every_query.generate_tasks import (
     sample_evaluation_query_sequences as eval_sqs,
 )
 from every_query.generate_tasks.sample_tasks import INDEX_DIRNAME
+from tests.designed_specs import from_triples
 
 QUERY_CODES = [
     "DX//SEPSIS",
@@ -480,28 +480,30 @@ def test_supplied_sequences_path_labels_complete_dense_grid(tmp_path: Path) -> N
     sequences_path = tmp_path / "designed_sequences.yaml"
     sequences_path.write_text(
         yaml.safe_dump(
-            {
-                "duration_windows": [
-                    ["DX//SEPSIS", 10],
-                    ["HOSPITAL//DISCHARGE", 10],
-                    ["MED//ANTIBIOTIC", 10],
-                ],
-                "mixed_event_bounds": [
-                    ["DX//SEPSIS", -1, "FOLLOWUP//VISIT"],
-                    ["MED//ANTIBIOTIC", 10],
-                    ["LAB//LACTATE", -1, "FOLLOWUP//VISIT"],
-                ],
-                "boundary_edge_cases": [
-                    ["MED//ANTIBIOTIC", -1, "MED//ANTIBIOTIC"],
-                    ["FOLLOWUP//VISIT", -1, "HOSPITAL//DISCHARGE"],
-                    ["HOSPITAL//DISCHARGE", -1, "FOLLOWUP//VISIT"],
-                ],
-                "dag_ancestor_queries": [
-                    ["CLINICAL//INFECTION", 10],
-                    ["TREATMENT//ANTI_INFECTIVE", -1, "ENCOUNTER//END"],
-                    ["CLINICAL//BIOMARKER", -1, "ENCOUNTER//FOLLOWUP"],
-                ],
-            },
+            from_triples(
+                {
+                    "duration_windows": [
+                        ["DX//SEPSIS", 10],
+                        ["HOSPITAL//DISCHARGE", 10],
+                        ["MED//ANTIBIOTIC", 10],
+                    ],
+                    "mixed_event_bounds": [
+                        ["DX//SEPSIS", -1, "FOLLOWUP//VISIT"],
+                        ["MED//ANTIBIOTIC", 10],
+                        ["LAB//LACTATE", -1, "FOLLOWUP//VISIT"],
+                    ],
+                    "boundary_edge_cases": [
+                        ["MED//ANTIBIOTIC", -1, "MED//ANTIBIOTIC"],
+                        ["FOLLOWUP//VISIT", -1, "HOSPITAL//DISCHARGE"],
+                        ["HOSPITAL//DISCHARGE", -1, "FOLLOWUP//VISIT"],
+                    ],
+                    "dag_ancestor_queries": [
+                        ["CLINICAL//INFECTION", 10],
+                        ["TREATMENT//ANTI_INFECTIVE", -1, "ENCOUNTER//END"],
+                        ["CLINICAL//BIOMARKER", -1, "ENCOUNTER//FOLLOWUP"],
+                    ],
+                }
+            ),
             sort_keys=False,
         )
     )
@@ -633,7 +635,7 @@ def _label_both_ways(
     contexts_path = tmp_path / "contexts.parquet"
     contexts.write_parquet(contexts_path)
     sequences_path = tmp_path / "sequences.yaml"
-    sequences_path.write_text(yaml.safe_dump(sequences, sort_keys=False))
+    sequences_path.write_text(yaml.safe_dump(from_triples(sequences), sort_keys=False))
 
     eval_out = tmp_path / "eval_out"
     cfg = OmegaConf.create(
