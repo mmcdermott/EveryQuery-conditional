@@ -75,7 +75,12 @@ BOUND_EVENTS_COL = "bound_events"
 START_DURATIONS_COL = "start_durations"
 START_EVENTS_COL = "start_events"
 START_COLS = (START_DURATIONS_COL, START_EVENTS_COL)
-OPTIONAL_SEQ_LABEL_COLS = (BOUND_EVENTS_COL, *START_COLS)
+# Designed conditioning answers: ``forced_answers[j]`` (true/false) replaces ``answers[j]`` as the
+# answer fed to the model when query ``j`` conditions a later one; null teacher-forces the truth.
+# ``answers`` itself stays the labeled truth, so the scoring label is never affected.  Null on every
+# row's final query, which is scored and never conditions anything.
+FORCED_ANSWERS_COL = "forced_answers"
+OPTIONAL_SEQ_LABEL_COLS = (BOUND_EVENTS_COL, *START_COLS, FORCED_ANSWERS_COL)
 ALL_SEQ_LABEL_COLS = (*SEQ_LABEL_COLS, *OPTIONAL_SEQ_LABEL_COLS)
 
 # Duration written for an event-bounded query.  The window is defined by the boundary event, so
@@ -279,6 +284,7 @@ class QuerySeqPytorchDataset(MEDSPytorchDataset):
         strip_delta_tokens: bool = False,
         ontology_dir: str | None = None,
         allow_active_starts: bool = False,
+        allow_forced_answers: bool = False,
     ):
         """Build the dataset.
 
@@ -302,6 +308,12 @@ class QuerySeqPytorchDataset(MEDSPytorchDataset):
                 an event start) is rejected at init rather than silently scored as if every window
                 opened at the prediction time.  Absent or all-default (``0.0`` / null) starts are
                 always accepted.  Only the multitask prediction adapter passes ``True``.
+            allow_forced_answers: Opt in to the optional ``forced_answers`` label column, emitted
+                per item as ``condition_answers`` (the forced value where one is given, else the
+                labeled answer).  A model whose batch uses one answers tensor as both teacher-forcing
+                input and target cannot honor a forced answer, so with the default ``False`` a
+                grid carrying any non-null one is rejected at init.  An absent or all-null column
+                is always accepted.  Only the multitask prediction adapter passes ``True``.
         """
         super().__init__(cfg, split)
 
@@ -333,6 +345,8 @@ class QuerySeqPytorchDataset(MEDSPytorchDataset):
             )
         self.has_starts = bool(present_starts)
         self.allow_active_starts = allow_active_starts
+        self.has_forced_answers = FORCED_ANSWERS_COL in schema_cols
+        self.allow_forced_answers = allow_forced_answers
         self.start_durations = self.schema_df[START_DURATIONS_COL] if self.has_starts else None
         self.start_events = self.schema_df[START_EVENTS_COL] if self.has_starts else None
 
@@ -413,6 +427,8 @@ class QuerySeqPytorchDataset(MEDSPytorchDataset):
             )
         if self.has_starts:
             self._q_start_durations, self._q_start_codes = self._encode_starts()
+        if self.has_forced_answers:
+            self._q_condition_answers = self._encode_condition_answers()
 
         self.strip_delta_tokens = strip_delta_tokens
         self.delta_ids = rope_time.delta_vocab_ids(self.code_to_index)
@@ -428,6 +444,43 @@ class QuerySeqPytorchDataset(MEDSPytorchDataset):
                     "RoPE time: stripping %d delta-token vocab ids from the encoder input.",
                     self.delta_ids.numel(),
                 )
+
+    def _encode_condition_answers(self) -> np.ndarray:
+        """Validate ``forced_answers`` and fold it into the flat conditioning-answer array.
+
+        Returns the bool array aligned with ``_q_offsets`` holding, per query, the answer to feed the
+        model when that query conditions a later one: the forced value where one is given, else the
+        labeled answer.  Raised here, at init: ragged lists; a forced answer on a row's **final**
+        query (it is the scored one and conditions nothing, so the value would be a silent no-op
+        that reads as a forced label); and — unless ``allow_forced_answers`` — any forced answer at
+        all.  The generator enforces the final-query rule on specs; this is the same guard for a
+        grid that did not come from it.
+        """
+        forced = self.schema_df[FORCED_ANSWERS_COL]
+        lengths = forced.list.len().fill_null(0).to_numpy()
+        if not np.array_equal(np.diff(self._q_offsets), lengths):
+            raise ValueError("queries/forced_answers list lengths disagree in the labels.")
+        flat = forced.filter(forced.list.len() > 0).explode()
+        is_forced = flat.is_not_null().to_numpy()
+        if not is_forced.any():
+            return self._q_answers
+
+        final = self._q_offsets[1:][lengths > 0] - 1
+        if is_forced[final].any():
+            row = int(np.flatnonzero(lengths > 0)[np.flatnonzero(is_forced[final])[0]])
+            raise ValueError(
+                f"labels row {row} forces the answer of its final query; the final query is the scored "
+                "one and its answer is never fed to the model, so its forced_answers entry must be null."
+            )
+        if not self.allow_forced_answers:
+            raise ValueError(
+                f"{int(is_forced.sum())} query answer(s) in the labels are forced.  A model that uses "
+                "one answers tensor as both its teacher-forcing input and its target cannot condition "
+                "on a forced answer without also training/scoring against it, so this dataset refuses "
+                "the grid instead.  Score it with EQ_predict_multitask (its adapter passes "
+                "allow_forced_answers=True)."
+            )
+        return np.where(is_forced, flat.fill_null(False).to_numpy().astype(bool), self._q_answers)
 
     def _encode_starts(self) -> tuple[np.ndarray, np.ndarray]:
         """Validate the start columns against the module contract and pre-encode them.
@@ -516,6 +569,8 @@ class QuerySeqPytorchDataset(MEDSPytorchDataset):
         out["answers"] = self._q_answers[s:e]
         if self.has_bound_events:
             out["bound_events"] = self._q_bound_codes[s:e]
+        if self.has_forced_answers:
+            out["condition_answers"] = self._q_condition_answers[s:e]
         if self.allow_active_starts:
             # The adapter always gets start tensors: absent columns are the legacy all-default form.
             if self.has_starts:

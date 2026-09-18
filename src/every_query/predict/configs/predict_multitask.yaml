@@ -4,7 +4,8 @@
 # ConditionalMultitaskAR model over it, and writes
 # ONE scalar prediction per grid row: the probability that the row's final query occurs in its
 # window, conditioned on the patient and on the earlier queries with their true answers
-# (queries[:-1] / answers[:-1] are teacher-forced conditioning pairs; queries[-1] is scored).
+# (queries[:-1] / answers[:-1] are teacher-forced conditioning pairs — forced_answers[:-1] instead
+# wherever a designed spec dictates one; queries[-1] is scored against answers[-1], always the truth).
 # This is the only path that consumes the grid's explicit window starts
 # (start_durations / start_events), which only the multitask model encodes.  See
 # src/every_query/predict/predict_multitask.py for the row mapping and the output columns.

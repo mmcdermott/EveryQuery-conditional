@@ -237,6 +237,7 @@ class QuerySeqMultitaskEvalDataset(QuerySeqPytorchDataset):
             strip_delta_tokens=strip_delta_tokens,
             ontology_dir=None if ontology_dir is None else str(ontology_dir),
             allow_active_starts=True,
+            allow_forced_answers=True,
         )
 
         if self.n_grid_rows is None:
@@ -349,7 +350,10 @@ class QuerySeqMultitaskEvalDataset(QuerySeqPytorchDataset):
                 q_bound_codes[i, :n] = torch.as_tensor(item["bound_events"], dtype=torch.long)
             # Per real row: the first n-1 queries condition, the last one is scored.
             condition_codes[i, : n - 1] = queries[:-1]
-            condition_answers[i, : n - 1] = answers[:-1]
+            # A designed grid may dictate a conditioning answer (``forced_answers``); the parent has
+            # already folded that over the truth.  ``labels`` below is always the labeled truth.
+            conditioning = item.get("condition_answers", item["answers"])
+            condition_answers[i, : n - 1] = torch.as_tensor(np.asarray(conditioning, dtype=bool))[:-1]
             scored_codes[i] = queries[-1]
             labels[i] = answers[-1]
 

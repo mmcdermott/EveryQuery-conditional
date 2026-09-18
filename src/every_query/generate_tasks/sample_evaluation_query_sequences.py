@@ -75,13 +75,24 @@ measured from the *resolved start*::
 
 These are the multitask sampler's semantics, labeled here through the same ``interval_table``
 (:func:`~every_query.generate_tasks.query_sequence_labeling.label_with_explicit_starts`), so a
-multitask model can be scored on this grid.  Designed specs set starts explicitly (the mapping entry
-form, or the parquet ``start_duration_days`` / ``start_event`` columns); sampled specs draw them from
+multitask model can be scored on this grid.  Designed specs set starts explicitly (the
+``start_event`` / ``start_duration_days`` keys of each entry, or the parquet columns of the same
+names); sampled specs draw them from
 the ``eventstart_fraction`` / ``prediction_time_start_fraction`` / ``start_duration_*`` /
 ``start_event_codes`` knobs on three seed axes of their own.  With the default knobs every window
 opens at the prediction time and the output carries no start columns, exactly as before.  Active
 starts are opt-in on the reader side too: ``QuerySeqPytorchDataset`` refuses to tensorize them
 unless asked, so only ``EQ_predict_multitask`` consumes a grid that carries them.
+
+Forced answers.  A designed spec may fix the answer an earlier query must have when it conditions a
+later one (``forced_answer``: "among contexts where Q1 = YES, what is P(Q2)?").  It selects the spec's
+cohort: it is tiled onto the labeled grid as the optional ``forced_answers`` list column
+(:func:`attach_forced_answers`), and :func:`drop_forced_mismatches` then drops every row whose labeled
+truth disagrees, so a forced spec is **not** dense — it holds only the contexts where its conditioning
+really happened, and the model is never told a counterfactual.  ``answers`` is never touched, so the
+label a row is scored against is always the truth.  The final query of a sequence is the scored one
+and conditions nothing, so its forced answer must be null (:class:`SequenceSpec` rejects anything
+else).  Designed specs spell out every field of every entry — see :func:`read_sequence_specs`.
 
 Answers follow the module-wide sequence contract: binary, never null; an unobservable occurrence
 (record ends before the window does) is ``False``, and censoring is carried by an explicit
@@ -108,7 +119,12 @@ import numpy as np
 import polars as pl
 from omegaconf import DictConfig
 
-from every_query.data.query_seq_dataset import EVENT_BOUND_DURATION_SENTINEL
+from every_query.data.query_seq_dataset import (
+    ANSWERS_COL,
+    EVENT_BOUND_DURATION_SENTINEL,
+    FORCED_ANSWERS_COL,
+    QUERIES_COL,
+)
 from every_query.data.schema import QuerySeqSchema, TaskQuerySchema
 from every_query.generate_tasks.query_sequence_labeling import (
     BOUND_COL,
@@ -143,6 +159,9 @@ from every_query.utils.seeds import derive_seed
 logger = logging.getLogger(__name__)
 
 SPEC_ID_COL = "_spec_id"
+#: Designed-spec input key / long-format parquet column; the labeled grid carries the per-row list
+#: under ``FORCED_ANSWERS_COL``.
+FORCED_ANSWER_COL = "forced_answer"
 
 # Spec names become directory names under ``per_spec_dirs``, and YAML keys / parquet ``seq_id``
 # values are free-form (MEDS codes contain ``/``).  Anything outside this set is replaced with
@@ -167,11 +186,18 @@ class SequenceSpec:
         start_events: Optional per-query start-event codes aligned with ``start_durations`` (null
             for a duration-defined start).  Both start tuples are empty together (every window
             opens at the prediction time) or aligned together.
+        forced_answers: Optional per-query conditioning answers aligned with ``queries``: ``True`` /
+            ``False`` is fed to the decoder as that query's answer *instead of* the labeled one
+            ("assume Q1 = YES"), ``None`` teacher-forces the ground truth.  Empty means no position
+            is forced.  The labeled ``answers`` are never touched, so the scoring label stays the
+            truth.  The **last** position must be ``None``: it is the scored query, its answer is
+            never fed to the decoder, and a value there would be a silent no-op.
 
     Examples:
         >>> SequenceSpec("mortality_30d", ("TIMELINE//END", "MEDS_DEATH"), (1.0, 30.0))
         SequenceSpec(name='mortality_30d', queries=('TIMELINE//END', 'MEDS_DEATH'),
-                     durations=(1.0, 30.0), bounds=(), start_durations=(), start_events=())
+                     durations=(1.0, 30.0), bounds=(), start_durations=(), start_events=(),
+                     forced_answers=())
 
         A position may instead be bounded by an *event*: its window runs to the next occurrence
         of that code, so it carries the duration sentinel rather than a horizon.
@@ -192,6 +218,29 @@ class SequenceSpec:
         ((-1.0, 'HOSPITAL_ADMISSION'), (7.0, None), True)
         >>> spec.start_at(0), spec.has_active_starts
         ((0.0, None), False)
+
+        An earlier query's conditioning answer may be dictated rather than teacher-forced from the
+        truth; the final (scored) query's may not, and neither may a non-boolean:
+
+        >>> SequenceSpec("cf", ("TIMELINE//END", "MEDS_DEATH"), (30.0, 30.0),
+        ...              forced_answers=(False, None)).forced_answers
+        (False, None)
+        >>> SequenceSpec("bad", ("TIMELINE//END", "MEDS_DEATH"), (30.0, 30.0), forced_answers=(None, True))
+        Traceback (most recent call last):
+            ...
+        ValueError: spec 'bad' forces the answer of its final query 'MEDS_DEATH' (position 1) to
+        True; the final query is the scored one and its answer is never fed to the model, so its
+        forced_answer must be null
+        >>> SequenceSpec("bad", ("A",), (1.0,), forced_answers=(False,))
+        Traceback (most recent call last):
+            ...
+        ValueError: spec 'bad' forces the answer of its final query 'A' (position 0) to False; the
+        final query is the scored one and its answer is never fed to the model, so its
+        forced_answer must be null
+        >>> SequenceSpec("bad", ("A", "B"), (1.0, 1.0), forced_answers=(1, None))
+        Traceback (most recent call last):
+            ...
+        TypeError: spec 'bad' forced answer at position 0 must be true, false or null, got int: 1
 
         A bounded position with a real horizon is a contradiction and is rejected, as is a start
         event without the sentinel or a sentinel without a start event:
@@ -242,6 +291,7 @@ class SequenceSpec:
     bounds: tuple[str | None, ...] = ()
     start_durations: tuple[float, ...] = ()
     start_events: tuple[str | None, ...] = ()
+    forced_answers: tuple[bool | None, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.queries:
@@ -284,6 +334,31 @@ class SequenceSpec:
                     f"spec {self.name!r} duration {float(d)} at position {i} must be a finite number > 0"
                 )
         self._validate_starts()
+        self._validate_forced_answers()
+
+    def _validate_forced_answers(self) -> None:
+        """Forced answers are bool-or-null, aligned to the queries, and null on the final query."""
+        if not self.forced_answers:
+            return
+        if len(self.forced_answers) != len(self.queries):
+            raise ValueError(
+                f"spec {self.name!r} has {len(self.queries)} queries but {len(self.forced_answers)} "
+                "forced answer(s)"
+            )
+        for i, fa in enumerate(self.forced_answers):
+            # Strictly bool: ``1`` / ``"yes"`` are far likelier a typo than an intended answer.
+            if fa is not None and not isinstance(fa, bool):
+                raise TypeError(
+                    f"spec {self.name!r} forced answer at position {i} must be true, false or null, "
+                    f"got {type(fa).__name__}: {fa!r}"
+                )
+        last = len(self.queries) - 1
+        if self.forced_answers[last] is not None:
+            raise ValueError(
+                f"spec {self.name!r} forces the answer of its final query {self.queries[last]!r} "
+                f"(position {last}) to {self.forced_answers[last]}; the final query is the scored one and "
+                "its answer is never fed to the model, so its forced_answer must be null"
+            )
 
     def _validate_starts(self) -> None:
         """The start half of the contract: both tuples together or neither, one form per position."""
@@ -342,6 +417,15 @@ class SequenceSpec:
             for sd, se in zip(self.start_durations, self.start_events, strict=True)
         )
 
+    @property
+    def has_forced_answers(self) -> bool:
+        """Whether any position's conditioning answer is dictated rather than teacher-forced."""
+        return any(fa is not None for fa in self.forced_answers)
+
+    def forced_at(self, i: int) -> bool | None:
+        """Forced answer at position ``i``, or ``None`` when the ground truth is teacher-forced."""
+        return self.forced_answers[i] if self.forced_answers else None
+
     def __len__(self) -> int:
         return len(self.queries)
 
@@ -369,12 +453,14 @@ def _make_spec(
     bounds: Sequence[str | None],
     start_durations: Sequence[float],
     start_events: Sequence[str | None],
+    forced_answers: Sequence[bool | None],
 ) -> SequenceSpec:
     """Assemble a spec, keeping the optional tuples empty when every position is the default.
 
-    An all-null ``bounds`` becomes ``()`` and an all-``(0.0, None)`` start pair becomes ``((), ())``,
-    so a spec written without the feature is indistinguishable from one that spells the default
-    out — which is what keeps the fingerprint and the output columns of a default grid unchanged.
+    An all-null ``bounds`` becomes ``()``, an all-``(0.0, None)`` start pair becomes ``((), ())`` and
+    an all-null ``forced_answers`` becomes ``()``, so a designed file — which must spell every field
+    out — that only ever writes the defaults is indistinguishable from a spec built without the
+    feature.  That is what keeps the fingerprint and the output columns of a default grid unchanged.
     """
     active_start = any(
         se is not None or float(sd) != 0.0 for sd, se in zip(start_durations, start_events, strict=True)
@@ -386,125 +472,144 @@ def _make_spec(
         bounds=tuple(bounds) if any(b is not None for b in bounds) else (),
         start_durations=tuple(float(sd) for sd in start_durations) if active_start else (),
         start_events=tuple(start_events) if active_start else (),
+        forced_answers=tuple(forced_answers) if any(fa is not None for fa in forced_answers) else (),
     )
 
 
+#: Every designed entry must spell out all of these — ``null`` is a legal *value*, a missing key is
+#: not.  A designed file is read by a collaborator's eyes as often as by this parser, and an entry
+#: that names every field cannot be misread as "the default I did not know existed".
 _MAPPING_ENTRY_KEYS = frozenset(
-    {"query", "duration_days", "bound_event", "start_duration_days", "start_event"}
+    {"query", "start_event", "start_duration_days", "bound_event", "duration_days", "forced_answer"}
 )
 
 
-def _entry_from_mapping(name: str, i: int, entry: dict) -> tuple[str, float, str | None, float, str | None]:
-    """Read one ``{query, duration_days[, bound_event][, start_duration_days][, start_event]}`` entry."""
+def _entry_from_mapping(
+    name: str, i: int, entry: dict
+) -> tuple[str, float, str | None, float, str | None, bool | None]:
+    """Read one fully spelled-out entry; see :data:`_MAPPING_ENTRY_KEYS`.
+
+    Exactly one representation is active per window endpoint, and a ``null`` duration next to an
+    event takes the sentinel that event implies, so a designed file never has to write ``-1``:
+
+    ===========================================  ==================================================
+    ``start_event`` / ``start_duration_days``    code + (null | -1), or null + days ``>= 0``
+                                                 (``0`` / null = the prediction time)
+    ``bound_event`` / ``duration_days``          code + (null | -1), or null + days ``> 0``
+    ``forced_answer``                            true | false | null (= teacher-force the truth)
+    ===========================================  ==================================================
+
+    Examples:
+        >>> full = {"query": "A", "start_event": None, "start_duration_days": 0, "bound_event": None,
+        ...         "duration_days": 30, "forced_answer": True}
+        >>> _entry_from_mapping("s", 0, full)
+        ('A', 30, None, 0, None, True)
+        >>> _entry_from_mapping("s", 0, full | {"bound_event": "DISCHARGE", "duration_days": None,
+        ...                                     "start_event": "ADMIT", "start_duration_days": None})
+        ('A', -1.0, 'DISCHARGE', -1.0, 'ADMIT', True)
+        >>> _entry_from_mapping("s", 0, {"query": "A", "duration_days": 30})
+        Traceback (most recent call last):
+            ...
+        ValueError: sequence 's' entry 0 is missing required key(s) ['bound_event', 'forced_answer',
+        'start_duration_days', 'start_event']; every entry must spell out all of ['bound_event',
+        'duration_days', 'forced_answer', 'query', 'start_duration_days', 'start_event'] (null is a
+        legal value): {'query': 'A', 'duration_days': 30}
+        >>> _entry_from_mapping("s", 0, full | {"duration_days": None})
+        Traceback (most recent call last):
+            ...
+        ValueError: sequence 's' entry 0 has neither a duration_days nor a bound_event, so its window
+        has no end
+    """
     unknown = sorted(set(entry) - _MAPPING_ENTRY_KEYS)
     if unknown:
         raise ValueError(
             f"sequence {name!r} entry {i} has unknown key(s) {unknown}; "
             f"allowed: {sorted(_MAPPING_ENTRY_KEYS)}"
         )
-    missing = [k for k in ("query", "duration_days") if k not in entry]
+    missing = sorted(_MAPPING_ENTRY_KEYS - set(entry))
     if missing:
-        raise ValueError(f"sequence {name!r} entry {i} is missing required key(s) {missing}: {entry!r}")
-    bound = entry.get("bound_event")
-    start_event = entry.get("start_event")
-    # Missing start keys mean a prediction-time start; a start event alone implies the sentinel,
-    # and a duration alone implies no event.  Spelling both out is fine as long as they agree.  An
-    # explicit ``null`` reads as "absent", the same rule the long-format parquet reader applies.
-    start_duration = entry.get("start_duration_days")
+        raise ValueError(
+            f"sequence {name!r} entry {i} is missing required key(s) {missing}; every entry must spell "
+            f"out all of {sorted(_MAPPING_ENTRY_KEYS)} (null is a legal value): {entry!r}"
+        )
+    bound = entry["bound_event"]
+    start_event = entry["start_event"]
+    # A null duration takes the form its event implies — the sentinel next to an event — the same
+    # rule the long-format parquet reader applies.  A null start with no event is the prediction
+    # time; a null end with no event is no window at all.
+    start_duration = entry["start_duration_days"]
     if start_duration is None:
         start_duration = EVENT_BOUND_DURATION_SENTINEL if start_event is not None else 0.0
-    return entry["query"], entry["duration_days"], bound, start_duration, start_event
+    duration = entry["duration_days"]
+    if duration is None:
+        if bound is None:
+            raise ValueError(
+                f"sequence {name!r} entry {i} has neither a duration_days nor a bound_event, so its "
+                "window has no end"
+            )
+        duration = EVENT_BOUND_DURATION_SENTINEL
+    return entry["query"], duration, bound, start_duration, start_event, entry["forced_answer"]
 
 
-def _specs_from_pairs(name: str, pairs: object) -> SequenceSpec:
-    """Build one spec from a list of ``[code, duration]`` pairs, ``[code, -1, bound]`` triples, or mappings.
+def _spec_from_entries(name: str, entries: object) -> SequenceSpec:
+    """Build one spec from a list of fully spelled-out mapping entries::
 
-    The mapping form is the readable one for windows that do not open at the prediction time::
-
-        - query: LAB//X
-          start_event: HOSPITAL_ADMISSION      # opens at the next admission ...
-          duration_days: 30                    # ... and closes 30 days after it
-        - query: ICD//I10
-          start_duration_days: 7               # opens 7 days after the prediction time
-          duration_days: 30
+        - query: TIMELINE//END
+          start_event: null
+          start_duration_days: 0             # opens at the prediction time ...
+          bound_event: null
+          duration_days: 30                  # ... and closes 30 days later
+          forced_answer: false               # condition the next query on "record did NOT end"
         - query: PROCEDURE//X
-          start_event: HOSPITAL_ADMISSION
-          duration_days: -1
-          bound_event: HOSPITAL_DISCHARGE      # closes at the next discharge after the admission
+          start_event: HOSPITAL_ADMISSION    # opens at the next admission ...
+          start_duration_days: null
+          bound_event: HOSPITAL_DISCHARGE    # ... closes at the next discharge after it
+          duration_days: null
+          forced_answer: null                # the final query is scored, never forced
 
-    Missing start keys mean a prediction-time start.  The forms may be mixed within one sequence.
+    Every key is required in every entry (see :func:`_entry_from_mapping`); the ``[code, duration]``
+    list shorthand this reader once took is rejected, since it cannot say what it leaves out.
     """
-    if not isinstance(pairs, Sequence) or isinstance(pairs, str):
+    if not isinstance(entries, Sequence) or isinstance(entries, str):
         raise ValueError(
-            f"sequence {name!r} must be a list of [code, duration] pairs, [code, -1, bound_event] triples "
-            f"or {{query, duration_days, ...}} mappings, got {pairs!r}"
+            f"sequence {name!r} must be a list of {{{', '.join(sorted(_MAPPING_ENTRY_KEYS))}}} "
+            f"mappings, got {entries!r}"
         )
-    queries: list[str] = []
-    durations: list[float] = []
-    bounds: list[str | None] = []
-    start_durations: list[float] = []
-    start_events: list[str | None] = []
-    for i, pair in enumerate(pairs):
-        if isinstance(pair, dict):
-            query, duration, bound, start_duration, start_event = _entry_from_mapping(name, i, pair)
-        else:
-            if isinstance(pair, str) or not isinstance(pair, Sequence) or len(pair) not in (2, 3):
-                raise ValueError(
-                    f"sequence {name!r} entry {i} must be a [code, duration] pair, a "
-                    f"[code, duration, bound_event] triple, or a mapping, got {pair!r}"
-                )
-            bound = pair[2] if len(pair) == 3 else None
-            if bound is not None and not isinstance(bound, str):
-                # Guards the shape `[code, duration, 9]`, which would otherwise be read as a
-                # boundary rather than rejected as a malformed [code, duration] pair.
-                raise ValueError(
-                    f"sequence {name!r} entry {i} must be a [code, duration] pair or a "
-                    f"[code, duration, bound_event] triple with a string bound, got {pair!r}"
-                )
-            query, duration, start_duration, start_event = pair[0], pair[1], 0.0, None
-        queries.append(query)
-        durations.append(duration)
-        bounds.append(bound)
-        start_durations.append(start_duration)
-        start_events.append(start_event)
-    return _make_spec(name, queries, durations, bounds, start_durations, start_events)
+    columns: tuple[list, ...] = ([], [], [], [], [], [])
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"sequence {name!r} entry {i} must be a mapping with all of "
+                f"{sorted(_MAPPING_ENTRY_KEYS)} (null is a legal value), got {entry!r}"
+            )
+        for column, value in zip(columns, _entry_from_mapping(name, i, entry), strict=True):
+            column.append(value)
+    return _make_spec(name, *columns)
 
 
 def read_sequence_specs(path: str | Path) -> list[SequenceSpec]:
     """Read designed query sequences from a YAML/JSON or parquet file.
 
-    YAML/JSON accepts either a mapping of ``name -> [[code, duration], ...]``::
+    YAML/JSON is a mapping of ``name -> [entry, ...]``, every entry a mapping that spells out **all
+    six keys** (``null`` is a legal value; a missing key is an error — see
+    :func:`_entry_from_mapping` for the value rules)::
 
-        mortality_30d:
-          - [TIMELINE//END, 1]
-          - [MEDS_DEATH, 30]
+        death_given_not_censored:
+          - {query: TIMELINE//END, start_event: null, start_duration_days: 0,
+             bound_event: null, duration_days: 30, forced_answer: false}
+          - {query: MEDS_DEATH, start_event: null, start_duration_days: 0,
+             bound_event: null, duration_days: 30, forced_answer: null}
 
-    Event-bounded entries are triples whose duration is the ``-1`` sentinel::
+    or a bare list of such sequences, in which case names are generated (``seq_0000``, ...).
 
-        sepsis_before_discharge:
-          - [SEPSIS, -1, HOSPITAL_DISCHARGE//HOME]
+    ``forced_answer`` dictates the answer fed to the model for that query when it conditions a later
+    one; ``null`` teacher-forces the labeled truth.  It must be ``null`` on a sequence's final query.
 
-    or a bare list of sequences, in which case names are generated (``seq_0000``, ...)::
-
-        - [[TIMELINE//END, 1], [MEDS_DEATH, 30]]
-
-    Entries may also be mappings, which is the readable form for windows that open later than
-    the prediction time (issue #27) — a start delay, or a start event with the end measured from
-    it — see :func:`_specs_from_pairs`::
-
-        post_admission:
-          - query: LAB//X
-            start_event: HOSPITAL_ADMISSION
-            duration_days: 30
-
-    A parquet is read as long-format ``(seq_id, position, query, duration_days[, bound_event][,
-    start_duration_days][, start_event])``, one row per query; ``seq_id`` becomes the spec name
-    and ``position`` fixes the within-sequence order. ``bound_event`` is optional and nullable: a
-    non-null value marks that row as event-bounded and requires the ``-1`` duration sentinel.
-    ``start_duration_days`` / ``start_event`` are optional the same way (a null or absent
-    ``start_event`` with a null or absent ``start_duration_days`` is a prediction-time start; a
-    non-null ``start_event`` requires the ``-1`` start sentinel, or may omit the column).  That
-    form is the convenient one when the specs are themselves generated by a script.
+    A parquet is read as long-format ``(seq_id, position, query, start_event, start_duration_days,
+    bound_event, duration_days, forced_answer)``, one row per query and **every column required**;
+    ``seq_id`` becomes the spec name and ``position`` fixes the within-sequence order.  Nulls mean
+    what they mean in the mapping form.  That form is the convenient one when the specs are
+    themselves generated by a script.
 
     Raises:
         ValueError: If the file is empty, has an unsupported suffix, or any sequence is malformed.
@@ -515,38 +620,41 @@ def read_sequence_specs(path: str | Path) -> list[SequenceSpec]:
         # Accept both ``position`` and the internal ``_position`` spelling, so a frame dumped
         # straight out of ``build_dense_sequence_index_df`` can be fed back in.
         pos_col = "position" if "position" in df.columns else POSITION_COL
-        required = {"seq_id", pos_col, "query", "duration_days"}
+        required = {
+            "seq_id",
+            pos_col,
+            "query",
+            "duration_days",
+            BOUND_COL,
+            START_EVENT_COL,
+            START_DURATION_COL,
+            FORCED_ANSWER_COL,
+        }
         missing = required - set(df.columns)
         if missing:
             raise ValueError(f"{p} is missing required column(s) {sorted(missing)}")
-        has_bounds = BOUND_COL in df.columns
-        selections = [
-            pl.col("seq_id").cast(pl.Utf8),
-            pl.col(pos_col).cast(pl.Int64),
-            pl.col("query").cast(pl.Utf8),
-            pl.col("duration_days").cast(pl.Float64),
-            (pl.col(BOUND_COL).cast(pl.Utf8) if has_bounds else pl.lit(None, dtype=pl.Utf8).alias(BOUND_COL)),
-            (
-                pl.col(START_EVENT_COL).cast(pl.Utf8)
-                if START_EVENT_COL in df.columns
-                else pl.lit(None, dtype=pl.Utf8).alias(START_EVENT_COL)
-            ),
-            (
-                pl.col(START_DURATION_COL).cast(pl.Float64)
-                if START_DURATION_COL in df.columns
-                else pl.lit(None, dtype=pl.Float64).alias(START_DURATION_COL)
-            ),
-        ]
         grouped = (
-            df.select(selections)
+            df.select(
+                pl.col("seq_id").cast(pl.Utf8),
+                pl.col(pos_col).cast(pl.Int64),
+                pl.col("query").cast(pl.Utf8),
+                pl.col("duration_days").cast(pl.Float64),
+                pl.col(BOUND_COL).cast(pl.Utf8),
+                pl.col(START_EVENT_COL).cast(pl.Utf8),
+                pl.col(START_DURATION_COL).cast(pl.Float64),
+                pl.col(FORCED_ANSWER_COL).cast(pl.Boolean),
+            )
             .with_columns(
-                # A null start duration takes the form its start event implies (see the mapping
-                # reader): the sentinel next to an event, zero otherwise.
+                # A null duration takes the form its event implies (see the mapping reader): the
+                # sentinel next to an event; a null start with no event is the prediction time.
                 pl.col(START_DURATION_COL).fill_null(
                     pl.when(pl.col(START_EVENT_COL).is_not_null())
                     .then(pl.lit(EVENT_BOUND_DURATION_SENTINEL))
                     .otherwise(pl.lit(0.0))
-                )
+                ),
+                pl.col("duration_days").fill_null(
+                    pl.when(pl.col(BOUND_COL).is_not_null()).then(pl.lit(EVENT_BOUND_DURATION_SENTINEL))
+                ),
             )
             .sort("seq_id", pos_col)
             .group_by("seq_id", maintain_order=True)
@@ -556,6 +664,7 @@ def read_sequence_specs(path: str | Path) -> list[SequenceSpec]:
                 pl.col(BOUND_COL),
                 pl.col(START_DURATION_COL),
                 pl.col(START_EVENT_COL),
+                pl.col(FORCED_ANSWER_COL),
             )
         )
         specs = [
@@ -566,6 +675,7 @@ def read_sequence_specs(path: str | Path) -> list[SequenceSpec]:
                 row[BOUND_COL],
                 row[START_DURATION_COL],
                 row[START_EVENT_COL],
+                row[FORCED_ANSWER_COL],
             )
             for row in grouped.iter_rows(named=True)
         ]
@@ -579,13 +689,13 @@ def read_sequence_specs(path: str | Path) -> list[SequenceSpec]:
         if isinstance(data, dict) and "sequences" in data:
             data = data["sequences"]
         if isinstance(data, dict):
-            specs = [_specs_from_pairs(str(name), pairs) for name, pairs in data.items()]
+            specs = [_spec_from_entries(str(name), entries) for name, entries in data.items()]
         elif isinstance(data, list):
-            specs = [_specs_from_pairs(f"seq_{i:04d}", pairs) for i, pairs in enumerate(data)]
+            specs = [_spec_from_entries(f"seq_{i:04d}", entries) for i, entries in enumerate(data)]
         else:
             raise ValueError(
-                f"{p} must contain a mapping of name -> [[code, duration], ...] or a list of "
-                f"such sequences, got {type(data).__name__}"
+                f"{p} must contain a mapping of name -> [entry, ...] or a list of such sequences, "
+                f"got {type(data).__name__}"
             )
     else:
         raise ValueError(f"{p} must be a .yaml/.yml/.json or .parquet file (got suffix {p.suffix!r})")
@@ -776,6 +886,7 @@ def sample_sequence_specs(
                 [q.bound_event for q in seq],
                 start_durations[offset : offset + n].tolist(),
                 start_events[offset : offset + n].tolist(),
+                [None] * n,  # forced answers are a designed-spec feature; sampled specs never force
             )
         )
         offset += n
@@ -1188,11 +1299,27 @@ def _specs_fingerprint(specs: list[SequenceSpec]) -> str:
         ...                         start_events=(None, None))]
         >>> _specs_fingerprint(a) == _specs_fingerprint(delayed)
         False
+
+        Forced answers join the same way — only when some spec has one — so flipping one relabels
+        instead of serving the shard written under the other value:
+
+        >>> unforced = [SequenceSpec("x", ("A", "B"), (1.0, 30.0), forced_answers=(None, None))]
+        >>> _specs_fingerprint(a) == _specs_fingerprint(unforced)
+        True
+        >>> yes, no = ([SequenceSpec("x", ("A", "B"), (1.0, 30.0), forced_answers=(fa, None))]
+        ...            for fa in (True, False))
+        >>> len({_specs_fingerprint(a), _specs_fingerprint(yes), _specs_fingerprint(no)})
+        3
     """
     payload = [[list(s.queries), list(s.durations), list(s.bounds)] for s in specs]
     if any(s.has_active_starts for s in specs):
         for entry, s in zip(payload, specs, strict=True):
             entry.append([[s.start_at(i)[0], s.start_at(i)[1]] for i in range(len(s))])
+    if any(s.has_forced_answers for s in specs):
+        for entry, s in zip(payload, specs, strict=True):
+            # "forced_cohort", not "forced_answers": renamed when a forced answer became a cohort
+            # filter, so a dense forced grid written before that reads as stale and is relabeled.
+            entry.append({"forced_cohort": [s.forced_at(i) for i in range(len(s))]})
     return f"{len(specs)}:{hashlib.sha256(json.dumps(payload).encode()).hexdigest()[:16]}"
 
 
@@ -1265,6 +1392,76 @@ def _output_is_current(out_dir: Path, fp: Path, fingerprint: dict[str, str | Non
     the same reason.
     """
     return fp.exists() and _recorded_fingerprint(out_dir, fp) == fingerprint
+
+
+def attach_forced_answers(labeled: pl.DataFrame, specs: list[SequenceSpec]) -> pl.DataFrame:
+    """Add the per-row ``forced_answers`` list column, or nothing when no spec forces an answer.
+
+    A forced answer is a property of the spec, not of the events, so the labelers never see it; it is
+    tiled onto their output instead, relying on the dense grid's context-major row order (row ``i``
+    is ``specs[i % N]``).  That order is checked against ``queries`` rather than trusted: attaching a
+    forced answer to the wrong sequence would be a well-formed parquet of wrong conditioning.
+
+    Examples:
+        >>> specs = [SequenceSpec("a", ("A", "B"), (1.0, 1.0), forced_answers=(True, None)),
+        ...          SequenceSpec("b", ("C",), (1.0,))]
+        >>> labeled = pl.DataFrame({"queries": [["A", "B"], ["C"], ["A", "B"], ["C"]]})
+        >>> attach_forced_answers(labeled, specs)["forced_answers"].to_list()
+        [[True, None], [None], [True, None], [None]]
+        >>> attach_forced_answers(labeled, specs[1:]).columns
+        ['queries']
+        >>> attach_forced_answers(labeled[::-1], specs)
+        Traceback (most recent call last):
+            ...
+        RuntimeError: labeled grid row 0 holds queries ['C'] where spec 'a' (['A', 'B']) was
+        expected; the grid is not in context-major spec order, so forced answers cannot be attached
+    """
+    if not any(s.has_forced_answers for s in specs):
+        return labeled
+    n = len(specs)
+    if labeled.height % n:
+        raise RuntimeError(f"labeled grid has {labeled.height} rows, not a multiple of the {n} spec(s)")
+    for i, got in enumerate(labeled[QUERIES_COL].to_list()):
+        if got != list(specs[i % n].queries):
+            raise RuntimeError(
+                f"labeled grid row {i} holds queries {got} where spec {specs[i % n].name!r} "
+                f"({list(specs[i % n].queries)}) was expected; the grid is not in context-major spec "
+                "order, so forced answers cannot be attached"
+            )
+    per_spec = [[s.forced_at(p) for p in range(len(s))] for s in specs]
+    tiled = pl.Series(FORCED_ANSWERS_COL, per_spec * (labeled.height // n), dtype=pl.List(pl.Boolean))
+    return labeled.with_columns(tiled)
+
+
+def drop_forced_mismatches(labeled: pl.DataFrame) -> pl.DataFrame:
+    """Keep only the rows whose labeled truth agrees with every designed ``forced_answers`` entry.
+
+    A forced answer selects a spec's cohort: "P(death | record did not end)" is scored on the contexts
+    where the record really did not end, never on a counterfactual.  So what the model is told always
+    equals the truth, and a forced spec's rows are exactly the matching ``prior_answers`` cell of the
+    same spec left unforced.  Specs that force nothing — every sampled spec — keep every context.
+
+    Examples:
+        >>> labeled = pl.DataFrame({
+        ...     "queries": [["A", "B"]] * 3 + [["C"]],
+        ...     "answers": [[True, False], [False, True], [True, True], [False]],
+        ...     "forced_answers": [[True, None]] * 3 + [[None]],
+        ... })
+        >>> drop_forced_mismatches(labeled)["answers"].to_list()
+        [[True, False], [True, True], [False]]
+        >>> drop_forced_mismatches(labeled.drop("forced_answers")).height
+        4
+    """
+    if FORCED_ANSWERS_COL not in labeled.columns:
+        return labeled
+    forced, truth = pl.col(FORCED_ANSWERS_COL), pl.col(ANSWERS_COL)
+    rows = labeled.with_row_index("_row")
+    contradicted = (
+        rows.select("_row", FORCED_ANSWERS_COL, ANSWERS_COL)
+        .explode(FORCED_ANSWERS_COL, ANSWERS_COL)
+        .filter(forced.is_not_null() & (forced != truth))["_row"]
+    )
+    return rows.filter(~pl.col("_row").is_in(contradicted.implode())).drop("_row")
 
 
 def _write(labeled: pl.DataFrame, fp: Path, out_dir: Path, fingerprint: dict[str, str | None]) -> None:
@@ -1408,7 +1605,8 @@ def run_worker(
     # An empty cohort still writes an empty, well-formed parquet, so downstream sees a complete
     # split even when a sparse shard yields no eligible prediction time.
     index_df = build_dense_sequence_index_df(shard_contexts, specs)
-    labeled = label_query_sequences(index_df, events_df)
+    labeled = attach_forced_answers(label_query_sequences(index_df, events_df), specs)
+    labeled = drop_forced_mismatches(labeled)
     _write(labeled, labels_fp, root, fingerprint)
 
     if unique_fp is not None:

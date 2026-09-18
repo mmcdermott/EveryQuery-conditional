@@ -96,6 +96,8 @@ def _write_grid(root: Path, rows: list[dict], *, split: str = train_split, shard
     if "start_durations" in rows[0]:
         cols["start_durations"] = pl.List(pl.Float32)
         cols["start_events"] = pl.List(pl.Utf8)
+    if "forced_answers" in rows[0]:
+        cols["forced_answers"] = pl.List(pl.Boolean)
     pl.DataFrame(rows, schema=cols).write_parquet(split_dir / f"{shard}.parquet")
     return root
 
@@ -744,6 +746,97 @@ def test_one_query_rows_have_no_conditioning_pairs_and_k_may_be_one(tensorized_c
     assert batch.labels.tolist() == [True, False]
 
 
+def _forced_rows() -> list[dict]:
+    """``_mixed_rows`` with a designed conditioning answer wherever a row has one to give.
+
+    Every forced value is the *opposite* of the labeled answer, so a collate that ignored the column could not
+    pass by coincidence.
+    """
+    a, b, c, d = _TRAIN_SUBJECTS
+    return [
+        _row(a, [Q1], [True], forced_answers=[None]),
+        _row(b, [Q1, Q2], [False, True], forced_answers=[True, None]),
+        _row(c, [Q2, Q1, Q3], [True, True, False], forced_answers=[None, False, None]),
+        _row(d, [Q3, Q2], [False, False], forced_answers=[None, None]),
+    ]
+
+
+def test_forced_answers_replace_the_conditioning_answer_and_never_the_label(tensorized_cohort_dir, tmp_path):
+    rows = _forced_rows()
+    forced_ds = _dataset(tensorized_cohort_dir, _write_grid(tmp_path / "forced", rows))
+    forced = _collate_all(forced_ds)
+    truth = _collate_all(_dataset(tensorized_cohort_dir, _write_grid(tmp_path / "truth", _mixed_rows())))
+
+    # Forced where given, the labeled truth where null.
+    assert forced.condition_answers.tolist() == [
+        [False, False],
+        [True, False],
+        [True, False],
+        [False, False],
+    ]
+    assert truth.condition_answers.tolist() == [
+        [False, False],
+        [False, False],
+        [True, True],
+        [False, False],
+    ]
+    # Everything that is not the conditioning answer is untouched: the label above all.
+    assert forced.labels.tolist() == truth.labels.tolist() == [r["answers"][-1] for r in rows]
+    assert torch.equal(forced.condition_codes, truth.condition_codes)
+    assert torch.equal(forced.scored_codes, truth.scored_codes)
+
+    # And the model is actually conditioned on it: only the two rows with a forced answer move.
+    model = _tiny_model(max(forced_ds.code_to_index.values()) + 1)
+    with torch.no_grad():
+        moved = model.score_final_query(forced, forced.scored_codes) != model.score_final_query(
+            truth, truth.scored_codes
+        )
+    assert moved.tolist() == [False, True, True, False]
+
+
+def test_an_all_null_forced_answers_column_is_the_unforced_grid(tensorized_cohort_dir, tmp_path):
+    rows = [{**r, "forced_answers": [None] * len(r["queries"])} for r in _mixed_rows()]
+    nulls = _collate_all(_dataset(tensorized_cohort_dir, _write_grid(tmp_path / "nulls", rows)))
+    plain = _collate_all(_dataset(tensorized_cohort_dir, _write_grid(tmp_path / "plain", _mixed_rows())))
+    assert torch.equal(nulls.condition_answers, plain.condition_answers)
+
+
+@pytest.mark.parametrize(
+    "queries, answers, forced",
+    [([Q1, Q2], [False, True], [None, True]), ([Q1], [True], [False])],
+    ids=["final-of-two", "only-query"],
+)
+def test_a_forced_answer_on_the_final_query_is_rejected(
+    tensorized_cohort_dir, tmp_path, queries, answers, forced
+):
+    """The generator enforces this on specs; a hand-built grid must hit the same wall at load."""
+    a, b = _TRAIN_SUBJECTS[:2]
+    rows = [
+        _row(a, [Q1, Q2], [True, True], forced_answers=[False, None]),
+        _row(b, queries, answers, forced_answers=forced),
+    ]
+    with pytest.raises(ValueError, match="labels row 1 forces the answer of its final query"):
+        _dataset(tensorized_cohort_dir, _write_grid(tmp_path / "grid", rows))
+
+
+def test_ragged_forced_answers_are_rejected(tensorized_cohort_dir, tmp_path):
+    a = _TRAIN_SUBJECTS[0]
+    grid = _write_grid(tmp_path / "grid", [_row(a, [Q1, Q2], [True, True], forced_answers=[None])])
+    with pytest.raises(ValueError, match="forced_answers list lengths disagree"):
+        _dataset(tensorized_cohort_dir, grid)
+
+
+def test_a_model_that_cannot_honor_forced_answers_refuses_the_grid(tensorized_cohort_dir, tmp_path):
+    """The plain sequence dataset uses one answers tensor as input *and* target, so it must not silently drop
+    a designed conditioning answer; an all-null column is still fine."""
+    forced = _write_grid(tmp_path / "forced", _forced_rows())
+    with pytest.raises(ValueError, match=r"are forced.*EQ_predict_multitask"):
+        QuerySeqPytorchDataset(_data_config(tensorized_cohort_dir, forced), split=train_split)
+    rows = [{**r, "forced_answers": [None] * len(r["queries"])} for r in _mixed_rows()]
+    nulls = _write_grid(tmp_path / "nulls", rows)
+    assert len(QuerySeqPytorchDataset(_data_config(tensorized_cohort_dir, nulls), split=train_split)) == 4
+
+
 def test_empty_query_lists_are_rejected(tensorized_cohort_dir, tmp_path):
     a = _TRAIN_SUBJECTS[0]
     grid = _write_grid(tmp_path / "grid", [_row(a, [], [])])
@@ -877,10 +970,12 @@ def test_predictions_are_row_aligned_one_per_grid_row(tensorized_cohort_dir, tmp
         "durations",
         "bound_events",
         "answers",
+        "forced_answers",
         "target_code",
         "label",
         "prob",
     ]
+    assert out["forced_answers"].to_list() == [[None] * len(r["queries"]) for r in rows]
     assert out["subject_id"].to_list() == [r["subject_id"] for r in rows]
     assert out["queries"].to_list() == [r["queries"] for r in rows]
     assert out["target_code"].to_list() == [r["queries"][-1] for r in rows]

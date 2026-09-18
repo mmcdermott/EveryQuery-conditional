@@ -20,6 +20,7 @@ from conftest import run_and_check
 from every_query.model.conditional_multitask_lightning import ConditionalMultitaskLightningModule
 from every_query.predict.predict_multitask import build_eval_dataset
 from every_query.utils.model_loader import setup_model
+from tests.designed_specs import entry
 
 
 def test_conditional_multitask_config_help():
@@ -187,17 +188,16 @@ def test_csv_logger_logs_best_ckpt_path_as_a_plain_string(max_steps_before_first
 
 # Designed sequences with duration and event starts (issue #27), labeled at a supplied cohort.
 _GRID_SPECS = {
-    "post_admission": [{"query": "DISCHARGE", "start_event": "ADMISSION//PULMONARY", "duration_days": 30}],
+    "post_admission": [entry("DISCHARGE", 30, start_event="ADMISSION//PULMONARY")],
     "delayed_then_bounded": [
-        {"query": "HR//value_[119.8,inf)", "start_duration_days": 1, "duration_days": 30},
-        {
-            "query": "DISCHARGE",
-            "start_event": "ADMISSION//PULMONARY",
-            "duration_days": -1,
-            "bound_event": "TIMELINE//END",
-        },
+        entry("HR//value_[119.8,inf)", 30, start_duration_days=1),
+        entry("DISCHARGE", start_event="ADMISSION//PULMONARY", bound_event="TIMELINE//END"),
     ],
-    "single": [["TIMELINE//END", 1]],
+    "single": [entry("TIMELINE//END", 1)],
+    # One query spec under both designed conditioning answers: same windows, and each keeps only the
+    # contexts whose true first answer is the forced one, so together they partition the cohort.
+    "forced_yes": [entry("TIMELINE//END", 30, forced_answer=True), entry("DISCHARGE", 30)],
+    "forced_no": [entry("TIMELINE//END", 30, forced_answer=False), entry("DISCHARGE", 30)],
 }
 
 
@@ -262,7 +262,8 @@ def test_predict_multitask_scores_a_queryseq_grid_with_active_starts(
     grid = pl.concat(
         [pl.read_parquet(fp) for fp in sorted((grid_dir / "eval" / tuning_split).glob("*.parquet"))]
     )
-    assert grid.height == cohort.height * len(specs)
+    # ``forced_yes`` + ``forced_no`` partition the cohort, so they add one cohort's worth of rows.
+    assert grid.height == cohort.height * (len(specs) - 1)
     assert {"start_durations", "start_events"} <= set(grid.columns)
     for name in ("_multitask_manifest.json", "eval_meta", "eval_tasks.parquet"):
         assert not list(grid_dir.parent.rglob(name)), name
@@ -290,18 +291,31 @@ def test_predict_multitask_scores_a_queryseq_grid_with_active_starts(
         "durations",
         "bound_events",
         "answers",
+        "forced_answers",
         "target_code",
         "label",
         "prob",
     ]
+    # A designed conditioning answer selects its cohort: the two variants split the contexts by the
+    # first query's true answer, so what the model is told is always what happened.
+    by_forced = {
+        forced: preds.filter(pl.col("forced_answers").list.first() == forced) for forced in (True, False)
+    }
+    assert by_forced[True].height + by_forced[False].height == cohort.height
+    for forced, rows in by_forced.items():
+        assert rows["answers"].list.first().to_list() == [forced] * rows.height
     assert preds["prob"].is_between(0.0, 1.0).all()
     assert preds["target_code"].to_list() == [q[-1] for q in preds["queries"].to_list()]
     assert preds["label"].to_list() == [a[-1] for a in preds["answers"].to_list()]
     # The grid rows come back verbatim, active starts included.
-    key = ["subject_id", "prediction_time", "queries"]
-    joined = preds.join(grid, on=key, how="inner", suffix="_grid")
+    # ``forced_first`` tells the two forced variants apart; they share every other key column.
+    forced_first = pl.col("forced_answers").list.first().alias("forced_first")
+    key = ["subject_id", "prediction_time", "queries", "forced_first"]
+    joined = preds.with_columns(forced_first).join(
+        grid.with_columns(forced_first), on=key, how="inner", suffix="_grid", nulls_equal=True
+    )
     assert joined.height == grid.height
-    for col in ("answers", "durations", "bound_events", "start_durations", "start_events"):
+    for col in ("answers", "forced_answers", "durations", "bound_events", "start_durations", "start_events"):
         assert joined[col].to_list() == joined[f"{col}_grid"].to_list(), col
     starts = preds.explode("start_durations", "start_events")
     assert (starts["start_events"] == "ADMISSION//PULMONARY").sum() == 2 * cohort.height
@@ -554,9 +568,9 @@ def ancestor_queryseq_grid(
     specs_fp.write_text(
         yaml.safe_dump(
             {
-                "family": [[ancestor, 30]],
-                "leaf_then_family": [["TIMELINE//END", 1], [ancestor, 30]],
-                "family_then_leaf": [[ancestor, 30], ["DISCHARGE", 30]],
+                "family": [entry(ancestor, 30)],
+                "leaf_then_family": [entry("TIMELINE//END", 1), entry(ancestor, 30)],
+                "family_then_leaf": [entry(ancestor, 30), entry("DISCHARGE", 30)],
             }
         )
     )

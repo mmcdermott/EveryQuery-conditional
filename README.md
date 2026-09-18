@@ -81,7 +81,7 @@ flowchart TD
     ckpt --> predict[EQ_predict_multitask]
     geneval -- QuerySeqSchema --> predict
     predict -- "one row per grid row" --> evaluate[EQ_evaluate_multitask]
-    evaluate --> metrics[("by_task / summary parquets")]
+    evaluate --> metrics[("by_task parquet")]
 ```
 
 ### 1. Preprocess — `EQ_process_data`
@@ -190,27 +190,58 @@ EQ_generate_evaluation_query_sequences \
 vocabulary:
 
 ```yaml
-# designed.yaml   name -> [entry, ...]
-mortality_30d_uncensored:
-  - [TIMELINE//END, 30]      # condition on "record continues past 30d"
-  - [MEDS_DEATH, 30]
-sepsis_before_discharge:
-  - [SEPSIS, -1, HOSPITAL_DISCHARGE//HOME]
-lab_in_the_month_after_admission:
-  - query: LAB//220645//ANY  # ancestor query (needs ontology_dir)
-    start_event: HOSPITAL_ADMISSION
+# designed.yaml   name -> [entry, ...]; every entry spells out all six keys (null is a legal value)
+mortality_30d_given_uncensored:
+  - query: TIMELINE//END
+    start_event: null
+    start_duration_days: 0          # opens at the prediction time ...
+    bound_event: null
+    duration_days: 30               # ... closes 30 days later
+    forced_answer: false            # tell the model "the record continues past 30d"
+  - query: MEDS_DEATH
+    start_event: null
+    start_duration_days: 0
+    bound_event: null
     duration_days: 30
+    forced_answer: null             # the final query is the scored one: always null
+sepsis_before_discharge:
+  - query: SEPSIS
+    start_event: null
+    start_duration_days: 0
+    bound_event: HOSPITAL_DISCHARGE//HOME
+    duration_days: null             # closes at the discharge, not after a horizon
+    forced_answer: null
+lab_in_the_month_after_admission:
+  - query: LAB//220645//ANY         # ancestor query (needs ontology_dir)
+    start_event: HOSPITAL_ADMISSION
+    start_duration_days: null
+    bound_event: null
+    duration_days: 30
+    forced_answer: null
 ```
 
 ```bash
 EQ_generate_evaluation_query_sequences ... sequences_path=designed.yaml
 ```
 
-An entry is `[code, duration_days]`, `[code, -1, bound_event]`, or the mapping form
-`{query, duration_days[, bound_event][, start_duration_days][, start_event]}` — the mapping is the
-readable one for a window that opens later than the prediction time. A long-format parquet
-`(seq_id, position, query, duration_days[, bound_event][, start_duration_days][, start_event])`
-works too.
+Every entry is a mapping with **all six keys** — a missing key is an error, so a designed file can
+never mean "the default I did not know about":
+
+- `query`: a vocabulary code (or, with `ontology_dir`, an ancestor node).
+- `start_event` / `start_duration_days`: a code + `null`, **or** `null` + days `>= 0` (`0` = the
+  prediction time).
+- `bound_event` / `duration_days`: a code + `null`, **or** `null` + days `> 0`, measured from the
+  resolved start.
+- `forced_answer`: `true` / `false` / `null`; **must be `null` on the final query of every sequence**.
+
+`forced_answer` fixes the answer an earlier query must have ("among contexts where the record did
+not end — what is P(death)?"): the grid keeps that sequence only at the contexts whose labeled truth
+agrees, so the model is never told a counterfactual. `null` keeps every context and teacher-forces
+the truth. It never touches the labels: `answers` stays the truth and the final query is scored
+against it. The `-1` sentinel may be
+written in place of a `null` duration next to an event. A long-format parquet
+`(seq_id, position, query, start_event, start_duration_days, bound_event, duration_days, forced_answer)`
+works too, every column required.
 
 | Knob                                                       | Default                  | Meaning                                                                                                                                                           |
 | ---------------------------------------------------------- | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -284,12 +315,15 @@ their true answers — and writes one row per grid row, in grid order:
 
 ```
 subject_id, prediction_time,
-queries, start_durations, start_events, durations, bound_events, answers,
+queries, start_durations, start_events, durations, bound_events, answers, forced_answers,
 target_code, label, prob
 ```
 
 `target_code` is `queries[-1]` and `label` is `answers[-1]`; the final query is never teacher-forced
-into its own prediction. Options: `ckpt_name=` (checkpoint stem under `checkpoints/`, default best),
+into its own prediction. `answers` is always the labeled truth; `forced_answers` records which
+conditioning answers a designed spec fixed its cohort to (all-null otherwise), and
+`EQ_evaluate_multitask` keys its task cells on it, so the forced-YES and forced-NO variants of one
+query spec are scored as two tasks. Options: `ckpt_name=` (checkpoint stem under `checkpoints/`, default best),
 `batch_size=`, `num_workers=`, `device=` (`cpu`, `cuda`, `cuda:N`, `mps`), `precision=` (default
 `bf16-mixed`, matching every shipped training config), `enable_progress_bar=false` for log-file
 runs, `overwrite=true`. `split=train` is refused.
@@ -307,26 +341,26 @@ EQ_evaluate_multitask \
 ```
 
 Groups the prediction rows by the query **specification** — the five list columns `queries`,
-`durations`, `start_durations`, `start_events`, `bound_events` — which recovers exactly the `N`
-specs step 4 resolved, each populated by the whole cohort. It writes two tables:
+`durations`, `start_durations`, `start_events`, `bound_events`, which recover exactly the `N` specs
+step 4 resolved — **plus `prior_answers`** (`answers[:-1]`, the teacher-forced answers the final
+query was conditioned on). A cell is thus one spec under one fixed conditioning, so its AUROC cannot
+be earned by echoing the conditioning answer. (`forced_answers` is in the key as well, so a designed
+forced spec and the matching cell of its unforced twin stay separate rather than pooling.) A one-query spec has `prior_answers = []` and stays
+one cell; at `K > 1` a spec splits into up to `2^(K-1)` cells, many of them small or single-class.
+The sampled grid draws `K` from `min_queries..max_queries` (1..3 by default), so expect more rows
+than `num_evaluation_sequences`, and a cohort-dependent number of them. It writes one table:
 
-- `metrics.by_task.parquet`, one row per spec: the spec itself, a descriptive `target_code` /
-  `n_queries` / `duration_bucket`, `n_rows` / `n_positive` / `prevalence`, `n_subjects`, the
-  within-cell `auroc` (null when the cell is single-class) and its 95% subject-cluster bootstrap
-  interval `auroc_ci_lo` / `auroc_ci_hi`.
-- `metrics.summary.parquet`, exactly one row: `macro_auroc` — the mean over the scorable cells —
-  with three 95% intervals, `macro_auroc_ci_{lo,hi}_tasks`, `_subjects` and `_nested`, plus
-  `n_tasks_scored`, `n_tasks_null`, `n_resamples` and `bootstrap_seed`.
+- `metrics.by_task.parquet`, one row per cell: the spec and `prior_answers`, a descriptive
+  `target_code` / `n_queries` / `duration_bucket`, `n_rows` / `n_positive` / `prevalence`,
+  `n_subjects`, the within-cell `auroc` (null when the cell is single-class), its 95% bootstrap
+  interval `auroc_ci_lo` / `auroc_ci_hi`, and `n_degenerate_replicates`.
 
-**Quote `_nested` as the headline uncertainty.** It is the only one of the three that resamples both
-axes — patients *and* task specs. `_subjects` holds the `N` specs fixed and sees patient noise
-alone; `_tasks` treats each cell's AUROC as exact and sees between-task spread alone (it is kept
-because it is the form `upstream/task-auroc-ci` adds to the training-time callback — that branch has
-not landed, so the callback in this tree still logs a point estimate only).
-
-`n_tasks_null` is reported next to `macro_auroc` for a reason: AUROC is undefined on a single-class
-cell, so a macro over 12 of 64 cells must not be readable as a macro over 64. The only knob is
-`n_resamples` (default 1000) — the intervals themselves are not optional.
+The interval is a **row bootstrap within the cell**: draw the cell's rows with replacement, recompute
+the AUROC, repeat `n_resamples` times (default 1000, seeded by `bootstrap_seed`), and take the 2.5th
+/ 97.5th percentiles. Each `(subject_id, prediction_time)` row is one prediction; with several
+prediction times per subject those rows are correlated and the interval runs a little narrow, which
+`n_subjects` next to `n_rows` makes visible. There is no macro and no cross-task interval — take
+`by_task["auroc"].mean()` if you want one.
 
 > Report **macro (per-spec) AUROC, not AUROC pooled over specs.** Pooled AUROC scores cross-query
 > pairs and is inflated by base-rate differences between queries; it measures cross-query

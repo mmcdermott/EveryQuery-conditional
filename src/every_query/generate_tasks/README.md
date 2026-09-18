@@ -82,10 +82,9 @@ families of (scattered-for-training, dense-for-evaluation) pairs — one per mod
     `subject_subsample_fraction`, one worker per shard), so for one `(seed, split, K, ...)` the
     flat grid and the sequence grid score the identical `(subject, time)` set; `contexts_path`
     overrides the sampled cohort with a supplied one. The `N` sequences are designed
-    (`sequences_path=tasks.yaml`, a mapping of `name -> [[code, duration], ...]`, with
-    `[code, -1, bound_event]` for an event-bounded position and a mapping entry
-    `{query, duration_days, start_event | start_duration_days, bound_event}` for a window that
-    opens later than the prediction time) or drawn once from the training query distribution
+    (`sequences_path=tasks.yaml`, a mapping of `name -> [entry, ...]` whose every entry spells out
+    all of `{query, start_event, start_duration_days, bound_event, duration_days, forced_answer}`)
+    or drawn once from the training query distribution
     (`num_evaluation_sequences=64`, 50% event-bounded by default, every window opening at the
     prediction time unless the `eventstart_fraction` / `prediction_time_start_fraction` start knobs
     say otherwise) and shared by every shard. Reuses `sample_evaluation_tasks`'s cohort sampler and
@@ -255,27 +254,51 @@ A start event that never occurs after the prediction time leaves the window empt
 even if the end is also unresolved); an end event that never occurs after a resolved start lets the
 window run to the end of the record. These are the multitask sampler's window semantics, and
 `label_query_sequences` labels a grid carrying starts through the same `interval_table.py`
-resolver — so `EQ_predict_multitask` can score the grid. Designed specs spell starts out with the
-mapping entry form (missing start keys mean a prediction-time start):
+resolver — so `EQ_predict_multitask` can score the grid. Designed specs spell **every** field out in
+every entry — a missing key is an error, `null` is a legal value, and a `null` duration next to an
+event stands for the `-1` sentinel:
 
 ```yaml
 post_admission:                        # opens at the next admission, closes 30d after it
   - query: LAB//X
     start_event: HOSPITAL_ADMISSION
+    start_duration_days: null
+    bound_event: null
     duration_days: 30
-delayed:                               # opens 7d after the prediction time, closes 30d later
-  - query: ICD//I10
-    start_duration_days: 7
-    duration_days: 30
+    forced_answer: null
 between_events:                        # opens at the admission, closes at the next discharge
   - query: PROCEDURE//X
     start_event: HOSPITAL_ADMISSION
-    duration_days: -1
+    start_duration_days: null
     bound_event: HOSPITAL_DISCHARGE
+    duration_days: null
+    forced_answer: null
+death_given_not_censored:              # opens 7d out; "assume the record does NOT end within 30d"
+  - query: TIMELINE//END
+    start_event: null
+    start_duration_days: 7
+    bound_event: null
+    duration_days: 30
+    forced_answer: false
+  - query: MEDS_DEATH
+    start_event: null
+    start_duration_days: 7
+    bound_event: null
+    duration_days: 30
+    forced_answer: null
 ```
 
-or, in a long-format parquet, the optional `start_duration_days` / `start_event` columns next to
-`seq_id, position, query, duration_days[, bound_event]`. Sampled specs draw starts from the
+`forced_answer` (`true` / `false`) fixes the answer that query must have when it conditions a later
+one: the sequence is written only at the contexts whose labeled truth agrees, so a forced sequence
+covers a sub-cohort (every other sequence still covers every context) and the model is never told a
+counterfactual. `null` keeps every context and teacher-forces the truth. It is written to the grid
+as a `forced_answers` list column (absent when no spec forces anything) and never alters `answers`,
+so the scoring label is always the truth. **The final query of a sequence must have
+`forced_answer: null`** — it is the scored query and its answer conditions nothing; the spec reader
+rejects anything else, and so does the dataset for a grid that did not come from this generator.
+
+The same fields, all required, make up the long-format parquet: `seq_id, position, query,
+start_event, start_duration_days, bound_event, duration_days, forced_answer`. Sampled specs draw starts from the
 `eventstart_fraction` / `prediction_time_start_fraction` / `start_duration_min|max|distribution` /
 `start_event_codes` knobs (the multitask sampler's cumulative form split) on three seed axes of their
 own, so a start knob perturbs none of the query / duration / end draws; the defaults open every window
@@ -461,7 +484,8 @@ EQ_generate_evaluation_query_sequences   ->   QuerySeqSchema eval grid   ->   EQ
 
 `EQ_predict_multitask` reads the grid's `eval/` root directly — including the explicit window starts
 (`start_durations` / `start_events`) that only the multitask model can encode — maps each row's
-`queries[:-1]` / `answers[:-1]` onto the teacher-forced conditioning pairs and scores the row's final
+`queries[:-1]` / `answers[:-1]` (or, where a designed spec gives one, `forced_answers[:-1]`) onto the
+conditioning pairs and scores the row's final
 query at its last window, and writes one scalar prediction per grid row (`target_code = queries[-1]`,
 `label = answers[-1]`, `prob`). No packed labels, manifest or sidecar is read or written on this path.
 `EQ_evaluate_multitask` then groups those rows by the query *spec* and macro-averages AUROC over

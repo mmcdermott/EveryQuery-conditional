@@ -74,6 +74,7 @@ from every_query.generate_tasks.sample_evaluation_tasks import (
 )
 from every_query.generate_tasks.sample_tasks import _read_event_shard
 from every_query.utils.seeds import derive_seed
+from tests.designed_specs import entry
 
 SPLIT = "held_out"
 SHARDS = ["0", "1"]
@@ -337,12 +338,12 @@ def test_supplied_event_bounded_sequence_is_labeled_end_to_end(
         yaml.safe_dump(
             {
                 "before_d": [
-                    ["ICD//C03", -1, "MED//D04"],
-                    ["MED//E05", -1, "MED//D04"],
-                    ["MED//E05", -1, never_boundary],
-                    [never_target, -1, never_boundary],
-                    ["MED//E05", 1],
-                    ["ICD//A01", 100],
+                    entry("ICD//C03", bound_event="MED//D04"),
+                    entry("MED//E05", bound_event="MED//D04"),
+                    entry("MED//E05", bound_event=never_boundary),
+                    entry(never_target, bound_event=never_boundary),
+                    entry("MED//E05", 1),
+                    entry("ICD//A01", 100),
                 ]
             }
         )
@@ -418,7 +419,7 @@ def test_changed_specs_relabel_instead_of_skipping(tmp_path: Path, data_dir: Pat
     designed = tmp_path / "designed.yaml"
     codes = yaml.safe_load(codes_yaml.read_text())
     code = codes[0]
-    designed.write_text(yaml.safe_dump({"one": [[code, 1]]}))
+    designed.write_text(yaml.safe_dump({"one": [entry(code, 1)]}))
     before = _inodes(out_dir)
     _run_seq(data_dir, out_dir, codes_yaml, sequences_path=designed)
     assert all(a != b for a, b in zip(_inodes(out_dir), before, strict=True)), "designed specs must relabel"
@@ -433,10 +434,10 @@ def test_changed_specs_relabel_instead_of_skipping(tmp_path: Path, data_dir: Pat
 
     # Changing only the boundary changes both the labels and the task consumed by the model, so
     # it must participate in the provenance fingerprint just like the query and duration do.
-    designed.write_text(yaml.safe_dump({"one": [[code, -1, codes[1]]]}))
+    designed.write_text(yaml.safe_dump({"one": [entry(code, bound_event=codes[1])]}))
     _run_seq(data_dir, out_dir, codes_yaml, sequences_path=designed)
     before = _inodes(out_dir)
-    designed.write_text(yaml.safe_dump({"one": [[code, -1, codes[2]]]}))
+    designed.write_text(yaml.safe_dump({"one": [entry(code, bound_event=codes[2])]}))
     _run_seq(data_dir, out_dir, codes_yaml, sequences_path=designed)
     assert all(a != b for a, b in zip(_inodes(out_dir), before, strict=True)), (
         "a boundary-only spec change must relabel"

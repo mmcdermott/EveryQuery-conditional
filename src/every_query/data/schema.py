@@ -156,6 +156,14 @@ class QuerySeqSchema(LabelSchema):
             (``QuerySeqPytorchDataset`` and the ``label_query_sequences`` dispatch).  Active
             starts are consumed only by the multitask predictor; ``QuerySeqPytorchDataset``
             rejects them unless the caller opts in.
+        forced_answers: Optional per-query designed conditioning answers aligned with ``queries``:
+            ``true`` / ``false`` is fed to the model in place of ``answers[j]`` when query ``j``
+            conditions a later one, null teacher-forces the labeled truth.  ``answers`` is never
+            altered, so the scoring label stays the truth.  Null on every row's final query (the
+            scored one).  ``EQ_generate_evaluation_query_sequences`` writes a forced row only where
+            the truth agrees with it, so in its grids the fed value is always the truth.  Absent
+            from grids that force nothing; like active starts, consumed only by the multitask
+            predictor and rejected by ``QuerySeqPytorchDataset`` otherwise.
 
     Examples:
         >>> from datetime import datetime
@@ -207,6 +215,7 @@ class QuerySeqSchema(LabelSchema):
     bound_events: Optional(pa.large_list(pa.large_string()), nullable=True)
     start_durations: Optional(pa.large_list(pa.float32()), nullable=True)
     start_events: Optional(pa.large_list(pa.large_string()), nullable=True)
+    forced_answers: Optional(pa.large_list(pa.bool_()), nullable=True)
 
 
 class MultitaskBoundarySchema(LabelSchema):

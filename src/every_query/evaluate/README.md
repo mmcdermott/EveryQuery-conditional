@@ -35,16 +35,20 @@ One Hydra main. No model instantiation, no trainer loop, no multi-model orchestr
 `(query, duration_days)` pair, so `EQ_evaluate` cannot read it. `EQ_evaluate_multitask`
 groups those rows by the query **specification** — the five window list columns
 `(queries, durations, start_durations, start_events, bound_events)` — which is what
-`EQ_generate_evaluation_query_sequences` resolves once and labels at every context. Each
-group is therefore one task scored over the whole cohort, and the headline is a macro
-average over those cells rather than a pooled AUROC, which would measure cross-query
-base-rate separation instead.
+`EQ_generate_evaluation_query_sequences` resolves once and labels at every context — plus
+`prior_answers` (`answers[:-1]`), the teacher-forced answers the final query was conditioned
+on. Each group is therefore one task — one spec under one fixed conditioning — and every
+`(subject_id, prediction_time)` row in it is one prediction. AUROC is computed within the
+task, never pooled across tasks, which would measure cross-query (or cross-conditioning)
+base-rate separation instead. With one query per spec, `prior_answers` is always `[]` and
+the tasks are exactly the specs. `forced_answers` is in the key too: a designed spec that forces
+an answer is written only at the contexts where that answer is true, so it holds the same rows as
+the matching `prior_answers` task of the unforced spec, and keying on it keeps the two from being
+pooled (and double-counted) when a grid carries both.
 
 ```
 predict/ predictions.parquet  ──►  EQ_evaluate_multitask  ──►  <stem>.by_task.parquet
-(one row per grid row)                                          (one row per query spec)
-                                                            ──►  <stem>.summary.parquet
-                                                                 (macro AUROC + 3 CI pairs)
+(one row per grid row)                                          (one row per task: AUROC + 95% CI)
 ```
 
 ```bash
@@ -53,15 +57,13 @@ EQ_evaluate_multitask \
 	metrics_stem="$TRAINING_OUTPUT_DIR/metrics"
 ```
 
-Bootstrap confidence intervals are always emitted, per cell and on the macro; `n_resamples`
-trades runtime for resolution but is not a way to switch them off. The resampling unit is the
-**subject**, not the row, since `prediction_times_per_subject` may exceed 1. One subject index
-is drawn per replicate and shared across every cell, so a single `n_cells x n_resamples` AUROC
-grid yields all four intervals — the per-cell one plus three macro variants that differ in what
-they resample: `_subjects` (patients), `_tasks` (specs, comparable to what the training-time
-callback logs), and `_nested` (both, and the one to quote). `n_tasks_null` is reported beside
-`n_tasks_scored` so a macro over a handful of scorable cells cannot pass as a macro over all of
-them.
+The output is the per-task AUROC and its 95% interval, nothing else — no macro, no cross-task
+intervals. The interval is a row bootstrap within the task: draw the task's rows with
+replacement, recompute the AUROC, repeat `n_resamples` times (default 1000, seeded by
+`bootstrap_seed`), and take the 2.5th / 97.5th percentiles. A single-class task has a null
+`auroc` and a null interval. Rows are treated as independent, so when
+`prediction_times_per_subject` exceeds 1 the interval runs a little narrow; `n_subjects` is
+reported beside `n_rows` so that case is visible.
 
 ## Related
 

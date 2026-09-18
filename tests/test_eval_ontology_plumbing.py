@@ -53,6 +53,7 @@ from every_query.generate_tasks import query_sequence_labeling as train_seq
 from every_query.generate_tasks import sample_evaluation_query_sequences as eval_seq
 from every_query.generate_tasks import sample_multitask_sequences as sms
 from every_query.generate_tasks.sample_tasks import LABELED_DIRNAME
+from tests.designed_specs import entry
 
 
 @pytest.fixture(autouse=True)
@@ -205,9 +206,9 @@ def codes_yaml(tmp_path: Path) -> Path:
 
 
 def _specs_yaml(tmp_path: Path, **name_to_query: str) -> Path:
-    """Write a designed-spec YAML of one-query sequences: ``{name: [[code, HORIZON]]}``."""
+    """Write a designed-spec YAML of one-query sequences: ``{name: [entry(code, HORIZON)]}``."""
     fp = tmp_path / "specs.yaml"
-    fp.write_text(yaml.safe_dump({n: [[q, HORIZON]] for n, q in name_to_query.items()}))
+    fp.write_text(yaml.safe_dump({n: [entry(q, HORIZON)] for n, q in name_to_query.items()}))
     return fp
 
 
@@ -507,7 +508,7 @@ def test_eval_and_training_paths_agree_on_the_same_ancestor_query(
     cohort = tmp_path / "sampled_cohort.parquet"
     train_df.select("subject_id", "prediction_time").unique().write_parquet(cohort)
     specs = tmp_path / "ancestor_spec.yaml"
-    specs.write_text(yaml.safe_dump({"statin": [[ANCESTOR_ONLY_NODE, horizon]]}))
+    specs.write_text(yaml.safe_dump({"statin": [entry(ANCESTOR_ONLY_NODE, horizon)]}))
     eval_out = tmp_path / "eval_grid"
     _run_eval(
         data_dir=data_dir,
@@ -769,7 +770,9 @@ def test_each_shard_output_carries_its_own_provenance(
     """
     out_dir = tmp_path / "grid"
     specs = tmp_path / "two_specs.yaml"
-    specs.write_text(yaml.safe_dump({"circ_30d": [[ANCESTOR, 30.0]], "circ_60d": [[ANCESTOR, 60.0]]}))
+    specs.write_text(
+        yaml.safe_dump({"circ_30d": [entry(ANCESTOR, 30.0)], "circ_60d": [entry(ANCESTOR, 60.0)]})
+    )
     common = {
         "data_dir": data_dir,
         "out_dir": out_dir,
