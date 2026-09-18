@@ -103,9 +103,9 @@ EQ_generate_evaluation_query_sequences = "every_query.generate_tasks.sample_eval
 # Inference over that grid with the multitask model: one scalar final-query probability per grid
 # row, target-only (#28); no packed labels, manifest or sidecar are read.
 EQ_predict_multitask = "every_query.predict.predict_multitask:main"
-# Metrics over that same grid: groups the EQ_predict_multitask rows by the query *spec* (the five
-# window list columns), scores each cell's final-query probability against its final-query answer,
-# and macro-averages over cells, with subject-cluster bootstrap CIs per cell and on the macro.
+# Metrics over that same grid: groups the EQ_predict_multitask rows by task (the five window list
+# columns plus answers[:-1]) and scores each task's final-query probability against its final-query
+# answer: one AUROC per task with a 95% row-bootstrap CI.
 EQ_evaluate_multitask = "every_query.evaluate.evaluate_multitask:main"
 
 [tool.coverage.run]

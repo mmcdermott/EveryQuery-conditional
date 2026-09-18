@@ -81,7 +81,7 @@ flowchart TD
     ckpt --> predict[EQ_predict_multitask]
     geneval -- QuerySeqSchema --> predict
     predict -- "one row per grid row" --> evaluate[EQ_evaluate_multitask]
-    evaluate --> metrics[("by_task / summary parquets")]
+    evaluate --> metrics[("by_task parquet")]
 ```
 
 ### 1. Preprocess — `EQ_process_data`
@@ -344,26 +344,19 @@ step 4 resolved — **plus `prior_answers`** (`answers[:-1]`, the teacher-forced
 query was conditioned on). A cell is thus one spec under one fixed conditioning, so its AUROC cannot
 be earned by echoing the conditioning answer. At the default one-query grid `prior_answers` is
 always `[]` and the cells are exactly the specs; at `K > 1` a spec splits into up to `2^(K-1)`
-cells, many of them small or single-class. It writes two tables:
+cells, many of them small or single-class. It writes one table:
 
 - `metrics.by_task.parquet`, one row per cell: the spec and `prior_answers`, a descriptive
   `target_code` / `n_queries` / `duration_bucket`, `n_rows` / `n_positive` / `prevalence`,
-  `n_subjects` (those whose conditioning matches), the
-  within-cell `auroc` (null when the cell is single-class) and its 95% subject-cluster bootstrap
-  interval `auroc_ci_lo` / `auroc_ci_hi`.
-- `metrics.summary.parquet`, exactly one row: `macro_auroc` — the mean over the scorable cells —
-  with three 95% intervals, `macro_auroc_ci_{lo,hi}_tasks`, `_subjects` and `_nested`, plus
-  `n_tasks_scored`, `n_tasks_null`, `n_resamples` and `bootstrap_seed`.
+  `n_subjects`, the within-cell `auroc` (null when the cell is single-class), its 95% bootstrap
+  interval `auroc_ci_lo` / `auroc_ci_hi`, and `n_degenerate_replicates`.
 
-**Quote `_nested` as the headline uncertainty.** It is the only one of the three that resamples both
-axes — patients *and* task specs. `_subjects` holds the `N` specs fixed and sees patient noise
-alone; `_tasks` treats each cell's AUROC as exact and sees between-task spread alone (it is kept
-because it is the form `upstream/task-auroc-ci` adds to the training-time callback — that branch has
-not landed, so the callback in this tree still logs a point estimate only).
-
-`n_tasks_null` is reported next to `macro_auroc` for a reason: AUROC is undefined on a single-class
-cell, so a macro over 12 of 64 cells must not be readable as a macro over 64. The only knob is
-`n_resamples` (default 1000) — the intervals themselves are not optional.
+The interval is a **row bootstrap within the cell**: draw the cell's rows with replacement, recompute
+the AUROC, repeat `n_resamples` times (default 1000, seeded by `bootstrap_seed`), and take the 2.5th
+/ 97.5th percentiles. Each `(subject_id, prediction_time)` row is one prediction; with several
+prediction times per subject those rows are correlated and the interval runs a little narrow, which
+`n_subjects` next to `n_rows` makes visible. There is no macro and no cross-task interval — take
+`by_task["auroc"].mean()` if you want one.
 
 > Report **macro (per-spec) AUROC, not AUROC pooled over specs.** Pooled AUROC scores cross-query
 > pairs and is inflated by base-rate differences between queries; it measures cross-query
