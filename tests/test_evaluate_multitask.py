@@ -35,6 +35,7 @@ _GRID_SCHEMA = {
     "start_durations": pl.List(pl.Float32),
     "start_events": pl.List(pl.Utf8),
     "bound_events": pl.List(pl.Utf8),
+    "forced_answers": pl.List(pl.Boolean),
     "label": pl.Boolean,
     "prob": pl.Float32,
 }
@@ -67,6 +68,7 @@ def _spec(
     start_durations: list[float] | None = None,
     start_events: list[str | None] | None = None,
     bound_events: list[str | None] | None = None,
+    forced_answers: list[bool | None] | None = None,
 ) -> dict:
     """One ``SequenceSpec``-shaped set of the five list columns, defaults filled in as
     ``EQ_predict_multitask`` normalises them (``0.0`` starts, null start/bound events)."""
@@ -77,6 +79,7 @@ def _spec(
         "start_durations": start_durations if start_durations is not None else [0.0] * k,
         "start_events": start_events if start_events is not None else [None] * k,
         "bound_events": bound_events if bound_events is not None else [None] * k,
+        "forced_answers": forced_answers if forced_answers is not None else [None] * k,
     }
 
 
@@ -207,6 +210,31 @@ def test_start_duration_sentinel_never_merges_with_a_real_delay() -> None:
     assert sorted(by_task["start_durations"].to_list()) == [[-1.0], [7.0]]
 
 
+def test_forced_answers_split_an_otherwise_identical_spec() -> None:
+    """``P(B | A forced YES)``, ``P(B | A forced NO)`` and teacher-forced ``P(B | A)`` are three tasks over
+    the same five window columns; keyed on the windows alone they would pool into one cell."""
+    specs = [
+        _spec(["A", "B"], [1.0, 30.0], forced_answers=[True, None]),
+        _spec(["A", "B"], [1.0, 30.0], forced_answers=[False, None]),
+        _spec(["A", "B"], [1.0, 30.0]),
+    ]
+    by_task = _cells(_grid(specs))
+    assert by_task.height == 3
+    assert by_task["n_rows"].to_list() == [4, 4, 4]
+    assert _tuple_set(by_task["forced_answers"]) == {(True, None), (False, None), (None, None)}
+
+
+def test_predictions_written_before_forced_answers_existed_still_evaluate() -> None:
+    """No ``forced_answers`` column reads as nothing forced: same cells, same numbers."""
+    grid = _grid([_spec(["A"], [30.0]), _spec(["A", "B"], [1.0, 30.0])])
+    by_task, summary = compute_multitask_metrics(grid, n_resamples=_N_RESAMPLES)
+    legacy_by_task, legacy_summary = compute_multitask_metrics(
+        grid.drop("forced_answers"), n_resamples=_N_RESAMPLES
+    )
+    assert legacy_by_task.equals(by_task)
+    assert legacy_summary.equals(summary)
+
+
 # --- 4. round-trip against the grid -----------------------------------------------------------
 
 
@@ -224,6 +252,7 @@ def test_cells_round_trip_against_the_grid() -> None:
         _spec(["A", "B"], [1.0, -1.0], bound_events=[None, None]),
         _spec(["B"], [30.0], start_durations=[-1.0], start_events=["ADMISSION"]),
         _spec(["B"], [30.0], start_durations=[7.0]),
+        _spec(["A", "B"], [1.0, 30.0], forced_answers=[True, None]),
     ]
     n_subjects = 6
     grid = _grid(specs, n_subjects=n_subjects)

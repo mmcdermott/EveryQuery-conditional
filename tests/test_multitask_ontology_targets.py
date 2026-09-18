@@ -54,6 +54,7 @@ from every_query.generate_tasks.sample_multitask_sequences import (
     label_multitask_index,
 )
 from every_query.utils.digest import vocab_fingerprint
+from tests.designed_specs import entry
 from tests.multitask.conftest import CODES, base_cfg, make_events, make_index, write_cohort
 from tests.ontology_suite.golden import DECLARED_PARENTS, EVENTS, LEAVES, ONTOLOGY, T0, TRUTH_TABLE
 from tests.ontology_suite.oracle import label_duration, label_event_bounded
@@ -419,7 +420,7 @@ def test_multitask_eval_and_scalar_grid_agree_on_the_same_ancestor_query(tmp_pat
     leaf_codes = tmp_path / "codes.yaml"
     leaf_codes.write_text(yaml.safe_dump(list(CODES)))
     specs = tmp_path / "spec.yaml"
-    specs.write_text(yaml.safe_dump({"any_c": [[_ANCESTOR, _HORIZON]]}))
+    specs.write_text(yaml.safe_dump({"any_c": [entry(_ANCESTOR, _HORIZON)]}))
     eval_out = tmp_path / "grid"
     _run_eval(
         data_dir=cohort,

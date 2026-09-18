@@ -110,7 +110,11 @@ Four mechanisms with disjoint jobs.
 
 The logits at `W_i` estimate `P(v occurs in window i | patient, W_0..W_i, (C, A)_0..(C, A)_{i-1})`
 for every `v`. Earlier answers are caller-supplied conditioning values, teacher-forced in training
-and — at evaluation — taken from the grid's own true answers. Feeding the model's own predictions
+and — at evaluation — taken from the grid's own true answers, unless a designed spec dictates one
+(`forced_answer`, see `generate_tasks/README.md`): that value is then fed as `A_i` in place of the
+truth, which asks the counterfactual "given `C_i` had this answer". It is an input only — the label
+the final query is scored against is always the truth, and the final query itself can never be
+forced. Feeding the model's own predictions
 back in as later conditions is a separate sampling capability, deliberately not implemented.
 
 At evaluation the model takes a second path,

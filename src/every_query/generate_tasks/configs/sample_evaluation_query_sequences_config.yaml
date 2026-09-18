@@ -71,33 +71,36 @@ sequences_path: null
 # `sequences_path` accepts any of:
 #   YAML/JSON mapping    name -> [entry, ...]
 #   YAML/JSON list       [[entry, ...], ...]                 (names auto-generated)
-#   long-format parquet  (seq_id, position, query, duration_days[, bound_event]
-#                         [, start_duration_days][, start_event])
-# where an entry is `[code, duration_days]`, `[code, -1, bound_event]`, or a mapping
-# `{query, duration_days[, bound_event][, start_duration_days][, start_event]}` — the mapping
-# form is the readable one for a window that opens later than the prediction time (see the
-# window rule under "Window starts" below).  e.g. designed.yaml:
-#   mortality_30d:
-#     - [TIMELINE//END, 1]
-#     - [MEDS_DEATH, 30]
-#   sepsis_before_discharge:
-#     - [SEPSIS, -1, HOSPITAL_DISCHARGE//HOME]
+#   long-format parquet  (seq_id, position, query, start_event, start_duration_days, bound_event,
+#                         duration_days, forced_answer)       — every column required
+# where an entry is a mapping that spells out ALL SIX keys (a missing key is an error; `null` is a
+# legal value; see the window rule under "Window starts" below):
+#   query                               a vocabulary code (or an ancestor node, with `ontology_dir`)
+#   start_event / start_duration_days   a code + null,  OR  null + days >= 0 (0 = prediction time)
+#   bound_event / duration_days         a code + null,  OR  null + days > 0 (from the resolved start)
+#   forced_answer                       true | false | null
+# `forced_answer` is the answer FED TO THE MODEL for that query when it conditions a later one, in
+# place of the labeled truth ("assume Q1 = YES, what is P(Q2)?"); null teacher-forces the truth.  It
+# never alters the labels — `answers` stays the truth and the final query is scored against it — and
+# it MUST be null on the final query of every sequence, which is scored and conditions nothing.
+# e.g. designed.yaml:
+#   death_given_not_censored:              # "the record does NOT end within 30d" — now P(death)?
+#     - {query: TIMELINE//END, start_event: null, start_duration_days: 0,
+#        bound_event: null, duration_days: 30, forced_answer: false}
+#     - {query: MEDS_DEATH, start_event: null, start_duration_days: 0,
+#        bound_event: null, duration_days: 30, forced_answer: null}
+#   sepsis_before_discharge:               # closes at the next discharge
+#     - {query: SEPSIS, start_event: null, start_duration_days: 0,
+#        bound_event: HOSPITAL_DISCHARGE//HOME, duration_days: null, forced_answer: null}
 #   post_admission:                        # opens at the next admission, closes 30d after it
-#     - query: LAB//X
-#       start_event: HOSPITAL_ADMISSION
-#       duration_days: 30
+#     - {query: LAB//X, start_event: HOSPITAL_ADMISSION, start_duration_days: null,
+#        bound_event: null, duration_days: 30, forced_answer: null}
 #   delayed:                               # opens 7d after the prediction time, closes 30d later
-#     - query: ICD//I10
-#       start_duration_days: 7
-#       duration_days: 30
-#   between_events:                        # opens at the admission, closes at the next discharge
-#     - query: PROCEDURE//X
-#       start_event: HOSPITAL_ADMISSION
-#       duration_days: -1
-#       bound_event: HOSPITAL_DISCHARGE
-# Missing start keys mean a prediction-time start.  On this path nothing is sampled: the codes,
-# durations and starts are exactly what you wrote, and `query_codes` is used only to reject query,
-# boundary and start codes outside the model's vocabulary.
+#     - {query: ICD//I10, start_event: null, start_duration_days: 7,
+#        bound_event: null, duration_days: 30, forced_answer: null}
+# On this path nothing is sampled: the codes, durations, starts and forced answers are exactly what
+# you wrote, and `query_codes` is used only to reject query, boundary and start codes outside the
+# model's vocabulary.  The grid gains a `forced_answers` list column only when some spec forces one.
 
 # --- Sampling knobs (all `sequences_path: null` only) ---------------------
 # The code and duration distributions below mirror `sample_query_sequences_config.yaml` so a
@@ -162,9 +165,10 @@ eventbound_fraction: 0.5
 # exactly `sample_multitask_sequences_config.yaml`'s window rule (open_open / prediction_time /
 # resolved_start / empty_window / infinity), so a multitask model can be scored on this grid.
 #
-# The defaults below (`eventstart_fraction: 0`, `prediction_time_start_fraction: 1`) open every
-# sampled window at the prediction time and reproduce the pre-#27 grid exactly: the same specs on
-# the same seed, and no `start_durations` / `start_events` columns in the output.  Only the START
+# The shipped defaults draw active starts (20% event-defined, 40% at the prediction time, 40% after
+# a delay).  `eventstart_fraction=0 prediction_time_start_fraction=1` instead opens every sampled
+# window at the prediction time and reproduces the pre-#27 grid exactly: the same specs on the same
+# seed, and no `start_durations` / `start_events` columns in the output.  Only the START
 # component below mirrors the multitask sampler; the query / duration / end draw above stays
 # parity-anchored to `sample_query_sequences_config.yaml`, and the start draw uses its own three
 # seed axes ("start_forms", "start_durations", "start_codes"), so changing any start knob perturbs
