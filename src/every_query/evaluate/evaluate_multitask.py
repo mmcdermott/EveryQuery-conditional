@@ -41,30 +41,16 @@ from sklearn.metrics import roc_auc_score
 
 from every_query.data.query_seq_dataset import (
     ANSWERS_COL,
-    BOUND_EVENTS_COL,
-    DURATIONS_COL,
     FORCED_ANSWERS_COL,
     QUERIES_COL,
-    START_DURATIONS_COL,
-    START_EVENTS_COL,
 )
+from every_query.data.query_seq_task import PRIOR_ANSWERS_COL, SPEC_KEY, TASK_KEY, _with_prior_answers
 from every_query.evaluate.metrics import _auroc_or_none
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 CONFIGS = str(files("every_query") / "evaluate" / "configs")
-
-#: The five window list columns — what was asked, over which windows.
-SPEC_KEY = [QUERIES_COL, DURATIONS_COL, START_DURATIONS_COL, START_EVENTS_COL, BOUND_EVENTS_COL]
-
-#: ``answers[:-1]`` — the teacher-forced answers the final query was conditioned on.  Derived by
-#: :func:`_with_prior_answers`, never read from the parquet.
-PRIOR_ANSWERS_COL = "prior_answers"
-
-#: One task: a query sequence (codes and windows), its designed ``forced_answers`` (defaulted to
-#: all-null when absent, so not a *required* column), under one fixed set of conditioning answers.
-TASK_KEY = [*SPEC_KEY, FORCED_ANSWERS_COL, PRIOR_ANSWERS_COL]
 
 SUBJECT_ID_COL = "subject_id"
 LABEL_COL = "label"
@@ -198,18 +184,6 @@ def _validate_columns(predictions: pl.DataFrame) -> None:
             "grid's answers are binary and never null (censoring is carried by an explicit "
             "TIMELINE//END query), so a null label means the grid or the prediction run is malformed."
         )
-
-
-def _with_prior_answers(predictions: pl.DataFrame) -> pl.DataFrame:
-    """Append :data:`PRIOR_ANSWERS_COL` — ``answers`` minus its final (scored) entry.
-
-    Examples:
-        >>> df = pl.DataFrame({"answers": [[True, False, True], [False]]})
-        >>> _with_prior_answers(df)["prior_answers"].to_list()
-        [[True, False], []]
-    """
-    answers = pl.col(ANSWERS_COL)
-    return predictions.with_columns(answers.list.head(answers.list.len() - 1).alias(PRIOR_ANSWERS_COL))
 
 
 def compute_multitask_metrics(

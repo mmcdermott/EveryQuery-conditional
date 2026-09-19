@@ -50,10 +50,17 @@ Output layout, the same as ``sample_evaluation_tasks``':
                                                         (``write_unique_prediction_times``)
 
 Every output parquet gets a provenance sidecar under ``{out_dir}_artifacts/_labeled/`` recording the
-three inputs that determine its rows — the ontology, the specs and the cohort source — and
-``overwrite=false`` skips a shard only when all three match (:func:`_run_fingerprint`).  Re-running
-into the same ``out_dir`` with a different ``sequences_path``/``num_evaluation_sequences``/``seed``/cohort
+inputs that determine its rows — the ontology, the specs, the cohort source and the optional
+minimum-positive threshold — and ``overwrite=false`` skips a shard only when these match
+(:func:`_run_fingerprint`).  Re-running into the same ``out_dir`` with a different
+``sequences_path``/``num_evaluation_sequences``/``seed``/cohort
 therefore relabels rather than silently keeping the previous grid.
+
+When ``min_task_positives`` is set, all shards are labeled before a split-wide pass counts true
+final answers for each conditional task (including prior observed answers in its key).  Every row
+of an eligible task survives, preserving its negative examples.  A split-level completion marker
+keeps partially filtered outputs from being mistaken for a reusable finished grid; changing the
+threshold or retrying an interrupted run relabels the full grid before filtering.
 
 ``{out_dir}/eval`` is directly consumable as ``EQ_predict_multitask tasks_dir=...`` (MEDS-TorchData
 rglobs it, so point it at ``eval/`` — never at ``out_dir`` itself, or the ``eval_unique/`` frames
@@ -125,6 +132,7 @@ from every_query.data.query_seq_dataset import (
     FORCED_ANSWERS_COL,
     QUERIES_COL,
 )
+from every_query.data.query_seq_task import TASK_KEY, _with_prior_answers, normalize_task_columns
 from every_query.data.schema import QuerySeqSchema, TaskQuerySchema
 from every_query.generate_tasks.query_sequence_labeling import (
     BOUND_COL,
@@ -1352,9 +1360,16 @@ def _cohort_fingerprint(
     )
 
 
-def _run_fingerprint(ontology: str | None, specs: str, cohort: str) -> dict[str, str | None]:
+def _run_fingerprint(
+    ontology: str | None, specs: str, cohort: str, min_task_positives: int | None = None
+) -> dict[str, str | int | None]:
     """The sidecar payload: everything that decides an output's rows, so "exists" can mean "current"."""
-    return {"ontology_fingerprint": ontology, "specs_fingerprint": specs, "cohort_fingerprint": cohort}
+    return {
+        "ontology_fingerprint": ontology,
+        "specs_fingerprint": specs,
+        "cohort_fingerprint": cohort,
+        "min_task_positives": min_task_positives,
+    }
 
 
 def _provenance_path(out_dir: Path, fp: Path) -> Path:
@@ -1383,7 +1398,7 @@ def _recorded_fingerprint(out_dir: Path, fp: Path) -> dict | None:
     return recorded if isinstance(recorded, dict) else None
 
 
-def _output_is_current(out_dir: Path, fp: Path, fingerprint: dict[str, str | None]) -> bool:
+def _output_is_current(out_dir: Path, fp: Path, fingerprint: dict[str, str | int | None]) -> bool:
     """Whether an existing output was labeled under the ontology, specs and cohort of this run.
 
     A missing or unreadable sidecar is stale, as in :func:`label_one_sequence_shard`: the sidecar
@@ -1392,6 +1407,63 @@ def _output_is_current(out_dir: Path, fp: Path, fingerprint: dict[str, str | Non
     the same reason.
     """
     return fp.exists() and _recorded_fingerprint(out_dir, fp) == fingerprint
+
+
+def _support_filter_marker(out_dir: Path, split: str) -> Path:
+    return default_artifacts_dir(out_dir) / "_support_filter" / f"{split}.json"
+
+
+def filter_tasks_by_min_positives(
+    files: list[Path], min_positives: int, unique_files: list[Path] | None = None
+) -> dict[str, int]:
+    """Count final-answer positives globally, then retain complete conditional tasks per shard.
+
+    Only the compact per-shard task counts are concatenated; the full grid is read one shard at a
+    time.  This bounds memory for large dense evaluation grids.
+
+    The optional columns are filled only to build the task key: each shard is written back with
+    the columns it had, so a filtered grid reads exactly as an unfiltered one does.  When
+    ``unique_files`` is given (aligned with ``files``), each ``eval_unique`` frame is rewritten
+    from its shard's retained rows, so it keeps mirroring ``eval/``.
+    """
+    counts = []
+    rows_before = 0
+    for fp in files:
+        shard = _with_prior_answers(normalize_task_columns(pl.read_parquet(fp)))
+        rows_before += shard.height
+        counts.append(
+            shard.group_by(TASK_KEY).agg(
+                pl.len().alias("n_rows"),
+                pl.col(ANSWERS_COL).list.last().cast(pl.Int64).sum().alias("n_positive"),
+            )
+        )
+
+    global_counts = (
+        pl.concat(counts, how="vertical_relaxed")
+        .group_by(TASK_KEY)
+        .agg(pl.col("n_rows").sum(), pl.col("n_positive").sum())
+    )
+    eligible = global_counts.filter(pl.col("n_positive") >= min_positives).select(TASK_KEY)
+    sid = TaskQuerySchema.subject_id_name
+    pt = TaskQuerySchema.prediction_time_name
+    rows_after = 0
+    for fp, unique_fp in zip(files, unique_files or [None] * len(files), strict=True):
+        raw = pl.read_parquet(fp)
+        shard = _with_prior_answers(normalize_task_columns(raw))
+        retained = shard.join(eligible, on=TASK_KEY, how="semi", nulls_equal=True).select(raw.columns)
+        rows_after += retained.height
+        _atomic_write_parquet(retained, fp)
+        if unique_fp is not None:
+            _atomic_write_parquet(retained.select(sid, pt).unique().sort(sid, pt), unique_fp)
+
+    summary = {
+        "tasks_before": global_counts.height,
+        "tasks_after": eligible.height,
+        "rows_before": rows_before,
+        "rows_after": rows_after,
+    }
+    logger.info("Global task support filter (min_positives=%d): %s", min_positives, summary)
+    return summary
 
 
 def attach_forced_answers(labeled: pl.DataFrame, specs: list[SequenceSpec]) -> pl.DataFrame:
@@ -1464,7 +1536,7 @@ def drop_forced_mismatches(labeled: pl.DataFrame) -> pl.DataFrame:
     return rows.filter(~pl.col("_row").is_in(contradicted.implode())).drop("_row")
 
 
-def _write(labeled: pl.DataFrame, fp: Path, out_dir: Path, fingerprint: dict[str, str | None]) -> None:
+def _write(labeled: pl.DataFrame, fp: Path, out_dir: Path, fingerprint: dict[str, str | int | None]) -> None:
     """Align to ``QuerySeqSchema``, atomically write one output parquet, and record its provenance.
 
     The sidecar is written *after* the parquet is committed, so a present sidecar always describes
@@ -1495,7 +1567,7 @@ def run_worker(
     subject_subsample_fraction: float | None = None,
     contexts: pl.DataFrame | None = None,
     ontology_dir: str | None = None,
-    fingerprint: dict[str, str | None] | None = None,
+    fingerprint: dict[str, str | int | None] | None = None,
     write_unique_prediction_times: bool = True,
     unique_out_dir: Path | None = None,
 ) -> Path | None:
@@ -1650,6 +1722,11 @@ def main(cfg: DictConfig) -> None:
     split = str(cfg.split)
     seed = int(cfg.seed)
     ontology_dir = cfg.get("ontology_dir")
+    threshold = cfg.get("min_task_positives")
+    if threshold is not None and (
+        isinstance(threshold, bool) or not isinstance(threshold, int) or threshold < 1
+    ):
+        raise ValueError(f"min_task_positives must be a positive integer or null, got {threshold!r}")
 
     # The same two arguments, read the same way, as ``QuerySequenceDistribution.from_config``: an
     # eval grid drawn from a *narrower* universe than training's is the drift this whole module
@@ -1734,9 +1811,29 @@ def main(cfg: DictConfig) -> None:
             int(cfg.min_context_per_subject),
             subject_subsample_fraction,
         ),
+        threshold,
     )
 
     write_unique_prediction_times = bool(cfg.get("write_unique_prediction_times", True))
+    # A per-shard sidecar alone cannot certify a global filtering pass.  If the completion marker
+    # is absent or stale, regenerate *every* shard: some may already have had tasks removed when
+    # an earlier attempt stopped, and those dropped rows cannot be recovered by recounting.
+    marker = _support_filter_marker(Path(out_dir), split) if threshold is not None else None
+    files = [_labels_fp(Path(out_dir) / "eval", split, shard) for shard in shards]
+    if marker is not None:
+        try:
+            completed = json.loads(marker.read_text()).get("fingerprint") == fingerprint
+        except (OSError, json.JSONDecodeError, AttributeError):
+            completed = False
+        if (
+            completed
+            and not bool(cfg.get("overwrite", False))
+            and all(_output_is_current(Path(out_dir), fp, fingerprint) for fp in files)
+        ):
+            logger.info("Filtered evaluation grid is current for %s, skipping.", split)
+            return
+        marker.unlink(missing_ok=True)
+
     for input_shard in shards:
         run_worker(
             data_dir=data_dir,
@@ -1747,7 +1844,7 @@ def main(cfg: DictConfig) -> None:
             prediction_times_per_subject=int(cfg.prediction_times_per_subject),
             min_context_per_subject=int(cfg.min_context_per_subject),
             seed=seed,
-            overwrite=bool(cfg.get("overwrite", False)),
+            overwrite=bool(cfg.get("overwrite", False)) or marker is not None,
             subject_subsample_fraction=subject_subsample_fraction,
             contexts=contexts,
             ontology_dir=ontology_dir,
@@ -1755,6 +1852,16 @@ def main(cfg: DictConfig) -> None:
             write_unique_prediction_times=write_unique_prediction_times,
             unique_out_dir=Path(out_dir) / "eval_unique" if write_unique_prediction_times else None,
         )
+
+    if marker is not None:
+        unique_files = (
+            [_unique_fp(Path(out_dir) / "eval_unique", split, shard) for shard in shards]
+            if write_unique_prediction_times
+            else None
+        )
+        summary = filter_tasks_by_min_positives(files, threshold, unique_files)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_json({"fingerprint": fingerprint, "summary": summary}, marker)
 
 
 if __name__ == "__main__":
