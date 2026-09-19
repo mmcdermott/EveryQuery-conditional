@@ -11,7 +11,7 @@ import yaml
 from every_query.data.schema import QuerySeqSchema
 from every_query.generate_tasks import sample_evaluation_query_sequences as eval_seq
 from tests.designed_specs import entry
-from tests.sampler.test_eval_grid_per_shard import SPLIT, _labels, _run_seq
+from tests.sampler.test_eval_grid_per_shard import SPLIT, _labels, _run_seq, _unique
 
 
 @pytest.fixture
@@ -77,10 +77,16 @@ def test_generator_filter_regenerates_when_threshold_changes_or_pass_is_interrup
     _run_seq(data_dir, out_dir, codes_yaml, **args)
     n_positive = sum(_labels(out_dir, shard)["answers"].list.last().sum() for shard in ("0", "1"))
     assert n_positive >= 2
+    raw_columns = _labels(out_dir, "0").columns
 
     _run_seq(data_dir, out_dir, codes_yaml, **args, min_task_positives=n_positive)
     original = [_labels(out_dir, shard) for shard in ("0", "1")]
     assert all(df.height > 0 for df in original)
+    # The key's defaulted optional columns are not written back, and eval_unique mirrors eval/.
+    assert all(df.columns == raw_columns for df in original)
+    contexts = ["subject_id", "prediction_time"]
+    for shard, df in zip(("0", "1"), original, strict=True):
+        assert _unique(out_dir, shard).equals(df.select(contexts).unique().sort(contexts))
     for shard in ("0", "1"):
         QuerySeqSchema.align(pq.read_table(out_dir / "eval" / SPLIT / f"{shard}.parquet"))
     marker = eval_seq._support_filter_marker(out_dir, SPLIT)
@@ -94,6 +100,7 @@ def test_generator_filter_regenerates_when_threshold_changes_or_pass_is_interrup
     # rather than recounting the now-empty outputs.
     _run_seq(data_dir, out_dir, codes_yaml, **args, min_task_positives=n_positive + 1)
     assert all(_labels(out_dir, shard).is_empty() for shard in ("0", "1"))
+    assert all(_unique(out_dir, shard).is_empty() for shard in ("0", "1"))
     _run_seq(data_dir, out_dir, codes_yaml, **args, min_task_positives=n_positive)
     assert all(_labels(out_dir, shard).equals(raw) for shard, raw in zip(("0", "1"), original, strict=True))
 

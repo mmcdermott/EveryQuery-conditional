@@ -66,7 +66,8 @@ write_unique_prediction_times: true
 # Optional global support filter on conditional tasks.  After all shards are labeled, keep every
 # positive and negative row for a task only when its final answer is true at least this many times
 # across the whole split.  Task identity includes answers before the final one, just as
-# EQ_evaluate_multitask does.  null keeps all labeled rows (the existing behavior).  Changing this
+# EQ_evaluate_multitask does.  eval_unique/ is rewritten from the retained rows, so it still mirrors
+# eval/.  null keeps all labeled rows (the existing behavior).  Changing this
 # value in the same out_dir regenerates the unfiltered grid before applying the new threshold.
 min_task_positives: null
 

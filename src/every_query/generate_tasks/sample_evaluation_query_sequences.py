@@ -1413,11 +1413,18 @@ def _support_filter_marker(out_dir: Path, split: str) -> Path:
     return default_artifacts_dir(out_dir) / "_support_filter" / f"{split}.json"
 
 
-def filter_tasks_by_min_positives(files: list[Path], min_positives: int) -> dict[str, int]:
+def filter_tasks_by_min_positives(
+    files: list[Path], min_positives: int, unique_files: list[Path] | None = None
+) -> dict[str, int]:
     """Count final-answer positives globally, then retain complete conditional tasks per shard.
 
     Only the compact per-shard task counts are concatenated; the full grid is read one shard at a
     time.  This bounds memory for large dense evaluation grids.
+
+    The optional columns are filled only to build the task key: each shard is written back with
+    the columns it had, so a filtered grid reads exactly as an unfiltered one does.  When
+    ``unique_files`` is given (aligned with ``files``), each ``eval_unique`` frame is rewritten
+    from its shard's retained rows, so it keeps mirroring ``eval/``.
     """
     counts = []
     rows_before = 0
@@ -1437,12 +1444,17 @@ def filter_tasks_by_min_positives(files: list[Path], min_positives: int) -> dict
         .agg(pl.col("n_rows").sum(), pl.col("n_positive").sum())
     )
     eligible = global_counts.filter(pl.col("n_positive") >= min_positives).select(TASK_KEY)
+    sid = TaskQuerySchema.subject_id_name
+    pt = TaskQuerySchema.prediction_time_name
     rows_after = 0
-    for fp in files:
-        shard = _with_prior_answers(normalize_task_columns(pl.read_parquet(fp)))
-        retained = shard.join(eligible, on=TASK_KEY, how="semi", nulls_equal=True).drop("prior_answers")
+    for fp, unique_fp in zip(files, unique_files or [None] * len(files), strict=True):
+        raw = pl.read_parquet(fp)
+        shard = _with_prior_answers(normalize_task_columns(raw))
+        retained = shard.join(eligible, on=TASK_KEY, how="semi", nulls_equal=True).select(raw.columns)
         rows_after += retained.height
         _atomic_write_parquet(retained, fp)
+        if unique_fp is not None:
+            _atomic_write_parquet(retained.select(sid, pt).unique().sort(sid, pt), unique_fp)
 
     summary = {
         "tasks_before": global_counts.height,
@@ -1842,7 +1854,12 @@ def main(cfg: DictConfig) -> None:
         )
 
     if marker is not None:
-        summary = filter_tasks_by_min_positives(files, threshold)
+        unique_files = (
+            [_unique_fp(Path(out_dir) / "eval_unique", split, shard) for shard in shards]
+            if write_unique_prediction_times
+            else None
+        )
+        summary = filter_tasks_by_min_positives(files, threshold, unique_files)
         marker.parent.mkdir(parents=True, exist_ok=True)
         _atomic_write_json({"fingerprint": fingerprint, "summary": summary}, marker)
 
