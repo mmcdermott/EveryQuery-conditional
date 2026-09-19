@@ -119,7 +119,7 @@ sequences_path: null
 # Number of sequences to draw.  They are drawn once, seeded on `(seed, "eval_seq_specs", split)`
 # alone, and shared across every context of every shard — so the same `(seed, split)` yields the
 # same `N` sequences for any cohort, and two cohorts' metrics are comparable query-for-query.
-num_evaluation_sequences: 64
+num_evaluation_sequences: 1000
 
 # Sequence length ~ Uniform{min_queries..max_queries} inclusive, per sequence.  Fixed at 3
 # rather than training's 1..5 range: one length keeps the grid simple and makes per-position
