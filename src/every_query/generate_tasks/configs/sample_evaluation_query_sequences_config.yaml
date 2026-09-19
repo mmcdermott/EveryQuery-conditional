@@ -69,7 +69,7 @@ write_unique_prediction_times: true
 # EQ_evaluate_multitask does.  eval_unique/ is rewritten from the retained rows, so it still mirrors
 # eval/.  null keeps all labeled rows (the existing behavior).  Changing this
 # value in the same out_dir regenerates the unfiltered grid before applying the new threshold.
-min_task_positives: null
+min_task_positives: 40
 
 # --- The N query sequences ------------------------------------------------
 # Path to designed sequences.  Leave null to instead draw `num_evaluation_sequences` of them from the
