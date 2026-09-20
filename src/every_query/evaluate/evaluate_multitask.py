@@ -113,25 +113,16 @@ def _duration_bucket(duration_days: float | None) -> str | None:
     return ">365d"
 
 
-def _auroc_or_nan(y_true: np.ndarray, y_score: np.ndarray) -> float:
-    """AUROC of one bootstrap replicate, ``nan`` when the resample happened to land single-class.
-
-    Examples:
-        >>> _auroc_or_nan(np.array([True, False]), np.array([0.9, 0.1]))
-        1.0
-        >>> bool(np.isnan(_auroc_or_nan(np.array([True, True]), np.array([0.9, 0.1]))))
-        True
-    """
-    n_pos = int(y_true.sum())
-    if n_pos == 0 or n_pos == y_true.size:
-        return float("nan")
-    return float(roc_auc_score(y_true, y_score))
-
-
 def _bootstrap_aurocs(
     y: np.ndarray, score: np.ndarray, n_resamples: int, rng: np.random.Generator
 ) -> np.ndarray:
     """AUROCs of ``n_resamples`` resamples of one task's rows, drawn with replacement.
+
+    AUROC is the Mann-Whitney statistic, so a replicate is fully determined by how many positives
+    and negatives it drew at each distinct score -- never by which rows they were.  Resampling the
+    rows is therefore one multinomial draw over the (score, label) cells, and every replicate is
+    scored at once by cumulative sums, instead of sorting each one through ``roc_auc_score``.
+    Tied scores get midranks, which is what ``roc_auc_score``'s trapezoidal curve already does.
 
     Examples:
         A perfectly separable task scores 1.0 on every resample that holds both classes:
@@ -140,11 +131,34 @@ def _bootstrap_aurocs(
         >>> replicates = _bootstrap_aurocs(y, score, 16, np.random.default_rng(0))
         >>> replicates.shape, set(replicates[~np.isnan(replicates)].tolist())
         ((16,), {1.0})
+
+        Tied scores carrying both labels land on the midrank answer, not on 0.0 or 1.0:
+
+        >>> y, score = np.array([True, False]), np.array([0.5, 0.5])
+        >>> r = _bootstrap_aurocs(y, score, 8, np.random.default_rng(0))
+        >>> set(r[~np.isnan(r)].tolist())
+        {0.5}
     """
-    out = np.empty(n_resamples)
-    for b in range(n_resamples):
-        rows = rng.integers(0, y.size, y.size)
-        out[b] = _auroc_or_nan(y[rows], score[rows])
+    n = y.size
+    # inv indexes the ascending distinct scores, so cell counts are already in rank order.
+    uniq, inv = np.unique(score, return_inverse=True)
+    n_scores = uniq.size
+    cells = np.concatenate(
+        [np.bincount(inv[y], minlength=n_scores), np.bincount(inv[~y], minlength=n_scores)]
+    )
+    # ponytail: (n_resamples, 2 * n_scores) held at once -- fine while scores are coarse, as the
+    # Monte Carlo probabilities are.  Chunk over replicates if continuous scores ever come through.
+    counts = rng.multinomial(n, cells / n, size=n_resamples)
+    n_pos_c, n_neg_c = counts[:, :n_scores], counts[:, n_scores:]
+
+    tied = n_pos_c + n_neg_c
+    midrank = np.cumsum(tied, axis=1) - tied + (tied + 1.0) / 2.0
+    n_pos = n_pos_c.sum(axis=1)
+    n_neg = n_neg_c.sum(axis=1)
+    u = (n_pos_c * midrank).sum(axis=1) - n_pos * (n_pos + 1.0) / 2.0
+    with np.errstate(invalid="ignore", divide="ignore"):
+        out = u / (n_pos * n_neg)
+    out[(n_pos == 0) | (n_neg == 0)] = np.nan  # a single-class replicate has no AUROC
     return out
 
 
