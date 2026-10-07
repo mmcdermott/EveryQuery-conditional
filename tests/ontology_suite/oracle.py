@@ -52,9 +52,12 @@ fully observed.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Mapping, Sequence
 
 SEP = "//"
 EOS_CODE = "TIMELINE//END"
@@ -229,7 +232,10 @@ class Ontology:
 
 
 def subject_events(events: Sequence[Event], subject_id: int) -> list[Event]:
-    """This subject's events, oldest first.  Ties keep input order (never consulted below)."""
+    """This subject's events, oldest first.
+
+    Ties keep input order (never consulted below).
+    """
     return sorted((e for e in events if e.subject_id == subject_id), key=lambda e: e.time)
 
 
@@ -305,7 +311,10 @@ def label_censor(
     t: datetime,
     duration_days: float,
 ) -> bool:
-    """Does the record end inside ``(t, t + d)``?  The answer to the ``TIMELINE//END`` query."""
+    """Does the record end inside ``(t, t + d)``?
+
+    The answer to the ``TIMELINE//END`` query.
+    """
     return label_duration(events, subject_id, onto, t, EOS_CODE, duration_days)
 
 

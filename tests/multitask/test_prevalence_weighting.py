@@ -11,6 +11,8 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 import pytest
+from omegaconf import OmegaConf
+
 from every_query.generate_tasks.sample_multitask_sequences import (
     BoundaryDistribution,
     _apply_prefix_exclusions,
@@ -22,8 +24,6 @@ from every_query.generate_tasks.sample_multitask_sequences import (
     read_exclude_prefixes,
     resolve_boundary_pools,
 )
-from omegaconf import OmegaConf
-
 from tests.multitask.conftest import CODES, K, base_cfg, make_codes_parquet
 
 WEIGHTED = ["A", "B", "C", "D"]
@@ -231,8 +231,8 @@ def test_resolve_boundary_pools_rejects_unknown_policy(tmp_path: Path):
 
 
 def test_weights_change_the_config_fingerprint(tmp_path: Path):
-    """Same pool, different weights => different labels, so the fingerprint must differ or a rerun
-    into an existing out_dir would silently reuse the other arm's shards."""
+    """Same pool, different weights => different labels, so the fingerprint must differ or a rerun into an
+    existing out_dir would silently reuse the other arm's shards."""
     make_codes_parquet(tmp_path, WEIGHTED)
     vocab = build_target_vocabulary(tmp_path)
     uniform = _dist(())
@@ -270,9 +270,9 @@ def test_end_to_end_weighted_run_records_its_policy(tmp_path: Path, synthetic_co
     assert manifest["start_event_code_policy"] == "weighted"
     assert manifest["num_bounds"] == K
 
-    bounds = pl.concat(
-        [pl.read_parquet(fp) for fp in sorted((out_dir / "train").glob("*.parquet"))]
-    )["bound_events"].explode()
+    bounds = pl.concat([pl.read_parquet(fp) for fp in sorted((out_dir / "train").glob("*.parquet"))])[
+        "bound_events"
+    ].explode()
     drawn = set(bounds.drop_nulls().unique().to_list())
     assert drawn, "no event-bounded slot was drawn"
     # The dominant code carries ~99.9% of the mass, so every drawn boundary should be it.

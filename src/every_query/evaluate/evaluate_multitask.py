@@ -37,7 +37,6 @@ import hydra
 import numpy as np
 import polars as pl
 from omegaconf import DictConfig
-from sklearn.metrics import roc_auc_score
 
 from every_query.data.query_seq_dataset import (
     ANSWERS_COL,

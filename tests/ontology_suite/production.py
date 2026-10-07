@@ -6,14 +6,17 @@ This is the only module in the package allowed to import production code.  :mod:
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import polars as pl
 
 from every_query.data.ontology import build_event_to_query_nodes, build_ontology, expand_events_to_query_nodes
 from every_query.generate_tasks.query_sequence_labeling import label_query_sequences
 
-from .oracle import Event
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from .oracle import Event
 
 BOUND_COL = "bound_event"
 #: The sequence sampler writes this in place of a horizon on event-bounded rows.

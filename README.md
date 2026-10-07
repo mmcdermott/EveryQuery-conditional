@@ -193,31 +193,31 @@ vocabulary:
 # designed.yaml   name -> [entry, ...]; every entry spells out all six keys (null is a legal value)
 mortality_30d_given_uncensored:
   - query: TIMELINE//END
-    start_event: null
+    start_event:
     start_duration_days: 0          # opens at the prediction time ...
-    bound_event: null
+    bound_event:
     duration_days: 30               # ... closes 30 days later
     forced_answer: false            # tell the model "the record continues past 30d"
   - query: MEDS_DEATH
-    start_event: null
+    start_event:
     start_duration_days: 0
-    bound_event: null
+    bound_event:
     duration_days: 30
-    forced_answer: null             # the final query is the scored one: always null
+    forced_answer:                  # the final query is the scored one: always null
 sepsis_before_discharge:
   - query: SEPSIS
-    start_event: null
+    start_event:
     start_duration_days: 0
     bound_event: HOSPITAL_DISCHARGE//HOME
-    duration_days: null             # closes at the discharge, not after a horizon
-    forced_answer: null
+    duration_days:                  # closes at the discharge, not after a horizon
+    forced_answer:
 lab_in_the_month_after_admission:
   - query: LAB//220645//ANY         # ancestor query (needs ontology_dir)
     start_event: HOSPITAL_ADMISSION
-    start_duration_days: null
-    bound_event: null
+    start_duration_days:
+    bound_event:
     duration_days: 30
-    forced_answer: null
+    forced_answer:
 ```
 
 ```bash
@@ -229,9 +229,9 @@ never mean "the default I did not know about":
 
 - `query`: a vocabulary code (or, with `ontology_dir`, an ancestor node).
 - `start_event` / `start_duration_days`: a code + `null`, **or** `null` + days `>= 0` (`0` = the
-  prediction time).
+    prediction time).
 - `bound_event` / `duration_days`: a code + `null`, **or** `null` + days `> 0`, measured from the
-  resolved start.
+    resolved start.
 - `forced_answer`: `true` / `false` / `null`; **must be `null` on the final query of every sequence**.
 
 `forced_answer` fixes the answer an earlier query must have ("among contexts where the record did
@@ -284,18 +284,18 @@ automatically, and both widths are recorded in the checkpoint.
 Common overrides (full list:
 `src/every_query/train/configs/conditional_multitask_ar_config.yaml`):
 
-| Knob                                                        | Default                                                         |
-| ----------------------------------------------------------- | --------------------------------------------------------------- |
-| `datamodule.batch_size` / `datamodule.num_workers`          | 96 / 8                                                          |
-| `datamodule.config.max_seq_len`                             | 256 patient tokens                                              |
-| `datamodule.eval_tasks_dir`                                 | null — an optional step-4 `eval/` root; `fit` never reads it    |
-| `lightning_module.model.max_windows`                        | 5 (must be ≥ the labels' `num_bounds`)                          |
-| `lightning_module.model.use_rope_time`                      | true — elapsed hours as rotary positions, delta tokens stripped |
-| `lightning_module.model.config_overrides.num_hidden_layers` | 12 (hidden 384, 6 heads, intermediate 1536)                     |
-| `lightning_module.optimizer.lr` / `lightning_module.warmup_ratio` | 2e-4 / 0.05                                               |
-| `trainer.max_epochs` / `trainer.precision`                  | 1 / `bf16-mixed`                                                |
-| `do_resume=true`                                            | resume the run in `output_dir` (mid-epoch, stateful loader)     |
-| `seed`                                                      | 140799                                                          |
+| Knob                                                              | Default                                                         |
+| ----------------------------------------------------------------- | --------------------------------------------------------------- |
+| `datamodule.batch_size` / `datamodule.num_workers`                | 96 / 8                                                          |
+| `datamodule.config.max_seq_len`                                   | 256 patient tokens                                              |
+| `datamodule.eval_tasks_dir`                                       | null — an optional step-4 `eval/` root; `fit` never reads it    |
+| `lightning_module.model.max_windows`                              | 5 (must be ≥ the labels' `num_bounds`)                          |
+| `lightning_module.model.use_rope_time`                            | true — elapsed hours as rotary positions, delta tokens stripped |
+| `lightning_module.model.config_overrides.num_hidden_layers`       | 12 (hidden 384, 6 heads, intermediate 1536)                     |
+| `lightning_module.optimizer.lr` / `lightning_module.warmup_ratio` | 2e-4 / 0.05                                                     |
+| `trainer.max_epochs` / `trainer.precision`                        | 1 / `bf16-mixed`                                                |
+| `do_resume=true`                                                  | resume the run in `output_dir` (mid-epoch, stateful loader)     |
+| `seed`                                                            | 140799                                                          |
 
 Checkpointing and early stopping monitor `tuning/loss`. `ontology_dir` is set once on the model;
 the datamodule interpolates it.
@@ -351,9 +351,9 @@ The sampled grid draws `K` from `min_queries..max_queries` (1..3 by default), so
 than `num_evaluation_sequences`, and a cohort-dependent number of them. It writes one table:
 
 - `metrics.by_task.parquet`, one row per cell: the spec and `prior_answers`, a descriptive
-  `target_code` / `n_queries` / `duration_bucket`, `n_rows` / `n_positive` / `prevalence`,
-  `n_subjects`, the within-cell `auroc` (null when the cell is single-class), its 95% bootstrap
-  interval `auroc_ci_lo` / `auroc_ci_hi`, and `n_degenerate_replicates`.
+    `target_code` / `n_queries` / `duration_bucket`, `n_rows` / `n_positive` / `prevalence`,
+    `n_subjects`, the within-cell `auroc` (null when the cell is single-class), its 95% bootstrap
+    interval `auroc_ci_lo` / `auroc_ci_hi`, and `n_degenerate_replicates`.
 
 The interval is a **row bootstrap within the cell**: draw the cell's rows with replacement, recompute
 the AUROC, repeat `n_resamples` times (default 1000, seeded by `bootstrap_seed`), and take the 2.5th
@@ -463,11 +463,11 @@ stays exact. `subtree_suffix=null` disables this.
 ## Development
 
 ```bash
-uv run pytest                                                          # full suite minus slow tests
-uv run pytest -m "slow or not slow"                                    # including the heavy end-to-end runs
-uv run pytest tests/multitask tests/test_conditional_multitask_cli.py  # this pipeline
-uv run pytest tests/test_cli_smoke.py                                  # every EQ_* --help exits 0
-uv run pre-commit run --all-files                                      # ruff, mdformat, codespell
+uv run pytest                                                         # full suite minus slow tests
+uv run pytest -m "slow or not slow"                                   # including the heavy end-to-end runs
+uv run pytest tests/multitask tests/test_conditional_multitask_cli.py # this pipeline
+uv run pytest tests/test_cli_smoke.py                                 # every EQ_* --help exits 0
+uv run pre-commit run --all-files                                     # ruff, mdformat, codespell
 ```
 
 `tests/test_conditional_multitask_cli.py` runs the full generate → train → predict chain on a

@@ -44,17 +44,17 @@ import numpy as np
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+#: Start of the first interval of every ``(subject, code)`` chain: "no earlier occurrence".
 NEG_INF = -(2**62)
-"""Start of the first interval of every ``(subject, code)`` chain: "no earlier occurrence"."""
 
+#: Boundary time of an event bound whose code never recurs: any later occurrence is eligible.
 INF = 2**62
-"""Boundary time of an event bound whose code never recurs: any later occurrence is eligible."""
 
+#: Microseconds per day; durations in (fractional) days are converted with ``round(d * US_PER_DAY)``.
 US_PER_DAY = 86_400_000_000
-"""Microseconds per day; durations in (fractional) days are converted with ``round(d * US_PER_DAY)``."""
 
+#: Width of the time-rank field packed into the low bits of the composite lookup key.
 _RANK_BITS = 28
-"""Width of the time-rank field packed into the low bits of the composite lookup key."""
 
 
 class IntervalTable(NamedTuple):

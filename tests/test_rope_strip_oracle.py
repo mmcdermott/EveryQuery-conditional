@@ -22,7 +22,10 @@ DELTA_IDS = torch.tensor([90, 91, 92])
 
 
 def _oracle_row(code, numeric_value, numeric_value_mask, time_delta_days, delta_ids, protect_first_n):
-    """One row, by hand.  Returns the five compacted lists (unpadded)."""
+    """One row, by hand.
+
+    Returns the five compacted lists (unpadded).
+    """
     n = len(code)
     # Cumulative elapsed time is summed BEFORE the strip, or the deltas' own time is lost.
     cum, running = [], 0.0

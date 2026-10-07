@@ -50,15 +50,16 @@ The production configs instantiate a `WandbLogger` plus a `LearningRateMonitor`.
 work on every shipped config:
 
 - No logger at all: `trainer.logger=false`. `train.py` drops the `LearningRateMonitor` itself in
-  that case (Lightning refuses the monitor without a logger, only after the dataset is loaded).
+    that case (Lightning refuses the monitor without a logger, only after the dataset is loaded).
+
 - CSV logging: the logger node has to be *replaced*, not merged, or the wandb-only keys (`offline`,
-  `entity`, ...) reach `CSVLogger.__init__`:
+    `entity`, ...) reach `CSVLogger.__init__`:
 
-  ```
-  '~trainer.logger' '+trainer.logger={_target_: lightning.pytorch.loggers.CSVLogger, save_dir: ${trainer.default_root_dir}/loggers}'
-  ```
+    ```
+    '~trainer.logger' '+trainer.logger={_target_: lightning.pytorch.loggers.CSVLogger, save_dir: ${trainer.default_root_dir}/loggers}'
+    ```
 
-  Metrics land in `<run>/loggers/lightning_logs/version_0/metrics.csv`.
+    Metrics land in `<run>/loggers/lightning_logs/version_0/metrics.csv`.
 
 ## Capping steps
 

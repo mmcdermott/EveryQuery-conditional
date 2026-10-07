@@ -13,15 +13,15 @@ examples under `src/` run as part of the suite.
 ## Layout
 
 - `tests/sampler/` — the query-sequence sampler, split by pipeline stage (prediction times, query
-  distribution, patient contexts, index build, labelling), plus the orchestration that chains them
-  and the per-shard evaluation grid.
+    distribution, patient contexts, index build, labelling), plus the orchestration that chains them
+    and the per-shard evaluation grid.
 - `tests/multitask/` — the multitask pipeline: datamodule, lightning module, orchestration,
-  multi-boundary labelling, prevalence weighting, interval table, predict-side logic.
+    multi-boundary labelling, prevalence weighting, interval table, predict-side logic.
 - `tests/ontology_suite/` — not tests, but the fixtures the ontology tests are built from: an
-  independent `oracle.py`, a hand-computed `golden.py` truth table, and a `production.py` adapter.
-  Driven by `test_ontology_golden.py` and `test_ontology_differential.py`.
+    independent `oracle.py`, a hand-computed `golden.py` truth table, and a `production.py` adapter.
+    Driven by `test_ontology_golden.py` and `test_ontology_differential.py`.
 - `tests/test_*.py` — everything else: CLI smoke tests, per-module logic, and the feature tests
-  described below.
+    described below.
 
 ## Why the feature tests look the way they do
 
@@ -61,22 +61,22 @@ This is worth most where the optimised code is hardest to read, and each oracle 
 silently-wrong-label failure:
 
 - **Delta-token stripping** compacts four parallel tensors at once, re-bases each row's clock to its
-  first surviving token, and *recomputes* rather than compacts the time deltas. A misalignment
-  between any two of those outputs would not raise — it would hand the encoder a stream whose values
-  belong to different tokens than its codes, corrupting every training sequence while every shape
-  assertion still passed.
+    first surviving token, and *recomputes* rather than compacts the time deltas. A misalignment
+    between any two of those outputs would not raise — it would hand the encoder a stream whose values
+    belong to different tokens than its codes, corrupting every training sequence while every shape
+    assertion still passed.
 - **Event-bounded labelling** turns on window edges that are easy to get wrong and impossible to see
-  wrong: the window is open at both ends, the boundary is the *first* occurrence strictly after the
-  prediction time, and a target sharing a timestamp with the boundary does not count. That last rule
-  is load-bearing on MEDS data, where many codes cluster on one instant — a discharge and everything
-  charted with it routinely share a timestamp.
+    wrong: the window is open at both ends, the boundary is the *first* occurrence strictly after the
+    prediction time, and a target sharing a timestamp with the boundary does not count. That last rule
+    is load-bearing on MEDS data, where many codes cluster on one instant — a discharge and everything
+    charted with it routinely share a timestamp.
 - **The ontology closure** is where the worst of these lived. A leaf code that is a strict `//`-prefix
-  of another code was receiving closure rows from its descendants, so every ordinary leaf query
-  naming such a code silently changed meaning from "this exact code occurred" to "this code *or any
-  descendant* occurred", flipping labels False→True — no crash, no warning, a well-formed parquet of
-  wrong labels. Separately, declared parent edges were followed exactly one hop and never
-  transitively closed, so ancestor queries were labelled False for descendants more than one hop
-  away, silently truncating the multi-level DAG the feature exists to express.
+    of another code was receiving closure rows from its descendants, so every ordinary leaf query
+    naming such a code silently changed meaning from "this exact code occurred" to "this code *or any
+    descendant* occurred", flipping labels False→True — no crash, no warning, a well-formed parquet of
+    wrong labels. Separately, declared parent edges were followed exactly one hop and never
+    transitively closed, so ancestor queries were labelled False for descendants more than one hop
+    away, silently truncating the multi-level DAG the feature exists to express.
 
 A suite that cannot fail is not evidence, so the oracles were red-proofed against the genuine
 pre-fix modules and confirmed to disagree.
@@ -93,9 +93,9 @@ tests cannot detect that, because they assert the model *runs* with the new tens
 
 - **Gradient** — each new parameter receives a non-zero gradient from a batch that exercises it.
 - **Sensitivity** — perturbing one new input field alone moves the output, by a margin well above
-  float noise (`LIVE = 1e-6`, against ~1e-7 rounding and ~1e-4 real effects).
+    float noise (`LIVE = 1e-6`, against ~1e-7 rounding and ~1e-4 real effects).
 - **Atom invariance** — a batch using none of the new machinery is **bit-identical** with and without
-  the new tensors attached, at exactly `0.0`.
+    the new tensors attached, at exactly `0.0`.
 
 Atom invariance is the one every reported number rests on. An atomic evaluation grid is entirely
 time-bounded single-code queries, so if merely attaching the feature machinery perturbed them, every

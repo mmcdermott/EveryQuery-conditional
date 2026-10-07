@@ -48,8 +48,7 @@ Key files:
     ontology's leaves to be that cohort's `codes.parquet` rows code for code. Inference
     is `Trainer.predict` over a `ConditionalMultitaskDataModule` built from the checkpoint's cohort
     settings with only the label root swapped for the grid (#30), on exactly one device in exactly
-    one process (`device=` picks the accelerator; a multi-device trainer or a `torchrun` / `srun
-    --ntasks>1` launch is refused so rows stay aligned with the grid, and the collated labels and
+    one process (`device=` picks the accelerator; a multi-device trainer or a `torchrun` / `srun   --ntasks>1` launch is refused so rows stay aligned with the grid, and the collated labels and
     scored codes are re-checked row by row against the grid before writing).
 - `schema.py` — `PredictionSchema` (`TaskQuerySchema` + `censor_prob` + `occurs_prob`).
 - `configs/predict_multitask.yaml` — the same required trio as `predict.yaml`

@@ -51,8 +51,7 @@ def _oracle_answer(case: Case) -> bool:
 def test_oracle_matches_truth_table(case: Case):
     """The oracle is only trustworthy if it independently lands on every hand-computed answer."""
     assert _oracle_answer(case) is case.expected, (
-        f"{case.case_id}: oracle said {_oracle_answer(case)}, hand-computed {case.expected}.\n"
-        f"  {case.why}"
+        f"{case.case_id}: oracle said {_oracle_answer(case)}, hand-computed {case.expected}.\n  {case.why}"
     )
 
 
@@ -109,9 +108,9 @@ def test_production_matches_truth_table_event_bounded(case: Case, closure_df):
 def test_enabling_ontology_does_not_move_leaf_answers(closure_df):
     """The whole safety property in one test.
 
-    For every LEAF query in the table, the answer with the ontology switched on must equal the
-    answer with it switched off.  Ancestor queries are excluded — they are only answerable with
-    the ontology on, which is the feature.
+    For every LEAF query in the table, the answer with the ontology switched on must equal the answer with it
+    switched off.  Ancestor queries are excluded — they are only answerable with the ontology on, which is the
+    feature.
     """
     leaf_cases = [c for c in DURATION_CASES if c.target_kind == "leaf"]
     assert leaf_cases, "no leaf duration cases to compare"

@@ -95,16 +95,16 @@ MEDS data, where a discharge and everything charted with it routinely share one 
 Four mechanisms with disjoint jobs.
 
 - **Clinical-time RoPE.** With `use_rope_time=true` (the default in the shipped config) the rotary
-  positions are the dataset's elapsed-hour `time_pos_ids` with delta tokens stripped, and *every*
-  query token repeats the final real patient event's hour. That event is the prediction time and
-  every window is specified at it, so no clinical time passes across `W_i, C_i, A_i` or between
-  windows — earlier answers are logical conditioning, not later observations. A window that opens
-  seven days out is expressed in its *token*, not in its rotary position.
+    positions are the dataset's elapsed-hour `time_pos_ids` with delta tokens stripped, and *every*
+    query token repeats the final real patient event's hour. That event is the prediction time and
+    every window is specified at it, so no clinical time passes across `W_i, C_i, A_i` or between
+    windows — earlier answers are logical conditioning, not later observations. A window that opens
+    seven days out is expressed in its *token*, not in its rotary position.
 - **Block-position** embeddings (learned, `max_windows` entries) carry window order, added
-  identically to all three tokens of a block and never to patient tokens.
+    identically to all three tokens of a block and never to patient tokens.
 - **Token-type** embeddings carry the slot role: patient, window, condition-code, condition-answer.
 - **The causal mask** — derived from physical token order, not from RoPE — enforces autoregressive
-  visibility, so repeated rotary positions are safe.
+    visibility, so repeated rotary positions are safe.
 
 ### 1.4 Conditioning semantics
 
@@ -192,45 +192,45 @@ labels and scored codes are then re-checked row by row against the grid before a
 ### Key source modules
 
 - `src/every_query/model/conditional_multitask_ar_model.py` — `ConditionalMultitaskARModel`,
-  `TOKENS_PER_WINDOW = 3`, the four token types, `ConditionalMultitaskOutput`,
-  `window_hidden_states` (shared by both paths) and `score_final_query`.
+    `TOKENS_PER_WINDOW = 3`, the four token types, `ConditionalMultitaskOutput`,
+    `window_hidden_states` (shared by both paths) and `score_final_query`.
 - `src/every_query/model/conditional_multitask_lightning.py` — the Lightning module. Each loop is
-  bound to one dataset, batch type and model path; nothing branches on `self.training`. Logged
-  metrics are `train/loss`, `tuning/loss` and `held_out/loss` only — full-vocabulary macro metrics
-  are deliberately deferred to `EQ_evaluate_multitask` (§4).
+    bound to one dataset, batch type and model path; nothing branches on `self.training`. Logged
+    metrics are `train/loss`, `tuning/loss` and `held_out/loss` only — full-vocabulary macro metrics
+    are deliberately deferred to `EQ_evaluate_multitask` (§4).
 - `src/every_query/model/answers.py` — `ANSWER_NO` / `ANSWER_YES` / `N_ANSWER_CLASSES`, plus
-  `_init_aux_embeddings` and `validate_rope_time_pair`, shared with the datasets.
+    `_init_aux_embeddings` and `validate_rope_time_pair`, shared with the datasets.
 - `src/every_query/model/ontology_embedding.py` — `OntologyEmbedding` / `wrap_tok_embeddings`:
-  substituting the *embedding module* (not the call sites) is what lets patient, start, bound and
-  condition codes all inherit the ancestor mix.
+    substituting the *embedding module* (not the call sites) is what lets patient, start, bound and
+    condition codes all inherit the ancestor mix.
 - `src/every_query/data/multitask_dataset.py` — `MultitaskBoundaryPytorchDataset` /
-  `MultitaskBoundaryBatch`. Memory-maps each `.labels.npy`, gathers packed rows and unpacks once per
-  batch, and re-checks every stored conditioning answer against the unpacked target bit.
+    `MultitaskBoundaryBatch`. Memory-maps each `.labels.npy`, gathers packed rows and unpacks once per
+    batch, and re-checks every stored conditioning answer against the unpacked target bit.
 - `src/every_query/data/multitask_eval_dataset.py` — `QuerySeqMultitaskEvalDataset` /
-  `MultitaskEvalBatch`: the adapter that maps a `QuerySeqSchema` grid row onto the model's window
-  tensors (`queries[:-1]` / `answers[:-1]` become conditioning pairs; `queries[-1]` is scored).
+    `MultitaskEvalBatch`: the adapter that maps a `QuerySeqSchema` grid row onto the model's window
+    tensors (`queries[:-1]` / `answers[:-1]` become conditioning pairs; `queries[-1]` is scored).
 - `src/every_query/data/query_seq_dataset.py` — `QuerySeqPytorchDataset` (the eval dataset's base),
-  `EOS_CODE = "TIMELINE//END"`, `EVENT_BOUND_DURATION_SENTINEL`, `NO_BOUND_INDEX` and the
-  `QuerySeqSchema` column names the samplers, predictor and evaluator all share.
+    `EOS_CODE = "TIMELINE//END"`, `EVENT_BOUND_DURATION_SENTINEL`, `NO_BOUND_INDEX` and the
+    `QuerySeqSchema` column names the samplers, predictor and evaluator all share.
 - `src/every_query/data/schema.py` — `QuerySeqSchema` (`queries` / `durations` / `answers` list
-  columns plus the optional `bound_events` and, for evaluation grids, `start_durations` /
-  `start_events`) and `MultitaskBoundarySchema` (the training metadata rows), on top of upstream's
-  `TaskQuerySchema`.
+    columns plus the optional `bound_events` and, for evaluation grids, `start_durations` /
+    `start_events`) and `MultitaskBoundarySchema` (the training metadata rows), on top of upstream's
+    `TaskQuerySchema`.
 - `src/every_query/generate_tasks/sample_multitask_sequences.py` — the staged training sampler
-  (prediction-time map → window draw → contexts → index → per-shard labelling), writing packed
-  targets incrementally through a temporary `open_memmap` so no shard-wide target tensor is ever
-  allocated.
+    (prediction-time map → window draw → contexts → index → per-shard labelling), writing packed
+    targets incrementally through a temporary `open_memmap` so no shard-wide target tensor is ever
+    allocated.
 - `src/every_query/generate_tasks/sample_evaluation_query_sequences.py` — the dense grid, plus
-  `interval_table.py`, the subject-sorted interval kernel both samplers label through.
+    `interval_table.py`, the subject-sorted interval kernel both samplers label through.
 - `src/every_query/generate_tasks/query_sequence_labeling.py` — the shared labelling library the
-  grid generator imports: the query universe, the sequence distribution, and the
-  `label_with_event_bounds` / `label_with_explicit_starts` labellers that are the correctness oracle
-  the multitask window rule is tested against.
+    grid generator imports: the query universe, the sequence distribution, and the
+    `label_with_event_bounds` / `label_with_explicit_starts` labellers that are the correctness oracle
+    the multitask window rule is tested against.
 - `src/every_query/predict/predict_multitask.py` and
-  `src/every_query/evaluate/evaluate_multitask.py` — §4.
+    `src/every_query/evaluate/evaluate_multitask.py` — §4.
 - `src/every_query/train/configs/conditional_multitask_ar_config.yaml` — the training config
-  (12-layer Llama, hidden 384, 6 heads, `use_rope_time: true`, `max_windows: 5`, bf16-mixed;
-  `vocab_size` and `max_position_embeddings` are sized from the data by `train.py`).
+    (12-layer Llama, hidden 384, 6 heads, `use_rope_time: true`, `max_windows: 5`, bf16-mixed;
+    `vocab_size` and `max_position_embeddings` are sized from the data by `train.py`).
 
 ______________________________________________________________________
 
@@ -286,9 +286,15 @@ pooling.
 ### The grouping key is the query specification plus the conditioning answers
 
 ```python
-TASK_KEY = ["queries", "durations", "start_durations", "start_events", "bound_events",
-            "forced_answers",  # a designed spec's cohort selector; all-null when nothing is forced
-            "prior_answers"]   # prior_answers = answers[:-1], derived by the evaluator
+TASK_KEY = [
+    "queries",
+    "durations",
+    "start_durations",
+    "start_events",
+    "bound_events",
+    "forced_answers",  # a designed spec's cohort selector; all-null when nothing is forced
+    "prior_answers",
+]  # prior_answers = answers[:-1], derived by the evaluator
 ```
 
 `EQ_generate_evaluation_query_sequences` resolves `N` specifications once and labels **every one of
@@ -365,12 +371,12 @@ The [README](../README.md) has the seven-step walkthrough end to end, with every
 default. Two notes that belong here rather than there:
 
 - **Run the samplers and the grid with the same knobs.** The evaluation grid draws its horizons,
-  event bounds and window starts from the same distributions the training sampler does, so a
-  checkpoint trained with overrides needs the same overrides passed to the grid generator. Drift
-  between the two does not raise: it silently puts the grid out of distribution and reads as an
-  unexplained metric shift, which is the hardest kind of wrong answer to notice.
+    event bounds and window starts from the same distributions the training sampler does, so a
+    checkpoint trained with overrides needs the same overrides passed to the grid generator. Drift
+    between the two does not raise: it silently puts the grid out of distribution and reads as an
+    unexplained metric shift, which is the hardest kind of wrong answer to notice.
 - **Check which checkout you are importing.** The venv is shared across worktrees and its editable
-  install names one absolute path, so an ad-hoc script launched from a worktree can silently import
-  the main checkout's code. `pyproject.toml`'s `pythonpath = ["src"]` fixes this for `pytest` and
-  only for `pytest`. [`CONTRIBUTING.md`](../CONTRIBUTING.md) has the guard to copy into any
-  measurement driver; this has already cost one real result.
+    install names one absolute path, so an ad-hoc script launched from a worktree can silently import
+    the main checkout's code. `pyproject.toml`'s `pythonpath = ["src"]` fixes this for `pytest` and
+    only for `pytest`. [`CONTRIBUTING.md`](../CONTRIBUTING.md) has the guard to copy into any
+    measurement driver; this has already cost one real result.

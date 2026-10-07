@@ -62,11 +62,11 @@ DECLARED_PARENTS: dict[str, list[str]] = {
 ONTOLOGY = Ontology(LEAVES, DECLARED_PARENTS)
 
 #: The prediction time every query in the truth table is anchored at.
-T0 = datetime(2024, 3, 1, 0, 0, 0)
+T0 = datetime(2024, 3, 1, 0, 0, 0)  # noqa: DTZ001 — naive ts is fine for synthetic fixtures
 
 
 def _d(month: int, day: int, hour: int = 0) -> datetime:
-    return datetime(2024, month, day, hour, 0, 0)
+    return datetime(2024, month, day, hour, 0, 0)  # noqa: DTZ001
 
 
 # --------------------------------------------------------------------------------------------
@@ -75,33 +75,33 @@ def _d(month: int, day: int, hour: int = 0) -> datetime:
 
 EVENTS: list[Event] = [
     # --- Subject 1: duration-window endpoint cases -------------------------------------------
-    Event(1, _d(2, 25), "DX//CARDIO//MI"),          # strictly BEFORE t0
-    Event(1, _d(3, 1), "LAB//GLU"),                 # EXACTLY at t0 -> excluded (open below)
-    Event(1, _d(3, 3), "DX//RESP//COPD"),           # strictly inside a 7-day window
-    Event(1, _d(3, 8), "PROC//X//SUB"),             # EXACTLY at the 7-day endpoint -> excluded
-    Event(1, _d(3, 9), "READMISSION//CHILD_A"),     # just AFTER the 7-day endpoint
-    Event(1, _d(3, 31), "TIMELINE//END"),           # record extends far past the window
+    Event(1, _d(2, 25), "DX//CARDIO//MI"),  # strictly BEFORE t0
+    Event(1, _d(3, 1), "LAB//GLU"),  # EXACTLY at t0 -> excluded (open below)
+    Event(1, _d(3, 3), "DX//RESP//COPD"),  # strictly inside a 7-day window
+    Event(1, _d(3, 8), "PROC//X//SUB"),  # EXACTLY at the 7-day endpoint -> excluded
+    Event(1, _d(3, 9), "READMISSION//CHILD_A"),  # just AFTER the 7-day endpoint
+    Event(1, _d(3, 31), "TIMELINE//END"),  # record extends far past the window
     # --- Subject 2: event-boundary cases -----------------------------------------------------
     Event(2, _d(3, 2), "ADMISSION"),
-    Event(2, _d(3, 4), "DX//CARDIO//HF"),           # target BEFORE the boundary
-    Event(2, _d(3, 6), "DISCHARGE"),                # boundary occurrence #1
-    Event(2, _d(3, 6), "READMISSION//CHILD_B"),     # target SHARING the boundary instant
-    Event(2, _d(3, 10), "DX//CARDIO//MI"),          # target AFTER the boundary
-    Event(2, _d(3, 12), "DISCHARGE"),               # boundary occurrence #2 (must be ignored)
+    Event(2, _d(3, 4), "DX//CARDIO//HF"),  # target BEFORE the boundary
+    Event(2, _d(3, 6), "DISCHARGE"),  # boundary occurrence #1
+    Event(2, _d(3, 6), "READMISSION//CHILD_B"),  # target SHARING the boundary instant
+    Event(2, _d(3, 10), "DX//CARDIO//MI"),  # target AFTER the boundary
+    Event(2, _d(3, 12), "DISCHARGE"),  # boundary occurrence #2 (must be ignored)
     Event(2, _d(3, 20), "TIMELINE//END"),
     # --- Subject 3: missing boundary, early record end, declared 2-hop chain -----------------
     Event(3, _d(3, 2), "LAB//GLU"),
     Event(3, _d(3, 4), "MED//WARFARIN_SODIUM"),
-    Event(3, _d(3, 5), "TIMELINE//END"),            # record ends BEFORE a 7-day endpoint
+    Event(3, _d(3, 5), "TIMELINE//END"),  # record ends BEFORE a 7-day endpoint
     # (deliberately no DISCHARGE anywhere -> the boundary never occurs)
     # --- Subject 4: repeats, and no matching event at all ------------------------------------
     Event(4, _d(3, 2), "LAB//GLU"),
-    Event(4, _d(3, 3), "LAB//GLU"),                 # repeated
-    Event(4, _d(3, 4), "LAB//GLU"),                 # repeated
+    Event(4, _d(3, 3), "LAB//GLU"),  # repeated
+    Event(4, _d(3, 4), "LAB//GLU"),  # repeated
     Event(4, _d(3, 25), "TIMELINE//END"),
     # --- Subject 5: the ontology-required readmission case -----------------------------------
     Event(5, _d(3, 2), "ADMISSION"),
-    Event(5, _d(3, 5), "READMISSION//CHILD_B"),     # only descendant; no raw READMISSION event
+    Event(5, _d(3, 5), "READMISSION//CHILD_B"),  # only descendant; no raw READMISSION event
     Event(5, _d(3, 9), "DISCHARGE"),
     Event(5, _d(3, 28), "TIMELINE//END"),
 ]

@@ -22,18 +22,18 @@ Two habits avoid it:
 
 1. Put this checkout's `src` at the **front** of `PYTHONPATH` before running anything ad hoc:
 
-   ```bash
-   PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}" .venv/bin/python path/to/script.py
-   ```
+    ```bash
+    PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}" .venv/bin/python path/to/script.py
+    ```
 
 2. Assert it, rather than trusting it. The deleted `scripts/experiments/_common.sh` guard was worth
-   copying into any new driver:
+    copying into any new driver:
 
-   ```bash
-   .venv/bin/python -c 'import every_query, pathlib; print(pathlib.Path(every_query.__file__).parent.parent)'
-   ```
+    ```bash
+    .venv/bin/python -c 'import every_query, pathlib; print(pathlib.Path(every_query.__file__).parent.parent)'
+    ```
 
-   (There is no bare `python` on the usual dev box — use `uv run python` or the venv's interpreter
-   directly.)
+    (There is no bare `python` on the usual dev box — use `uv run python` or the venv's interpreter
+    directly.)
 
-   If that is not `<this checkout>/src`, stop — do not measure.
+    If that is not `<this checkout>/src`, stop — do not measure.

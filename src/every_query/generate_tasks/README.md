@@ -262,30 +262,30 @@ event stands for the `-1` sentinel:
 post_admission:                        # opens at the next admission, closes 30d after it
   - query: LAB//X
     start_event: HOSPITAL_ADMISSION
-    start_duration_days: null
-    bound_event: null
+    start_duration_days:
+    bound_event:
     duration_days: 30
-    forced_answer: null
+    forced_answer:
 between_events:                        # opens at the admission, closes at the next discharge
   - query: PROCEDURE//X
     start_event: HOSPITAL_ADMISSION
-    start_duration_days: null
+    start_duration_days:
     bound_event: HOSPITAL_DISCHARGE
-    duration_days: null
-    forced_answer: null
+    duration_days:
+    forced_answer:
 death_given_not_censored:              # opens 7d out; "assume the record does NOT end within 30d"
   - query: TIMELINE//END
-    start_event: null
+    start_event:
     start_duration_days: 7
-    bound_event: null
+    bound_event:
     duration_days: 30
     forced_answer: false
   - query: MEDS_DEATH
-    start_event: null
+    start_event:
     start_duration_days: 7
-    bound_event: null
+    bound_event:
     duration_days: 30
-    forced_answer: null
+    forced_answer:
 ```
 
 `forced_answer` (`true` / `false`) fixes the answer that query must have when it conditions a later
@@ -297,8 +297,7 @@ so the scoring label is always the truth. **The final query of a sequence must h
 `forced_answer: null`** — it is the scored query and its answer conditions nothing; the spec reader
 rejects anything else, and so does the dataset for a grid that did not come from this generator.
 
-The same fields, all required, make up the long-format parquet: `seq_id, position, query,
-start_event, start_duration_days, bound_event, duration_days, forced_answer`. Sampled specs draw starts from the
+The same fields, all required, make up the long-format parquet: `seq_id, position, query, start_event, start_duration_days, bound_event, duration_days, forced_answer`. Sampled specs draw starts from the
 `eventstart_fraction` / `prediction_time_start_fraction` / `start_duration_min|max|distribution` /
 `start_event_codes` knobs (the multitask sampler's cumulative form split) on three seed axes of their
 own, so a start knob perturbs none of the query / duration / end draws; the defaults open every window
@@ -429,12 +428,12 @@ an **event** — an ancestor-valued `start_event` / `bound_event` ("until the ne
 `LAB//220645//*`") — and as a **conditioning code**. Set `ontology_dir` and, optionally,
 `ontology_mode`:
 
-| `ontology_mode` | ancestor start / bound events | ancestor conditioning codes |
-|---|---|---|
-| `none` (the default without an `ontology_dir`) | no | no |
-| `boundaries` | yes | no |
-| `conditions` | no | yes |
-| `boundaries+conditions` (the default *with* one) | yes | yes |
+| `ontology_mode`                                  | ancestor start / bound events | ancestor conditioning codes |
+| ------------------------------------------------ | ----------------------------- | --------------------------- |
+| `none` (the default without an `ontology_dir`)   | no                            | no                          |
+| `boundaries`                                     | yes                           | no                          |
+| `conditions`                                     | no                            | yes                         |
+| `boundaries+conditions` (the default *with* one) | yes                           | yes                         |
 
 Mechanically: `build_target_vocabulary` widens the *event* names to the ontology's nodes at their
 `[V, V_ext)` token ids (checking the ontology against this cohort by identity, not width),

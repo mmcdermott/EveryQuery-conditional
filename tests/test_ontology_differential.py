@@ -29,7 +29,7 @@ BASE = datetime(2024, 6, 1)
 N_WORLDS = 120
 
 #: Code-name atoms chosen so `//`-prefix collisions are common: `A//B` is both a code in its own
-#: right and a prefix of `A//B//C`. 
+#: right and a prefix of `A//B//C`.
 LEAF_POOL = [
     "A",
     "A//B",
@@ -187,9 +187,11 @@ def test_production_agrees_with_oracle(seed: int):
 
 
 def test_ontology_off_matches_identity_ontology():
-    """Leaf-only labeling must be identical with the ontology off and with a closure that only
-    ever pairs a code with itself.  This is the `ancestor_fraction=0` safety claim, stated as an
-    equality rather than as a vibe."""
+    """Leaf-only labeling must be identical with the ontology off and with a closure that only ever pairs a
+    code with itself.
+
+    This is the `ancestor_fraction=0` safety claim, stated as an equality rather than as a vibe.
+    """
     import polars as pl
 
     for seed in range(30):

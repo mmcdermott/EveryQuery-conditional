@@ -14,35 +14,35 @@ assumes `dev` already contains #33.
 open a PR against `payalchandak/EveryQuery`:
 
 1. **EQ-single** — the original single-code / single-duration EveryQuery model. This is
-   *verbatim upstream*: `upstream/main` contains it and nothing else.
+    *verbatim upstream*: `upstream/main` contains it and nothing else.
 2. **EQ-multitask** — `ConditionalMultitaskARModel`: the decoder-only, all-vocabulary,
-   multi-boundary model with ontology-derived targets.
+    multi-boundary model with ontology-derived targets.
 
 Everything else goes. The bulk of "everything else" is one coherent thing: the **conditional
 query-sequence pipeline** (`ConditionalQueryEncoderDecoderModel` and its decoder-only sibling
 `ConditionalQueryARModel`), plus the ~4.5k lines of one-off analysis scripts and three report PDFs
 that exist only to measure it.
 
----
+______________________________________________________________________
 
 ## 1. The headline number
 
 Tracked Python in the fork today: **49,712 lines**.
 
-| Bucket | Lines | Confidence |
-| --- | ---: | --- |
-| Straight deletions — src modules that only the conditional-seq pipeline uses | 897 | high |
-| Straight deletions — one-off analysis / report scripts | 4,453 | high |
-| Straight deletions — tests that only exercise the conditional-seq pipeline | 2,512 | high |
-| Partial deletions inside shared modules (see §3) | ~700 | medium |
-| Tests that must be **rehomed onto the multitask model**, not deleted (see §4) | 1,876 | this is the real work |
-| Docs / notes | 1,146 | high |
-| Tracked PDFs | 1.2 MB binary | high |
+| Bucket                                                                        |         Lines | Confidence            |
+| ----------------------------------------------------------------------------- | ------------: | --------------------- |
+| Straight deletions — src modules that only the conditional-seq pipeline uses  |           897 | high                  |
+| Straight deletions — one-off analysis / report scripts                        |         4,453 | high                  |
+| Straight deletions — tests that only exercise the conditional-seq pipeline    |         2,512 | high                  |
+| Partial deletions inside shared modules (see §3)                              |          ~700 | medium                |
+| Tests that must be **rehomed onto the multitask model**, not deleted (see §4) |         1,876 | this is the real work |
+| Docs / notes                                                                  |         1,146 | high                  |
+| Tracked PDFs                                                                  | 1.2 MB binary | high                  |
 
 Roughly **8.5k lines of Python deleted outright**, ~1.9k lines of feature tests rewritten, ~1.2 MB
 of binaries dropped from git.
 
----
+______________________________________________________________________
 
 ## 2. What survives, in full
 
@@ -92,7 +92,7 @@ it is **the** evaluation-grid generator for the multitask model — `EQ_predict_
 exactly its output, and only it can emit the explicit window starts the multitask model consumes.
 It stays.
 
----
+______________________________________________________________________
 
 ## 3. The entanglement — this is where the actual work is
 
@@ -102,13 +102,13 @@ extraction first.
 
 ### 3.1 `model/conditional_model.py` (581 lines) — split, don't delete
 
-| Symbol | Used by | Fate |
-| --- | --- | --- |
-| `ANSWER_NO`, `ANSWER_YES`, `N_ANSWER_CLASSES` | `seq_dataset`, multitask model, tests | **keep** |
-| `_init_aux_embeddings`, `validate_rope_time_pair` | `conditional_multitask_ar_model` | **keep** |
-| `TOKEN_CODE/DURATION/ANSWER`, `TOKENS_PER_QUERY` | `conditional_ar_model`, `train.py` size-inference | **delete** (multitask has its own `TOKENS_PER_WINDOW`) |
-| `build_block_causal_mask`, `masked_bce`, `ConditionalQueryOutput` | conditional-seq only | **delete** |
-| `ConditionalQueryEncoderDecoderModel` (+ `ConditionalQueryModel` alias) | conditional-seq only | **delete** (~430 lines) |
+| Symbol                                                                  | Used by                                           | Fate                                                   |
+| ----------------------------------------------------------------------- | ------------------------------------------------- | ------------------------------------------------------ |
+| `ANSWER_NO`, `ANSWER_YES`, `N_ANSWER_CLASSES`                           | `seq_dataset`, multitask model, tests             | **keep**                                               |
+| `_init_aux_embeddings`, `validate_rope_time_pair`                       | `conditional_multitask_ar_model`                  | **keep**                                               |
+| `TOKEN_CODE/DURATION/ANSWER`, `TOKENS_PER_QUERY`                        | `conditional_ar_model`, `train.py` size-inference | **delete** (multitask has its own `TOKENS_PER_WINDOW`) |
+| `build_block_causal_mask`, `masked_bce`, `ConditionalQueryOutput`       | conditional-seq only                              | **delete**                                             |
+| `ConditionalQueryEncoderDecoderModel` (+ `ConditionalQueryModel` alias) | conditional-seq only                              | **delete** (~430 lines)                                |
 
 **Action:** move the five surviving symbols into a new `src/every_query/model/answers.py` (or fold
 them into `model/__init__.py`), repoint `seq_dataset` and `conditional_multitask_ar_model`, then
@@ -139,8 +139,8 @@ Python-only rename.
 Two survivors import from it:
 
 - `sample_evaluation_query_sequences` → `QuerySequenceDistribution`, `build_query_universe`,
-  `label_query_sequences`, `maybe_expand_to_matching_query_nodes`, `label_with_event_bounds`,
-  `label_with_explicit_starts`, and the `_ctx_id` / `_position` / bound / start column names.
+    `label_query_sequences`, `maybe_expand_to_matching_query_nodes`, `label_with_event_bounds`,
+    `label_with_explicit_starts`, and the `_ctx_id` / `_position` / bound / start column names.
 - `sample_multitask_sequences` → `resolve_prediction_times`.
 
 Dead once `EQ_generate_query_sequences` goes: `label_one_sequence_shard`, `_label_sequence_shards`,
@@ -160,21 +160,21 @@ its config `sample_query_sequences_config.yaml`.
 ### 3.4 `train/train.py` and `utils/model_loader.py` — small edits
 
 - `train.py:45–71` — the model-size-from-data inference branches on `ConditionalQueryARModel` and
-  imports `TOKENS_PER_QUERY` from `conditional_model`. Delete that branch and its doctest; keep the
-  `ConditionalMultitaskARModel` branch above it.
+    imports `TOKENS_PER_QUERY` from `conditional_model`. Delete that branch and its doctest; keep the
+    `ConditionalMultitaskARModel` branch above it.
 - `model_loader.py:43–44` — a docstring reference to `ConditionalQueryLightningModule`. One-line fix.
 
----
+______________________________________________________________________
 
 ## 4. Tests — the one place this plan can lose real coverage
 
 ### 4.1 Delete outright (2,512 lines)
 
-| File | Lines | Why |
-| --- | ---: | --- |
-| `tests/test_conditional_ar_model.py` | 730 | tests `ConditionalQueryARModel` |
-| `tests/test_conditional_cli.py` | 709 | end-to-end for `EQ_generate_query_sequences` → `EQ_predict_sequences` |
-| `tests/test_conditional_queries.py` | 1,073 | the conditional-seq sampler + lightning module |
+| File                                 | Lines | Why                                                                   |
+| ------------------------------------ | ----: | --------------------------------------------------------------------- |
+| `tests/test_conditional_ar_model.py` |   730 | tests `ConditionalQueryARModel`                                       |
+| `tests/test_conditional_cli.py`      |   709 | end-to-end for `EQ_generate_query_sequences` → `EQ_predict_sequences` |
+| `tests/test_conditional_queries.py`  | 1,073 | the conditional-seq sampler + lightning module                        |
 
 ### 4.2 Rehome onto `ConditionalMultitaskARModel` — do **not** delete (1,876 lines)
 
@@ -184,14 +184,14 @@ wrong labels* that a green suite had missed (`docs/history/2026-08-21-three-feat
 is the post-mortem). They happen to drive those features through `ConditionalQueryModel` because
 that was the only model when they were written.
 
-| File | Lines | What to do |
-| --- | ---: | --- |
-| `tests/test_rope_time.py` | 518 | swap the model under test for `ConditionalMultitaskARModel`; the sampler/dataset halves need no change |
-| `tests/test_ontology_embedding.py` | 426 | same — `OntologyEmbedding` / `wrap_tok_embeddings` are shared |
-| `tests/test_event_bounded.py` | 385 | most of it is labeller-level and survives as-is; only the model-forward assertions move |
-| `tests/test_ontology.py` | 345 | mostly `data/ontology.py` — only the `ConditionalQueryModel` liveness checks move |
-| `tests/test_feature_composition.py` | 202 | all three features at once; must move wholesale |
-| `tests/test_feature_liveness.py` | 151 | pure model-liveness; move wholesale, or delete if `tests/test_conditional_multitask_ar_model.py` already covers each toggle |
+| File                                | Lines | What to do                                                                                                                  |
+| ----------------------------------- | ----: | --------------------------------------------------------------------------------------------------------------------------- |
+| `tests/test_rope_time.py`           |   518 | swap the model under test for `ConditionalMultitaskARModel`; the sampler/dataset halves need no change                      |
+| `tests/test_ontology_embedding.py`  |   426 | same — `OntologyEmbedding` / `wrap_tok_embeddings` are shared                                                               |
+| `tests/test_event_bounded.py`       |   385 | most of it is labeller-level and survives as-is; only the model-forward assertions move                                     |
+| `tests/test_ontology.py`            |   345 | mostly `data/ontology.py` — only the `ConditionalQueryModel` liveness checks move                                           |
+| `tests/test_feature_composition.py` |   202 | all three features at once; must move wholesale                                                                             |
+| `tests/test_feature_liveness.py`    |   151 | pure model-liveness; move wholesale, or delete if `tests/test_conditional_multitask_ar_model.py` already covers each toggle |
 
 **Budget this honestly.** It is a day of work, not an afternoon, and it is the step where the trim
 can quietly reduce the quality of the thing you are trying to upstream. Recommendation: do it as its
@@ -213,7 +213,7 @@ The root conftest's `seq_task_labels_dir` / `seq_dataset` / `seq_sample_batch` f
 (lines 393–469) serve the conditional-seq tests. Check whether the rehomed tests in §4.2 still want
 them (they probably do, for the dataset half) before deleting.
 
----
+______________________________________________________________________
 
 ## 5. Straight deletions — no untangling needed
 
@@ -302,14 +302,14 @@ covers `outputs/` and `*.log`; it does **not** cover `node_modules/` or `*.pdf` 
 
 ### 5.4 docs (1,146 lines)
 
-| File | Lines | Fate |
-| --- | ---: | --- |
-| `docs/COHORT_INFERENCE_NOTES.md` | 376 | **delete** — self-described "reference notes, not a plan", dated 2026-07-24, about an archived checkpoint at a path that no longer matters |
-| `docs/history/2026-08-18-conditional-v2-integration-plan.md` | 318 | **delete** — port plan, fully executed |
-| `docs/history/2026-08-21-ontology-handoff.md` | 278 | **delete** — session handoff, resolved |
-| `docs/history/2026-08-21-three-features-verification.md` | 174 | **keep, or salvage** — this is the "why the tests look like that" document. Fold its argument into a `tests/README.md` before deleting; do not lose it |
-| `docs/CONDITIONAL_QUERIES.md` | 280 | **rewrite** as `docs/MULTITASK.md` — the §§ on censoring-as-a-query, event bounds, ontology queries and the macro-vs-pooled AUROC argument all still describe EQ-multitask. Per D4, **drop the results sections**: they quote the conditional-seq `big_v2` run, and the rewritten doc should carry no numbers the surviving model did not produce. Add them back once PR #33's model is measured |
-| `src/every_query/generate_tasks/redesign-spec.md` | — | **keep** — exists upstream |
+| File                                                         | Lines | Fate                                                                                                                                                                                                                                                                                                                                                                                             |
+| ------------------------------------------------------------ | ----: | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `docs/COHORT_INFERENCE_NOTES.md`                             |   376 | **delete** — self-described "reference notes, not a plan", dated 2026-07-24, about an archived checkpoint at a path that no longer matters                                                                                                                                                                                                                                                       |
+| `docs/history/2026-08-18-conditional-v2-integration-plan.md` |   318 | **delete** — port plan, fully executed                                                                                                                                                                                                                                                                                                                                                           |
+| `docs/history/2026-08-21-ontology-handoff.md`                |   278 | **delete** — session handoff, resolved                                                                                                                                                                                                                                                                                                                                                           |
+| `docs/history/2026-08-21-three-features-verification.md`     |   174 | **keep, or salvage** — this is the "why the tests look like that" document. Fold its argument into a `tests/README.md` before deleting; do not lose it                                                                                                                                                                                                                                           |
+| `docs/CONDITIONAL_QUERIES.md`                                |   280 | **rewrite** as `docs/MULTITASK.md` — the §§ on censoring-as-a-query, event bounds, ontology queries and the macro-vs-pooled AUROC argument all still describe EQ-multitask. Per D4, **drop the results sections**: they quote the conditional-seq `big_v2` run, and the rewritten doc should carry no numbers the surviving model did not produce. Add them back once PR #33's model is measured |
+| `src/every_query/generate_tasks/redesign-spec.md`            |     — | **keep** — exists upstream                                                                                                                                                                                                                                                                                                                                                                       |
 
 Git history keeps every deleted doc; the `docs/history/` files exist to brief a cold session, and
 that job is done.
@@ -332,22 +332,22 @@ upstream PR.
 24 local branches, most merged or dead. Not part of the upstream PR, but worth pruning in the same
 sweep: `git branch --merged dev` first, and keep `main`, `dev`, and #33's branch.
 
----
+______________________________________________________________________
 
 ## 6. Suggested sequencing
 
 Six PRs into `dev`, then one PR to upstream. Each step leaves the suite green.
 
-| # | PR | Risk |
-| --- | --- | --- |
-| 0 | Land #33 | — |
-| 1 | **Rehome the feature tests** (§4.2) onto `ConditionalMultitaskARModel`. Adds tests, deletes nothing. | medium — the real work |
-| 2 | **Delete the analysis scripts, PDFs, reports/, stale docs** (§5.2–5.4). Pure removal, no code touched. | trivial |
-| 3 | **Extract the shared symbols** (§3.1–3.3): new `model/answers.py`, trim `seq_dataset`, demote `sample_query_sequences` to a library. No deletions yet — both pipelines still import fine. | low |
-| 4 | **Delete the conditional-seq pipeline** (§5.1 + §4.1) and fix `train.py` / `model_loader.py`. | low, after 1 & 3 |
-| 5 | **Port `EQ_evaluate_multitask`** (D1) — group by the query *spec*, macro-average AUROC over task cells. Design below. | medium — new code |
-| 6 | **Rewrite README + `docs/MULTITASK.md`** (§5.5, §5.4), results sections omitted. | low |
-| 7 | **Stacked PR series to `payalchandak/EveryQuery`** (D5). | — |
+| #   | PR                                                                                                                                                                                        | Risk                   |
+| --- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- |
+| 0   | Land #33                                                                                                                                                                                  | —                      |
+| 1   | **Rehome the feature tests** (§4.2) onto `ConditionalMultitaskARModel`. Adds tests, deletes nothing.                                                                                      | medium — the real work |
+| 2   | **Delete the analysis scripts, PDFs, reports/, stale docs** (§5.2–5.4). Pure removal, no code touched.                                                                                    | trivial                |
+| 3   | **Extract the shared symbols** (§3.1–3.3): new `model/answers.py`, trim `seq_dataset`, demote `sample_query_sequences` to a library. No deletions yet — both pipelines still import fine. | low                    |
+| 4   | **Delete the conditional-seq pipeline** (§5.1 + §4.1) and fix `train.py` / `model_loader.py`.                                                                                             | low, after 1 & 3       |
+| 5   | **Port `EQ_evaluate_multitask`** (D1) — group by the query *spec*, macro-average AUROC over task cells. Design below.                                                                     | medium — new code      |
+| 6   | **Rewrite README + `docs/MULTITASK.md`** (§5.5, §5.4), results sections omitted.                                                                                                          | low                    |
+| 7   | **Stacked PR series to `payalchandak/EveryQuery`** (D5).                                                                                                                                  | —                      |
 
 Step 0 is a hard gate, not a formality — see the status note at the top.
 
@@ -390,16 +390,16 @@ the final query's answer. Prior answers are context, not identity, and not the l
 
 **Output** — `<metrics_stem>.by_task.parquet`, one row per spec:
 
-| column | |
-| --- | --- |
-| the five `TASK_KEY` columns | the spec itself |
-| `target_code` | `queries[-1]`, for readability |
-| `n_queries` | `len(queries)`; `1` means no conditioning |
-| `duration_bucket` | bucket of the final query's horizon, descriptive only — for rollups, never a key |
-| `n_rows`, `n_positive`, `prevalence` | over the cell |
-| `n_subjects` | distinct `subject_id` in the cell — the bootstrap's resampling unit |
-| `auroc` | within-cell, null when single-class (`_auroc_or_none`) |
-| `auroc_ci_lo`, `auroc_ci_hi` | 95% subject-cluster bootstrap, null wherever `auroc` is |
+| column                               |                                                                                  |
+| ------------------------------------ | -------------------------------------------------------------------------------- |
+| the five `TASK_KEY` columns          | the spec itself                                                                  |
+| `target_code`                        | `queries[-1]`, for readability                                                   |
+| `n_queries`                          | `len(queries)`; `1` means no conditioning                                        |
+| `duration_bucket`                    | bucket of the final query's horizon, descriptive only — for rollups, never a key |
+| `n_rows`, `n_positive`, `prevalence` | over the cell                                                                    |
+| `n_subjects`                         | distinct `subject_id` in the cell — the bootstrap's resampling unit              |
+| `auroc`                              | within-cell, null when single-class (`_auroc_or_none`)                           |
+| `auroc_ci_lo`, `auroc_ci_hi`         | 95% subject-cluster bootstrap, null wherever `auroc` is                          |
 
 **Headline** = mean of the non-null `auroc` over cells, reported alongside `n_tasks_scored` and
 `n_tasks_null` so a macro over 12 of 64 cells cannot pass as a macro over 64.
@@ -440,17 +440,17 @@ positions stay correlated within one).
 **One bootstrap pass produces every interval.** Per replicate `b`:
 
 1. Draw a subject index `S_b` — `n_subjects` distinct `subject_id`s with replacement — **shared
-   across all cells**, not redrawn per cell.
+    across all cells**, not redrawn per cell.
 2. For each cell `c`, recompute `AUROC[c, b]` over the rows of `c` whose subject is in `S_b`.
 
 That single `n_cells x n_resamples` grid of AUROCs yields all four numbers:
 
-| interval | read off the grid as | resampling axis | the question it answers |
-| --- | --- | --- | --- |
-| `auroc_ci_{lo,hi}` (per cell `c`) | percentiles of `AUROC[c, :]` | subjects | would *this task's* AUROC hold on a different draw of patients? |
-| `macro_auroc_ci_*_subjects` | percentiles of `mean_c AUROC[:, b]` | subjects | would the macro hold on a different cohort, holding the query specs fixed? |
-| `macro_auroc_ci_*_nested` | within each `b`, resample cells with replacement from `AUROC[:, b]`, take the mean; percentiles over `b` | subjects **and** tasks | would the macro hold on a different cohort *and* a different draw of specs? |
-| `macro_auroc_ci_*_tasks` | resample the *point* AUROCs with replacement, take the mean | tasks | would the macro hold on a different draw of specs, holding the cohort fixed? |
+| interval                          | read off the grid as                                                                                     | resampling axis        | the question it answers                                                      |
+| --------------------------------- | -------------------------------------------------------------------------------------------------------- | ---------------------- | ---------------------------------------------------------------------------- |
+| `auroc_ci_{lo,hi}` (per cell `c`) | percentiles of `AUROC[c, :]`                                                                             | subjects               | would *this task's* AUROC hold on a different draw of patients?              |
+| `macro_auroc_ci_*_subjects`       | percentiles of `mean_c AUROC[:, b]`                                                                      | subjects               | would the macro hold on a different cohort, holding the query specs fixed?   |
+| `macro_auroc_ci_*_nested`         | within each `b`, resample cells with replacement from `AUROC[:, b]`, take the mean; percentiles over `b` | subjects **and** tasks | would the macro hold on a different cohort *and* a different draw of specs?  |
+| `macro_auroc_ci_*_tasks`          | resample the *point* AUROCs with replacement, take the mean                                              | tasks                  | would the macro hold on a different draw of specs, holding the cohort fixed? |
 
 The sharing in step 1 is what makes the macro rows valid: the grid is dense, so every cell holds the
 **same** subjects and the cells are correlated through them. Redrawing per cell would destroy that
@@ -498,14 +498,14 @@ specs partition correctly, nulls inside lists do not collapse distinct specs, an
 sentinel separates from real horizons. The test guards the rest of the 1.x range.
 
 1. **No collision.** Same codes with different `durations` → two cells; same codes with one position
-   event-bounded (`durations` `-1.0` + a `bound_events` code) → two cells.
+    event-bounded (`durations` `-1.0` + a `bound_events` code) → two cells.
 2. **Nulls inside lists are significant.** `bound_events` `[None, None]` and `[None, "DISCHARGE"]`
-   must not group together.
+    must not group together.
 3. **Sentinel floats.** `-1.0` in `durations` / `start_durations` groups by exact equality and never
-   merges with a real horizon.
+    merges with a real horizon.
 4. **Round-trip against the grid** — the strongest of the five, since it catches collision *and*
-   fragmentation in one assertion: cell count equals the number of distinct `SequenceSpec`s in the
-   input grid, and `sum(n_rows)` equals the input height (nothing dropped, nothing double-counted).
+    fragmentation in one assertion: cell count equals the number of distinct `SequenceSpec`s in the
+    input grid, and `sum(n_rows)` equals the input height (nothing dropped, nothing double-counted).
 5. **Order independence.** Shuffling the input rows yields identical cells and identical metrics.
 
 If a future polars breaks any of these, the fallback is a derived `task_id` —
@@ -516,27 +516,27 @@ If a future polars breaks any of these, the fallback is a derived `task_id` —
 
 Per D5, four PRs against `payalchandak/EveryQuery:main` rather than one, each depending on the last:
 
-| PR | Contents |
-| --- | --- |
-| U1 | **Ontology** — `data/ontology.py`, `data/build_ontology.py`, `model/ontology_embedding.py`, `EQ_build_ontology`, `tests/ontology_suite/**`, `test_ontology*.py`. Self-contained and useful on its own; the natural first ask. |
-| U2 | **Multitask sampler** — `sample_multitask_sequences.py`, `interval_table.py`, `query_sequence_labeling.py`, `MultitaskBoundarySchema` / `QuerySeqSchema`, `EQ_generate_multitask_sequences`, the sampler half of `tests/multitask/`. |
-| U3 | **Multitask model** — `conditional_multitask_ar_model.py`, `conditional_multitask_lightning.py`, the datamodule and datasets, `rope_time.py`, the train config, and the rehomed feature tests from §4.2. |
-| U4 | **Evaluation** — `sample_evaluation_query_sequences.py`, `predict_multitask.py`, `EQ_evaluate_multitask` (+ `scipy` if `upstream/task-auroc-ci` has not landed), `docs/MULTITASK.md`, README rewrite. |
+| PR  | Contents                                                                                                                                                                                                                             |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| U1  | **Ontology** — `data/ontology.py`, `data/build_ontology.py`, `model/ontology_embedding.py`, `EQ_build_ontology`, `tests/ontology_suite/**`, `test_ontology*.py`. Self-contained and useful on its own; the natural first ask.        |
+| U2  | **Multitask sampler** — `sample_multitask_sequences.py`, `interval_table.py`, `query_sequence_labeling.py`, `MultitaskBoundarySchema` / `QuerySeqSchema`, `EQ_generate_multitask_sequences`, the sampler half of `tests/multitask/`. |
+| U3  | **Multitask model** — `conditional_multitask_ar_model.py`, `conditional_multitask_lightning.py`, the datamodule and datasets, `rope_time.py`, the train config, and the rehomed feature tests from §4.2.                             |
+| U4  | **Evaluation** — `sample_evaluation_query_sequences.py`, `predict_multitask.py`, `EQ_evaluate_multitask` (+ `scipy` if `upstream/task-auroc-ci` has not landed), `docs/MULTITASK.md`, README rewrite.                                |
 
 Confirm upstream will take a chain before splitting; if they would rather have one PR, U1–U4
 collapse without rework, since the ordering is already dependency-clean.
 
----
+______________________________________________________________________
 
 ## 7. Decisions — resolved 2026-09-08
 
-| | Question | Answer |
-| --- | --- | --- |
+|        | Question                        | Answer                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ------ | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **D1** | The missing multitask evaluator | **Port `EQ_evaluate_multitask`.** Adapt `evaluate_sequences.py` to the one-row-per-grid-row schema; group by the query spec `(queries, durations, start_durations, start_events, bound_events)`, excluding `answers[:-1]`; macro-average AUROC over task cells; emit 95% bootstrap CIs both **per cell** and on the **macro** (three macro variants — tasks, subjects, nested — all falling out of one shared-subject-index bootstrap pass) following the `upstream/task-auroc-ci` convention; guard the list-column `group_by` with a defensive test. Shipping an inference CLI with no evaluator was judged the wrong look on an upstream PR. Full design in §6 "Step 5". |
-| **D2** | `scripts/experiments/` | **Delete entirely.** Machine-local and redundant with the README's Hydra invocations. Salvage the venv/`PYTHONPATH` warning into prose first (§5.2). |
-| **D3** | Vestigial names | **Rename both.** `seq_dataset.py` → `query_seq_dataset.py` (class → `QuerySeqPytorchDataset`), `sample_query_sequences.py` → `query_sequence_labeling.py`. Pure renames show as `R100`; no surviving YAML names the class (§3.2). |
-| **D4** | `docs/CONDITIONAL_QUERIES.md` | **Rewrite as `docs/MULTITASK.md`, drop the results sections.** They quote the conditional-seq `big_v2` run; add multitask numbers once PR #33's model is measured (§5.4). |
-| **D5** | Upstream PR shape | **Stacked series** — ontology → sampler → model → eval, four PRs against `payalchandak/EveryQuery:main`. Confirm upstream accepts a chain first (§6, step 7). |
+| **D2** | `scripts/experiments/`          | **Delete entirely.** Machine-local and redundant with the README's Hydra invocations. Salvage the venv/`PYTHONPATH` warning into prose first (§5.2).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| **D3** | Vestigial names                 | **Rename both.** `seq_dataset.py` → `query_seq_dataset.py` (class → `QuerySeqPytorchDataset`), `sample_query_sequences.py` → `query_sequence_labeling.py`. Pure renames show as `R100`; no surviving YAML names the class (§3.2).                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| **D4** | `docs/CONDITIONAL_QUERIES.md`   | **Rewrite as `docs/MULTITASK.md`, drop the results sections.** They quote the conditional-seq `big_v2` run; add multitask numbers once PR #33's model is measured (§5.4).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| **D5** | Upstream PR shape               | **Stacked series** — ontology → sampler → model → eval, four PRs against `payalchandak/EveryQuery:main`. Confirm upstream accepts a chain first (§6, step 7).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 
 No decisions remain open. One thing to watch that is not a decision: D1's new CLI is the only step
 that adds code rather than removing it, so it is the one most likely to slip.
@@ -545,13 +545,13 @@ that adds code rather than removing it, so it is the one most likely to slip.
 
 ```bash
 # after every deletion PR
-uv run pytest tests/ -x -q                       # full suite
+uv run pytest tests/ -x -q # full suite
 uv run python -c "import every_query, pkgutil, importlib; \
     [importlib.import_module(m.name) for m in pkgutil.walk_packages(every_query.__path__, 'every_query.')]"
 uv run pre-commit run --all-files
 for cli in EQ_process_data EQ_train EQ_predict EQ_evaluate EQ_build_ontology \
-           EQ_generate_multitask_sequences EQ_generate_evaluation_query_sequences \
-           EQ_predict_multitask; do "$cli" --help >/dev/null || echo "BROKEN: $cli"; done
+	EQ_generate_multitask_sequences EQ_generate_evaluation_query_sequences \
+	EQ_predict_multitask; do "$cli" --help >/dev/null || echo "BROKEN: $cli"; done
 git grep -nE 'conditional_model|conditional_ar_model|conditional_lightning|predict_sequences|evaluate_sequences'
 ```
 
