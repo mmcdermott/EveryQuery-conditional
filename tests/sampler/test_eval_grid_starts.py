@@ -552,6 +552,7 @@ def _run(data_dir: Path, out_dir: Path, codes_yaml: Path, **overrides) -> None:
         "prediction_times_per_subject": 3,
         "min_context_per_subject": 5,
         "seed": 1,
+        "min_task_positives": "null",  # the production default (40) would drop every tiny-fixture task
     }
     kwargs.update(overrides)
     with initialize_config_dir(config_dir=eval_seq.CONFIGS, version_base=None):

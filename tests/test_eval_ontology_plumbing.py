@@ -222,6 +222,8 @@ def _run_eval(**overrides) -> None:
     that Hydra accepted ``ontology_dir=`` and ``main`` dropped it on the floor, which no call made
     straight to ``run_worker`` would ever notice.
     """
+    # The production default (40 positives) would drop every task in these tiny fixtures.
+    overrides = {"min_task_positives": "null", **overrides}
     with initialize_config_dir(config_dir=eval_seq.CONFIGS, version_base=None):
         cfg = compose(
             config_name="sample_evaluation_query_sequences_config",

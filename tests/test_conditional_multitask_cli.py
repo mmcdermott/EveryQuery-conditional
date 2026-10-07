@@ -224,6 +224,7 @@ def queryseq_grid(eq_preprocessed_dataset: Path, tmp_path_factory) -> tuple[Path
             f"split={tuning_split}",
             f"contexts_path={cohort_fp!s}",
             f"sequences_path={specs_fp!s}",
+            "min_task_positives=null",  # the production default (40) would drop every tiny-fixture task
         ],
         timeout=180.0,
     )
@@ -584,6 +585,7 @@ def ancestor_queryseq_grid(
             f"split={tuning_split}",
             f"contexts_path={cohort_fp!s}",
             f"sequences_path={specs_fp!s}",
+            "min_task_positives=null",  # the production default (40) would drop every tiny-fixture task
             f"ontology_dir={multitask_ontology_dir!s}",
         ],
         timeout=180.0,

@@ -355,6 +355,8 @@ _ANCESTOR = "C"  # every synthetic leaf ``C//i`` sits under it; ``TIMELINE//END`
 
 
 def _run_eval(**overrides) -> None:
+    # The production default (40 positives) would drop every task in these tiny fixtures.
+    overrides = {"min_task_positives": "null", **overrides}
     with initialize_config_dir(config_dir=eval_seq.CONFIGS, version_base=None):
         cfg = compose(
             config_name="sample_evaluation_query_sequences_config",
